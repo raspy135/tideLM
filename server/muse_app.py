@@ -346,23 +346,36 @@ def make_handler(tpl: Template, jobs, model_name: str, defaults: dict):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
+            # No length is known up front: the end of the stream is the end of the connection.
+            self.send_header("Connection", "close")
             self.end_headers()
+            self.close_connection = True
             rid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
             parser = Parser(tpl)
             n = 0
+
+            last = [time.monotonic()]
 
             def send(delta, finish=None):
                 chunk = {"id": rid, "object": "chat.completion.chunk", "created": int(time.time()),
                          "model": model_name, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
                 self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
                 self.wfile.flush()
+                last[0] = time.monotonic()
 
             try:
                 send({"role": "assistant"})
                 for tok in self._events(job):
                     n += 1
-                    for chan, text in parser.feed(tok):
+                    events = parser.feed(tok)
+                    for chan, text in events:
                         send({"reasoning_content": text} if chan == "reasoning" else {"content": text})
+                    if not events and time.monotonic() - last[0] > 1.0:
+                        # Headers and tool-call bodies stream nothing visible; an SSE comment
+                        # keeps proxies awake and is how a closed client gets noticed.
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                        last[0] = time.monotonic()
                 for chan, text in parser.finish():
                     send({"reasoning_content": text} if chan == "reasoning" else {"content": text})
                 calls = parser.tool_calls(req.get("tools"))

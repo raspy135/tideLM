@@ -234,6 +234,7 @@ class MuseTP:
         self.use_graphs = env("MUSE_GRAPHS", "1") == "1"
         self.prefill_moe = env("MUSE_PREFILL_MOE", "triton")
         self.decode_rows = 16          # steps of at most this many rows take the device-position path
+        self.graph_rows = {1}          # step sizes replayed from captured graphs
         if self.miss not in ("substitute", "stream"):
             raise ValueError("MUSE_MISS must be substitute or stream")
         W, r = self.world, self.rank
@@ -251,7 +252,15 @@ class MuseTP:
         if want == "auto":
             # Whatever is free after dense weights and caches, less a reserve for activations,
             # graph pools and the host; the smaller rank decides for both.
+            # Unified memory: the page cache (a model download, the checkpoint just read) is
+            # reclaimable but cudaMemGetInfo counts it as used. MemAvailable does not.
             free = torch.cuda.mem_get_info(self.dev)[0]
+            try:
+                for line in open("/proc/meminfo"):
+                    if line.startswith("MemAvailable:"):
+                        free = max(free, int(line.split()[1]) * 1024)
+            except OSError:
+                pass
             reserve = float(env("MUSE_RESERVE_GB", "12")) * 1e9
             per = Arena.slot_bytes(cfg, W)
             mine = max(0, int((free - reserve) // per) - transient)
@@ -625,8 +634,11 @@ class MuseTP:
         self.tokens.extend(ids.tolist())
         if T <= self.decode_rows:
             self.pos_t.fill_(self.pos)
-            if (self.use_graphs and self.miss == "substitute" and hidden_out is None
-                    and self.record is None):
+            # Graphs only for the step sizes decoding repeats (one row; verify blocks later).
+            # A short prompt suffix after prefix reuse runs eagerly instead of capturing a
+            # graph for its one-off row count.
+            if (self.use_graphs and T in self.graph_rows and self.miss == "substitute"
+                    and hidden_out is None and self.record is None):
                 out = self._replay(ids)
             else:
                 out = self._step(ids, hidden_out)
