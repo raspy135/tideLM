@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from pathlib import Path
 
@@ -163,11 +164,12 @@ class GlmTP:
             self.graph_rows = {1, int(env("MUSE_MTP_DEPTH", "3")) + 1}
         self.adapt_every = int(env("MUSE_ADAPT_EVERY", "200"))
         self.adapt_prefill_swaps = int(env("MUSE_ADAPT_PREFILL_SWAPS", "2048"))
-        self.adapt_decode_swaps = int(env("MUSE_ADAPT_DECODE_SWAPS", "512"))
+        self.adapt_decode_swaps = int(env("MUSE_ADAPT_DECODE_SWAPS", "256"))
+        self.adapt_margin = float(env("MUSE_ADAPT_MARGIN", "1.5"))
         self.adapt_log = []
         self.adapt_cross_layer = env("MUSE_ADAPT_CROSS_LAYER", "1") == "1"
         if env("MUSE_ADAPT", "1") == "1" and self.miss == "substitute":
-            self.enable_adaptation(float(env("MUSE_ADAPT_DECAY", "0.5")))
+            self.enable_adaptation(float(env("MUSE_ADAPT_DECAY", "0.9")))
         torch.cuda.synchronize()
         self.log(f"[glm] rank {r}/{W} ready in {time.perf_counter() - t0:.1f}s: dense {self.dense_bytes / 1e9:.2f} GB, "
                  f"{self.slots_resident} of {total} routed experts resident + {fixed} fixed "
@@ -193,9 +195,10 @@ class GlmTP:
         mine = {"version": VERSION, "code": digest, "miss": self.miss, "native": self.native,
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
-                "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"),
+                "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"), "db": env("MUSE_STATS_DB", ""),
                 "adapt": [env(k, "") for k in ("MUSE_ADAPT", "MUSE_ADAPT_EVERY", "MUSE_ADAPT_PREFILL_SWAPS",
-                                               "MUSE_ADAPT_DECODE_SWAPS", "MUSE_ADAPT_DECAY", "MUSE_ADAPT_CROSS_LAYER")],
+                                               "MUSE_ADAPT_DECODE_SWAPS", "MUSE_ADAPT_DECAY", "MUSE_ADAPT_CROSS_LAYER",
+                                               "MUSE_ADAPT_MARGIN")],
                 "fast_comm": self.comm.fast,
                 "config": json.dumps({k: v for k, v in self.cfg.extra["raw"].items()
                                       if k != "quantization_config"}, sort_keys=True)}
@@ -313,8 +316,51 @@ class GlmTP:
         self.first_routed = slot
         self.ck.drop_cache()
 
+    def _db_resident(self):
+        """Cross-layer top-N by the stats DB's accumulated router mass (rank 0 reads, broadcasts)."""
+        plan = None
+        if self.rank == 0 and self.db_mass is not None and self.db_tokens > 0:
+            layers = torch.tensor(self.moe_layers)
+            m = self.db_mass[layers].clone()
+            E, k2 = self.cfg.experts, 2 * self.cfg.topk
+            plan = {int(L): [] for L in layers}
+            # Every layer first gets its 2 x top-k best, then the rest goes by global mass.
+            for li, L in enumerate(self.moe_layers):
+                top = torch.argsort(m[li], descending=True)[:k2].tolist()
+                plan[L] += top
+                m[li, top] = -1.0
+            left = self.slots_resident - sum(len(v) for v in plan.values())
+            for idx in torch.argsort(m.reshape(-1), descending=True)[:max(0, left)].tolist():
+                li, e = divmod(idx, E)
+                plan[self.moe_layers[li]].append(e)
+            plan = {L: sorted(v) for L, v in plan.items()}
+        return self.comm.broadcast_obj(plan)
+
+    def _load_db(self):
+        self.db_path = env("MUSE_STATS_DB", "")
+        self.db_mass, self.db_tokens = None, 0
+        if self.rank == 0 and self.db_path and Path(self.db_path).exists():
+            db = torch.load(self.db_path, map_location="cpu", weights_only=True)
+            if tuple(db["mass"].shape) == (self.nL, self.cfg.experts):
+                self.db_mass, self.db_tokens = db["mass"].double(), int(db["tokens"])
+        if self.rank == 0 and self.db_path and self.db_mass is None:
+            self.db_mass = torch.zeros((self.nL, self.cfg.experts), dtype=torch.float64)
+
+    def save_db(self):
+        if self.rank != 0 or not self.db_path or self.db_mass is None:
+            return
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.db_path + ".tmp"
+        torch.save({"version": 1, "mass": self.db_mass, "tokens": self.db_tokens}, tmp)
+        os.replace(tmp, self.db_path)
+
     def _place_resident(self, resident=None):
         cfg = self.cfg
+        self._load_db()
+        if resident is None and not env("MUSE_RESIDENT", ""):
+            resident = self._db_resident()
+            if resident:
+                self.log(f"[glm] resident set from the stats DB ({self.db_tokens} tokens of routing)")
         if resident is None and env("MUSE_RESIDENT", ""):
             raw = json.loads(Path(env("MUSE_RESIDENT", "")).read_text())
             raw = raw.get("resident", raw)
@@ -380,18 +426,29 @@ class GlmTP:
         self.pos = 0
         self.tokens: list[int] = []
 
-    def enable_adaptation(self, decay: float = 0.5):
+    def enable_adaptation(self, decay: float = 0.9):
+        self.demand_tokens = 0
+        self.adapt_epoch = 0
+        self.slot_epoch = [-10] * self.arena.slots          # adaptation that last loaded a slot
+        self.adapt_totals = {"swaps": 0, "churn": 0}
         self.demand = torch.zeros((self.nL, self.cfg.experts), dtype=torch.float32, device=self.dev)
         self.score = torch.zeros_like(self.demand)        # decayed history the swaps rank by
         self.decay = decay
 
     @torch.no_grad()
-    def adapt(self, max_swaps: int = 4096, margin: float = 1.05):
+    def adapt(self, max_swaps: int = 4096, margin: float | None = None):
         """Swap toward recent demand between requests. Per MoE layer: the non-resident experts
         with the most decayed router mass replace the resident ones with the least, while the
         newcomer's score beats the victim's by ``margin``. Rank 0 decides; both ranks load the
         same experts into the same slots. Returns (swaps, seconds)."""
         t0 = time.perf_counter()
+        margin = self.adapt_margin if margin is None else margin
+        self.adapt_epoch += 1
+        churn = 0
+        if self.rank == 0 and getattr(self, "db_mass", None) is not None:
+            self.db_mass += self.demand.double().cpu()
+            self.db_tokens += int(self.demand_tokens)
+        self.demand_tokens = 0
         self.score.mul_(self.decay).add_(self.demand)
         self.demand.zero_()
         plan = None
@@ -447,13 +504,20 @@ class GlmTP:
             parts = self._read_many(L, [c for c, _, _ in items])
             for (c, VL, v), pr in zip(items, parts):
                 slot = int(self.lut[VL, v])
+                # Churn: evicting what one of the last two adaptations just brought in.
+                churn += self.adapt_epoch - self.slot_epoch[slot] <= 2
+                self.slot_epoch[slot] = self.adapt_epoch
                 self.lut[VL, v] = -1
                 self.owner[slot] = None
                 self._load(L, c, slot, pr)
         if self.allowed is not None:
             self.allowed.copy_(self.lut >= 0)
         self.ck.drop_cache()
+        self.save_db()
         torch.cuda.synchronize()
+        self.adapt_totals["swaps"] += len(plan)
+        self.adapt_totals["churn"] += churn
+        self.last_churn = churn
         return len(plan), time.perf_counter() - t0
 
     # ------------------------------------------------------------------ attention
@@ -779,7 +843,7 @@ class GlmTP:
             # After prefill: swap toward what this prompt routed to (decode benefits; the prompt's
             # KV is already computed with the substituted experts).
             n, sec = self.adapt(self.adapt_prefill_swaps)
-            self.adapt_log.append(("prefill", n, round(sec, 2)))
+            self.adapt_log.append(("prefill", n, round(sec, 2), self.last_churn))
         spec = self.mtp_on and depth > 0
         self.mtp_fill = not spec
         if spec:
@@ -799,7 +863,7 @@ class GlmTP:
             if self.demand is not None and self.adapt_every and emitted >= next_adapt:
                 # Both ranks reach this at the same token count (emitted is decided on rank 0).
                 n, sec = self.adapt(self.adapt_decode_swaps)
-                self.adapt_log.append((f"decode@{emitted}", n, round(sec, 2)))
+                self.adapt_log.append((f"decode@{emitted}", n, round(sec, 2), self.last_churn))
                 next_adapt += self.adapt_every
             yield anchor
             emitted += 1
@@ -877,6 +941,8 @@ class GlmTP:
             raise ValueError(f"context {self.pos + ids.numel()} exceeds max_seq {self.max_seq}")
         T = ids.numel()
         self.tokens.extend(ids.tolist())
+        if self.demand is not None:
+            self.demand_tokens += T
         if T <= self.decode_rows:
             self.pos_t.fill_(self.pos)
             if self.use_graphs and T in self.graph_rows and self.miss == "substitute":
