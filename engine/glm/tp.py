@@ -156,6 +156,8 @@ class GlmTP:
         self.graphs: dict[int, tuple] = {}
         self.stats = {"stream_loads": 0, "stream_s": 0.0}
         self.miss_stats = None
+        self.miss_hist = None          # [2, 50]: missed picks and their mass by router weight / routed scale
+        self.route_dump = None         # list: per MoE layer call (L, ids0, w0, missed, {L+d: ids predicted from this x})
         self.record = None
         self.demand = None             # [layers, E] router mass wanted since the last adapt()
         self.mtp_fill = True
@@ -614,6 +616,21 @@ class GlmTP:
             ms["missed"] += int(missed.sum())
             ms["mass"] += float(w0.sum())
             ms["mass_missed"] += float((w0 * missed).sum())
+        if self.route_dump is not None and allowed is not None:
+            w0, ids0 = route(cfg, x, lw["router"], lw["bias"], None)
+            ahead = {}
+            for d in (1, 2, 4, 8):
+                N = L + d
+                if N < self.nL - 1 and not self.dense(N):        # not into the MTP layer
+                    ahead[N] = route(cfg, x, self.L[N]["router"], self.L[N]["bias"], None)[1].to(torch.int16)
+            self.route_dump.append((L, ids0.to(torch.int16), w0.half(), ~allowed[ids0], ahead))
+        if self.miss_hist is not None and allowed is not None:
+            w0, ids0 = route(cfg, x, lw["router"], lw["bias"], None)
+            m = (~allowed[ids0]).float().reshape(-1)
+            wn = (w0 / cfg.routed_scaling).reshape(-1)
+            b = (wn * self.miss_hist.shape[1]).long().clamp_(0, self.miss_hist.shape[1] - 1)
+            self.miss_hist[0].index_add_(0, b, m)
+            self.miss_hist[1].index_add_(0, b, wn * m)
         if self.miss == "stream":
             self._stream_misses(L, ids)
         slots = self.lut[L][ids]

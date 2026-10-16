@@ -2628,3 +2628,30 @@ placement covers ~67% of the mass of the routing it was built from and ~58% of a
 (DB placement vs the trace-v3 set; they share 5,010 of ~7,500 experts), so a fixed 39% set
 misses about a third in-sample. The trace curve put ~10% mass missed at ~70% residency. Default
 stays 200: same floor as 64 at a third of the swap time.
+
+## GLM-5.3 decode misses: router weight does not single out the costly ones; background streaming (2026-10-16)
+
+Same workload as above (every 200, round 2 settled: 23.7% decode mass missed, 172 missed picks a
+token). `glm_adapt_test.py --hist`: missed picks by router weight (share of the token's routed
+mass; uniform top-8 = 0.125). Streaming every miss at or above a weight, synchronously:
+
+| weight >= | streams / token | mass left missed |
+| --- | --- | --- |
+| 0.30 | 0.65 | 23.4% |
+| 0.20 | 4.4 | 22.2% |
+| 0.16 | 10 | 20.9% |
+| 0.12 | 39 | 15.7% |
+| 0.10 | 83 | 9.3% |
+
+GLM's sigmoid top-8 weights are flat; the misses are ordinary picks (0.06-0.12). A cold read costs
+~15 ms for one expert (rank half, ~10 MB), ~30 ms for eight at once (~3.8 ms each; `--read-bench`),
+against a ~110 ms decode token, so synchronous streaming of 80 a token is out.
+
+Background streaming, simulated on a decode routing dump (`--dump`, tools/glm_bg_stream_sim.py):
+- reactive (a miss queues a read, heaviest first, B a token; it lands next token in an LRU of C
+  transient slots): C=1024/B=40 21.6% -> 15.5%; C=2048/B=40 -> 12.4%. The slots are not free --
+  they come out of the resident set -- so the net is smaller than shown. Short-term reuse is low:
+  only 14% of missed mass was picked by the same layer the token before, 43% within 16 tokens.
+- pre-gating (layer N's router on layer N-d's input): recall of missed mass 66% at d=1, 56% d=2,
+  44% d=4, 31% d=8. A layer is ~1.4 ms and a read 15 ms, so d=1-2 leaves no time to read, and at
+  d=8 recall is a third. It also costs ~135 reads a token. Not usable for decode.
