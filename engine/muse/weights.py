@@ -258,3 +258,49 @@ def write_synthetic(model_dir: str | Path, raw_config: dict, *, seed: int = 0,
     out.mkdir(parents=True, exist_ok=True)
     save_file(t, str(out / "model.safetensors"))
     (out / "config.json").write_text(json.dumps(raw_config, indent=1))
+
+
+def write_synthetic_dspark(out_dir: str | Path, target_raw: dict, *, seed: int = 1,
+                           layers: int = 2, taps=(0, 1, 2, 3), std: float = 0.02,
+                           device: str = "cpu") -> None:
+    """A random DSpark drafter in the published layout, for a synthetic target (tests only)."""
+    from safetensors.torch import save_file
+    from .config import MuseConfig
+    cfg = MuseConfig.from_dict(target_raw)
+    g = torch.Generator().manual_seed(seed)
+
+    def rnd(*shape, s=std):
+        return (torch.randn(*shape, generator=g) * s).to(torch.bfloat16)
+
+    H, D = cfg.hidden, cfg.head_dim
+    inter = 2 * H
+    t = {"fc.weight": rnd(H, H * len(taps)), "hidden_norm.weight": rnd(H, s=0.01),
+         "norm.weight": rnd(H, s=0.1), "lm_head.weight": rnd(cfg.vocab, H),
+         "markov_head.markov_w1.weight": rnd(cfg.vocab, 512, s=0.01),
+         "markov_head.markov_w2.weight": rnd(cfg.vocab, 512, s=0.01),
+         "confidence_head.proj.weight": rnd(1, H + 512), "confidence_head.proj.bias": rnd(1),
+         "d2t": torch.zeros(cfg.vocab, dtype=torch.long)}
+    for i in range(layers):
+        p = f"layers.{i}."
+        t.update({p + "self_attn.pre_qkv_proj_norm.weight": rnd(H, s=0.02),
+                  p + "self_attn.q_proj.weight": rnd(cfg.heads * D, H),
+                  p + "self_attn.k_proj.weight": rnd(cfg.kv_heads * D, H),
+                  p + "self_attn.v_proj.weight": rnd(cfg.kv_heads * D, H),
+                  p + "self_attn.o_gate_proj.weight": rnd(cfg.heads * D, H),
+                  p + "self_attn.o_proj.weight": rnd(H, cfg.heads * D),
+                  p + "add_attn.gate": rnd(H, s=0.03), p + "add_ffn.gate": rnd(H, s=0.03),
+                  p + "pre_ffn_norm.weight": rnd(H, s=0.02), p + "post_ffn_norm.weight": rnd(H, s=0.01),
+                  p + "feed_forward.gate_proj.weight": rnd(inter, H),
+                  p + "feed_forward.up_proj.weight": rnd(inter, H),
+                  p + "feed_forward.down_proj.weight": rnd(H, inter)})
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    save_file(t, str(out / "model.safetensors"))
+    conf = {"model_type": "muse_spark_dspark", "hidden_size": H, "num_hidden_layers": layers,
+            "num_attention_heads": cfg.heads, "num_key_value_heads": cfg.kv_heads, "head_dim": D,
+            "intermediate_size": inter, "rms_norm_eps": 1e-5, "rms_post_norm_eps": 1e-8,
+            "rope_theta": cfg.rope_theta, "sliding_window": 2048, "block_size": 7,
+            "mask_token_id": cfg.pad, "target_layer_ids": list(taps), "markov_rank": 512,
+            "output_soft_cap_temp": 20.0, "metap": {"use_metap": True, "base_width": 256.0},
+            "vocab_size": cfg.vocab}
+    (out / "config.json").write_text(json.dumps(conf, indent=1))

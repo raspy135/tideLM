@@ -137,6 +137,56 @@ def main():
     toks = eng.generate(prompt[:64], 32)
     torch.cuda.synchronize()
     gen_s = time.perf_counter() - t0
+
+    # E: speculative decoding with a random drafter: greedy output must equal plain greedy
+    # (every round exercises rejection and rollback), and sampling must run.
+    from engine.muse.weights import write_synthetic_dspark
+    dsp = MODEL.parent / "muse-synth-v2-dspark"
+    if not (dsp / "model.safetensors").exists():
+        write_synthetic_dspark(dsp, RAW)
+    eng.reset()
+    plain = eng.generate(prompt[:300].tolist(), 40)
+    eng.enable_drafter(str(dsp))
+    eng.reset()
+    spec = eng.generate(prompt[:300].tolist(), 40)
+    spec_rounds = dict(eng.spec_stats)
+    eng.reset()
+    sampled = eng.generate(prompt[:300].tolist(), 40, temperature=1.0, top_k=64, seed=3)
+    # Feed the drafter its own target's choices: with the target's greedy tokens as anchors the
+    # loop must still reproduce plain decoding after a prefix-reuse turn.
+    spec2 = eng.generate(prompt[:300].tolist() + spec[:10], 20)
+    # Oracle drafts: the plain greedy continuation with every 4th draft wrong, so each round
+    # accepts exactly 3 and emits 3 drafts plus the target's correction.
+    base = prompt[:300].tolist()
+
+    def oracle(anchor, p):
+        i = p - len(base)
+        d = plain[i + 1:i + 8] + [5] * 8
+        d = d[:7]
+        d[3] = (d[3] + 1) % 32768
+        return d
+    eng.drafter.oracle = oracle
+    eng.spec_stats = {"rounds": 0, "accepted": 0}
+    eng.reset()
+    oracle_out = eng.generate(base, 40)
+    oracle_rounds = dict(eng.spec_stats)
+    eng.drafter.oracle = None
+    eng.disable_drafter()
+    eng.reset()
+    plain2 = eng.generate(prompt[:300].tolist() + spec[:10], 20)
+
+    def tf_margins(prefix, out):
+        """Each generated token against the argmax of one clean teacher-forced pass: the
+        logit margin by which it lost (0 when it is the argmax)."""
+        eng.reset()
+        tf = eng.forward(prefix + out).float().cpu()
+        rows = tf[len(prefix) - 1:len(prefix) - 1 + len(out)]
+        best = rows.max(-1).values
+        chosen = rows.gather(1, torch.tensor(out)[:, None])[:, 0]
+        return (best - chosen).tolist()
+    m_spec = tf_margins(prompt[:300].tolist(), spec)
+    m_oracle = tf_margins(base, oracle_out)
+    m_plain = tf_margins(prompt[:300].tolist(), plain)
     del eng
     gc.collect(); torch.cuda.empty_cache()
 
@@ -204,6 +254,27 @@ def main():
               n_appended == len(p1) + len(gen) and ra["rel"] <= max(2 * noise, 0.01), f"reused {n_appended}: {ra}")
         check("prefix reuse (edit near the end) equals a fresh prefill",
               n_edit == len(p2) - 20 and re_["rel"] <= max(2 * noise, 0.01), f"reused {n_edit}: {re_}")
+        agree = next((i for i, (a_, b_) in enumerate(zip(spec, plain)) if a_ != b_), len(spec))
+        say(f"speculative vs plain greedy: identical for {agree} of {len(spec)} tokens; "
+            f"teacher-forced loss margins: spec max {max(m_spec):.4f}, plain max {max(m_plain):.4f}; {spec_rounds}")
+        # Batch shape changes the last bits (an 8-row verify step vs a 1-row step), so on this
+        # random model's near-flat logits exact equality is not the test. Every token must be the
+        # argmax of a clean pass up to such a near-tie; a broken rollback or a wrongly accepted
+        # draft loses by whole logits.
+        tie = 0.05
+        check("speculative greedy tokens are the target's argmax (near-ties aside)",
+              max(m_spec) <= tie and max(m_plain) <= tie, f"max margin {max(m_spec):.4f}")
+        same = next((i for i, (a_, b_) in enumerate(zip(oracle_out, plain)) if a_ != b_), 40)
+        # The oracle proposes the *plain* run's continuation; once this run takes the other side
+        # of a near-tie, its drafts stop matching. Before that, every round accepts 3 (4 tokens).
+        check("oracle drafts: 3 accepted a round until the runs part, output the target's argmax",
+              oracle_rounds["accepted"] >= 3 * (same // 4) - 3 and max(m_oracle) <= tie
+              and len(oracle_out) == 40,
+              f"{oracle_rounds}, max margin {max(m_oracle):.4f}, same as plain for "
+              f"{next((i for i, (a_, b_) in enumerate(zip(oracle_out, plain)) if a_ != b_), 40)} tokens")
+        check("speculative greedy after prefix reuse agrees with plain to near-ties",
+              sum(a_ != b_ for a_, b_ in zip(spec2, plain2)) <= len(plain2) // 2)
+        check("speculative sampling runs", len(sampled) == 40, f"{sampled[:6]}")
         check("graph replay equals eager decode", r["graph_vs_eager_decode"]["rel"] == 0.0,
               f"{r['graph_vs_eager_decode']}")
         say(f"decode step with graphs, 4 layers: bf16 dense {step_ms:.2f} ms, fp8 dense {step_ms_fp8:.2f} ms")

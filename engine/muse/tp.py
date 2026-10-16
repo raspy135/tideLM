@@ -278,8 +278,15 @@ class MuseTP:
         self.graphs: dict[int, tuple] = {}
         self.record: list | None = None
         self.miss_stats: dict | None = None
+        self.drafter = None
+        self.spec = False
+        self.tap_layers: list[int] = []
+        self.tap_input = True
+        self.spec_stats = {"rounds": 0, "accepted": 0}
         self.stats = {"stream_loads": 0, "stream_s": 0.0}
         torch.cuda.synchronize()
+        if env("MUSE_DRAFTER", ""):
+            self.enable_drafter(env("MUSE_DRAFTER", ""))
         self.log(f"[muse] rank {r}/{W} ready in {time.perf_counter() - t0:.1f}s: dense {self.dense_fmt}"
                  f" {self.dense_bytes / 1e9:.2f} GB, {self.slots_resident} resident slots of {total}"
                  f" ({self.arena.bytes_per_slot * self.arena.slots / 1e9:.2f} GB), miss={self.miss},"
@@ -639,20 +646,20 @@ class MuseTP:
             # graph for its one-off row count.
             if (self.use_graphs and T in self.graph_rows and self.miss == "substitute"
                     and hidden_out is None and self.record is None):
-                out = self._replay(ids)
+                out, taps = self._replay(ids)
             else:
-                out = self._step(ids, hidden_out)
+                out, taps = self._step(ids, hidden_out)
+            if self.drafter is not None:
+                self.drafter.update_context(taps, self.pos)
             self.pos += T
             return out if all_logits else out[-1:]
         outs = []
         for c0 in range(0, ids.numel(), self.chunk):
             part = ids[c0:c0 + self.chunk]
             self.pos_t.fill_(self.pos)       # a chunk of <= decode_rows tokens takes the decode path
-            h = self.embed_ids(part)
-            for L in range(self.cfg.layers):
-                h = self.layer(L, h)
-                if hidden_out is not None:
-                    hidden_out.append(h)
+            h, taps = self._layers(self.embed_ids(part), hidden_out)
+            if self.drafter is not None:
+                self.drafter.update_context(taps, self.pos)
             self.pos += part.numel()
             if all_logits:
                 outs.append(self.logits(h))
@@ -660,14 +667,24 @@ class MuseTP:
                 outs.append(self.logits(h[-1:]))
         return torch.cat(outs)
 
-    def _step(self, ids: torch.Tensor, hidden_out: list | None = None) -> torch.Tensor:
-        """One decode-size step at pos_t (no host position use inside)."""
-        h = self.embed_ids(ids)
+    def _layers(self, h: torch.Tensor, hidden_out: list | None = None):
+        """All layers; returns (h, taps [T, n_taps, H] or None). A tap of layer L is that
+        layer's input (the convention of vLLM's auxiliary hidden states) or its output."""
+        taps = []
         for L in range(self.cfg.layers):
+            if self.tap_input and L in self.tap_layers:
+                taps.append(h)
             h = self.layer(L, h)
+            if not self.tap_input and L in self.tap_layers:
+                taps.append(h)
             if hidden_out is not None:
                 hidden_out.append(h)
-        return self.logits(h)
+        return h, (torch.stack(taps, 1) if taps else None)
+
+    def _step(self, ids: torch.Tensor, hidden_out: list | None = None):
+        """One decode-size step at pos_t (no host position use inside): (logits, taps)."""
+        h, taps = self._layers(self.embed_ids(ids), hidden_out)
+        return self.logits(h), taps
 
     def _replay(self, ids: torch.Tensor) -> torch.Tensor:
         T = ids.numel()
@@ -682,20 +699,18 @@ class MuseTP:
             torch.cuda.current_stream().wait_stream(side)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                static_out = self._step(static_ids)
-            entry = self.graphs[T] = (graph, static_ids, static_out)
+                static_out, static_taps = self._step(static_ids)
+            entry = self.graphs[T] = (graph, static_ids, static_out, static_taps)
             self.log(f"[muse] captured decode graph for {T} rows")
-        graph, static_ids, static_out = entry
+        graph, static_ids, static_out, static_taps = entry
         static_ids.copy_(ids)
         graph.replay()
-        return static_out.clone()
+        return static_out.clone(), (static_taps.clone() if static_taps is not None else None)
 
-    def sample(self, z: torch.Tensor, temperature: float, top_p: float, top_k: int,
-               gen: torch.Generator) -> int:
-        z = z.float()
-        if temperature <= 0:
-            return int(z.argmax())
-        z = z / temperature
+    @staticmethod
+    def sample_probs(z: torch.Tensor, temperature: float, top_p: float, top_k: int) -> torch.Tensor:
+        """The sampling distribution over the vocabulary: temperature, then top-k, then top-p."""
+        z = z.float() / max(temperature, 1e-6)
         if 0 < top_k < z.numel():
             vals, idx = z.topk(top_k)
         else:
@@ -704,7 +719,14 @@ class MuseTP:
         if top_p < 1.0:
             keep = pr.cumsum(0) - pr < top_p
             pr = pr * keep
-        return int(idx[torch.multinomial(pr, 1, generator=gen)])
+            pr = pr / pr.sum()
+        return torch.zeros_like(z).scatter_(0, idx, pr)
+
+    def sample(self, z: torch.Tensor, temperature: float, top_p: float, top_k: int,
+               gen: torch.Generator) -> int:
+        if temperature <= 0:
+            return int(z.float().argmax())
+        return int(torch.multinomial(self.sample_probs(z, temperature, top_p, top_k), 1, generator=gen))
 
     @torch.no_grad()
     def stream(self, prompt: list[int], max_new: int, *, temperature: float = 0.0,
@@ -715,6 +737,10 @@ class MuseTP:
         stop = self.cfg.eos if stop is None else stop
         gen = torch.Generator(device=self.dev).manual_seed(seed)
         logits = self.prefill(list(prompt))
+        if self.drafter is not None and self.spec:
+            yield from self._stream_spec(logits, max_new, temperature, top_p, top_k, gen,
+                                         stop, should_stop)
+            return
         for _ in range(max_new):
             msg = None
             if self.rank == 0:
@@ -727,6 +753,97 @@ class MuseTP:
             if tok in stop:
                 return
             logits = self.forward([tok], all_logits=False)
+
+    def _stream_spec(self, logits, max_new, temperature, top_p, top_k, gen, stop, should_stop):
+        """Speculative decoding with the DSpark drafter. Each round: the anchor (the target's
+        own last choice, not yet run through it) and B drafts go through the target in one
+        (B+1)-row step; drafts are accepted while they match the target (greedy) or pass the
+        rejection test min(1, p/q) (sampling, exact); the target's choice at the first
+        rejection, or after the last draft, is the next anchor. Rank 0 decides and broadcasts."""
+        B = self.drafter.block
+        anchor = None
+        if self.rank == 0:
+            anchor = self.sample(logits[-1], temperature, top_p, top_k, gen)
+        anchor = self.comm.broadcast_obj(anchor)
+        emitted = 0
+        while True:
+            if should_stop and self.rank == 0 and should_stop():
+                halt = True
+            else:
+                halt = False
+            halt = self.comm.broadcast_obj(halt)
+            if halt:
+                return
+            yield anchor
+            emitted += 1
+            if anchor in stop or emitted >= max_new:
+                # The anchor's KV is not cached yet; run it so a follow-up turn can reuse it.
+                self.forward([anchor], all_logits=False)
+                return
+            p = self.pos
+            drafts, q, conf = self.drafter.propose(anchor, p, temperature=temperature, top_k=top_k,
+                                                   top_p=top_p, gen=gen)
+            rows = [anchor] + drafts
+            tl = self.forward(rows)                                     # [B+1, V]
+            decision = None
+            if self.rank == 0:
+                n_acc, nxt = B, None
+                for k in range(B):
+                    if temperature <= 0:
+                        t = int(tl[k].float().argmax())
+                        if t != drafts[k]:
+                            n_acc, nxt = k, t
+                            break
+                    else:
+                        pk = self.sample_probs(tl[k], temperature, top_p, top_k)
+                        d = drafts[k]
+                        ratio = float(pk[d] / q[k][d].clamp_min(1e-20))
+                        if float(torch.rand((), generator=gen, device=self.dev)) >= min(1.0, ratio):
+                            resid = (pk - q[k]).clamp_min(0)
+                            if float(resid.sum()) <= 0:
+                                resid = pk
+                            n_acc = k
+                            nxt = int(torch.multinomial(resid / resid.sum(), 1, generator=gen))
+                            break
+                if nxt is None:
+                    nxt = self.sample(tl[B], temperature, top_p, top_k, gen)
+                decision = (n_acc, nxt)
+            n_acc, nxt = self.comm.broadcast_obj(decision)
+            self.spec_stats["rounds"] += 1
+            self.spec_stats["accepted"] += n_acc
+            # Keep the anchor and the accepted drafts; the rest of the step's KV is overwritten
+            # later (positions are reused) and never read before that.
+            self.pos = p + 1 + n_acc
+            self.tokens = self.tokens[:self.pos]
+            for d in drafts[:n_acc]:
+                yield d
+                emitted += 1
+                if d in stop or emitted >= max_new:
+                    return
+            anchor = nxt
+
+    def enable_drafter(self, path: str, **kw) -> None:
+        from .dspark import DSpark
+        self.drafter = DSpark(self, path, **kw)
+        src = (Path(__file__).resolve().parent / "dspark.py").read_bytes()
+        mine = {"code": hashlib.sha256(src).hexdigest()[:16], "opts": repr(self.drafter.opts),
+                "path": path, "shared_head": self.drafter.shared_head}
+        allv = self.comm.gather_objects(mine)
+        if any(v != allv[0] for v in allv):
+            raise RuntimeError(f"muse ranks disagree on the drafter: {allv}")
+        self.tap_layers = list(self.drafter.taps)
+        self.tap_input = self.drafter.opts.tap == "input"
+        self.graph_rows = {1, self.drafter.block + 1}
+        self.graphs.clear()            # graphs captured without taps would not feed the drafter
+        self.spec = True
+        self.log(f"[muse] DSpark drafter: block {self.drafter.block}, taps {self.tap_layers} "
+                 f"({self.drafter.opts.tap}), head shared: {self.drafter.shared_head}, "
+                 f"options {self.drafter.opts}")
+
+    def disable_drafter(self) -> None:
+        self.drafter, self.spec, self.tap_layers = None, False, []
+        self.graph_rows = {1}
+        self.graphs.clear()
 
     def generate(self, prompt, max_new: int, **kw) -> list[int]:
         return list(self.stream(list(prompt), max_new, **kw))
