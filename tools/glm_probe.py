@@ -84,7 +84,8 @@ def main():
             outs.append(out)
         st = eng.spec_stats
         row = {"depth": depth, "decode_tok_s": round(n / dt, 2),
-               "accepted_per_round": round(st["accepted"] / max(1, st["rounds"]), 3) if depth else None}
+               "accepted_per_round": round(st["accepted"] / max(1, st["rounds"]), 3) if depth else None,
+               "hot": dict(getattr(eng, "hot_stats", {})), "bg_installed": getattr(eng, "bg_stats", {}).get("installed")}
         rows.append(row)
         if eng.rank == 0:
             print(f"[probe] {json.dumps(row)}", flush=True)

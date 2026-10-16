@@ -137,6 +137,11 @@ class GlmTP:
         # They share the transient slots with the prefill prefetch (never both at once).
         self.hot_n = int(env("MUSE_HOT", "0")) if self.miss == "substitute" else 0
         self.hot_min = float(env("MUSE_HOT_MIN", "0.2"))
+        # Graphed decode: the threshold rises above hot_min to keep about MUSE_HOT_TARGET reads a
+        # step (an MTP verify step of 3 rows finds a >= 0.2 miss in about half the layers), and
+        # never more than twice that. Both ranks count the same reads, so they keep the same one.
+        self.hot_target = float(env("MUSE_HOT_TARGET", "4"))
+        self.hot_thr = {}
         transient = cfg.experts if self.miss == "stream" else max(2 * self.pf_n, self.hot_n)
         t0 = time.perf_counter()
         self._load_dense()
@@ -224,7 +229,8 @@ class GlmTP:
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"), "db": env("MUSE_STATS_DB", ""),
-                "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_HOT", "MUSE_HOT_MIN")],
+                "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_HOT", "MUSE_HOT_MIN",
+                                            "MUSE_HOT_TARGET")],
                 "adapt": [env(k, "") for k in ("MUSE_ADAPT", "MUSE_ADAPT_EVERY", "MUSE_ADAPT_PREFILL_SWAPS",
                                                "MUSE_ADAPT_DECODE_SWAPS", "MUSE_ADAPT_DECAY", "MUSE_ADAPT_CROSS_LAYER",
                                                "MUSE_ADAPT_MARGIN", "MUSE_BG", "MUSE_BG_EVERY", "MUSE_BG_READS",
@@ -310,13 +316,25 @@ class GlmTP:
         self.h_ring = torch.zeros((self.h_ring_n, cfg.hidden), **kw)
 
     # ------------------------------------------------------------------ experts
-    def _expert_parts(self, L, e):
-        """(gate, up, down) of this rank for routed expert e (or "shared") of layer L."""
+    def _expert_parts(self, L, e, urgent=False):
+        """(gate, up, down) of this rank for routed expert e (or "shared") of layer L; the six
+        tensors are read together (get_rows_many)."""
         r, Il, Hl = self.rank, self.arena.Il, self.arena.Hl
         b = f"{P}layers.{L}.mlp." + ("shared_experts." if e == "shared" else f"experts.{e}.")
-        return (self.ck.mx_rows(b + "gate_proj.weight", r * Il, (r + 1) * Il),
-                self.ck.mx_rows(b + "up_proj.weight", r * Il, (r + 1) * Il),
-                self.ck.mx_rows(b + "down_proj.weight", r * Hl, (r + 1) * Hl))
+        specs = []
+        for part, a, z in (("gate_proj", r * Il, (r + 1) * Il), ("up_proj", r * Il, (r + 1) * Il),
+                           ("down_proj", r * Hl, (r + 1) * Hl)):
+            specs += [(b + part + ".weight", a, z), (b + part + ".weight_scale", a, z)]
+        t = self.ck.get_rows_many(specs, urgent)
+        return (t[0], t[1]), (t[2], t[3]), (t[4], t[5])
+
+    def _read_urgent(self, L, experts):
+        """Hot-miss reads: a decode step is waiting, so neither the expert pool nor the piece
+        pool is shared with background reads (those can hold 48 experts in the queue)."""
+        if not hasattr(self, "_hot_pool"):
+            from concurrent.futures import ThreadPoolExecutor
+            self._hot_pool = ThreadPoolExecutor(max_workers=4)
+        return list(self._hot_pool.map(lambda e: self._expert_parts(L, e, True), experts))
 
     def _pseudo_parts(self, L, j):
         """Dense MLP of layer L as pseudo-expert j: intermediate columns [j*I, (j+1)*I)."""
@@ -896,7 +914,7 @@ class GlmTP:
         if not es:
             return False
         t0 = time.perf_counter()
-        for e, slot, pr in zip(es, self.transient, self._read_many(L, es)):
+        for e, slot, pr in zip(es, self.transient, self._read_urgent(L, es)):
             self.arena.put(slot, *pr)
             self.lut[L, e] = slot
         self.allowed[L, es] = True
@@ -977,6 +995,113 @@ class GlmTP:
         static_ids.copy_(ids)
         graph.replay()
         return static_out.clone(), static_h.clone()
+
+    def _hot_candidate(self, L, x):
+        """Graph-safe: this layer's heaviest missed picks (weight share, expert) into the pinned
+        host buffer, read by _replay_split between this layer's two graphs."""
+        from .ref import route
+        cfg, n = self.cfg, self.hot_n
+        w0, ids0 = route(cfg, x, self.L[L]["router"], self.L[L]["bias"], None)
+        share = (w0 / cfg.routed_scaling) * (~self.allowed[L][ids0])
+        k = min(share.numel(), 2 * n)
+        v, i = share.reshape(-1).topk(k)
+        self._hot_dev[L, :k] = v
+        self._hot_dev[L, 2 * n:2 * n + k] = ids0.reshape(-1)[i].float()
+        self._hot_host[L].copy_(self._hot_dev[L], non_blocking=True)
+
+    def _capture_split(self, ids):
+        """Decode for T rows as per-layer graphs: [embed], then per layer (attention + the hot
+        candidate) and (MLP), then [head]. Captured in replay order into one memory pool, every
+        boundary tensor kept alive by the entry, so later graphs read earlier graphs' outputs."""
+        cfg = self.cfg
+        if not hasattr(self, "_hot_dev"):
+            self._hot_dev = torch.zeros((self.nL, 4 * self.hot_n), dtype=torch.float32, device=self.dev)
+            self._hot_host = torch.zeros((self.nL, 4 * self.hot_n), dtype=torch.float32).pin_memory()
+        st_ids = ids.clone()
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                self._step(st_ids)
+        torch.cuda.current_stream().wait_stream(side)
+        pool = torch.cuda.graph_pool_handle()
+        segs, keep = [], []
+
+        def cap(fn):
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, pool=pool):
+                out = fn()
+            keep.append(out)
+            return g, out
+
+        g, h = cap(lambda: self.embed_ids(st_ids))
+        segs.append(("embed", -1, g))
+        topk = None
+        for L in range(cfg.layers):
+            def attn(L=L, h=h, topk=topk):
+                a, tk = self.attention(L, rms(h, self.L[L]["ln_in"], cfg.rms_eps), topk)
+                h1 = h + a
+                x = rms(h1, self.L[L]["ln_post"], cfg.rms_eps)
+                if not self.dense(L):
+                    self._hot_candidate(L, x)
+                return h1, x, tk
+            g, (h1, x, topk) = cap(attn)
+            segs.append(("attn", L, g))
+            g, h = cap(lambda L=L, h1=h1, x=x: h1 + self.mlp(L, x))
+            segs.append(("mlp", L, g))
+        g, (st_out, st_h) = cap(lambda: self.logits(h))
+        segs.append(("head", -1, g))
+        self.log(f"[glm] captured split decode graphs for {ids.numel()} rows ({len(segs)} segments)")
+        return segs, st_ids, st_out, st_h, keep
+
+    def _replay_split(self, ids):
+        T = ids.numel()
+        entry = self.graphs.get(("split", T))
+        if entry is None:
+            entry = self.graphs[("split", T)] = self._capture_split(ids)
+        segs, st_ids, st_out, st_h, _ = entry
+        st_ids.copy_(ids)
+        n, st = self.hot_n, self.hot_stats
+        thr = self.hot_thr.get(T, self.hot_min)
+        cap = max(1, int(2 * self.hot_target)) if self.hot_target > 0 else 1 << 30
+        reads = 0
+        for kind, L, g in segs:
+            g.replay()
+            if kind == "mlp" and self.pf_live:
+                self._pf_release()                 # stream-ordered after the layer's experts
+            if kind != "attn" or self.dense(L):
+                continue
+            # The candidate's pinned copy is the attention graph's last op; both ranks read the
+            # same values (replicated x), so they read the same experts.
+            torch.cuda.current_stream().synchronize()
+            row = self._hot_host[L].tolist()
+            es = []
+            for v, e in zip(row[:2 * n], row[2 * n:]):
+                if v < thr or len(es) >= min(n, cap - reads):
+                    break
+                if int(e) not in es:
+                    es.append(int(e))
+            if not es:
+                continue
+            reads += len(es)
+            t0 = time.perf_counter()
+            for e, slot, pr in zip(es, self.transient, self._read_urgent(L, es)):
+                self.arena.put(slot, *pr)
+                self.lut[L, e] = slot
+            self.allowed[L, es] = True
+            self.pf_live = (L, es)
+            st["reads"] += len(es)
+            st["layers"] += 1
+            st["s"] += time.perf_counter() - t0
+            if st["reads"] // 512 != (st["reads"] - len(es)) // 512:
+                self.ck.drop_cache()
+        if self.hot_target > 0:
+            # Multiplicative step toward the target; float math on identical counts on both ranks.
+            thr *= 1.1 ** ((reads - self.hot_target) / self.hot_target)
+            self.hot_thr[T] = min(1.0, max(self.hot_min, thr))
+        st["steps"] = st.get("steps", 0) + 1
+        st[f"thr_{T}"] = round(self.hot_thr.get(T, self.hot_min), 3)
+        return st_out.clone(), st_h.clone()
 
     def _mtp_core(self, next_ids, h_prev):
         """The MTP layer at positions pos_t.. (device) -- graph-capturable for one row."""
@@ -1189,7 +1314,7 @@ class GlmTP:
         if T <= self.decode_rows:
             self.pos_t.fill_(self.pos)
             if self.use_graphs and T in self.graph_rows and self.miss == "substitute":
-                out, hn = self._replay(ids)
+                out, hn = self._replay_split(ids) if self.hot_n else self._replay(ids)
             else:
                 out, hn = self._step(ids)
             self._after_rows(ids, hn, self.pos)

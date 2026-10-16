@@ -2695,3 +2695,25 @@ agreement and KL(exact || this) over exact's top-20 are.
 Reading the single heaviest miss of a layer synchronously cut KL by 42% while moving mass missed
 by 0.6 points: mass missed understates what a top pick costs. A second hot read buys little for 3x
 the reads. One synchronous expert read is ~18 ms (six preadv calls in series on one thread).
+
+## Hot-miss reads under graphs: what they cost, and the read path that made them affordable (2026-10-16)
+
+Reads: one cold rank-half expert (six tensors) took 8.8 ms through get_rows one tensor after
+another, each tensor's 256 KB pieces in parallel; all six tensors' pieces submitted together
+(Checkpoint.get_rows_many) take 3.8 ms. The GPU copy is not the cost (0.2 ms pageable or pinned).
+Hot reads have their own expert and piece pools: on the shared ones they queued behind up to 48
+background reads (9.7 ms a hot read in eager decode with background reads at 48).
+
+Graphs: decode with MUSE_HOT runs as per-layer graphs ([attention + hot candidate], [MLP]) with a
+host sync between; with no hot reads (MUSE_HOT_MIN=9) the samples are identical to the single
+graph at fixed MUSE_SLOTS (auto slots differ boot to boot -- an equality test must pin them),
+3-4% slower. A fixed 0.2 threshold read in about half the layers of an MTP verify step (3 rows):
+4.85 tok/s. The threshold now tracks MUSE_HOT_TARGET reads a step. glm_probe, MTP depth 2,
+7,000 slots, background reads 8: 12.50 tok/s without hot reads, 10.63 at target 4 (threshold
+settles at 0.37 for 3 rows, 0.29 for 1), 8.98 at target 8.
+
+Quality at 7,000 slots (glm_quality, eager, fixed 0.2): hot 1 + background 48: KL 0.167, top-1
+89.1%; hot 1 + background 8: 0.178, 90.7%, with 3,535 background installs instead of 21,324;
+hot 2 (>= 0.15) + background 8: 0.147, 91.2% at 12 reads a token. Background 96 + hot 1 was worse
+than 48 (KL 0.179 vs 0.139 at auto slots) while missing less mass (15.6% vs 16.0%): eviction
+churn costs more than the extra coverage buys, and mass missed alone would have picked it.

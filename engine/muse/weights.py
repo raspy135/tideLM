@@ -22,6 +22,7 @@ CPU uint8); BF16 sources are quantized with ``quantize_mxfp4`` on the way.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,6 +32,35 @@ import threading
 
 GROUP = 32
 _OPEN_LOCK = threading.Lock()
+
+
+_READ_CHUNK = int(os.environ.get("MUSE_READ_CHUNK_KB", "256")) * 1024
+_CHUNK_POOLS = {}
+
+
+def _chunk_pool(urgent=False):
+    """Piece readers; urgent reads (a decode step waiting on them) get their own, so they do not
+    queue behind background reads."""
+    pool = _CHUNK_POOLS.get(urgent)
+    if pool is None:
+        from concurrent.futures import ThreadPoolExecutor
+        with _OPEN_LOCK:
+            pool = _CHUNK_POOLS.get(urgent)
+            if pool is None:
+                n = 16 if urgent else int(os.environ.get("MUSE_READ_CHUNK_THREADS", "32"))
+                pool = _CHUNK_POOLS[urgent] = ThreadPoolExecutor(max_workers=n)
+    return pool
+
+
+def _pread_full(fd, view, off):
+    """preadv until the view is full or the file ends; returns the bytes read."""
+    done = 0
+    while done < len(view):
+        got = os.preadv(fd, [view[done:]], off + done)
+        if got <= 0:
+            break
+        done += got
+    return done
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
                      -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
 PREFIX = "model.language_model."
@@ -174,7 +204,8 @@ class Checkpoint:
         m = meta[name]
         return self.dir / f, base + m["data_offsets"][0], self._DTYPES[m["dtype"]], m["shape"]
 
-    def _read(self, name: str, start: int | None = None, end: int | None = None) -> torch.Tensor:
+    def _read(self, name: str, start: int | None = None, end: int | None = None,
+              urgent: bool = False) -> torch.Tensor:
         """Rows [start, end) of a tensor read with preadv into a fresh tensor. Not through
         safetensors' slices: on this box those kept every expert's bytes in host memory after the
         copy to the GPU (+15 MB a slot, +53 MB a BF16 expert), which over a full arena is the
@@ -199,20 +230,67 @@ class Checkpoint:
                 fd = self._fds.get(path)
                 if fd is None:
                     fd = self._fds[path] = os.open(path, os.O_RDONLY)
-        done = 0
-        while done < len(buf):
-            got = os.preadv(fd, [buf[done:]], off + done)
-            if got <= 0:
-                raise IOError(f"short read of {name}")
-            done += got
+        chunk = _READ_CHUNK
+        if chunk and len(buf) > 2 * chunk:
+            # One preadv streams ~1 GB/s from a cold file; 256 KB pieces in parallel keep the NVMe
+            # queue deep: a cold rank-half GLM expert (9.6 MB, six tensors) 10.5 -> 3.2 ms.
+            # Its own pool: the callers already run on a thread pool, and waiting on pieces
+            # queued behind them in the same pool could deadlock.
+            pieces = [(c, min(chunk, len(buf) - c)) for c in range(0, len(buf), chunk)]
+            for got, (c, m) in zip(_chunk_pool(urgent).map(lambda p: _pread_full(fd, buf[p[0]:p[0] + p[1]], off + p[0]),
+                                                      pieces), pieces):
+                if got != m:
+                    raise IOError(f"short read of {name}")
+            return out
+        if _pread_full(fd, buf, off) != len(buf):
+            raise IOError(f"short read of {name}")
         return out
 
     def get(self, name: str) -> torch.Tensor:
         return self._read(name)
 
-    def get_rows(self, name: str, start: int, end: int) -> torch.Tensor:
+    def get_rows_many(self, specs, urgent: bool = False) -> list[torch.Tensor]:
+        """Several row ranges [(name, start, end)] read at once: every tensor's 256 KB pieces go to
+        the piece pool together, instead of one tensor after another (a cold rank-half GLM expert,
+        six tensors: 8.2 ms through get_rows in turn)."""
+        outs, jobs = [], []
+        for name, start, end in specs:
+            path, off, dtype, shape = self._meta(name)
+            shape = list(shape)
+            row = 1
+            for d in shape[1:]:
+                row *= d
+            itemsize = torch.empty((), dtype=dtype).element_size()
+            off += start * row * itemsize
+            shape[0] = end - start
+            out = torch.empty(shape, dtype=dtype)
+            outs.append(out)
+            if not out.numel():
+                continue
+            buf = memoryview(out.view(torch.uint8).numpy()).cast("B")
+            fd = self._fd(path)
+            chunk = _READ_CHUNK or len(buf)
+            jobs += [(name, fd, buf[c:c + min(chunk, len(buf) - c)], off + c) for c in range(0, len(buf), chunk)]
+        for (name, _, view, _), got in zip(jobs, _chunk_pool(urgent).map(lambda j: _pread_full(j[1], j[2], j[3]), jobs)):
+            if got != len(view):
+                raise IOError(f"short read of {name}")
+        return outs
+
+    def _fd(self, path):
+        import os
+        fd = self._fds.get(path) if hasattr(self, "_fds") else None
+        if fd is None:
+            with _OPEN_LOCK:
+                if not hasattr(self, "_fds"):
+                    self._fds = {}
+                fd = self._fds.get(path)
+                if fd is None:
+                    fd = self._fds[path] = os.open(path, os.O_RDONLY)
+        return fd
+
+    def get_rows(self, name: str, start: int, end: int, urgent: bool = False) -> torch.Tensor:
         """Rows [start, end) of a 2D+ tensor without reading the rest."""
-        return self._read(name, start, end)
+        return self._read(name, start, end, urgent)
 
     def _detect(self) -> str:
         if any(k.endswith("experts.gate_up_proj_weight_scale") for k in self.map):

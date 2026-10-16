@@ -43,8 +43,8 @@ class GlmCheckpoint(Checkpoint):
     def fp8_float(self, name: str) -> torch.Tensor:
         return self.fp8(name).dequant(torch.float32)
 
-    def mx_rows(self, name: str, a: int, b: int):
-        return self.get_rows(name, a, b), self.get_rows(name + "_scale", a, b)
+    def mx_rows(self, name: str, a: int, b: int, urgent: bool = False):
+        return self.get_rows(name, a, b, urgent), self.get_rows(name + "_scale", a, b, urgent)
 
     def mx_float(self, name: str) -> torch.Tensor:
         return dequant_mxfp4(self.get(name), self.get(name + "_scale"))
