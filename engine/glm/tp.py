@@ -229,7 +229,8 @@ class GlmTP:
             if L == self.mtp_L:
                 lw.update({"enorm": ck.get(p + "enorm.weight").to(d), "hnorm": ck.get(p + "hnorm.weight").to(d),
                            "sh_norm": ck.get(p + "shared_head.norm.weight").to(d),
-                           "eh": Lin(ck.get(p + "eh_proj.weight"), d)})
+                           # rows split over the ranks + a gather: half the bytes of a draft step's 151 MB
+                           "eh": Lin(ck.get_rows(p + "eh_proj.weight", r * cfg.hidden // W, (r + 1) * cfg.hidden // W), d)})
             if self.full(L):
                 i = a + "indexer."
                 lw.update({"i_q": Lin(ck.fp8(i + "wq_b.weight"), d), "i_k": Lin(ck.fp8(i + "wk.weight"), d),
@@ -549,27 +550,57 @@ class GlmTP:
         graph.replay()
         return static_out.clone(), static_h.clone()
 
-    @torch.no_grad()
-    def mtp_forward(self, next_ids, h_prev, pos0):
-        """The MTP layer at positions pos0..: (token i+1, post-norm hidden at i) -> (its
-        post-norm hidden, logits for token i+2). Writes the MTP layer's caches."""
+    def _mtp_core(self, next_ids, h_prev):
+        """The MTP layer at positions pos_t.. (device) -- graph-capturable for one row."""
         cfg, L = self.cfg, self.mtp_L
         lw = self.L[L]
         T = next_ids.numel()
-        positions = torch.arange(pos0, pos0 + T, device=self.dev)
+        positions = self.pos_t + torch.arange(T, device=self.dev)
         e = self.embed_ids(next_ids)
         e = torch.where(positions[:, None] == 0, torch.zeros_like(e), e)
-        x = lw["eh"](torch.cat([rms(e, lw["enorm"], cfg.rms_eps), rms(h_prev.to(e.dtype), lw["hnorm"], cfg.rms_eps)], -1))
-        saved, saved_t = self.pos, self.pos_t.clone()
-        self.pos = pos0
-        self.pos_t.fill_(pos0)
+        x = self.comm.cat_last(lw["eh"](torch.cat([rms(e, lw["enorm"], cfg.rms_eps),
+                                                    rms(h_prev.to(e.dtype), lw["hnorm"], cfg.rms_eps)], -1)))
         a, _ = self.attention(L, rms(x, lw["ln_in"], cfg.rms_eps), None)
         h = x + a
         h = h + self.mlp(L, rms(h, lw["ln_post"], cfg.rms_eps))
-        self.pos = saved
-        self.pos_t.copy_(saved_t)
         hn = rms(h, lw["sh_norm"], cfg.rms_eps)
         return hn, self.comm.cat_last(self.head(hn, out_dtype=torch.float32))
+
+    @torch.no_grad()
+    def mtp_forward(self, next_ids, h_prev, pos0):
+        """The MTP layer at positions pos0..: (token i+1, post-norm hidden at i) -> (its
+        post-norm hidden, logits for token i+2). Writes the MTP layer's caches. One-row calls
+        (the draft chain) replay a captured graph."""
+        next_ids = torch.as_tensor(next_ids, dtype=torch.long, device=self.dev).reshape(-1)
+        T = next_ids.numel()
+        saved, saved_t = self.pos, self.pos_t.clone()
+        self.pos = pos0
+        self.pos_t.fill_(pos0)
+        if T == 1 and self.use_graphs and self.miss == "substitute":
+            entry = self.graphs.get("mtp")
+            if entry is None:
+                st_ids, st_h = next_ids.clone(), h_prev.to(torch.bfloat16).clone()
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    for _ in range(2):
+                        self._mtp_core(st_ids, st_h)
+                torch.cuda.current_stream().wait_stream(side)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    st_hn, st_z = self._mtp_core(st_ids, st_h)
+                entry = self.graphs["mtp"] = (graph, st_ids, st_h, st_hn, st_z)
+                self.log("[glm] captured MTP graph")
+            graph, st_ids, st_h, st_hn, st_z = entry
+            st_ids.copy_(next_ids)
+            st_h.copy_(h_prev)
+            graph.replay()
+            out = st_hn.clone(), st_z.clone()
+        else:
+            out = self._mtp_core(next_ids, h_prev)
+        self.pos = saved
+        self.pos_t.copy_(saved_t)
+        return out
 
     def reusable_prefix(self, prompt):
         n, limit = 0, min(len(prompt) - 1, len(self.tokens))
