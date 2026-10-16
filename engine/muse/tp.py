@@ -209,6 +209,8 @@ class MuseTP:
         self.dense_fmt = dense or env("MUSE_DENSE", "bf16")
         self.miss = miss or env("MUSE_MISS", "substitute")
         self.native = env("MUSE_NATIVE_MOE", "1") == "1"
+        self.use_graphs = env("MUSE_GRAPHS", "1") == "1"
+        self.decode_rows = 16          # steps of at most this many rows take the device-position path
         if self.miss not in ("substitute", "stream"):
             raise ValueError("MUSE_MISS must be substitute or stream")
         W, r = self.world, self.rank
@@ -229,6 +231,8 @@ class MuseTP:
         self.allowed = (self.arena.lut >= 0) if self.miss == "substitute" else None
         self._alloc_cache()
         self.ones = torch.ones(512, dtype=torch.float32, device=self.dev)
+        self.pos_t = torch.zeros(1, dtype=torch.long, device=self.dev)
+        self.graphs: dict[int, tuple] = {}
         self.record: list | None = None
         self.stats = {"stream_loads": 0, "stream_s": 0.0}
         torch.cuda.synchronize()
@@ -245,7 +249,7 @@ class MuseTP:
         digest = hashlib.sha256(b"".join((src / f).read_bytes() for f in
                                          ("tp.py", "ref.py", "weights.py", "config.py"))).hexdigest()[:16]
         mine = {"version": VERSION, "code": digest, "dense": self.dense_fmt, "miss": self.miss,
-                "native": self.native, "max_seq": self.max_seq, "chunk": self.chunk,
+                "native": self.native, "graphs": self.use_graphs, "max_seq": self.max_seq, "chunk": self.chunk,
                 "slots": self.slots_resident, "transient": transient, "fast_comm": self.comm.fast,
                 "config": json.dumps(self.cfg.extra["raw"].get("text_config", {}), sort_keys=True)}
         allv = self.comm.gather_objects(mine)
@@ -339,6 +343,34 @@ class MuseTP:
 
     def reset(self) -> None:
         self.pos = 0
+        self.tokens: list[int] = []
+
+    def reusable_prefix(self, prompt: list[int]) -> int:
+        """Tokens of ``prompt`` whose KV the cache already holds from the previous request.
+
+        Full layers keep every position, but a sliding layer's ring only holds the last
+        ``window + chunk`` positions, so rolling back is possible by at most ``chunk`` positions
+        (the ring's slack beyond the window). An agent turn that appends to the conversation
+        reuses everything; an edit further back recomputes. At least one prompt token is always
+        recomputed, for its logits."""
+        n = 0
+        limit = min(len(prompt) - 1, len(self.tokens))
+        while n < limit and prompt[n] == self.tokens[n]:
+            n += 1
+        if n == 0 or self.pos - n > self.chunk:
+            return 0
+        return n
+
+    def prefill(self, prompt: list[int]) -> torch.Tensor:
+        """Logits of the prompt's last token, reusing the cached prefix when it matches."""
+        n = self.reusable_prefix(prompt)
+        if n:
+            self.pos = n
+            self.tokens = self.tokens[:n]
+        else:
+            self.reset()
+        self.last_reuse = n
+        return self.forward(prompt[n:], all_logits=False)
 
     # ------------------------------------------------------------------ layers
     def attention(self, L: int, x: torch.Tensor) -> torch.Tensor:
@@ -349,6 +381,8 @@ class MuseTP:
         v = lw["v"](x).view(T, self.kvl, D)
         q = norm_plain(q, cfg.rms_eps) * cfg.qk_scale
         k = norm_plain(k, cfg.rms_eps)
+        if T <= self.decode_rows:
+            return self._attention_decode(L, x, q, k, v)
         p0 = self.pos
         if cfg.rope[L]:
             cos, sin = self.cos[p0:p0 + T, None], self.sin[p0:p0 + T, None]
@@ -372,6 +406,28 @@ class MuseTP:
         out = F.scaled_dot_product_attention(
             q.transpose(0, 1)[None], K.transpose(0, 1)[None], V.transpose(0, 1)[None],
             attn_mask=mask[None, None], scale=D ** -0.5, enable_gqa=True)[0].transpose(0, 1)
+        out = norm_plain(out, cfg.rms_eps).reshape(T, self.hl * D)
+        out = out * torch.sigmoid(lw["g"](x))
+        partial = lw["o"](out, out_dtype=torch.float32)
+        return self.comm.all_reduce(partial).to(torch.bfloat16)
+
+    def _attention_decode(self, L, x, q, k, v) -> torch.Tensor:
+        """Decode rows at positions pos_t..pos_t+T-1, all on the device (graph-capturable)."""
+        from .attn_decode import decode_attention
+        cfg, lw = self.cfg, self.L[L]
+        T, D = x.shape[0], cfg.head_dim
+        positions = self.pos_t + torch.arange(T, device=x.device)
+        if cfg.rope[L]:
+            cos = self.cos.index_select(0, positions)[:, None]
+            sin = self.sin.index_select(0, positions)[:, None]
+            q = q * cos + torch.cat((-q[..., D // 2:], q[..., :D // 2]), -1) * sin
+            k = k * cos + torch.cat((-k[..., D // 2:], k[..., :D // 2]), -1) * sin
+        idx = positions % self.ring if cfg.sliding[L] else positions
+        self.kc[L].index_copy_(0, idx, k)
+        self.vc[L].index_copy_(0, idx, v)
+        out = decode_attention(q.contiguous(), self.kc[L], self.vc[L], self.pos_t,
+                               sliding=cfg.sliding[L], ring=self.ring, window=cfg.sliding_window,
+                               scale=D ** -0.5)
         out = norm_plain(out, cfg.rms_eps).reshape(T, self.hl * D)
         out = out * torch.sigmoid(lw["g"](x))
         partial = lw["o"](out, out_dtype=torch.float32)
@@ -481,9 +537,21 @@ class MuseTP:
         ids = torch.as_tensor(ids, dtype=torch.long, device=self.dev).reshape(-1)
         if self.pos + ids.numel() > self.max_seq:
             raise ValueError(f"context {self.pos + ids.numel()} exceeds max_seq {self.max_seq}")
+        T = ids.numel()
+        self.tokens.extend(ids.tolist())
+        if T <= self.decode_rows:
+            self.pos_t.fill_(self.pos)
+            if (self.use_graphs and self.miss == "substitute" and hidden_out is None
+                    and self.record is None):
+                out = self._replay(ids)
+            else:
+                out = self._step(ids, hidden_out)
+            self.pos += T
+            return out if all_logits else out[-1:]
         outs = []
         for c0 in range(0, ids.numel(), self.chunk):
             part = ids[c0:c0 + self.chunk]
+            self.pos_t.fill_(self.pos)       # a chunk of <= decode_rows tokens takes the decode path
             h = self.embed_ids(part)
             for L in range(self.cfg.layers):
                 h = self.layer(L, h)
@@ -496,30 +564,73 @@ class MuseTP:
                 outs.append(self.logits(h[-1:]))
         return torch.cat(outs)
 
+    def _step(self, ids: torch.Tensor, hidden_out: list | None = None) -> torch.Tensor:
+        """One decode-size step at pos_t (no host position use inside)."""
+        h = self.embed_ids(ids)
+        for L in range(self.cfg.layers):
+            h = self.layer(L, h)
+            if hidden_out is not None:
+                hidden_out.append(h)
+        return self.logits(h)
+
+    def _replay(self, ids: torch.Tensor) -> torch.Tensor:
+        T = ids.numel()
+        entry = self.graphs.get(T)
+        if entry is None:
+            static_ids = ids.clone()
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(2):          # warm-up: Triton/JIT compiles, lazy NCCL setup
+                    self._step(static_ids)
+            torch.cuda.current_stream().wait_stream(side)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                static_out = self._step(static_ids)
+            entry = self.graphs[T] = (graph, static_ids, static_out)
+            self.log(f"[muse] captured decode graph for {T} rows")
+        graph, static_ids, static_out = entry
+        static_ids.copy_(ids)
+        graph.replay()
+        return static_out.clone()
+
+    def sample(self, z: torch.Tensor, temperature: float, top_p: float, top_k: int,
+               gen: torch.Generator) -> int:
+        z = z.float()
+        if temperature <= 0:
+            return int(z.argmax())
+        z = z / temperature
+        if 0 < top_k < z.numel():
+            vals, idx = z.topk(top_k)
+        else:
+            vals, idx = z.sort(descending=True)
+        pr = torch.softmax(vals, -1)
+        if top_p < 1.0:
+            keep = pr.cumsum(0) - pr < top_p
+            pr = pr * keep
+        return int(idx[torch.multinomial(pr, 1, generator=gen)])
+
     @torch.no_grad()
-    def generate(self, prompt, max_new: int, *, temperature: float = 0.0, top_p: float = 1.0,
-                 seed: int = 0, stop: tuple[int, ...] | None = None) -> list[int]:
-        """Greedy or sampled continuation; rank 0 samples and broadcasts each token."""
+    def stream(self, prompt: list[int], max_new: int, *, temperature: float = 0.0,
+               top_p: float = 1.0, top_k: int = 0, seed: int = 0,
+               stop: tuple[int, ...] | None = None, should_stop=None):
+        """Yield generated tokens. Both ranks iterate it to the end: rank 0 samples and decides
+        whether to stop (``should_stop()``, e.g. a closed client), and broadcasts both."""
         stop = self.cfg.eos if stop is None else stop
         gen = torch.Generator(device=self.dev).manual_seed(seed)
-        logits = self.forward(prompt, all_logits=False)
-        out: list[int] = []
+        logits = self.prefill(list(prompt))
         for _ in range(max_new):
-            tok = None
+            msg = None
             if self.rank == 0:
-                z = logits[-1].float()
-                if temperature <= 0:
-                    tok = int(z.argmax())
-                else:
-                    pr = torch.softmax(z / temperature, -1)
-                    if top_p < 1.0:
-                        sp, si = pr.sort(descending=True)
-                        keep = sp.cumsum(0) - sp < top_p
-                        pr = torch.zeros_like(pr).scatter_(0, si[keep], sp[keep])
-                    tok = int(torch.multinomial(pr, 1, generator=gen))
-            tok = self.comm.broadcast_obj(tok)
-            out.append(tok)
+                msg = (self.sample(logits[-1], temperature, top_p, top_k, gen),
+                       bool(should_stop and should_stop()))
+            tok, halt = self.comm.broadcast_obj(msg)
+            if halt:
+                return
+            yield tok
             if tok in stop:
-                break
+                return
             logits = self.forward([tok], all_logits=False)
-        return out
+
+    def generate(self, prompt, max_new: int, **kw) -> list[int]:
+        return list(self.stream(list(prompt), max_new, **kw))

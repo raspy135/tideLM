@@ -57,6 +57,20 @@ def compare(a: torch.Tensor, b: torch.Tensor) -> dict:
     return {"rel": round(rel, 5), "argmax": round(agree, 4), "max_abs": round(float((a - b).abs().max()), 4)}
 
 
+def time_decode(eng, steps=64) -> float:
+    g = torch.Generator().manual_seed(3)
+    eng.reset()
+    eng.forward(torch.randint(3, 32768, (600,), generator=g))
+    for t in range(4):
+        eng.forward([5])
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for t in range(steps):
+        eng.forward([7 + t])
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t0) / steps * 1000
+
+
 def main():
     rank = int(os.environ.get("RANK", 0))
     if not (MODEL / "model.safetensors").exists():
@@ -81,10 +95,29 @@ def main():
     eng.forward(prompt[:200], hidden_out=layers_eng)
     layers_eng = [h.cpu() for h in layers_eng]
     full = run(eng)
+    eng.use_graphs = False
+    eager = run(eng)
+    eng.use_graphs = True
     eng.native = False
     full_dequant = run(eng)
     eng.native = True
+    step_ms = time_decode(eng)
     t0 = time.perf_counter()
+    # Prefix reuse: an appended turn and an edit near the end must equal a fresh prefill.
+    p1 = prompt[:400].tolist()
+    eng.reset()
+    gen = eng.generate(p1, 6)
+    p2 = p1 + gen + follow.tolist()
+    reuse_appended = eng.prefill(p2).cpu()
+    n_appended = eng.last_reuse
+    eng.reset()
+    fresh_appended = eng.forward(p2, all_logits=False).cpu()
+    p3 = p2[:-20] + [11, 12, 13]
+    eng.prefill(p2)
+    reuse_edit = eng.prefill(p3).cpu()
+    n_edit = eng.last_reuse
+    eng.reset()
+    fresh_edit = eng.forward(p3, all_logits=False).cpu()
     eng.reset()
     toks = eng.generate(prompt[:64], 32)
     torch.cuda.synchronize()
@@ -110,6 +143,7 @@ def main():
     # D: FP8 dense weights, everything resident.
     eng = MuseTP(str(MODEL), max_seq=2048, chunk=256, dense="fp8", miss="substitute")
     fp8 = run(eng)
+    step_ms_fp8 = time_decode(eng)
     del eng
     gc.collect(); torch.cuda.empty_cache()
 
@@ -138,6 +172,7 @@ def main():
             "engine_vs_ref_fp32": compare(full, want32),
             "engine_decode_steps_vs_ref_fp32": compare(full[600:], want32[600:]),
             "native_vs_dequant_decode": compare(full[600:], full_dequant[600:]),
+            "graph_vs_eager_decode": compare(full[600:], eager[600:]),
             "substitute_vs_masked_ref": compare(sub, want_sub),
             "substitute_vs_full": compare(sub, full),
             "stream_vs_full": compare(stream, full),
@@ -148,6 +183,14 @@ def main():
         check("engine within 2x the reference's own bf16 noise",
               r["engine_vs_ref_fp32"]["rel"] <= max(2 * noise, 0.01), f"{r['engine_vs_ref_fp32']} noise {noise}")
         check("decode steps match", r["engine_decode_steps_vs_ref_fp32"]["rel"] <= max(2 * noise, 0.01))
+        ra, re_ = compare(reuse_appended, fresh_appended), compare(reuse_edit, fresh_edit)
+        check("prefix reuse (appended turn) equals a fresh prefill",
+              n_appended == len(p1) + len(gen) and ra["rel"] <= max(2 * noise, 0.01), f"reused {n_appended}: {ra}")
+        check("prefix reuse (edit near the end) equals a fresh prefill",
+              n_edit == len(p2) - 20 and re_["rel"] <= max(2 * noise, 0.01), f"reused {n_edit}: {re_}")
+        check("graph replay equals eager decode", r["graph_vs_eager_decode"]["rel"] == 0.0,
+              f"{r['graph_vs_eager_decode']}")
+        say(f"decode step with graphs, 4 layers: bf16 dense {step_ms:.2f} ms, fp8 dense {step_ms_fp8:.2f} ms")
         check("native and dequant MoE agree", r["native_vs_dequant_decode"]["rel"] <= max(2 * noise, 0.01))
         check("substitution matches the masked reference",
               r["substitute_vs_masked_ref"]["rel"] <= max(2 * noise, 0.01))
