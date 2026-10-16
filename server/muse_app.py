@@ -197,7 +197,7 @@ class Job:
 
 def engine_loop(engine, jobs: "queue.Queue[Job]", log, tpl: Template, stop: tuple[int, ...]):
     """Rank 0: run jobs one at a time; every engine call is mirrored on rank 1."""
-    start_id = tpl.special[START]
+    start_id = tpl.special.get(START)          # Muse's header guard; None for other formats
     while True:
         job = jobs.get()
         if job is None:
@@ -222,7 +222,7 @@ def engine_loop(engine, jobs: "queue.Queue[Job]", log, tpl: Template, stop: tupl
                 job.out.put(tok)
                 # A new message header that is not the assistant's (a made-up tool result or
                 # user turn) ends the turn.
-                if after_start and not tpl.decode([tok]).strip().startswith("assistant"):
+                if start_id is not None and after_start and not tpl.decode([tok]).strip().startswith("assistant"):
                     job.cancelled.set()
                 after_start = tok == start_id
         except Exception as exc:          # the pair may now be inconsistent: stop serving
@@ -248,7 +248,8 @@ def follower_loop(engine):
             pass
 
 
-def make_handler(tpl: Template, jobs, model_name: str, defaults: dict):
+def make_handler(tpl: Template, jobs, model_name: str, defaults: dict, parser_cls=None):
+    Parser_ = parser_cls or Parser
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -315,7 +316,7 @@ def make_handler(tpl: Template, jobs, model_name: str, defaults: dict):
                 yield tok
 
         def _complete(self, job, req, chat):
-            parser = Parser(tpl)
+            parser = Parser_(tpl)
             ids = []
             for tok in self._events(job):
                 ids.append(tok)
@@ -351,7 +352,7 @@ def make_handler(tpl: Template, jobs, model_name: str, defaults: dict):
             self.end_headers()
             self.close_connection = True
             rid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
-            parser = Parser(tpl)
+            parser = Parser_(tpl)
             n = 0
 
             last = [time.monotonic()]
@@ -393,36 +394,48 @@ def make_handler(tpl: Template, jobs, model_name: str, defaults: dict):
     return Handler
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=os.environ.get("MUSE_MODEL", "/models"))
-    ap.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
-    ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
-    ap.add_argument("--name", default=os.environ.get("SERVED_MODEL_NAME", "muse-spark"))
-    args = ap.parse_args()
-    from engine.muse.tp import MuseTP
-    engine = MuseTP(args.model)
-    if engine.rank != 0:
-        follower_loop(engine)
-        return
-    tpl = Template(args.model)
+def serve(engine, tpl, parser_cls, args):
+    """Rank 0's HTTP server and engine loop (rank 1 calls follower_loop)."""
     gen = json.loads((Path(args.model) / "generation_config.json").read_text()) \
         if (Path(args.model) / "generation_config.json").exists() else {}
     defaults = {"max_tokens": int(os.environ.get("MUSE_DEFAULT_MAX_TOKENS", "4096")),
                 "temperature": float(gen.get("temperature", 1.0)), "top_p": float(gen.get("top_p", 1.0)),
-                "top_k": int(gen.get("top_k", 64)),
+                "top_k": int(gen.get("top_k", 64 if "top_k" in gen else 0)),
                 "reasoning_effort": os.environ.get("MUSE_REASONING_EFFORT", "medium"),
                 "max_seq": engine.max_seq}
     jobs: queue.Queue = queue.Queue(maxsize=64)
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(tpl, jobs, args.name, defaults))
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(tpl, jobs, args.name, defaults, parser_cls))
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    print(f"[muse] serving {args.name} on {args.host}:{args.port}", flush=True)
-    eos = gen.get("eos_token_id", [200001, 200008])
+    print(f"[serve] {args.name} on {args.host}:{args.port}", flush=True)
+    eos = gen.get("eos_token_id", [])
     stop = tuple(eos if isinstance(eos, list) else [eos])
     try:
         engine_loop(engine, jobs, lambda m: print(m, flush=True), tpl, stop)
     finally:
         server.shutdown()
+
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default=os.environ.get("MUSE_MODEL", "/models"))
+    ap.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
+    ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
+    ap.add_argument("--name", default=os.environ.get("SERVED_MODEL_NAME", "muse-spark"))
+    return ap.parse_args()
+
+
+def main():
+    args = parse_args()
+    cfg = json.loads((Path(args.model) / "config.json").read_text())
+    if cfg.get("model_type") == "glm_moe_dsa":
+        from server.glm_app import main as glm_main
+        return glm_main(args)
+    from engine.muse.tp import MuseTP
+    engine = MuseTP(args.model)
+    if engine.rank != 0:
+        follower_loop(engine)
+        return
+    serve(engine, Template(args.model), Parser, args)
 
 
 if __name__ == "__main__":
