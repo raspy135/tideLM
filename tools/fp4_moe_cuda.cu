@@ -289,7 +289,7 @@ __global__ void moe_down_bm16(
 #ifndef FP4_V2_FMA_SCALE
 #define FP4_V2_FMA_SCALE 0
 #endif
-constexpr int kV2MaxGroups = 160;  // k <= 5120
+constexpr int kV2MaxGroups = 192;  // k <= 6144 (GLM-5.3 hidden; was 160 = 5120 for V4.1)
 
 // Benchmark-only compile switch. 1 retains the deployed v2 kernels; 2 stages two routed
 // pairs' partials before replaying their independent ordered chains in parallel.

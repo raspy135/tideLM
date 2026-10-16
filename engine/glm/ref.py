@@ -89,8 +89,9 @@ class GlmRef:
         t = self._dense.get(name)
         if t is None:
             src = self._get(name)
-            t = self._dense[name] = src.to(self.device, src.dtype if (keep or src.dtype == torch.float32)
-                                           else self.dtype)
+            # Only tensors marked ``keep`` (router, correction bias, indexer weights) stay in
+            # their stored dtype; dequantized FP8/MXFP4 weights arrive fp32 and take the model's.
+            t = self._dense[name] = src.to(self.device, src.dtype if keep else self.dtype)
         return t
 
     def expert(self, L, e):
@@ -112,8 +113,8 @@ class GlmRef:
         self.ik[L] = k if self.ik[L] is None else torch.cat([self.ik[L], k])
         K = self.ik[L]
         scores = F.relu(torch.einsum("thd,sd->ths", q.float(), K.float()) * cfg.index_dim ** -0.5)
-        wproj = self.w(p + "weights_proj.weight", keep=True)      # kept fp32 in transformers
-        weights = F.linear(x.to(wproj.dtype), wproj).float() * cfg.index_heads ** -0.5
+        wproj = self.w(p + "weights_proj.weight", keep=True).float()   # fp32 module in transformers
+        weights = F.linear(x.float(), wproj) * cfg.index_heads ** -0.5
         idx = torch.einsum("th,ths->ts", weights, scores)
         kpos = torch.arange(K.shape[0], device=x.device)
         idx = idx.masked_fill(kpos[None] > positions[:, None], float("-inf"))
