@@ -185,6 +185,7 @@ class GlmTP:
         mine = {"version": VERSION, "code": digest, "miss": self.miss, "native": self.native,
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
+                "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"),
                 "fast_comm": self.comm.fast,
                 "config": json.dumps({k: v for k, v in self.cfg.extra["raw"].items()
                                       if k != "quantization_config"}, sort_keys=True)}
@@ -196,7 +197,13 @@ class GlmTP:
         cfg, d, ck, W, r = self.cfg, self.dev, self.ck, self.world, self.rank
         hq, hv = cfg.qk_dim, cfg.nope + cfg.v_dim
         self.embed = ck.get_rows(P + "embed_tokens.weight", r * self.vl, (r + 1) * self.vl).to(d)
-        self.head = Lin(ck.get_rows("lm_head.weight", r * self.vl, (r + 1) * self.vl), d)
+        head = ck.get_rows("lm_head.weight", r * self.vl, (r + 1) * self.vl)
+        if env("MUSE_HEAD", "bf16") == "fp8":
+            # Halves the largest single read of a decode step (vocab 154880: ~0.95 GB a rank).
+            from .weights import _fp8_quant
+            hq, hs = _fp8_quant(head.to(d))
+            head = FP8Block(hq, hs)
+        self.head = Lin(head, d)
         self.final_norm = ck.get(P + "norm.weight").to(d)
         self.L = []
         nbytes = self.embed.numel() * 2 + self.head.nbytes
@@ -616,6 +623,8 @@ class GlmTP:
         logits = self.prefill(list(prompt))
         spec = self.mtp_on and depth > 0
         self.mtp_fill = not spec
+        if spec:
+            self.graph_rows.add(depth + 1)
         emitted = 0
 
         def decide(x):
