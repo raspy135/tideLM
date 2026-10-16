@@ -156,10 +156,17 @@ class GlmTP:
         self.stats = {"stream_loads": 0, "stream_s": 0.0}
         self.miss_stats = None
         self.record = None
+        self.demand = None             # [layers, E] router mass wanted since the last adapt()
         self.mtp_fill = True
         self.spec_stats = {"rounds": 0, "accepted": 0}
         if self.mtp_on:
             self.graph_rows = {1, int(env("MUSE_MTP_DEPTH", "3")) + 1}
+        self.adapt_every = int(env("MUSE_ADAPT_EVERY", "200"))
+        self.adapt_prefill_swaps = int(env("MUSE_ADAPT_PREFILL_SWAPS", "2048"))
+        self.adapt_decode_swaps = int(env("MUSE_ADAPT_DECODE_SWAPS", "512"))
+        self.adapt_log = []
+        if env("MUSE_ADAPT", "1") == "1" and self.miss == "substitute":
+            self.enable_adaptation(float(env("MUSE_ADAPT_DECAY", "0.5")))
         torch.cuda.synchronize()
         self.log(f"[glm] rank {r}/{W} ready in {time.perf_counter() - t0:.1f}s: dense {self.dense_bytes / 1e9:.2f} GB, "
                  f"{self.slots_resident} of {total} routed experts resident + {fixed} fixed "
@@ -186,6 +193,8 @@ class GlmTP:
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"),
+                "adapt": [env(k, "") for k in ("MUSE_ADAPT", "MUSE_ADAPT_EVERY", "MUSE_ADAPT_PREFILL_SWAPS",
+                                               "MUSE_ADAPT_DECODE_SWAPS", "MUSE_ADAPT_DECAY")],
                 "fast_comm": self.comm.fast,
                 "config": json.dumps({k: v for k, v in self.cfg.extra["raw"].items()
                                       if k != "quantization_config"}, sort_keys=True)}
@@ -309,6 +318,19 @@ class GlmTP:
             raw = json.loads(Path(env("MUSE_RESIDENT", "")).read_text())
             raw = raw.get("resident", raw)
             resident = {int(k): [int(e) for e in v] for k, v in raw.items()}
+        if resident is not None:
+            # A trace of prefill alone never routes through the MTP layer: give layers the file
+            # leaves out the remaining slots by the placeholder ranking, at least top-k each.
+            absent = [L for L in self.moe_layers if L not in resident]
+            left = self.slots_resident - sum(len(v) for v in resident.values())
+            if absent:
+                per = left // len(absent)
+                if per < cfg.topk:
+                    raise ValueError(f"{left} slots left for {len(absent)} layers missing from the resident set")
+                for L in absent:
+                    order = torch.argsort(self.L[L]["bias"].cpu(), stable=True).tolist()
+                    resident[L] = sorted(order[:per])
+                self.log(f"[glm] resident set lacks layers {absent}: {per} placeholder experts each")
         if resident is None:
             total = len(self.moe_layers) * cfg.experts
             if self.slots_resident >= total:
@@ -356,6 +378,51 @@ class GlmTP:
     def reset(self):
         self.pos = 0
         self.tokens: list[int] = []
+
+    def enable_adaptation(self, decay: float = 0.5):
+        self.demand = torch.zeros((self.nL, self.cfg.experts), dtype=torch.float32, device=self.dev)
+        self.score = torch.zeros_like(self.demand)        # decayed history the swaps rank by
+        self.decay = decay
+
+    @torch.no_grad()
+    def adapt(self, max_swaps: int = 4096, margin: float = 1.05):
+        """Swap toward recent demand between requests. Per MoE layer: the non-resident experts
+        with the most decayed router mass replace the resident ones with the least, while the
+        newcomer's score beats the victim's by ``margin``. Rank 0 decides; both ranks load the
+        same experts into the same slots. Returns (swaps, seconds)."""
+        t0 = time.perf_counter()
+        self.score.mul_(self.decay).add_(self.demand)
+        self.demand.zero_()
+        plan = None
+        if self.rank == 0:
+            plan = []
+            sc = self.score.cpu()
+            lut = self.lut.cpu()
+            for L in self.moe_layers:
+                res = (lut[L] >= 0)
+                cand = torch.argsort(sc[L].masked_fill(res, -1.0), descending=True).tolist()
+                vict = torch.argsort(sc[L].masked_fill(~res, float("inf"))).tolist()
+                for c, v in zip(cand, vict):
+                    if res[c] or not res[v] or sc[L, c] <= sc[L, v] * margin or sc[L, c] <= 0:
+                        break
+                    plan.append((L, c, v))
+            plan.sort(key=lambda t: -float(sc[t[0], t[1]] - sc[t[0], t[2]]))
+            plan = plan[:max_swaps]
+        plan = self.comm.broadcast_obj(plan)
+        by_layer: dict[int, list] = {}
+        for L, c, v in plan:
+            by_layer.setdefault(L, []).append((c, v))
+        for L, pairs in by_layer.items():
+            parts = self._read_many(L, [c for c, _ in pairs])
+            for (c, v), pr in zip(pairs, parts):
+                slot = int(self.lut[L, v])
+                self.lut[L, v] = -1
+                self._load(L, c, slot, pr)
+        if self.allowed is not None:
+            self.allowed.copy_(self.lut >= 0)
+        self.ck.drop_cache()
+        torch.cuda.synchronize()
+        return len(plan), time.perf_counter() - t0
 
     # ------------------------------------------------------------------ attention
     def _indexer(self, L, x, q_resid, positions, cos, sin, S):
@@ -440,6 +507,9 @@ class GlmTP:
         w, ids = route(cfg, x, lw["router"], lw["bias"], allowed)
         if self.record is not None:
             self.record.append((L, ids.cpu(), w.cpu()))
+        if self.demand is not None and allowed is not None:
+            w0, ids0 = route(cfg, x, lw["router"], lw["bias"], None)
+            self.demand[L].index_add_(0, ids0.reshape(-1), w0.reshape(-1))
         if self.miss_stats is not None and allowed is not None:
             w0, ids0 = route(cfg, x, lw["router"], lw["bias"], None)
             missed = ~allowed[ids0]
@@ -673,6 +743,11 @@ class GlmTP:
         gen = torch.Generator(device=self.dev).manual_seed(seed)
         self.mtp_fill = True
         logits = self.prefill(list(prompt))
+        if self.demand is not None:
+            # After prefill: swap toward what this prompt routed to (decode benefits; the prompt's
+            # KV is already computed with the substituted experts).
+            n, sec = self.adapt(self.adapt_prefill_swaps)
+            self.adapt_log.append(("prefill", n, round(sec, 2)))
         spec = self.mtp_on and depth > 0
         self.mtp_fill = not spec
         if spec:
@@ -684,10 +759,16 @@ class GlmTP:
 
         anchor = decide(self.sample(logits[-1], temperature, top_p, top_k, gen) if self.rank == 0 else None)
         h_last = self.last_hidden[-1:]
+        next_adapt = self.adapt_every
         while True:
             halt = decide(bool(should_stop and self.rank == 0 and should_stop()))
             if halt:
                 return
+            if self.demand is not None and self.adapt_every and emitted >= next_adapt:
+                # Both ranks reach this at the same token count (emitted is decided on rank 0).
+                n, sec = self.adapt(self.adapt_decode_swaps)
+                self.adapt_log.append((f"decode@{emitted}", n, round(sec, 2)))
+                next_adapt += self.adapt_every
             yield anchor
             emitted += 1
             if anchor in stop or emitted >= max_new:

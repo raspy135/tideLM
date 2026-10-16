@@ -27,10 +27,44 @@ def main():
     ap.add_argument("--depths", default="0,1,2,3")
     ap.add_argument("--effort", default="low")
     ap.add_argument("--prompts", type=int, default=3)
+    ap.add_argument("--miss-window", type=int, default=0,
+                    help="report substituted picks per window of N decode tokens (depth 0 only)")
     args = ap.parse_args()
     tpl = GlmTemplate(args.model)
     eng = GlmTP(args.model)
     prompts = [tpl.encode(tpl.render(m, None, args.effort)) for m in PROMPTS[:args.prompts]]
+    if args.miss_window:
+        ms = {"picks": 0, "missed": 0, "mass": 0.0, "mass_missed": 0.0}
+        eng.miss_stats = ms
+
+        def snap():
+            return dict(ms)
+
+        def share(a, b):
+            p = b["picks"] - a["picks"]
+            return (round((b["missed"] - a["missed"]) / max(1, p), 4),
+                    round((b["mass_missed"] - a["mass_missed"]) / max(1e-9, b["mass"] - a["mass"]), 4))
+        for i, p in enumerate(prompts):
+            eng.reset()
+            s0 = snap()
+            it = eng.stream(p, args.tokens, depth=0)
+            out = [next(it)]
+            s1 = snap()
+            if eng.rank == 0:
+                print(f"[miss] prompt {i}: prefill {len(p)} tok: substituted picks / mass {share(s0, s1)}", flush=True)
+            w0, n = s1, 0
+            for t in it:
+                out.append(t)
+                n += 1
+                if n % args.miss_window == 0:
+                    w1 = snap()
+                    if eng.rank == 0:
+                        print(f"[miss]   decode tokens {n - args.miss_window + 1}-{n}: {share(w0, w1)}", flush=True)
+                    w0 = w1
+            if eng.rank == 0:
+                print(f"[miss]   decode total: {share(s1, snap())}", flush=True)
+                print("[probe] sample:", repr(tpl.decode(out)[:600]), flush=True)
+        eng.miss_stats = None
     rows = []
     for depth in [int(x) for x in args.depths.split(",")]:
         if depth and not eng.mtp_on:
