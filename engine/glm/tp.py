@@ -273,9 +273,12 @@ class GlmTP:
         self.r_cache = [torch.zeros((self.max_seq, cfg.rope_dim), **kw) for _ in range(self.nL)]
         self.i_cache = {L: torch.zeros((self.max_seq, cfg.index_dim), **kw)
                         for L in range(self.nL) if self.full(L)}
-        # Post-norm target hidden of recent positions: the MTP layer's input when a follow-up
-        # turn reuses the cache and its last reused position gets a new next token.
-        self.h_ring_n = self.chunk + 64
+        # Post-norm target hidden of every position: the MTP layer's input when a follow-up
+        # turn reuses the cache and its last reused position gets a new next token. It covers
+        # max_seq (~12 KB a position, 400 MB at 32K): a ring of one chunk refused reuse whenever
+        # the previous turn ran a chunk past the shared prefix -- every chat turn whose answer
+        # (reasoning included) passed 1,024 tokens re-prefilled the whole conversation.
+        self.h_ring_n = self.max_seq
         self.h_ring = torch.zeros((self.h_ring_n, cfg.hidden), **kw)
 
     # ------------------------------------------------------------------ experts
@@ -810,8 +813,6 @@ class GlmTP:
         n, limit = 0, min(len(prompt) - 1, len(self.tokens))
         while n < limit and prompt[n] == self.tokens[n]:
             n += 1
-        if n == 0 or self.pos - n > self.chunk:
-            return 0
         return n
 
     def prefill(self, prompt):
