@@ -2786,11 +2786,16 @@ serving does; `--rows 1` steps one token at a time.
   | **g=1 (even)** | 0.212 / 89.9% | 1,862 | 425 / 566 / 432 / 367 | 9.29 |
   | g=2 (back-loaded) | 0.231 / 89.1% | 1,500 | 234 / 376 / 412 / 407 | -- |
   | g=1, may run 2 ahead (MUSE_HOT_PACE_LEAD=2) | 0.210 / 89.2% | 2,013 | 529 / 671 / 451 / 292 | -- |
-  | **g=1, cap 12** (default) | 0.189 / 89.2% | 2,022 | 466 / 617 / 470 / 398 | 9.03 |
+  | g=1, cap 12 | 0.189 / 89.2% | 2,022 | 466 / 617 / 470 / 398 | 9.03 |
+  | **g=1, cap 16** (default) | 0.171 / 90.9% | 2,224 | 502 / 737 / 501 / 415 | 8.95 |
 
   Heavy misses are densest in the second quarter and sparsest in the last; holding budget for
   the last layers (g=2) starves the middle and leaves it unspent (5 reads a step against 10).
-  Even pacing at cap 12 reads what first-come cap 10 did, at its speed, for KL 0.235 -> 0.189.
+  Even pacing at cap 12 reads what first-come cap 10 did, at its speed, for KL 0.235 -> 0.189;
+  at cap 16 it matches no cap (0.171 vs 0.172) on 12% fewer reads, at cap 12's speed.
+- A lower threshold is worse, not just slower: 0.15 paced at cap 12 scored 0.248 (3,251 reads)
+  and at cap 16 0.194 (3,955) against 0.2's 0.189 / 0.171. The 0.15-0.2 misses take budget from
+  heavier ones and their keeps evict residents.
 - A rank gate on keeping (adapt()'s rule: the newcomer's score must beat the victim's by 1.5)
   would have dropped 817 of 1,969 kept reads, 418 of them below the victim outright; kept experts
   outrank 29% of residents on average. Not built: the single-topic eval cannot show what it
@@ -2798,3 +2803,13 @@ serving does; `--rows 1` steps one token at a time.
   victims anyway since their long-term score is low.
 - First request after boot is still the weak one: "浅浅浅..." at 200 tokens on a fresh boot with
   this config, typos on the second, clean by the fourth.
+
+## Substitute weights: the router's renormalization beats keeping exact weights (2026-10-16)
+
+A substituted top-k is renormalized over the picks it ended with, so a substitute's lower score
+also inflates the resident picks' weights. Two alternatives (MUSE_SUB_WEIGHT; glm_quality,
+Tokyo, 3-row steps, hot 0.2 paced cap 12, KL to exact / top-1): renorm 0.189 / 89.2%; `exact`
+(resident picks keep their exact weights, substitutes their own score over the exact total)
+0.217 / 88.8%; `transfer` (each substitute takes a missed pick's exact weight) 0.217 / 89.3%.
+Both lose by the same margin; renorm stays. With V4.1's skip results above, the pattern holds:
+leaning on the experts that are computed exactly beats preserving the router's exact numbers.

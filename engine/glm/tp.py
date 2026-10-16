@@ -154,6 +154,12 @@ class GlmTP:
         # holds more of it for the last layers. 0: first come, first served.
         self.hot_pace = float(env("MUSE_HOT_PACE", "0"))
         self.hot_pace_lead = int(env("MUSE_HOT_PACE_LEAD", "0"))   # reads a layer may run ahead of the pace
+        # MUSE_SUB_WEIGHT: weights of a substituted top-k. renorm (the router's own rule over the
+        # picks it ended with); exact (resident picks keep their exact weights, substitutes get
+        # their own score over the exact picks' total); transfer (each substitute takes a missed
+        # pick's exact weight, heaviest to the best-scored substitute).
+        self.sub_weight = env("MUSE_SUB_WEIGHT", "renorm")
+        assert self.sub_weight in ("renorm", "exact", "transfer"), self.sub_weight
         dec = [L for L in self.moe_layers if L < cfg.layers]
         self._hot_frac = {L: ((i + 1) / len(dec)) ** self.hot_pace for i, L in enumerate(dec)}
         self._hot_quarter = {L: 4 * i // len(dec) for i, L in enumerate(dec)}
@@ -256,7 +262,7 @@ class GlmTP:
                 "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"), "db": env("MUSE_STATS_DB", ""),
                 "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_PF_KEEP", "MUSE_PF_KEEP_MARGIN", "MUSE_HOT", "MUSE_HOT_MIN",
                                             "MUSE_HOT_TARGET", "MUSE_HOT_KEEP", "MUSE_HOT_MAX", "MUSE_HOT_KEEP_AUDIT", "MUSE_HOT_PACE",
-                                            "MUSE_HOT_PACE_LEAD")],
+                                            "MUSE_HOT_PACE_LEAD", "MUSE_SUB_WEIGHT")],
                 "adapt": [env(k, "") for k in ("MUSE_ADAPT", "MUSE_ADAPT_EVERY", "MUSE_ADAPT_PREFILL_SWAPS",
                                                "MUSE_ADAPT_DECODE_SWAPS", "MUSE_ADAPT_DECAY", "MUSE_ADAPT_CROSS_LAYER",
                                                "MUSE_ADAPT_MARGIN", "MUSE_BG", "MUSE_BG_EVERY", "MUSE_BG_READS",
@@ -800,6 +806,8 @@ class GlmTP:
         from .ref import route
         allowed = self.allowed[L] if self.allowed is not None else None
         w, ids = route(cfg, x, lw["router"], lw["bias"], allowed)
+        if allowed is not None and self.sub_weight != "renorm":
+            w = self._sub_weights(cfg, lw, x, ids)
         if self.record is not None:
             self.record.append((L, ids.cpu(), w.cpu()))
         if self.demand is not None and allowed is not None:
@@ -849,6 +857,25 @@ class GlmTP:
         w = torch.where(missing, torch.zeros_like(w), w)
         slots = torch.where(missing, fixed[:, :1].expand_as(slots), slots)
         return torch.cat([slots, fixed], 1).contiguous(), torch.cat([w, ones], 1)
+
+    def _sub_weights(self, cfg, lw, x, ids):
+        """MUSE_SUB_WEIGHT=exact|transfer for the substituted picks ``ids`` (graph-safe)."""
+        from .ref import route
+        sc = F.linear(x.float(), lw["router"].float()).sigmoid()            # [T, E]
+        w0, ids0 = route(cfg, x, lw["router"], lw["bias"], None)
+        if self.sub_weight == "exact":
+            w = sc.gather(1, ids)
+            denom = sc.gather(1, ids0).sum(-1, keepdim=True) if cfg.norm_topk else 1.0
+            return w / (denom + 1e-20) * cfg.routed_scaling
+        match = ids[:, :, None] == ids0[:, None, :]                          # [T, k, k]
+        resident = (match.float() * w0[:, None, :]).sum(-1)                  # exact weight where kept
+        is_sub = ~match.any(-1)
+        missed_w = torch.where(match.any(1), torch.zeros_like(w0), w0)       # exact picks not chosen
+        missed_sorted = missed_w.sort(-1, descending=True).values
+        choice = (sc + lw["bias"].float()).gather(1, ids).masked_fill(~is_sub, float("-inf"))
+        order = choice.argsort(-1, descending=True)                          # substitutes first, best first
+        moved = torch.zeros_like(w0).scatter_(1, order, missed_sorted)
+        return resident + moved * is_sub
 
     def _stream_misses(self, L, ids):
         need = ids.unique()
