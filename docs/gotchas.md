@@ -2606,3 +2606,25 @@ Also from that load: size arenas the V4.1 way (a 20 GB floor under MemAvailable,
 the rest), drop the page cache of files read once (`posix_fadvise(DONTNEED)`), and refuse to start
 below ~90 GB available. GPU allocations themselves count once (8 GiB `torch.zeros` = 8.9 GB off
 MemAvailable, no further growth when written).
+
+## GLM-5.3 at 39% routed residency: adaptation frequency does not move the miss floor (2026-10-16)
+
+Question: with the decode swap cap at 256, is the adaptation interval what limits the miss rate?
+Workload: tools/glm_adapt_test.py, the one ISO-8601 coding prompt, 600 tokens x 3 rounds, eager,
+7,524 of 19,456 routed experts resident, placement from the trained stats DB (328,554 tokens),
+decay 0.9, margin 1.5. Results in results/glm-freq/every-{64,200,600}/.
+
+| MUSE_ADAPT_EVERY | round 0 decode mass missed | round 2 | round 2 swaps (s) | churn r0/r1/r2 |
+| --- | --- | --- | --- | --- |
+| 64 | 32.7% | 21.0% | 835 (9.7) | 0 / 0 / 0 |
+| 200 | 37.6% | 20.9% | 324 (3.5) | 39 / 13 / 3 |
+| 600 (prefill only) | 41.7% | 21.6% | 588 (2.6) | 0 / 492 / 200 |
+
+Frequency matters only inside a request the residency has not seen: round 0 drifts from 29% to
+47% by the end of a 600-token answer without decode adaptations, and stays ~33% at every 64. Once
+the set has settled, all three land at ~21% -- the floor is capacity, not cadence or swap count.
+The earlier 1,024-swap cap settled at the same ~19-20%. The stats DB is not the fix either: a
+placement covers ~67% of the mass of the routing it was built from and ~58% of another corpus's
+(DB placement vs the trace-v3 set; they share 5,010 of ~7,500 experts), so a fixed 39% set
+misses about a third in-sample. The trace curve put ~10% mass missed at ~70% residency. Default
+stays 200: same floor as 64 at a third of the swap time.
