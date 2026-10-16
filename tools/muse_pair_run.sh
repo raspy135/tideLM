@@ -40,6 +40,9 @@ flags=(--rm --network host --gpus all --device /dev/infiniband --cap-add IPC_LOC
 if [[ -n "${MUSE_MODEL_DIR:-}" ]]; then
     flags+=(-v "$MUSE_MODEL_DIR:/models:ro" -e MUSE_MODEL=/models)
 fi
+if [[ -n "${MUSE_DRAFTER_DIR:-}" ]]; then
+    flags+=(-v "$MUSE_DRAFTER_DIR:/drafter:ro")
+fi
 for kv in ${MUSE_ENV:-}; do
     [[ "$kv" =~ ^(MUSE|DSV41)_[A-Z0-9_]+=[^[:space:]]*$ ]] || { echo "MUSE_ENV: bad entry '$kv'" >&2; exit 1; }
     flags+=(-e "$kv")

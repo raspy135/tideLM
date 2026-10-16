@@ -262,6 +262,10 @@ class MuseTP:
             except OSError:
                 pass
             reserve = float(env("MUSE_RESERVE_GB", "12")) * 1e9
+            if env("MUSE_DRAFTER", ""):
+                # The drafter's weights split over the ranks, its caches, and headroom.
+                files = Path(env("MUSE_DRAFTER", "")).glob("*.safetensors")
+                reserve += sum(f.stat().st_size for f in files) / W + 1e9
             per = Arena.slot_bytes(cfg, W)
             mine = max(0, int((free - reserve) // per) - transient)
             want = min(self.comm.gather_objects(mine))

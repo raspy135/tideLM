@@ -39,6 +39,7 @@ flags=(-d --network host --gpus all --device /dev/infiniband --cap-add IPC_LOCK 
        -v "$ROOT/engine:/app/engine:ro" -v "$ROOT/tools:/app/tools:ro" -v "$ROOT/server:/app/server:ro"
        -v "$ROOT/results:/app/results" -v "$ROOT/.triton-cache:/app/.triton"
        -v "$MODEL_DIR:/models:ro"
+       ${MUSE_DRAFTER_DIR:+-v "$MUSE_DRAFTER_DIR:/drafter:ro" -e MUSE_DRAFTER=/drafter}
        -e TRITON_CACHE_DIR=/app/.triton -e MUSE_MODEL=/models -e PYTHONUNBUFFERED=1
        -e WORLD_SIZE=2 -e MASTER_ADDR="$MASTER_ADDR" -e MASTER_PORT="$MASTER_PORT"
        -e NCCL_SOCKET_IFNAME="$IFACE" -e GLOO_SOCKET_IFNAME="$IFACE" -e NCCL_IB_DISABLE=0
@@ -46,7 +47,7 @@ flags=(-d --network host --gpus all --device /dev/infiniband --cap-add IPC_LOCK 
        -e HOST="$BIND_HOST" -e PORT="$PORT" -e SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-muse-spark}")
 while IFS='=' read -r key _; do
     flags+=(-e "$key=${!key}")
-done < <(env | grep -E '^MUSE_[A-Z0-9_]+=' | grep -v '^MUSE_MODEL_DIR=\|^MUSE_IMAGE=\|^MUSE_ENV_FILE=')
+done < <(env | grep -E '^MUSE_[A-Z0-9_]+=' | grep -v '^MUSE_MODEL_DIR=\|^MUSE_IMAGE=\|^MUSE_ENV_FILE=\|^MUSE_DRAFTER_DIR=\|^MUSE_DRAFTER=')
 docker run --name muse-serve-rank0 "${flags[@]}" -e RANK=0 \
     --entrypoint python "$IMAGE" /app/server/muse_app.py >/dev/null
 printf -v peer_cmd '%q ' docker run --name muse-serve-rank1 "${flags[@]}" -e RANK=1 \

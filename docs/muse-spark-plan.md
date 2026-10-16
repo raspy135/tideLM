@@ -7,6 +7,33 @@ Facts below marked **(read)** come from the gated repos' `config.json`, `hf_quan
 READMEs and safetensors shard headers (shapes and dtypes only; no weights downloaded). Every
 tok/s figure is an **estimate** from bytes moved per step; none is measured yet.
 
+## Status (2026-10-15)
+
+Built on branch `muse-spark` (engine/muse/, server/muse_app.py, scripts/muse-*.sh, tools/muse_*):
+
+| piece | state | evidence |
+| --- | --- | --- |
+| reference model (engine/muse/ref.py) | matches transformers 5.20's Muse code | fp32 logits within 2e-4, same argmax, prefill + decode past the window |
+| TP2 engine (engine/muse/tp.py) | correct on a synthetic checkpoint at real layer shapes | per-layer error equal to a BF16 reference's own (0.71-1.61%) |
+| experts: AMD MXFP4 on the existing native/Triton kernels | done | layout checked against the BF16 release (11.4% error, as FP4 should) |
+| misses: substitute / stream | done | stream bit-identical to full residency; substitute = masked reference |
+| decode: device-position attention + CUDA graphs | done | graph == eager bitwise; 4-layer step 10.3 ms BF16 dense, 8.0 ms FP8 |
+| prefill MoE on fp4_moe.py's grouped kernels | done | 5.5x the dequantize path (1024 tokens, 4 layers: 230 vs 1249 ms) |
+| prefix reuse across requests | done | appended turn / near-end edit = fresh prefill within noise; TTFT 1.5 -> 0.08 s |
+| OpenAI server (chat, tools, reasoning, SSE) | done | template/parser tests on the real tokenizer; cancellation on client exit |
+| DSpark drafter + speculative verify | done, unmeasured on real weights | exactness tests: rejection, rollback, oracle drafts (3 accepted a round) |
+| routing trace, NLL harness | done | checked end to end on the synthetic checkpoint |
+| real weights | pending download/replication at the time of writing | |
+
+Run (serving stopped): `cp .env.muse.example .env.muse`, adjust, `scripts/muse-up.sh`;
+`scripts/muse-down.sh` stops only the Muse containers. Tests: `tools/muse_pair_run.sh
+muse_pair_test.py` (two nodes, synthetic), `python -m unittest engine.muse.test_ref
+engine.muse.test_attn_decode server.test_muse_app` (CPU/GPU, one node).
+
+Profile of a synthetic decode step, per layer (eager, BF16 dense): dense matmuls 1.69 ms
+(~170 GB/s), expert kernels 0.50 ms (~200 GB/s), ~80 small elementwise kernels 0.33 ms, five
+RoCE gathers 0.12 ms. FP8 dense halves the first; fusing the small kernels is the next ~10%.
+
 ## The model (read)
 
 * 62 decoder layers, hidden 8192, vocab 202,048, untied embeddings, final logit softcap 20.
