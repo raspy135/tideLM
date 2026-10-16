@@ -93,8 +93,10 @@ def main():
         n_tok += len(ids) + len(out)
         if eng.rank == 0 and (i + 1) % 10 == 0:
             el = time.perf_counter() - t0
+            at = eng.adapt_totals
             print(f"[train] {i + 1}/{len(docs)} docs, {n_tok} tokens, {n_tok / el:.0f} tok/s, "
-                  f"DB {eng.db_tokens} tokens", flush=True)
+                  f"DB {eng.db_tokens} tokens, swaps {at['swaps']} (churn {at['churn']}, "
+                  f"{at['churn'] / max(1, at['swaps']):.1%})", flush=True)
     eng.adapt(0)          # fold the last request's demand into the DB
     if eng.rank == 0:
         print(f"[train] done: DB {eng.db_tokens} tokens at {eng.db_path}", flush=True)
