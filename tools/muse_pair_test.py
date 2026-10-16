@@ -99,8 +99,23 @@ def main():
     eager = run(eng)
     eng.use_graphs = True
     eng.native = False
+    eng.prefill_moe = "dequant"
     full_dequant = run(eng)
     eng.native = True
+
+    def time_prefill(n=1024):
+        eng.reset()
+        x = torch.randint(3, 32768, (n,), generator=torch.Generator().manual_seed(9))
+        eng.forward(x[:64])
+        eng.reset()
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        eng.forward(x, all_logits=False)
+        torch.cuda.synchronize()
+        return (time.perf_counter() - t0) * 1000
+    prefill_dequant_ms = time_prefill()
+    eng.prefill_moe = "triton"
+    prefill_triton_ms = time_prefill()
     step_ms = time_decode(eng)
     t0 = time.perf_counter()
     # Prefix reuse: an appended turn and an edit near the end must equal a fresh prefill.
@@ -172,6 +187,7 @@ def main():
             "engine_vs_ref_fp32": compare(full, want32),
             "engine_decode_steps_vs_ref_fp32": compare(full[600:], want32[600:]),
             "native_vs_dequant_decode": compare(full[600:], full_dequant[600:]),
+            "triton_vs_dequant_prefill": compare(full[:600], full_dequant[:600]),
             "graph_vs_eager_decode": compare(full[600:], eager[600:]),
             "substitute_vs_masked_ref": compare(sub, want_sub),
             "substitute_vs_full": compare(sub, full),
@@ -191,6 +207,10 @@ def main():
         check("graph replay equals eager decode", r["graph_vs_eager_decode"]["rel"] == 0.0,
               f"{r['graph_vs_eager_decode']}")
         say(f"decode step with graphs, 4 layers: bf16 dense {step_ms:.2f} ms, fp8 dense {step_ms_fp8:.2f} ms")
+        check("triton prefill MoE agrees with dequant", r["triton_vs_dequant_prefill"]["rel"] <= max(2 * noise, 0.01),
+              f"{r['triton_vs_dequant_prefill']}")
+        say(f"prefill 1024 tokens (4 layers, chunk 256): dequant MoE {prefill_dequant_ms:.0f} ms, "
+            f"triton MoE {prefill_triton_ms:.0f} ms")
         check("native and dequant MoE agree", r["native_vs_dequant_decode"]["rel"] <= max(2 * noise, 0.01))
         check("substitution matches the masked reference",
               r["substitute_vs_masked_ref"]["rel"] <= max(2 * noise, 0.01))

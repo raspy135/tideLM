@@ -210,6 +210,7 @@ class MuseTP:
         self.miss = miss or env("MUSE_MISS", "substitute")
         self.native = env("MUSE_NATIVE_MOE", "1") == "1"
         self.use_graphs = env("MUSE_GRAPHS", "1") == "1"
+        self.prefill_moe = env("MUSE_PREFILL_MOE", "triton")
         self.decode_rows = 16          # steps of at most this many rows take the device-position path
         if self.miss not in ("substitute", "stream"):
             raise ValueError("MUSE_MISS must be substitute or stream")
@@ -249,7 +250,7 @@ class MuseTP:
         digest = hashlib.sha256(b"".join((src / f).read_bytes() for f in
                                          ("tp.py", "ref.py", "weights.py", "config.py"))).hexdigest()[:16]
         mine = {"version": VERSION, "code": digest, "dense": self.dense_fmt, "miss": self.miss,
-                "native": self.native, "graphs": self.use_graphs, "max_seq": self.max_seq, "chunk": self.chunk,
+                "native": self.native, "graphs": self.use_graphs, "prefill_moe": self.prefill_moe, "max_seq": self.max_seq, "chunk": self.chunk,
                 "slots": self.slots_resident, "transient": transient, "fast_comm": self.comm.fast,
                 "config": json.dumps(self.cfg.extra["raw"].get("text_config", {}), sort_keys=True)}
         allv = self.comm.gather_objects(mine)
@@ -464,6 +465,35 @@ class MuseTP:
         CUDA.down(full, A.w2, A.s2, parts, bs, bp, k, A.Ml, cfg.moe_inter, T, nb, -1, False, 1)
         return parts.view(k, T, A.Ml)
 
+    def moe_triton(self, L: int, z: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+        """Same contract as moe_native for prefill sizes: tools/fp4_moe.py's grouped kernels
+        (their N/K are compile-time arguments; only V4.1's moe_forward wrapper fixes them), with
+        the call's slots relabelled compactly first, as V4.1's prefill does."""
+        import fp4_moe as K4
+        cfg, A = self.cfg, self.arena
+        T, k = slots.shape
+        P = T * k
+        BM = K4._pick_bm(P)
+        uniq, inv = torch.unique(slots, return_inverse=True)
+        compact = inv.to(torch.int32).view_as(slots)
+        bs, bp, nb = K4.build_routing(compact, int(uniq.numel()), BM)
+        bs = torch.where(bs >= 0, uniq.to(torch.int32)[bs.clamp_min(0)], bs)
+        bn1, nw1, ns1 = K4._UP_CFG[BM]
+        bn2, nw2, ns2 = K4._DOWN_CFG[BM]
+        h = torch.empty((P, A.Il), dtype=torch.bfloat16, device=z.device)
+        ones = torch.ones(P, dtype=torch.float32, device=z.device)
+        K4._moe_up_kernel[(nb, A.Il // bn1)](
+            z, A.w1, A.s1, A.w3, A.s3, h, ones, bs, bp, z.stride(0), h.stride(0), float("inf"),
+            TOPK=k, N=A.Il, K=cfg.moe_hidden, BM=BM, BN=bn1, SCALED=False, NULL_SLOT=-1,
+            num_warps=nw1, num_stages=ns1)
+        full = self.comm.cat_last(h)
+        parts = torch.empty((P, A.Ml), dtype=torch.float32, device=z.device)
+        K4._moe_down_kernel[(nb, A.Ml // bn2)](
+            full, A.w2, A.s2, parts, bs, bp, full.stride(0), parts.stride(0),
+            TOPK=k, N=A.Ml, K=cfg.moe_inter, BM=BM, BN=bn2, NTOK=T, SCALED=False, NULL_SLOT=-1,
+            PARTIAL=False, PARTS_WORLD=1, num_warps=nw2, num_stages=ns2)
+        return parts.view(k, T, A.Ml)
+
     def moe_dequant(self, L: int, z: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
         """Same contract as moe_native, one BF16 matmul per used expert (prefill sizes)."""
         A = self.arena
@@ -498,6 +528,8 @@ class MuseTP:
         T = x.shape[0]
         if self.native and T * cfg.topk <= 512:
             parts = self.moe_native(L, z, slots)
+        elif self.prefill_moe == "triton":
+            parts = self.moe_triton(L, z, slots)
         else:
             parts = self.moe_dequant(L, z, slots)
         for e in streamed:
