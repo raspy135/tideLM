@@ -132,6 +132,11 @@ class GlmTP:
         self.pf_on = env("MUSE_PF", "0") == "1" and self.miss == "substitute"
         self.pf_n = int(env("MUSE_PF_SLOTS", "32")) if self.pf_on else 0
         self.pf_min_rows = int(env("MUSE_PF_MIN_ROWS", "128"))
+        # MUSE_PF_KEEP=1: after its layer, a prefetched expert replaces the coldest resident
+        # (lowest long-term score, any layer, never a layer below 2 x top-k) instead of being
+        # dropped, so later chunks, the post-prefill adaptation and decode reuse the read.
+        self.pf_keep = env("MUSE_PF_KEEP", "0") == "1"
+        self.pf_keep_margin = float(env("MUSE_PF_KEEP_MARGIN", "1.5"))
         # Hot misses (MUSE_HOT=N, eager decode): per layer, read up to N missed experts whose
         # router weight share is at least MUSE_HOT_MIN synchronously and compute them exactly.
         # They share the transient slots with the prefill prefetch (never both at once).
@@ -229,7 +234,7 @@ class GlmTP:
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"), "db": env("MUSE_STATS_DB", ""),
-                "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_HOT", "MUSE_HOT_MIN",
+                "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_PF_KEEP", "MUSE_PF_KEEP_MARGIN", "MUSE_HOT", "MUSE_HOT_MIN",
                                             "MUSE_HOT_TARGET")],
                 "adapt": [env(k, "") for k in ("MUSE_ADAPT", "MUSE_ADAPT_EVERY", "MUSE_ADAPT_PREFILL_SWAPS",
                                                "MUSE_ADAPT_DECODE_SWAPS", "MUSE_ADAPT_DECAY", "MUSE_ADAPT_CROSS_LAYER",
@@ -501,6 +506,7 @@ class GlmTP:
         self.bg_pending = []                              # [(L, e, VL, ve, future)] read, not installed
         self.bg_period = 0
         self.bg_until = torch.zeros((self.nL, self.cfg.experts), dtype=torch.long, device=self.dev)  # no eviction before
+        self.pf_kept = torch.zeros((self.nL, self.cfg.experts), dtype=torch.bool, device=self.dev)   # this prefill's promotions
         self._bg_layers = torch.tensor(self.moe_layers, device=self.dev)
         self.bg_stats = {"periods": 0, "planned": 0, "installed": 0, "stale": 0, "wait_s": 0.0, "install_s": 0.0}
 
@@ -863,27 +869,69 @@ class GlmTP:
             mass.index_add_(0, ids.reshape(-1), w.reshape(-1))
             mass.masked_fill_(self.lut[N] >= 0, 0.0)
             top = torch.topk(mass, self.pf_n)
-            plan = [int(e) for e, m in zip(top.indices.tolist(), top.values.tolist()) if m > 0]
+            es = [int(e) for e, m in zip(top.indices.tolist(), top.values.tolist()) if m > 0]
+            plan = [(e, None) for e in es]
+            if self.pf_keep and es and self.demand is not None:
+                # Kept only if it ranks in: its long-term score + this request's demand + the
+                # predicted mass beats the victim's by the adaptation margin (MUSE_PF_KEEP_MARGIN).
+                cs = (self.score[N] + self.demand[N] + mass)[es].tolist()
+                plan = [(e, v) for e, v in zip(es, self._pf_victims(cs))]
         plan = self.comm.broadcast_obj(plan)
         if not hasattr(self, "_pool"):
             self._read_many(L, [])
         buf = self.pf_slots[(N % 2) * self.pf_n:(N % 2 + 1) * self.pf_n]
-        self.pf_pending[N] = [(e, slot, self._pool.submit(self._expert_parts, N, e)) for e, slot in zip(plan, buf)]
+        self.pf_pending[N] = [(e, slot, v, self._pool.submit(self._expert_parts, N, e))
+                              for (e, v), slot in zip(plan, buf)]
         self.pf_stats["planned"] += len(plan)
+
+    def _pf_victims(self, cand_scores):
+        """Rank 0: n resident experts to give up for promoted prefetches -- lowest long-term score
+        (decayed history + this request's demand so far), not promoted in this prefill, each layer
+        keeping more than 2 x top-k. None where there is no such expert."""
+        lay = self._bg_layers
+        slots = self.lut[lay]
+        res = slots >= 0
+        # Not this prefill's promotions, and not the layer being computed: its prefetched experts
+        # sit in transient slots (the highest indices) until _pf_release promotes them.
+        ok = res & ~self.pf_kept[lay] & (slots < self.transient[0])
+        n = len(cand_scores)
+        k = min(4 * n, int(ok.sum()))
+        if k == 0:
+            return [None] * n
+        vs = torch.topk((self.score + self.demand)[lay].masked_fill(~ok, float("inf")).reshape(-1), k, largest=False)
+        idx, vval = vs.indices.tolist(), vs.values.tolist()
+        left = (res & (slots < self.transient[0])).sum(1).tolist()
+        E, floor, margin = self.cfg.experts, 2 * self.cfg.topk, self.pf_keep_margin
+        out, vi = [None] * n, 0
+        # Strongest candidates take the weakest victims while they beat them by the margin.
+        for ci in sorted(range(n), key=lambda i: -cand_scores[i]):
+            while vi < len(idx):
+                vl, ve = divmod(idx[vi], E)
+                if left[vl] > floor:
+                    break
+                vi += 1
+            if vi >= len(idx) or cand_scores[ci] <= vval[vi] * margin:
+                break
+            left[vl] -= 1
+            out[ci] = (self.moe_layers[vl], ve)
+            self.pf_kept[self.moe_layers[vl], ve] = True        # not chosen twice
+            vi += 1
+        return out
 
     def _pf_install(self, L):
         items = self.pf_pending.pop(L, None)
         if not items:
             return
         t0 = time.perf_counter()
-        parts = [f.result() for _, _, f in items]
+        parts = [f.result() for *_, f in items]
         self.pf_stats["wait_s"] += time.perf_counter() - t0
-        for (e, slot, _), pr in zip(items, parts):
+        for (e, slot, _, _), pr in zip(items, parts):
             self.arena.put(slot, *pr)
             self.lut[L, e] = slot
-        es = [e for e, _, _ in items]
+        es = [e for e, *_ in items]
         self.allowed[L, es] = True
         self.pf_live = (L, es)
+        self.pf_promote = [(e, slot, v) for e, slot, v, _ in items if v is not None]
         self.pf_stats["reads"] += len(es)
         if self.pf_stats["reads"] // 512 != (self.pf_stats["reads"] - len(es)) // 512:
             self.ck.drop_cache()
@@ -894,6 +942,25 @@ class GlmTP:
             self.lut[L, es] = -1
             self.allowed[L, es] = False
             self.pf_live = None
+        items, self.pf_promote = getattr(self, "pf_promote", None), None
+        if not items:
+            return
+        # Promote: copy each prefetched expert from its transient slot over its victim's slot
+        # (stream-ordered after this layer's MLP), then repoint the lut. Same plan on both ranks.
+        A = self.arena
+        vslots = self.lut[[v[0] for _, _, v in items], [v[1] for _, _, v in items]].tolist()
+        for (e, slot, (VL, ve)), vs in zip(items, vslots):
+            if vs < 0 or self.owner[vs] != (VL, ve):
+                continue
+            for t in (A.w1, A.s1, A.w3, A.s3, A.w2, A.s2):
+                t[vs].copy_(t[slot])
+            self.lut[VL, ve] = -1
+            self.owner[vs] = (L, e)
+            self.lut[L, e] = vs
+            self.allowed[VL, ve] = False
+            self.allowed[L, e] = True
+            self.pf_kept[L, e] = True
+            self.pf_stats["promoted"] = self.pf_stats.get("promoted", 0) + 1
 
     def _hot_stream(self, L, x):
         """Decode: read this layer's heaviest missed picks (weight share >= MUSE_HOT_MIN, up to
@@ -1162,6 +1229,8 @@ class GlmTP:
         return n
 
     def prefill(self, prompt):
+        if getattr(self, "pf_kept", None) is not None:
+            self.pf_kept.zero_()
         n = self.reusable_prefix(prompt)
         if n:
             self.pos, self.tokens = n, self.tokens[:n]

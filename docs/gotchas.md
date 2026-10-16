@@ -2717,3 +2717,28 @@ Quality at 7,000 slots (glm_quality, eager, fixed 0.2): hot 1 + background 48: K
 hot 2 (>= 0.15) + background 8: 0.147, 91.2% at 12 reads a token. Background 96 + hot 1 was worse
 than 48 (KL 0.179 vs 0.139 at auto slots) while missing less mass (15.6% vs 16.0%): eviction
 churn costs more than the extra coverage buys, and mass missed alone would have picked it.
+
+## Prefill prefetch costs more TTFT than it buys; keeping prefetched experts churns (2026-10-16)
+
+glm_adapt_test, engine/glm/ref.py as a 3,321-token prompt, 2 rounds x 300 tokens, eager, 7,000
+slots, background reads 8, hot reads 1. Round 0 / round 1:
+
+| config | TTFT s | prefill mass missed | decode mass missed |
+| --- | --- | --- | --- |
+| no prefetch | 23.7 / 20.1 | 33.0 / 28.3% | 36.2 / 35.1% |
+| no prefetch, 512 post-prefill swaps | 22.0 / 20.1 | 33.0 / 28.9% | 36.3 / 35.8% |
+| prefetch 16 a layer | 32.8 / 29.0 | 25.0 / 21.9% | 36.6 / 39.5% |
+| prefetch 24 | 36.0 / 32.4 | 22.3 / 19.9% | 36.6 / 34.6% |
+| prefetch 24, keep every read (MUSE_PF_KEEP, no margin) | 51.4 / 50.5 | 25.7 / 26.5% | 39.7 / 37.8% |
+| prefetch 24, keep if it ranks in (margin 1.5) | 34.9 / 31.4 | 24.2 / 20.2% | 38.4 / 35.6% |
+
+Prefetch waits on reads for under 2 s; the rest of its ~9 s is the per-layer machinery (rank 0
+prediction and host sync, a broadcast, slot writes: ~27 ms a layer-chunk) and buys nothing in
+decode. Keeping every prefetched expert replaced ~7,000 residents a prompt -- nearly the whole
+set, evicting what later chunks needed -- and the post-prefill adaptation swapped 2,048 back.
+Gated on ranking it promoted 4,017, then 416 on the repeat, with the same miss as dropping them.
+Prefetch is off by default; post-prefill swaps 512.
+
+Also measured here: 256 KB read pieces for every read (not just urgent ones) made the prefill
+7 s slower (32.8 vs 39.8 s TTFT with prefetch 16) -- hundreds of small Python tasks a layer
+contend for the GIL with an eager prefill. Bulk reads use whole tensors (MUSE_READ_BULK_CHUNK_KB=0).

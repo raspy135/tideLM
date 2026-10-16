@@ -35,6 +35,9 @@ _OPEN_LOCK = threading.Lock()
 
 
 _READ_CHUNK = int(os.environ.get("MUSE_READ_CHUNK_KB", "256")) * 1024
+# Bulk (background, prefetch, placement) reads: whole tensors unless MUSE_READ_BULK_CHUNK_KB --
+# many small pieces are many Python tasks contending for the GIL with an eager prefill.
+_BULK_CHUNK = int(os.environ.get("MUSE_READ_BULK_CHUNK_KB", "0")) * 1024
 _CHUNK_POOLS = {}
 
 
@@ -230,7 +233,7 @@ class Checkpoint:
                 fd = self._fds.get(path)
                 if fd is None:
                     fd = self._fds[path] = os.open(path, os.O_RDONLY)
-        chunk = _READ_CHUNK
+        chunk = _READ_CHUNK if urgent else _BULK_CHUNK
         if chunk and len(buf) > 2 * chunk:
             # One preadv streams ~1 GB/s from a cold file; 256 KB pieces in parallel keep the NVMe
             # queue deep: a cold rank-half GLM expert (9.6 MB, six tensors) 10.5 -> 3.2 ms.
@@ -269,7 +272,7 @@ class Checkpoint:
                 continue
             buf = memoryview(out.view(torch.uint8).numpy()).cast("B")
             fd = self._fd(path)
-            chunk = _READ_CHUNK or len(buf)
+            chunk = (_READ_CHUNK if urgent else _BULK_CHUNK) or len(buf)
             jobs += [(name, fd, buf[c:c + min(chunk, len(buf) - c)], off + c) for c in range(0, len(buf), chunk)]
         for (name, _, view, _), got in zip(jobs, _chunk_pool(urgent).map(lambda j: _pread_full(j[1], j[2], j[3]), jobs)):
             if got != len(view):
