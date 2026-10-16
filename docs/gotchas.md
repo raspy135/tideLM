@@ -2676,3 +2676,22 @@ prompt (engine/glm/ref.py), round 0: prefill mass missed 30.8% off; 18.4% with 3
 TTFT 24.5 -> 43.6 s (18 s waiting: a 1,024-row layer is ~57 ms, 32 reads ~120 ms); 23.4% with
 16 a layer, TTFT 30.5 s, 3.4 s waiting. MUSE_READ_THREADS 12 -> 24 did not raise read speed (8
 experts ~31 ms either way, ~2.6 GB/s a rank): the buffered read path is the limit, not threads.
+
+## GLM-5.3 quality against the exact model: the heaviest miss matters more than its mass (2026-10-16)
+
+tools/glm_quality.py: three Tokyo-sightseeing chat prompts, 300 answer tokens each (generated once
+with background reads on), scored position by position against an exact run (MUSE_MISS=stream,
+teacher-forced prefill). Eval feeds the answer as decode steps, eager, DB snapshot at 372K tokens.
+NLL is not comparable here (the text is the background-reads model's own greedy output); top-1
+agreement and KL(exact || this) over exact's top-20 are.
+
+| config | mass missed | top-1 = exact | KL | sync reads a token |
+| --- | --- | --- | --- | --- |
+| substitute only | 22.2% | 82.3% | 0.369 | -- |
+| + background reads (48 / 2 rounds) | 16.4% | 89.2% | 0.231 | -- |
+| + hot 1 (weight share >= 0.2) | 15.8% | 91.4% | 0.135 | 2.5 (45 ms) |
+| + hot 2 (>= 0.15) | 14.7% | 91.0% | 0.122 | 8.1 (129 ms) |
+
+Reading the single heaviest miss of a layer synchronously cut KL by 42% while moving mass missed
+by 0.6 points: mass missed understates what a top pick costs. A second hot read buys little for 3x
+the reads. One synchronous expert read is ~18 ms (six preadv calls in series on one thread).

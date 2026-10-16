@@ -132,7 +132,12 @@ class GlmTP:
         self.pf_on = env("MUSE_PF", "0") == "1" and self.miss == "substitute"
         self.pf_n = int(env("MUSE_PF_SLOTS", "32")) if self.pf_on else 0
         self.pf_min_rows = int(env("MUSE_PF_MIN_ROWS", "128"))
-        transient = cfg.experts if self.miss == "stream" else 2 * self.pf_n
+        # Hot misses (MUSE_HOT=N, eager decode): per layer, read up to N missed experts whose
+        # router weight share is at least MUSE_HOT_MIN synchronously and compute them exactly.
+        # They share the transient slots with the prefill prefetch (never both at once).
+        self.hot_n = int(env("MUSE_HOT", "0")) if self.miss == "substitute" else 0
+        self.hot_min = float(env("MUSE_HOT_MIN", "0.2"))
+        transient = cfg.experts if self.miss == "stream" else max(2 * self.pf_n, self.hot_n)
         t0 = time.perf_counter()
         self._load_dense()
         self._alloc_cache()
@@ -157,6 +162,7 @@ class GlmTP:
         first_t = fixed + self.slots_resident
         self.transient = list(range(first_t, first_t + transient))
         self.pf_slots = self.transient if self.pf_on else []
+        self.hot_stats = {"reads": 0, "layers": 0, "s": 0.0}
         self.pf_pending = {}            # layer -> [(e, slot, future)] submitted by the layer before
         self.pf_live = None             # (layer, [experts]) installed for the layer being computed
         self.pf_stats = {"chunks": 0, "planned": 0, "used_mass": 0.0, "wait_s": 0.0, "reads": 0}
@@ -218,7 +224,7 @@ class GlmTP:
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"), "db": env("MUSE_STATS_DB", ""),
-                "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS")],
+                "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_HOT", "MUSE_HOT_MIN")],
                 "adapt": [env(k, "") for k in ("MUSE_ADAPT", "MUSE_ADAPT_EVERY", "MUSE_ADAPT_PREFILL_SWAPS",
                                                "MUSE_ADAPT_DECODE_SWAPS", "MUSE_ADAPT_DECAY", "MUSE_ADAPT_CROSS_LAYER",
                                                "MUSE_ADAPT_MARGIN", "MUSE_BG", "MUSE_BG_EVERY", "MUSE_BG_READS",
@@ -372,6 +378,17 @@ class GlmTP:
                 self.db_mass, self.db_tokens = db["mass"].double(), int(db["tokens"])
         if self.rank == 0 and self.db_path and self.db_mass is None:
             self.db_mass = torch.zeros((self.nL, self.cfg.experts), dtype=torch.float64)
+
+    def flush_db(self):
+        """Fold the demand since the last adapt() into the DB and save it (rank 0; the server calls
+        this on SIGTERM, so a stop does not lose the last request's routing)."""
+        if self.rank != 0 or self.demand is None or getattr(self, "db_mass", None) is None:
+            return
+        self.db_mass += self.demand.double().cpu()
+        self.db_tokens += int(self.demand_tokens)
+        self.demand_tokens = 0
+        self.demand.zero_()
+        self.save_db()
 
     def save_db(self):
         if self.rank != 0 or not self.db_path or self.db_mass is None:
@@ -860,12 +877,47 @@ class GlmTP:
             self.allowed[L, es] = False
             self.pf_live = None
 
+    def _hot_stream(self, L, x):
+        """Decode: read this layer's heaviest missed picks (weight share >= MUSE_HOT_MIN, up to
+        MUSE_HOT) now and allow them for this layer only. Both ranks route the same replicated
+        x with the same weights, so they choose the same experts (as _route already relies on)."""
+        from .ref import route
+        cfg = self.cfg
+        w0, ids0 = route(cfg, x, self.L[L]["router"], self.L[L]["bias"], None)
+        share = (w0 / cfg.routed_scaling) * (~self.allowed[L][ids0])
+        vals, idx = torch.topk(share.reshape(-1), min(share.numel(), 4 * self.hot_n))
+        picks = ids0.reshape(-1)[idx].tolist()
+        es = []
+        for v, e in zip(vals.tolist(), picks):
+            if v < self.hot_min or len(es) >= self.hot_n:
+                break
+            if e not in es:
+                es.append(e)
+        if not es:
+            return False
+        t0 = time.perf_counter()
+        for e, slot, pr in zip(es, self.transient, self._read_many(L, es)):
+            self.arena.put(slot, *pr)
+            self.lut[L, e] = slot
+        self.allowed[L, es] = True
+        self.pf_live = (L, es)
+        st = self.hot_stats
+        st["reads"] += len(es)
+        st["layers"] += 1
+        st["s"] += time.perf_counter() - t0
+        if st["reads"] // 512 != (st["reads"] - len(es)) // 512:
+            self.ck.drop_cache()
+        return True
+
     def mlp(self, L, x):
         self._streamed = None
         pf = self.pf_on and x.shape[0] >= self.pf_min_rows
         if pf:
             self._pf_install(L)
             self._pf_predict(L, x)
+        elif (self.hot_n and x.shape[0] <= self.decode_rows and not self.dense(L)
+              and not torch.cuda.is_current_stream_capturing()):
+            pf = self._hot_stream(L, x)
         slots, w = self._route(L, x)
         T, k = slots.shape
         x = x.contiguous()

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# dual-down.sh -- stop the EP2 pair and wait for the unified pool to come back on BOTH boxes.
+# dual-down.sh -- stop the serving pair (V4.1 EP2 or GLM-5.3) and wait for the unified pool to
+# come back on BOTH boxes.
 #
 # Stop both ranks concurrently: one grace period for the pair, then verify both
 # memory pools have been reclaimed before returning. --force skips the grace.
@@ -13,7 +14,15 @@ for v in STOP_TIMEOUT MIN_FREE_GIB PEER NAME0 NAME1; do
 done
 [[ -f .env ]] && { set -a; . ./.env; set +a; }
 for v in "${!_CLI[@]}"; do printf -v "$v" '%s' "${_CLI[$v]}"; export "${v?}"; done
+# The GLM pair (scripts/glm-up.sh) takes its peer from .env.glm.
+[[ -z "${PEER:-}" && -f .env.glm ]] && PEER=$(sed -n 's/^PEER=//p' .env.glm | tail -1)
 PEER="${PEER:-}"
+# Whichever pair is running here: the V4.1 EP2 pair, else the GLM pair.
+if [[ -z "${NAME0:-}" ]] && ! docker container inspect deepseek-v41-ep2-rank0 >/dev/null 2>&1 \
+        && docker container inspect glm-serve-rank0 >/dev/null 2>&1; then
+    NAME0=glm-serve-rank0 NAME1=glm-serve-rank1
+    PEER="${PEER:-ryan@10.0.0.2}"
+fi
 NAME0="${NAME0:-deepseek-v41-ep2-rank0}"
 NAME1="${NAME1:-deepseek-v41-ep2-rank1}"
 MIN_FREE_GIB="${MIN_FREE_GIB:-90}"

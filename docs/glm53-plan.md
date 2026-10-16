@@ -45,8 +45,8 @@ kernels slot -1.
 ## Run
 
 ```
-cp .env.glm.example .env.muse   # adjust
-scripts/muse-up.sh              # serving stopped first; scripts/muse-down.sh stops it
+cp .env.glm.example .env.glm    # adjust
+scripts/glm-up.sh               # serving stopped first; scripts/dual-down.sh stops it
 ```
 Tests: `tools/muse_pair_run.sh glm_pair_test.py` (two nodes, synthetic); `python -m unittest
 engine.glm.test_ref engine.glm.test_fp8_block server.test_glm_app`. Real weights:

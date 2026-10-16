@@ -157,9 +157,20 @@ class GlmParser:
 
 
 def main(args):
+    import os
+    import signal
     from engine.glm.tp import GlmTP
     engine = GlmTP(args.model)
     if engine.rank != 0:
         follower_loop(engine)
         return
+
+    def stop(*_):
+        # docker stop (scripts/dual-down.sh): keep the routing seen since the last adaptation.
+        try:
+            engine.flush_db()
+            print(f"[glm] stats DB saved on stop ({engine.db_tokens} tokens)", flush=True)
+        finally:
+            os._exit(0)
+    signal.signal(signal.SIGTERM, stop)
     serve(engine, GlmTemplate(args.model), GlmParser, args)

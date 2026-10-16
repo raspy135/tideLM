@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# muse-up.sh -- serve Muse Spark on both Sparks (rank 0 here, rank 1 on $PEER).
+# glm-up.sh -- serve GLM-5.3 on both Sparks (rank 0 here, rank 1 on $PEER); scripts/dual-down.sh
+# stops it.
 #
-# Containers muse-serve-rank0/1 from an existing engine image with this checkout's engine/,
+# Containers glm-serve-rank0/1 from an existing engine image with this checkout's engine/,
 # tools/ and server/ mounted read-only, so a code change needs a restart, not a rebuild. The
-# checkpoint must exist at the same path on both nodes. Settings come from .env.muse (see
-# .env.muse.example); MUSE_* and the few launch variables below are forwarded to both ranks.
-# Names differ from the V4.1 deployment's (deepseek-v41-ep2-rank*), so neither script can stop
-# the other's containers; the two cannot serve at once (each fills the GPUs).
+# checkpoint must exist at the same path on both nodes. Settings come from .env.glm (copy
+# .env.glm.example); MUSE_* and the few launch variables below are forwarded to both ranks.
+# The V4.1 deployment (deepseek-v41-ep2-rank*) cannot serve at the same time (each fills the
+# GPUs); dual-down.sh stops whichever pair is running.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
-ENV_FILE=${MUSE_ENV_FILE:-$ROOT/.env.muse}
-[[ -f "$ENV_FILE" ]] || { echo "missing $ENV_FILE (copy .env.muse.example)" >&2; exit 1; }
+ENV_FILE=${MUSE_ENV_FILE:-$ROOT/.env.glm}
+[[ -f "$ENV_FILE" ]] || { echo "missing $ENV_FILE (copy .env.glm.example)" >&2; exit 1; }
 set -a; source "$ENV_FILE"; set +a
 PEER=${PEER:-ryan@10.0.0.2}
 IMAGE=${MUSE_IMAGE:-deepseek-v41-flash-dgx-spark-dual-adaptive:20261011-topp}
@@ -21,9 +22,9 @@ BIND_HOST=${BIND_HOST:-0.0.0.0}
 MASTER_ADDR=${MASTER_ADDR:-10.0.0.1}
 MASTER_PORT=${MASTER_PORT:-29651}
 IFACE=${NCCL_SOCKET_IFNAME:-enp1s0f1np1}
-for name in deepseek-v41-ep2-rank0 muse-serve-rank0; do
+for name in deepseek-v41-ep2-rank0 glm-serve-rank0; do
     if docker container inspect "$name" >/dev/null 2>&1; then
-        echo "container $name exists: stop it first (scripts/dual-down.sh or scripts/muse-down.sh)" >&2
+        echo "container $name exists: stop it first (scripts/dual-down.sh)" >&2
         exit 1
     fi
 done
@@ -44,25 +45,25 @@ flags=(-d --network host --gpus all --device /dev/infiniband --cap-add IPC_LOCK 
        -e WORLD_SIZE=2 -e MASTER_ADDR="$MASTER_ADDR" -e MASTER_PORT="$MASTER_PORT"
        -e NCCL_SOCKET_IFNAME="$IFACE" -e GLOO_SOCKET_IFNAME="$IFACE" -e NCCL_IB_DISABLE=0
        -e DSV41_DIST_TIMEOUT_S="${DSV41_DIST_TIMEOUT_S:-1800}"
-       -e HOST="$BIND_HOST" -e PORT="$PORT" -e SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-muse-spark}")
+       -e HOST="$BIND_HOST" -e PORT="$PORT" -e SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-glm-5.3}")
 while IFS='=' read -r key _; do
     flags+=(-e "$key=${!key}")
 done < <(env | grep -E '^MUSE_[A-Z0-9_]+=' | grep -v '^MUSE_MODEL_DIR=\|^MUSE_IMAGE=\|^MUSE_ENV_FILE=\|^MUSE_DRAFTER_DIR=\|^MUSE_DRAFTER=')
-docker run --name muse-serve-rank0 "${flags[@]}" -e RANK=0 \
+docker run --name glm-serve-rank0 "${flags[@]}" -e RANK=0 \
     --entrypoint python "$IMAGE" /app/server/muse_app.py >/dev/null
-printf -v peer_cmd '%q ' docker run --name muse-serve-rank1 "${flags[@]}" -e RANK=1 \
+printf -v peer_cmd '%q ' docker run --name glm-serve-rank1 "${flags[@]}" -e RANK=1 \
     --entrypoint python "$IMAGE" /app/server/muse_app.py
 ssh -o BatchMode=yes "$PEER" "$peer_cmd" >/dev/null
-echo "--- started; waiting for http://127.0.0.1:$PORT/health (logs: docker logs -f muse-serve-rank0)"
+echo "--- started; waiting for http://127.0.0.1:$PORT/health (logs: docker logs -f glm-serve-rank0)"
 for i in $(seq 1 1800); do
     if curl -fs "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
         echo "--- up after ${i}s"; exit 0
     fi
-    if ! docker container inspect -f '{{.State.Running}}' muse-serve-rank0 2>/dev/null | grep -q true; then
-        echo "--- rank 0 exited:"; docker logs --tail 40 muse-serve-rank0; exit 1
+    if ! docker container inspect -f '{{.State.Running}}' glm-serve-rank0 2>/dev/null | grep -q true; then
+        echo "--- rank 0 exited:"; docker logs --tail 40 glm-serve-rank0; exit 1
     fi
-    if ! ssh -o BatchMode=yes "$PEER" "docker container inspect -f '{{.State.Running}}' muse-serve-rank1" 2>/dev/null | grep -q true; then
-        echo "--- rank 1 exited:"; ssh -o BatchMode=yes "$PEER" "docker logs --tail 40 muse-serve-rank1"; exit 1
+    if ! ssh -o BatchMode=yes "$PEER" "docker container inspect -f '{{.State.Running}}' glm-serve-rank1" 2>/dev/null | grep -q true; then
+        echo "--- rank 1 exited:"; ssh -o BatchMode=yes "$PEER" "docker logs --tail 40 glm-serve-rank1"; exit 1
     fi
     sleep 1
 done
