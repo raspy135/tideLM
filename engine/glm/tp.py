@@ -165,6 +165,7 @@ class GlmTP:
         self.adapt_prefill_swaps = int(env("MUSE_ADAPT_PREFILL_SWAPS", "2048"))
         self.adapt_decode_swaps = int(env("MUSE_ADAPT_DECODE_SWAPS", "512"))
         self.adapt_log = []
+        self.adapt_cross_layer = env("MUSE_ADAPT_CROSS_LAYER", "1") == "1"
         if env("MUSE_ADAPT", "1") == "1" and self.miss == "substitute":
             self.enable_adaptation(float(env("MUSE_ADAPT_DECAY", "0.5")))
         torch.cuda.synchronize()
@@ -194,7 +195,7 @@ class GlmTP:
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"),
                 "adapt": [env(k, "") for k in ("MUSE_ADAPT", "MUSE_ADAPT_EVERY", "MUSE_ADAPT_PREFILL_SWAPS",
-                                               "MUSE_ADAPT_DECODE_SWAPS", "MUSE_ADAPT_DECAY")],
+                                               "MUSE_ADAPT_DECODE_SWAPS", "MUSE_ADAPT_DECAY", "MUSE_ADAPT_CROSS_LAYER")],
                 "fast_comm": self.comm.fast,
                 "config": json.dumps({k: v for k, v in self.cfg.extra["raw"].items()
                                       if k != "quantization_config"}, sort_keys=True)}
@@ -395,28 +396,59 @@ class GlmTP:
         self.demand.zero_()
         plan = None
         if self.rank == 0:
-            plan = []
             sc = self.score.cpu()
             lut = self.lut.cpu()
-            for L in self.moe_layers:
-                res = (lut[L] >= 0)
-                cand = torch.argsort(sc[L].masked_fill(res, -1.0), descending=True).tolist()
-                vict = torch.argsort(sc[L].masked_fill(~res, float("inf"))).tolist()
-                for c, v in zip(cand, vict):
-                    if res[c] or not res[v] or sc[L, c] <= sc[L, v] * margin or sc[L, c] <= 0:
+            layers = torch.tensor(self.moe_layers)
+            res = lut[layers] >= 0                                   # [moe layers, E]
+            s = sc[layers]
+            if self.adapt_cross_layer:
+                # One ranking over all layers: router mass is comparable across layers (each
+                # token's top-k weights sum to the routed scale), and layers whose routing is
+                # diffuse should get slots from layers whose routing is concentrated.
+                cand = torch.argsort(s.masked_fill(res, -1.0).reshape(-1), descending=True)
+                vict = torch.argsort(s.masked_fill(~res, float("inf")).reshape(-1))
+                left = res.sum(1).clone()
+                plan, vi = [], 0
+                E = self.cfg.experts
+                for ci in cand.tolist():
+                    if len(plan) >= max_swaps:
                         break
-                    plan.append((L, c, v))
-            plan.sort(key=lambda t: -float(sc[t[0], t[1]] - sc[t[0], t[2]]))
-            plan = plan[:max_swaps]
+                    cl, ce = divmod(ci, E)
+                    if res[cl, ce] or s[cl, ce] <= 0:
+                        break
+                    while vi < vict.numel():
+                        vl, ve = divmod(int(vict[vi]), E)
+                        vi += 1
+                        if res[vl, ve] and left[vl] > 2 * self.cfg.topk:
+                            break
+                    else:
+                        break
+                    if s[cl, ce] <= s[vl, ve] * margin:
+                        break
+                    left[vl] -= 1
+                    left[cl] += 1
+                    plan.append((int(layers[cl]), ce, int(layers[vl]), ve))
+            else:
+                plan = []
+                for li, L in enumerate(self.moe_layers):
+                    cand = torch.argsort(s[li].masked_fill(res[li], -1.0), descending=True).tolist()
+                    vict = torch.argsort(s[li].masked_fill(~res[li], float("inf"))).tolist()
+                    for c, v in zip(cand, vict):
+                        if res[li, c] or not res[li, v] or s[li, c] <= s[li, v] * margin or s[li, c] <= 0:
+                            break
+                        plan.append((L, c, L, v))
+                plan.sort(key=lambda t: -float(sc[t[0], t[1]] - sc[t[2], t[3]]))
+                plan = plan[:max_swaps]
         plan = self.comm.broadcast_obj(plan)
         by_layer: dict[int, list] = {}
-        for L, c, v in plan:
-            by_layer.setdefault(L, []).append((c, v))
-        for L, pairs in by_layer.items():
-            parts = self._read_many(L, [c for c, _ in pairs])
-            for (c, v), pr in zip(pairs, parts):
-                slot = int(self.lut[L, v])
-                self.lut[L, v] = -1
+        for L, c, VL, v in plan:
+            by_layer.setdefault(L, []).append((c, VL, v))
+        for L, items in by_layer.items():
+            parts = self._read_many(L, [c for c, _, _ in items])
+            for (c, VL, v), pr in zip(items, parts):
+                slot = int(self.lut[VL, v])
+                self.lut[VL, v] = -1
+                self.owner[slot] = None
                 self._load(L, c, slot, pr)
         if self.allowed is not None:
             self.allowed.copy_(self.lut >= 0)
