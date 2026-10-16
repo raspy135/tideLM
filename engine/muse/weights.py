@@ -200,11 +200,14 @@ class Checkpoint:
 
 def write_synthetic(model_dir: str | Path, raw_config: dict, *, seed: int = 0,
                     expert_format: str = "mxfp4", std: float = 0.02,
-                    bf16_expert_layers: tuple[int, ...] = ()) -> None:
+                    bf16_expert_layers: tuple[int, ...] = (), device: str = "cpu",
+                    bias_std: float = 0.05) -> None:
     """A random checkpoint in a release's layout, for tests (expert_format mxfp4 or bf16).
 
     Weights are N(0, std) like the model's initializer; norms and gates get small random values
-    rather than the initializer's zeros so every term of the forward pass is exercised.
+    rather than the initializer's zeros so every term of the forward pass is exercised. A large
+    ``bias_std`` makes routing decisive: random weights otherwise leave near-ties that flip under
+    BF16 rounding and turn a numerical comparison into a comparison of chaos.
     """
     from safetensors.torch import save_file
     from .config import MuseConfig
@@ -233,7 +236,7 @@ def write_synthetic(model_dir: str | Path, raw_config: dict, *, seed: int = 0,
         t[p + "post_feedforward_residual_gate.gate"] = (torch.randn(H, generator=g) * 0.5).to(torch.bfloat16)
         m = p + "mlp."
         t[m + "gate.weight"] = (torch.randn(cfg.experts, H, generator=g) * std).float()
-        t[m + "gate.e_score_correction_bias"] = (torch.randn(cfg.experts, generator=g) * 0.05).float()
+        t[m + "gate.e_score_correction_bias"] = (torch.randn(cfg.experts, generator=g) * bias_std).float()
         t[m + "pre_expert_proj.weight"] = rnd(M, H)
         t[m + "post_expert_proj.weight"] = rnd(H, M)
         t[m + "pre_expert_norm.weight"] = rnd(M, s=0.1)
@@ -248,9 +251,9 @@ def write_synthetic(model_dir: str | Path, raw_config: dict, *, seed: int = 0,
                     if L in bf16_expert_layers:
                         t[f"{m}experts.{e}.{name}_proj.weight"] = w
                     else:
-                        packed, scale = quantize_mxfp4(w)
-                        t[f"{m}experts.{e}.{name}_proj.weight"] = packed
-                        t[f"{m}experts.{e}.{name}_proj.weight_scale"] = scale
+                        packed, scale = quantize_mxfp4(w.to(device))
+                        t[f"{m}experts.{e}.{name}_proj.weight"] = packed.cpu()
+                        t[f"{m}experts.{e}.{name}_proj.weight_scale"] = scale.cpu()
     out = Path(model_dir)
     out.mkdir(parents=True, exist_ok=True)
     save_file(t, str(out / "model.safetensors"))
