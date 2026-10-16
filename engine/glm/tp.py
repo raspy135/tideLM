@@ -118,7 +118,11 @@ class GlmTP:
         if cfg.heads % W or cfg.vocab % W or cfg.moe_inter % W or cfg.hidden % W:
             raise ValueError("dimensions must split evenly over the ranks")
         self.hl, self.vl = cfg.heads // W, cfg.vocab // W
-        self.moe_layers = [L for L in range(cfg.layers) if not cfg.dense_mlp[L]]
+        self.mtp_on = (env("MUSE_MTP", "1") == "1" and cfg.mtp_layers > 0
+                       and self.ck_has_mtp(model_dir, cfg))
+        self.mtp_L = cfg.layers
+        self.nL = cfg.layers + (1 if self.mtp_on else 0)
+        self.moe_layers = [L for L in range(self.nL) if not self.dense(L)]
         self.n_pseudo = cfg.inter // cfg.moe_inter
         fixed = len(self.moe_layers) * cfg.shared_experts + sum(cfg.dense_mlp) * self.n_pseudo
         total = len(self.moe_layers) * cfg.experts
@@ -140,7 +144,7 @@ class GlmTP:
         self.slots_resident = min(int(want), total)
         self._boot_guard(transient)
         self.arena = Arena(cfg.moe_inter, cfg.hidden, fixed + self.slots_resident + transient, r, W, self.dev)
-        self.lut = torch.full((cfg.layers, cfg.experts), -1, dtype=torch.int32, device=self.dev)
+        self.lut = torch.full((self.nL, cfg.experts), -1, dtype=torch.int32, device=self.dev)
         self.owner: list[tuple[int, int] | None] = [None] * self.arena.slots
         self._place_fixed()
         self._place_resident()
@@ -152,6 +156,10 @@ class GlmTP:
         self.stats = {"stream_loads": 0, "stream_s": 0.0}
         self.miss_stats = None
         self.record = None
+        self.mtp_fill = True
+        self.spec_stats = {"rounds": 0, "accepted": 0}
+        if self.mtp_on:
+            self.graph_rows = {1, int(env("MUSE_MTP_DEPTH", "3")) + 1}
         torch.cuda.synchronize()
         self.log(f"[glm] rank {r}/{W} ready in {time.perf_counter() - t0:.1f}s: dense {self.dense_bytes / 1e9:.2f} GB, "
                  f"{self.slots_resident} of {total} routed experts resident + {fixed} fixed "
@@ -160,13 +168,23 @@ class GlmTP:
         self.reset()
 
     # ------------------------------------------------------------------ setup
+    @staticmethod
+    def ck_has_mtp(model_dir, cfg):
+        return GlmCheckpoint(model_dir).has(f"{P}layers.{cfg.layers}.eh_proj.weight")
+
+    def full(self, L):
+        return L >= self.cfg.layers or self.cfg.indexer_full[L]
+
+    def dense(self, L):
+        return L < self.cfg.layers and self.cfg.dense_mlp[L]
+
     def _boot_guard(self, transient):
         src = Path(__file__).resolve().parent
         digest = hashlib.sha256(b"".join((src / f).read_bytes() for f in
                                          ("tp.py", "ref.py", "weights.py", "config.py", "fp8_block.py"))).hexdigest()[:16]
         mine = {"version": VERSION, "code": digest, "miss": self.miss, "native": self.native,
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
-                "chunk": self.chunk, "slots": self.slots_resident, "transient": transient,
+                "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "fast_comm": self.comm.fast,
                 "config": json.dumps({k: v for k, v in self.cfg.extra["raw"].items()
                                       if k != "quantization_config"}, sort_keys=True)}
@@ -182,7 +200,7 @@ class GlmTP:
         self.final_norm = ck.get(P + "norm.weight").to(d)
         self.L = []
         nbytes = self.embed.numel() * 2 + self.head.nbytes
-        for L in range(cfg.layers):
+        for L in range(self.nL):
             p = f"{P}layers.{L}."
             a = p + "self_attn."
             kvb = ck.fp8(a + "kv_b_proj.weight", (r * self.hl * hv, (r + 1) * self.hl * hv)).dequant(torch.bfloat16)
@@ -201,13 +219,17 @@ class GlmTP:
                 "w_uv": kvb[:, cfg.nope:].contiguous().to(d),
                 "o": Lin(o.cols(r * self.hl * cfg.v_dim, (r + 1) * self.hl * cfg.v_dim), d),
             }
-            if cfg.indexer_full[L]:
+            if L == self.mtp_L:
+                lw.update({"enorm": ck.get(p + "enorm.weight").to(d), "hnorm": ck.get(p + "hnorm.weight").to(d),
+                           "sh_norm": ck.get(p + "shared_head.norm.weight").to(d),
+                           "eh": Lin(ck.get(p + "eh_proj.weight"), d)})
+            if self.full(L):
                 i = a + "indexer."
                 lw.update({"i_q": Lin(ck.fp8(i + "wq_b.weight"), d), "i_k": Lin(ck.fp8(i + "wk.weight"), d),
                            "i_kn_w": ck.get(i + "k_norm.weight").to(d).float(),
                            "i_kn_b": ck.get(i + "k_norm.bias").to(d).float(),
                            "i_w": ck.get(i + "weights_proj.weight").to(d).float()})
-            if not cfg.dense_mlp[L]:
+            if not self.dense(L):
                 lw["router"] = ck.get(p + "mlp.gate.weight").to(d).float()
                 lw["bias"] = ck.get(p + "mlp.gate.e_score_correction_bias").to(d).float()
             nbytes += sum(v.nbytes for v in lw.values() if isinstance(v, Lin))
@@ -224,10 +246,14 @@ class GlmTP:
 
     def _alloc_cache(self):
         cfg, kw = self.cfg, dict(dtype=torch.bfloat16, device=self.dev)
-        self.c_cache = [torch.zeros((self.max_seq, cfg.kv_lora), **kw) for _ in range(cfg.layers)]
-        self.r_cache = [torch.zeros((self.max_seq, cfg.rope_dim), **kw) for _ in range(cfg.layers)]
+        self.c_cache = [torch.zeros((self.max_seq, cfg.kv_lora), **kw) for _ in range(self.nL)]
+        self.r_cache = [torch.zeros((self.max_seq, cfg.rope_dim), **kw) for _ in range(self.nL)]
         self.i_cache = {L: torch.zeros((self.max_seq, cfg.index_dim), **kw)
-                        for L in range(cfg.layers) if cfg.indexer_full[L]}
+                        for L in range(self.nL) if self.full(L)}
+        # Post-norm target hidden of recent positions: the MTP layer's input when a follow-up
+        # turn reuses the cache and its last reused position gets a new next token.
+        self.h_ring_n = self.chunk + 64
+        self.h_ring = torch.zeros((self.h_ring_n, cfg.hidden), **kw)
 
     # ------------------------------------------------------------------ experts
     def _expert_parts(self, L, e):
@@ -254,8 +280,8 @@ class GlmTP:
         cfg = self.cfg
         slot = 0
         self.fixed: dict[int, torch.Tensor] = {}
-        for L in range(cfg.layers):
-            if cfg.dense_mlp[L]:
+        for L in range(self.nL):
+            if self.dense(L):
                 ids = []
                 for j in range(self.n_pseudo):
                     self.arena.put(slot, *self._pseudo_parts(L, j))
@@ -281,6 +307,9 @@ class GlmTP:
                 resident = {L: list(range(cfg.experts)) for L in self.moe_layers}
             else:
                 per = self.slots_resident // len(self.moe_layers)
+                if per < cfg.topk:
+                    raise ValueError(f"{self.slots_resident} slots give {per} experts a layer, fewer than "
+                                     f"top-{cfg.topk}: substitution could not fill the routing")
                 extra = self.slots_resident - per * len(self.moe_layers)
                 resident = {}
                 for k, L in enumerate(self.moe_layers):
@@ -352,7 +381,7 @@ class GlmTP:
         kr = rope_interleave(ckv[:, None, cfg.kv_lora:], cos, sin)[:, 0]
         self.c_cache[L].index_copy_(0, positions, c)
         self.r_cache[L].index_copy_(0, positions, kr)
-        topk = self._indexer(L, x, q_resid, positions, cos, sin, S) if cfg.indexer_full[L] else topk_prev
+        topk = self._indexer(L, x, q_resid, positions, cos, sin, S) if self.full(L) else topk_prev
         q_lat = torch.einsum("thn,hnc->thc", q_nope, lw["w_uk"])                  # [T, h, kv_lora]
         scale = cfg.qk_dim ** -0.5
         C, R = self.c_cache[L], self.r_cache[L]
@@ -387,7 +416,7 @@ class GlmTP:
         T = x.shape[0]
         fixed = self.fixed[L][None].expand(T, -1)
         ones = torch.ones(fixed.shape, dtype=torch.float32, device=x.device)
-        if cfg.dense_mlp[L]:
+        if self.dense(L):
             return fixed.contiguous(), ones
         from .ref import route
         allowed = self.allowed[L] if self.allowed is not None else None
@@ -395,6 +424,12 @@ class GlmTP:
         if self.miss == "stream":
             self._stream_misses(L, ids)
         slots = self.lut[L][ids]
+        # A pick with no slot (a layer holding fewer experts than top-k, or a stream miss not yet
+        # placed) must not reach the kernels as -1 -- they skip it and leave its output rows
+        # unwritten. It becomes a zero-weight pick of the layer's fixed slot.
+        missing = slots < 0
+        w = torch.where(missing, torch.zeros_like(w), w)
+        slots = torch.where(missing, fixed[:, :1].expand_as(slots), slots)
         return torch.cat([slots, fixed], 1).contiguous(), torch.cat([w, ones], 1)
 
     def _stream_misses(self, L, ids):
@@ -479,8 +514,9 @@ class GlmTP:
         return self.comm.all_reduce(e.float()).to(torch.bfloat16)
 
     def logits(self, h):
-        h = rms(h, self.final_norm, self.cfg.rms_eps)
-        return self.comm.cat_last(self.head(h, out_dtype=torch.float32))
+        """(logits, post-norm hidden)."""
+        hn = rms(h, self.final_norm, self.cfg.rms_eps)
+        return self.comm.cat_last(self.head(hn, out_dtype=torch.float32)), hn
 
     def _step(self, ids):
         return self.logits(self._layers(self.embed_ids(ids)))
@@ -498,13 +534,167 @@ class GlmTP:
             torch.cuda.current_stream().wait_stream(side)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                static_out = self._step(static_ids)
-            entry = self.graphs[T] = (graph, static_ids, static_out)
+                static_out, static_h = self._step(static_ids)
+            entry = self.graphs[T] = (graph, static_ids, static_out, static_h)
             self.log(f"[glm] captured decode graph for {T} rows")
-        graph, static_ids, static_out = entry
+        graph, static_ids, static_out, static_h = entry
         static_ids.copy_(ids)
         graph.replay()
-        return static_out.clone()
+        return static_out.clone(), static_h.clone()
+
+    @torch.no_grad()
+    def mtp_forward(self, next_ids, h_prev, pos0):
+        """The MTP layer at positions pos0..: (token i+1, post-norm hidden at i) -> (its
+        post-norm hidden, logits for token i+2). Writes the MTP layer's caches."""
+        cfg, L = self.cfg, self.mtp_L
+        lw = self.L[L]
+        T = next_ids.numel()
+        positions = torch.arange(pos0, pos0 + T, device=self.dev)
+        e = self.embed_ids(next_ids)
+        e = torch.where(positions[:, None] == 0, torch.zeros_like(e), e)
+        x = lw["eh"](torch.cat([rms(e, lw["enorm"], cfg.rms_eps), rms(h_prev.to(e.dtype), lw["hnorm"], cfg.rms_eps)], -1))
+        saved, saved_t = self.pos, self.pos_t.clone()
+        self.pos = pos0
+        self.pos_t.fill_(pos0)
+        a, _ = self.attention(L, rms(x, lw["ln_in"], cfg.rms_eps), None)
+        h = x + a
+        h = h + self.mlp(L, rms(h, lw["ln_post"], cfg.rms_eps))
+        self.pos = saved
+        self.pos_t.copy_(saved_t)
+        hn = rms(h, lw["sh_norm"], cfg.rms_eps)
+        return hn, self.comm.cat_last(self.head(hn, out_dtype=torch.float32))
+
+    def reusable_prefix(self, prompt):
+        n, limit = 0, min(len(prompt) - 1, len(self.tokens))
+        while n < limit and prompt[n] == self.tokens[n]:
+            n += 1
+        if n == 0 or self.pos - n > self.chunk:
+            return 0
+        return n
+
+    def prefill(self, prompt):
+        n = self.reusable_prefix(prompt)
+        if n:
+            self.pos, self.tokens = n, self.tokens[:n]
+            if self.mtp_on:
+                # Position n-1's MTP entry was made with the old next token; redo it.
+                h = self.h_ring[(n - 1) % self.h_ring_n][None]
+                self.mtp_forward(torch.tensor([prompt[n]], device=self.dev), h, n - 1)
+        else:
+            self.reset()
+        self.last_reuse = n
+        return self.forward(prompt[n:], all_logits=False)
+
+    @staticmethod
+    def sample_probs(z, temperature, top_p, top_k):
+        z = z.float() / max(temperature, 1e-6)
+        if 0 < top_k < z.numel():
+            vals, idx = z.topk(top_k)
+        else:
+            vals, idx = z.sort(descending=True)
+        pr = torch.softmax(vals, -1)
+        if top_p < 1.0:
+            keep = pr.cumsum(0) - pr < top_p
+            pr = pr * keep
+            pr = pr / pr.sum()
+        return torch.zeros_like(z).scatter_(0, idx, pr)
+
+    def sample(self, z, temperature, top_p, top_k, gen):
+        if temperature <= 0:
+            return int(z.float().argmax())
+        return int(torch.multinomial(self.sample_probs(z, temperature, top_p, top_k), 1, generator=gen))
+
+    @torch.no_grad()
+    def stream(self, prompt, max_new, *, temperature=0.0, top_p=1.0, top_k=0, seed=0,
+               stop=None, should_stop=None, depth=None):
+        """Generate; with the MTP layer, speculative rounds of ``depth`` drafts. Rank 0 decides
+        every token and broadcasts; both ranks run the same calls."""
+        stop = self.cfg.eos if stop is None else stop
+        depth = int(env("MUSE_MTP_DEPTH", "3")) if depth is None else depth
+        gen = torch.Generator(device=self.dev).manual_seed(seed)
+        self.mtp_fill = True
+        logits = self.prefill(list(prompt))
+        spec = self.mtp_on and depth > 0
+        self.mtp_fill = not spec
+        emitted = 0
+
+        def decide(x):
+            return self.comm.broadcast_obj(x)
+
+        anchor = decide(self.sample(logits[-1], temperature, top_p, top_k, gen) if self.rank == 0 else None)
+        h_last = self.last_hidden[-1:]
+        while True:
+            halt = decide(bool(should_stop and self.rank == 0 and should_stop()))
+            if halt:
+                return
+            yield anchor
+            emitted += 1
+            if anchor in stop or emitted >= max_new:
+                self.mtp_fill = True
+                self.forward([anchor], all_logits=False)
+                return
+            P = self.pos
+            if not spec:
+                logits = self.forward([anchor], all_logits=False)
+                anchor = decide(self.sample(logits[-1], temperature, top_p, top_k, gen) if self.rank == 0 else None)
+                continue
+            # Drafts: the MTP layer at P-1 (anchor, target hidden at P-1), then on its own output.
+            drafts, qs = [], []
+            hm, z = self.mtp_forward(torch.tensor([anchor], device=self.dev), h_last, P - 1)
+            for k in range(depth):
+                if temperature <= 0:
+                    d = int(z[-1].float().argmax())
+                    qs.append(None)
+                else:
+                    q = self.sample_probs(z[-1], temperature, top_p, top_k)
+                    d = decide(int(torch.multinomial(q, 1, generator=gen)) if self.rank == 0 else None)
+                    qs.append(q)
+                drafts.append(d)
+                if k + 1 < depth:
+                    hm, z = self.mtp_forward(torch.tensor([d], device=self.dev), hm, P + k)
+            rows = [anchor] + drafts
+            tl = self.forward(rows)                                  # [depth+1, V]
+            th = self.last_hidden                                    # [depth+1, H]
+            decision = None
+            if self.rank == 0:
+                n_acc, nxt = depth, None
+                for k in range(depth):
+                    if temperature <= 0:
+                        t = int(tl[k].float().argmax())
+                        if t != drafts[k]:
+                            n_acc, nxt = k, t
+                            break
+                    else:
+                        pk = self.sample_probs(tl[k], temperature, top_p, top_k)
+                        dk = drafts[k]
+                        ratio = float(pk[dk] / qs[k][dk].clamp_min(1e-20))
+                        if float(torch.rand((), generator=gen, device=self.dev)) >= min(1.0, ratio):
+                            resid = (pk - qs[k]).clamp_min(0)
+                            resid = resid if float(resid.sum()) > 0 else pk
+                            n_acc, nxt = k, int(torch.multinomial(resid / resid.sum(), 1, generator=gen))
+                            break
+                if nxt is None:
+                    nxt = self.sample(tl[depth], temperature, top_p, top_k, gen)
+                decision = (n_acc, nxt)
+            n_acc, nxt = decide(decision)
+            self.spec_stats["rounds"] += 1
+            self.spec_stats["accepted"] += n_acc
+            self.pos = P + 1 + n_acc
+            self.tokens = self.tokens[:self.pos]
+            # The MTP cache for positions P..P+n_acc-1 gets the accepted tokens as next tokens
+            # (position P+n_acc is redone with the next anchor at the start of the next round).
+            if n_acc:
+                self.mtp_forward(torch.tensor(drafts[:n_acc], device=self.dev), th[:n_acc], P)
+            h_last = th[n_acc:n_acc + 1]
+            for d in drafts[:n_acc]:
+                yield d
+                emitted += 1
+                if d in stop or emitted >= max_new:
+                    return
+            anchor = nxt
+
+    def generate(self, prompt, max_new, **kw):
+        return list(self.stream(list(prompt), max_new, **kw))
 
     @torch.no_grad()
     def forward(self, ids, *, all_logits: bool = True):
@@ -516,9 +706,10 @@ class GlmTP:
         if T <= self.decode_rows:
             self.pos_t.fill_(self.pos)
             if self.use_graphs and T in self.graph_rows and self.miss == "substitute":
-                out = self._replay(ids)
+                out, hn = self._replay(ids)
             else:
-                out = self._step(ids)
+                out, hn = self._step(ids)
+            self._after_rows(ids, hn, self.pos)
             self.pos += T
             return out if all_logits else out[-1:]
         outs = []
@@ -526,9 +717,22 @@ class GlmTP:
             part = ids[c0:c0 + self.chunk]
             self.pos_t.fill_(self.pos)
             h = self._layers(self.embed_ids(part))
+            z, hn = self.logits(h)
+            self._after_rows(part, hn, self.pos, next_ids=ids[c0 + 1:c0 + self.chunk + 1])
             self.pos += part.numel()
             if all_logits:
-                outs.append(self.logits(h))
+                outs.append(z)
             elif c0 + self.chunk >= T:
-                outs.append(self.logits(h[-1:]))
+                outs.append(z[-1:])
         return torch.cat(outs)
+
+    def _after_rows(self, ids, hn, pos0, next_ids=None):
+        """Keep the rows' post-norm hidden; in prefill also run the MTP layer over the rows
+        whose next token is known (fills its cache; the last row waits for the sampled token)."""
+        T = ids.numel()
+        idx = (torch.arange(pos0, pos0 + T, device=self.dev)) % self.h_ring_n
+        self.h_ring.index_copy_(0, idx, hn)
+        self.last_hidden = hn
+        if self.mtp_on and self.mtp_fill and next_ids is not None and next_ids.numel():
+            n = min(T, next_ids.numel())
+            self.mtp_forward(next_ids[:n], hn[:n], pos0)

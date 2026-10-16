@@ -82,7 +82,8 @@ def _fp8_quant(w: torch.Tensor):
 
 def write_synthetic(model_dir: str | Path, raw: dict, *, seed: int = 0, std: float = 0.02,
                     bias_std: float = 0.05, device: str = "cpu") -> None:
-    """A random checkpoint in AMD's Quark layout (tests). MTP layer not written."""
+    """A random checkpoint in AMD's Quark layout (tests), with the MTP layer when the config has
+    num_nextn_predict_layers (layer index = num_hidden_layers, a full-indexer MoE layer)."""
     from safetensors.torch import save_file
     cfg = GlmConfig.from_dict(raw)
     g = torch.Generator().manual_seed(seed)
@@ -104,9 +105,15 @@ def write_synthetic(model_dir: str | Path, raw: dict, *, seed: int = 0, std: flo
     t[P + "embed_tokens.weight"] = rnd(cfg.vocab, H, s=1.0)
     t[P + "norm.weight"] = (1.0 + torch.randn(H, generator=g) * 0.1).to(torch.bfloat16)
     t["lm_head.weight"] = rnd(cfg.vocab, H)
-    for L in range(cfg.layers):
+    for L in range(cfg.layers + cfg.mtp_layers):
+        mtp = L >= cfg.layers
         p = f"{P}layers.{L}."
         a = p + "self_attn."
+        if mtp:
+            t[p + "enorm.weight"] = (1.0 + torch.randn(H, generator=g) * 0.1).to(torch.bfloat16)
+            t[p + "hnorm.weight"] = (1.0 + torch.randn(H, generator=g) * 0.1).to(torch.bfloat16)
+            t[p + "shared_head.norm.weight"] = (1.0 + torch.randn(H, generator=g) * 0.1).to(torch.bfloat16)
+            t[p + "eh_proj.weight"] = rnd(H, 2 * H)
         t[p + "input_layernorm.weight"] = (1.0 + torch.randn(H, generator=g) * 0.1).to(torch.bfloat16)
         t[p + "post_attention_layernorm.weight"] = (1.0 + torch.randn(H, generator=g) * 0.1).to(torch.bfloat16)
         fp8(a + "q_a_proj.weight", rnd(cfg.q_lora, H))
@@ -116,7 +123,7 @@ def write_synthetic(model_dir: str | Path, raw: dict, *, seed: int = 0, std: flo
         t[a + "kv_a_layernorm.weight"] = (1.0 + torch.randn(cfg.kv_lora, generator=g) * 0.1).to(torch.bfloat16)
         fp8(a + "kv_b_proj.weight", rnd(cfg.heads * (cfg.nope + cfg.v_dim), cfg.kv_lora))
         fp8(a + "o_proj.weight", rnd(H, cfg.heads * cfg.v_dim))
-        if cfg.indexer_full[L]:
+        if mtp or cfg.indexer_full[L]:
             i = a + "indexer."
             fp8(i + "wq_b.weight", rnd(cfg.index_heads * cfg.index_dim, cfg.q_lora))
             fp8(i + "wk.weight", rnd(cfg.index_dim, H))
@@ -124,7 +131,7 @@ def write_synthetic(model_dir: str | Path, raw: dict, *, seed: int = 0, std: flo
             t[i + "k_norm.bias"] = rnd(cfg.index_dim, s=0.1)
             t[i + "weights_proj.weight"] = rnd(cfg.index_heads, H)
         m = p + "mlp."
-        if cfg.dense_mlp[L]:
+        if not mtp and cfg.dense_mlp[L]:
             for n, shape in (("gate", (cfg.inter, H)), ("up", (cfg.inter, H)), ("down", (H, cfg.inter))):
                 mx(m + f"{n}_proj.weight", rnd(*shape))
             continue

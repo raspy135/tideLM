@@ -78,8 +78,14 @@ class GlmRef:
         self.allowed: dict[int, torch.Tensor] = {}
         self.reset()
 
+    def full(self, L):
+        return L >= self.cfg.layers or self.cfg.indexer_full[L]
+
+    def dense(self, L):
+        return L < self.cfg.layers and self.cfg.dense_mlp[L]
+
     def reset(self):
-        n = self.cfg.layers
+        n = self.cfg.layers + self.cfg.mtp_layers
         self.kv: list[torch.Tensor | None] = [None] * n       # normed latent [S, kv_lora]
         self.kr: list[torch.Tensor | None] = [None] * n       # roped shared key [S, rope_dim]
         self.ik: list[torch.Tensor | None] = [None] * n       # indexer keys [S, index_dim]
@@ -138,7 +144,7 @@ class GlmRef:
         k_rot = rope_interleave(k_rot[:, None], cos, sin)[:, 0]
         self.kv[L] = kv_pass if self.kv[L] is None else torch.cat([self.kv[L], kv_pass])
         self.kr[L] = k_rot if self.kr[L] is None else torch.cat([self.kr[L], k_rot])
-        if cfg.indexer_full[L]:
+        if self.full(L):
             topk = self.indexer(L, x, q_resid, cos, sin, positions)
         else:
             topk = topk_prev
@@ -182,8 +188,30 @@ class GlmRef:
         a, topk = self.attention(L, rms_norm(h, self.w(p + "input_layernorm.weight"), cfg.rms_eps), topk_prev)
         h = h + a
         x = rms_norm(h, self.w(p + "post_attention_layernorm.weight"), cfg.rms_eps)
-        f = self.mlp(p + "mlp.", x) if cfg.dense_mlp[L] else self.moe(L, x)
+        f = self.mlp(p + "mlp.", x) if self.dense(L) else self.moe(L, x)
         return h + f, topk
+
+    @torch.no_grad()
+    def mtp(self, next_ids: torch.Tensor, h_prev: torch.Tensor, pos0: int):
+        """The MTP layer (DeepSeek's, as vLLM's deepseek_mtp runs it) at positions pos0..: token
+        i+1's embedding (zero at position 0) and the target's post-norm hidden at i ->
+        eh_proj(cat(enorm(e), hnorm(h))) -> a decoder layer with its own caches -> shared norm
+        -> lm_head. Returns (normed hidden for the next step, logits predicting token i+2)."""
+        cfg = self.cfg
+        L = cfg.layers
+        T = next_ids.numel()
+        positions = torch.arange(pos0, pos0 + T, device=self.device)
+        e = self.w("embed_tokens.weight")[next_ids.to(self.device)]
+        e = torch.where(positions[:, None] == 0, torch.zeros_like(e), e)
+        p = f"layers.{L}."
+        x = F.linear(torch.cat([rms_norm(e, self.w(p + "enorm.weight"), cfg.rms_eps),
+                                rms_norm(h_prev.to(e.dtype), self.w(p + "hnorm.weight"), cfg.rms_eps)], -1),
+                     self.w(p + "eh_proj.weight"))
+        saved, self.pos = self.pos, pos0
+        h, _ = self.layer(L, x, None)
+        self.pos = saved
+        hn = rms_norm(h, self.w(p + "shared_head.norm.weight"), cfg.rms_eps)
+        return hn, F.linear(hn, self.w("lm_head.weight"))
 
     @torch.no_grad()
     def forward(self, ids: torch.Tensor, hidden_out: list | None = None) -> torch.Tensor:
@@ -195,4 +223,5 @@ class GlmRef:
                 hidden_out.append(h)
         self.pos += ids.numel()
         h = rms_norm(h, self.w("norm.weight"), self.cfg.rms_eps)
+        self.last_hidden = h                  # post-norm, what the MTP layer takes
         return F.linear(h, self.w("lm_head.weight"))

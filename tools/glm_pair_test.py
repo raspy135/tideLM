@@ -28,10 +28,10 @@ RAW = {
     "moe_intermediate_size": 2048, "n_shared_experts": 1, "n_group": 1, "topk_group": 1,
     "routed_scaling_factor": 2.5, "norm_topk_prob": True,
     "rope_parameters": {"rope_theta": 8000000.0, "rope_type": "default"}, "rope_interleave": True,
-    "indexer_rope_interleave": True, "rms_norm_eps": 1e-5, "num_nextn_predict_layers": 0,
+    "indexer_rope_interleave": True, "rms_norm_eps": 1e-5, "num_nextn_predict_layers": 1,
     "pad_token_id": 0, "eos_token_id": [1], "max_position_embeddings": 65536,
 }
-MODEL = Path(os.environ.get("GLM_SYNTH_DIR", "/app/results/glm-synth-v1"))
+MODEL = Path(os.environ.get("GLM_SYNTH_DIR", "/app/results/glm-synth-v2"))
 FAILED = []
 
 
@@ -82,22 +82,45 @@ def main():
         torch.cuda.synchronize()
         return (time.perf_counter() - t0) / n * 1000
 
-    eng = GlmTP(str(MODEL), max_seq=2048, chunk=256, slots=16 * 3)
+    eng = GlmTP(str(MODEL), max_seq=2048, chunk=256, slots=16 * 4)
     full = run(eng)
     eng.use_graphs = False
     eager = run(eng)
     eng.use_graphs = True
     step_ms = time_decode(eng)
+    # MTP: logits at the prompt's last position for a given next token, against the reference.
+    eng.reset()
+    eng.mtp_fill = True
+    eng.forward(prompt)
+    h_last = eng.last_hidden[-1:]
+    _, mtp_logits = eng.mtp_forward(torch.tensor([int(follow[0])], device=eng.dev), h_last, len(prompt) - 1)
+    mtp_logits = mtp_logits.cpu()
+    # Speculative greedy decoding with the (random) MTP drafter: every token must be the
+    # target's argmax of a clean teacher-forced pass, up to near-ties.
+    eng.spec_stats = {"rounds": 0, "accepted": 0}
+    spec = eng.generate(prompt[:300].tolist(), 24, depth=3)
+    spec_rounds = dict(eng.spec_stats)
+    plain = eng.generate(prompt[:300].tolist(), 24, depth=0)
+    eng.reset()
+    eng.mtp_fill = False
+    tf = eng.forward(prompt[:300].tolist() + spec).float().cpu()
+    rows = tf[299:299 + len(spec)]
+    m_spec = (rows.max(-1).values - rows.gather(1, torch.tensor(spec)[:, None])[:, 0]).max().item()
+    eng.reset()
+    tf = eng.forward(prompt[:300].tolist() + plain).float().cpu()
+    rows = tf[299:299 + len(plain)]
+    m_plain = (rows.max(-1).values - rows.gather(1, torch.tensor(plain)[:, None])[:, 0]).max().item()
+    sampled = eng.generate(prompt[:300].tolist(), 16, depth=3, temperature=1.0, top_k=64, seed=3)
     del eng
     gc.collect(); torch.cuda.empty_cache()
 
-    eng = GlmTP(str(MODEL), max_seq=2048, chunk=256, slots=24)
+    eng = GlmTP(str(MODEL), max_seq=2048, chunk=256, slots=36)
     allowed = (eng.lut >= 0).cpu()
     sub = run(eng)
     del eng
     gc.collect(); torch.cuda.empty_cache()
 
-    eng = GlmTP(str(MODEL), max_seq=2048, chunk=256, slots=24, miss="stream")
+    eng = GlmTP(str(MODEL), max_seq=2048, chunk=256, slots=36, miss="stream")
     stream = run(eng)
     loads = eng.stats["stream_loads"]
     del eng
@@ -114,6 +137,12 @@ def main():
         r16.allowed = {L: allowed[L] for L in range(cfg.layers)}
         want_sub = r16.forward(ids.cuda()).cpu()
         noise = compare(want16, want32)["rel"]
+        r32.reset()
+        r32.forward(prompt.cuda())
+        hid = r32.last_hidden
+        r32.mtp(prompt[1:].cuda(), hid[:-1], 0)            # the engine fills its MTP cache in prefill
+        _, want_mtp = r32.mtp(follow[:1].cuda(), hid[-1:], len(prompt) - 1)
+        mtp_cmp = compare(mtp_logits, want_mtp.cpu())
         r = {"bf16_ref_vs_fp32_ref": compare(want16, want32), "engine_vs_fp32_ref": compare(full, want32),
              "engine_decode_vs_fp32_ref": compare(full[600:], want32[600:]),
              "graph_vs_eager": compare(full[600:], eager[600:]), "substitute_vs_masked_ref": compare(sub, want_sub),
@@ -123,10 +152,15 @@ def main():
         check("engine within 2x the reference's bf16 noise", r["engine_vs_fp32_ref"]["rel"] <= tol, f"noise {noise}")
         check("decode rows match", r["engine_decode_vs_fp32_ref"]["rel"] <= tol)
         check("graph replay equals eager decode", r["graph_vs_eager"]["rel"] == 0.0)
-        check("substitution matches the masked reference", r["substitute_vs_masked_ref"]["rel"] <= tol)
+        check("substitution matches the masked reference", r["substitute_vs_masked_ref"]["rel"] <= tol,
+              f"{r['substitute_vs_masked_ref']} tol {tol}")
         check("substitution changed the output", r["substitute_vs_full"]["rel"] > 0.01)
         check("streamed misses reproduce full residency", r["stream_vs_full"]["rel"] < 1e-3, f"{loads} loads")
         say(f"graphed decode step, 4 layers: {step_ms:.2f} ms")
+        check("MTP layer logits match the reference", mtp_cmp["rel"] <= max(2 * noise, 0.02), f"{mtp_cmp}")
+        check("speculative greedy tokens are the target's argmax (near-ties aside)",
+              m_spec <= max(0.15, 1.5 * m_plain), f"margins spec {m_spec:.4f} plain {m_plain:.4f}; {spec_rounds}")
+        check("speculative sampling runs", len(sampled) == 16)
     flags = [FAILED]
     if int(os.environ.get("WORLD_SIZE", 1)) > 1:
         import torch.distributed as dist
