@@ -2813,3 +2813,27 @@ Tokyo, 3-row steps, hot 0.2 paced cap 12, KL to exact / top-1): renorm 0.189 / 8
 0.217 / 88.8%; `transfer` (each substitute takes a missed pick's exact weight) 0.217 / 89.3%.
 Both lose by the same margin; renorm stays. With V4.1's skip results above, the pattern holds:
 leaning on the experts that are computed exactly beats preserving the router's exact numbers.
+
+## Residency is the biggest quality lever left on MXFP4; the 20 GB floor was costing ~1,500 slots (2026-10-16)
+
+glm_quality, Tokyo, 3-row steps, hot 0.2 paced cap 16, kept, no background reads, max_seq 8192:
+
+| routed slots | KL / top-1 | miss mass | hot reads |
+| --- | --- | --- | --- |
+| 7,000 (36%) | 0.171 / 90.9% | 20.3% | 2,224 |
+| 8,500 (44%) | 0.132 / 91.2% | 16.0% | 1,826 |
+| 9,394 (48%, 6 GB floor, share 0.97) | 0.113 / 92.3% | 13.6% | 1,598 |
+
+Fewer misses also mean fewer hot reads, so the speed cost of more slots is negative. The stats
+DB's static coverage agrees (global top-N by router mass): 7,100 -> 37.9% of mass missed, 8,000
+-> 33.4%, 10,200 -> 23.7%, 15,300 -> 6.9%.
+
+Serving (max_seq 32768) has less room than the eval: the KV caches are 2.7 GB larger and a live
+pair loses another 4-5 GB of MemAvailable after its first long prefill (allocator reserve, not
+growing with context: a 28K-token context after a 20K one added nothing). At 8,900 slots a pair
+started at 7.1 GB available on rank 0 and fell to 5.1 GB on a 5.6K prompt -- too close on GB10,
+where running out wedges the box instead of raising an OOM. At 8,600: ready at 10.9 GB, minimum
+6.0 / 8.2 GB (rank 0 / 1) through 20K and 28K prompts, with an hf download holding ~4 GB on rank
+0 and rank 1's polkitd (5.3 GB) and bluetoothd (1.1 GB) leaking. Slots are the minimum over the
+ranks, so a leak on either node costs the pair. Watch with
+`NAME0=glm-serve-rank0 NAME1=glm-serve-rank1 PEER=ryan@10.0.0.2 scripts/mem-watchdog.sh --kill`.
