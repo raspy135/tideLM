@@ -2655,3 +2655,24 @@ Background streaming, simulated on a decode routing dump (`--dump`, tools/glm_bg
 - pre-gating (layer N's router on layer N-d's input): recall of missed mass 66% at d=1, 56% d=2,
   44% d=4, 31% d=8. A layer is ~1.4 ms and a read 15 ms, so d=1-2 leaves no time to read, and at
   d=8 recall is a third. It also costs ~135 reads a token. Not usable for decode.
+
+## GLM-5.3 background expert reads and prefill prefetch: what they buy (2026-10-16)
+
+Decode (MUSE_BG): every 2 rounds rank 0 ranks non-resident experts by recent router mass (decay
+0.7 a period), reads up to 48 on the thread pool, installs them over cold residents at the next
+boundary. First version never planned after the first request: victims needed recent mass == 0,
+and a decayed score never reaches zero (4 reads in 1,200 tokens). Victims now need mass below
+MUSE_BG_COLD (0.01). glm_adapt_test, ISO prompt, eager, decode mass missed round 0 / 1 / 2:
+37.6 / 22.7 / 20.9% off, 24.2 / 20.4 / 19.8% on; reads waited 0.02 s in 600 tokens; ~14K
+installs a round (the budget is always spent -- it churns, and the settled gain is ~1 point).
+Speed, graphed, MTP depth 2, glm_probe 3 prompts x 400 tokens: 13.25 off, 12.03 at 24 reads,
+11.97 at 48; the off run's text was visibly broken ("the premise is flawed -- the sky isn't
+blue", "#!/usr/bin bash"), both on runs clean.
+
+Prefill (MUSE_PF): at each MLP the next layer's router runs on this layer's input; the chunk's
+heaviest non-resident experts (by summed mass) are read into one of two transient buffers while
+this layer and the next attention compute, and are allowed for that layer only. 3,321-token
+prompt (engine/glm/ref.py), round 0: prefill mass missed 30.8% off; 18.4% with 32 a layer but
+TTFT 24.5 -> 43.6 s (18 s waiting: a 1,024-row layer is ~57 ms, 32 reads ~120 ms); 23.4% with
+16 a layer, TTFT 30.5 s, 3.4 s waiting. MUSE_READ_THREADS 12 -> 24 did not raise read speed (8
+experts ~31 ms either way, ~2.6 GB/s a rank): the buffered read path is the limit, not threads.

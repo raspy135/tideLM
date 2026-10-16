@@ -27,6 +27,8 @@ def main():
     ap.add_argument("--rounds", type=int, default=6)
     ap.add_argument("--window", type=int, default=32)
     ap.add_argument("--hist", action="store_true")
+    ap.add_argument("--prompt-file", default="", help="ask to explain this file (first --prompt-chars) instead")
+    ap.add_argument("--prompt-chars", type=int, default=12000)
     ap.add_argument("--read-bench", action="store_true")
     ap.add_argument("--dump", default="", help="save decode routing (unmasked ids, weights, missed, "
                     "ids predicted 1/2/4/8 layers ahead) per round to DUMP.r<round>.pt (rank 0)")
@@ -35,7 +37,11 @@ def main():
     eng = GlmTP(args.model)
     if eng.demand is None:
         eng.enable_adaptation()
-    ids = tpl.encode(tpl.render(PROMPT, None, "low"))
+    prompt = PROMPT
+    if args.prompt_file:
+        text = open(args.prompt_file, errors="ignore").read()[:args.prompt_chars]
+        prompt = [{"role": "user", "content": f"Here is a file:\n\n```\n{text}\n```\n\nExplain what it does."}]
+    ids = tpl.encode(tpl.render(prompt, None, "low"))
     ms = {"picks": 0, "missed": 0, "mass": 0.0, "mass_missed": 0.0}
     eng.miss_stats = ms
 
@@ -49,7 +55,9 @@ def main():
         s0 = dict(ms)
         it = eng.stream(ids, args.tokens, depth=0)
         eng.miss_hist = None
+        t_first = time.perf_counter()
         out = [next(it)]
+        t_first = time.perf_counter() - t_first
         s1 = dict(ms)
         if args.hist:
             eng.miss_hist = torch.zeros((2, 50), dtype=torch.float32, device=eng.dev)
@@ -66,9 +74,12 @@ def main():
         dt = time.perf_counter() - t0
         s2 = dict(ms)
         if eng.rank == 0:
-            print(json.dumps({"round": r, "prefill_tokens": len(ids), "prefill_missed": share(s0, s1),
+            print(json.dumps({"round": r, "prefill_tokens": len(ids), "ttft_s": round(t_first, 2),
+                              "prefetch": dict(getattr(eng, "pf_stats", {})), "prefill_missed": share(s0, s1),
                               "decode_missed": share(s1, s2), f"decode_mass_missed_per_{args.window}": windows,
-                              "decode_tok_s": round((len(out) - 1) / dt, 2), "adaptations": eng.adapt_log}), flush=True)
+                              "decode_tok_s": round((len(out) - 1) / dt, 2), "adaptations": eng.adapt_log,
+                              "background": {k: round(v, 2) if isinstance(v, float) else v
+                                             for k, v in getattr(eng, "bg_stats", {}).items()}}), flush=True)
             print("[text]", repr(tpl.decode(out)[:700]), flush=True)
         if args.dump:
             d, eng.route_dump = eng.route_dump, None

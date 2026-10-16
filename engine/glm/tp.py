@@ -127,7 +127,12 @@ class GlmTP:
         self.n_pseudo = cfg.inter // cfg.moe_inter
         fixed = len(self.moe_layers) * cfg.shared_experts + sum(cfg.dense_mlp) * self.n_pseudo
         total = len(self.moe_layers) * cfg.experts
-        transient = cfg.experts if self.miss == "stream" else 0
+        # Prefill prefetch (MUSE_PF=1): two buffers of MUSE_PF_SLOTS transient slots, one per
+        # alternate layer, taken from the resident budget. See _pf_predict.
+        self.pf_on = env("MUSE_PF", "0") == "1" and self.miss == "substitute"
+        self.pf_n = int(env("MUSE_PF_SLOTS", "32")) if self.pf_on else 0
+        self.pf_min_rows = int(env("MUSE_PF_MIN_ROWS", "128"))
+        transient = cfg.experts if self.miss == "stream" else 2 * self.pf_n
         t0 = time.perf_counter()
         self._load_dense()
         self._alloc_cache()
@@ -151,6 +156,10 @@ class GlmTP:
         self._place_resident()
         first_t = fixed + self.slots_resident
         self.transient = list(range(first_t, first_t + transient))
+        self.pf_slots = self.transient if self.pf_on else []
+        self.pf_pending = {}            # layer -> [(e, slot, future)] submitted by the layer before
+        self.pf_live = None             # (layer, [experts]) installed for the layer being computed
+        self.pf_stats = {"chunks": 0, "planned": 0, "used_mass": 0.0, "wait_s": 0.0, "reads": 0}
         self.allowed = (self.lut >= 0) if self.miss == "substitute" else None
         self.pos_t = torch.zeros(1, dtype=torch.long, device=self.dev)
         self.graphs: dict[int, tuple] = {}
@@ -170,6 +179,17 @@ class GlmTP:
         self.adapt_margin = float(env("MUSE_ADAPT_MARGIN", "1.5"))
         self.adapt_log = []
         self.adapt_cross_layer = env("MUSE_ADAPT_CROSS_LAYER", "1") == "1"
+        # Background expert reads during decode (MUSE_BG=1): every MUSE_BG_EVERY decode rounds,
+        # rank 0 ranks the non-resident experts by their recent router mass (decayed by
+        # MUSE_BG_DECAY a period), picks up to MUSE_BG_READS of them and a cold resident victim
+        # for each; both ranks read them on the thread pool while decode goes on and install
+        # them at the next period boundary. bg_step() has the rules.
+        self.bg_on = env("MUSE_BG", "0") == "1"
+        self.bg_every = max(1, int(env("MUSE_BG_EVERY", "2")))
+        self.bg_reads = int(env("MUSE_BG_READS", "48"))
+        self.bg_decay = float(env("MUSE_BG_DECAY", "0.7"))
+        self.bg_protect = int(env("MUSE_BG_PROTECT", "8"))
+        self.bg_cold = float(env("MUSE_BG_COLD", "0.01"))   # victims: recent router mass below this
         if env("MUSE_ADAPT", "1") == "1" and self.miss == "substitute":
             self.enable_adaptation(float(env("MUSE_ADAPT_DECAY", "0.9")))
         torch.cuda.synchronize()
@@ -198,9 +218,11 @@ class GlmTP:
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"), "db": env("MUSE_STATS_DB", ""),
+                "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS")],
                 "adapt": [env(k, "") for k in ("MUSE_ADAPT", "MUSE_ADAPT_EVERY", "MUSE_ADAPT_PREFILL_SWAPS",
                                                "MUSE_ADAPT_DECODE_SWAPS", "MUSE_ADAPT_DECAY", "MUSE_ADAPT_CROSS_LAYER",
-                                               "MUSE_ADAPT_MARGIN")],
+                                               "MUSE_ADAPT_MARGIN", "MUSE_BG", "MUSE_BG_EVERY", "MUSE_BG_READS",
+                                               "MUSE_BG_DECAY", "MUSE_BG_PROTECT", "MUSE_BG_COLD")],
                 "fast_comm": self.comm.fast,
                 "config": json.dumps({k: v for k, v in self.cfg.extra["raw"].items()
                                       if k != "quantization_config"}, sort_keys=True)}
@@ -439,6 +461,13 @@ class GlmTP:
         self.demand = torch.zeros((self.nL, self.cfg.experts), dtype=torch.float32, device=self.dev)
         self.score = torch.zeros_like(self.demand)        # decayed history the swaps rank by
         self.decay = decay
+        self.bg_score = torch.zeros_like(self.demand)     # short-term decayed router mass (background reads)
+        self.bg_last = torch.zeros_like(self.demand)      # demand at the last background period
+        self.bg_pending = []                              # [(L, e, VL, ve, future)] read, not installed
+        self.bg_period = 0
+        self.bg_until = torch.zeros((self.nL, self.cfg.experts), dtype=torch.long, device=self.dev)  # no eviction before
+        self._bg_layers = torch.tensor(self.moe_layers, device=self.dev)
+        self.bg_stats = {"periods": 0, "planned": 0, "installed": 0, "stale": 0, "wait_s": 0.0, "install_s": 0.0}
 
     @torch.no_grad()
     def adapt(self, max_swaps: int = 4096, margin: float | None = None):
@@ -456,6 +485,8 @@ class GlmTP:
         self.demand_tokens = 0
         self.score.mul_(self.decay).add_(self.demand)
         self.demand.zero_()
+        if getattr(self, "bg_last", None) is not None:
+            self.bg_last.zero_()                          # demand restarts from zero
         plan = None
         if self.rank == 0:
             sc = self.score.cpu()
@@ -524,6 +555,85 @@ class GlmTP:
         self.adapt_totals["churn"] += churn
         self.last_churn = churn
         return len(plan), time.perf_counter() - t0
+
+    @torch.no_grad()
+    def bg_step(self):
+        """One background-read period boundary; both ranks call it at the same decode round.
+
+        1. Install the previous period's reads: each rank waits for its own (normally done), then
+           an item goes in only if its victim still holds the slot and the expert is still not
+           resident -- decided on the shared lut, so both ranks agree.
+        2. Rank 0 plans the next reads: candidates are non-resident experts by bg_score (router
+           mass of the recent periods, decayed); victims are resident experts whose recent mass is
+           below MUSE_BG_COLD (decay never reaches zero), not filled by a background read in the
+           last MUSE_BG_PROTECT periods, the lowest long-term score first, never taking a layer
+           below 2 x top-k. Broadcast, then both ranks
+           submit the reads and return to decoding."""
+        st = self.bg_stats
+        self.bg_period += 1
+        st["periods"] += 1
+        if self.bg_pending:
+            t0 = time.perf_counter()
+            parts = [f.result() for *_, f in self.bg_pending]
+            t1 = time.perf_counter()
+            st["wait_s"] += t1 - t0
+            torch.cuda.synchronize()
+            lut = self.lut.cpu()
+            for (L, e, VL, ve, _), pr in zip(self.bg_pending, parts):
+                slot = int(lut[VL, ve])
+                if slot < 0 or int(lut[L, e]) >= 0 or self.owner[slot] != (VL, ve):
+                    st["stale"] += 1
+                    continue
+                lut[VL, ve] = -1
+                lut[L, e] = slot
+                self.lut[VL, ve] = -1
+                self.owner[slot] = None
+                self._load(L, e, slot, pr)
+                self.bg_until[L, e] = self.bg_period + self.bg_protect
+                st["installed"] += 1
+            if self.allowed is not None:
+                self.allowed.copy_(self.lut >= 0)
+            if st["installed"] // 512 != (st["installed"] - len(parts)) // 512:
+                self.ck.drop_cache()                  # page cache shares the GPU's pool on GB10
+            self.bg_pending = []
+            st["install_s"] += time.perf_counter() - t1
+        window = self.demand - self.bg_last
+        self.bg_last.copy_(self.demand)
+        self.bg_score.mul_(self.bg_decay).add_(window)
+        plan = None
+        if self.rank == 0 and self.bg_reads > 0:
+            # One pass on the GPU, one copy back: candidates, victims, per-layer counts.
+            lay = self._bg_layers
+            res = self.lut[lay] >= 0
+            short = self.bg_score[lay]
+            cold = res & (short < self.bg_cold) & (self.bg_until[lay] <= self.bg_period)
+            cs = torch.topk(short.masked_fill(res, -1.0).reshape(-1), self.bg_reads)
+            nv = min(4 * self.bg_reads, cold.numel())
+            vs = torch.topk((self.score + self.demand)[lay].masked_fill(~cold, float("inf")).reshape(-1), nv,
+                            largest=False)
+            c_val, c_idx, v_val, v_idx, left = (t.cpu().tolist() for t in (cs.values, cs.indices, vs.values,
+                                                                           vs.indices, res.sum(1)))
+            E, floor = self.cfg.experts, 2 * self.cfg.topk
+            plan, vi = [], 0
+            for cv, ci in zip(c_val, c_idx):
+                if cv <= 0:
+                    break
+                cl, ce = divmod(ci, E)
+                while vi < nv and v_val[vi] != float("inf"):
+                    vl, ve = divmod(v_idx[vi], E)
+                    vi += 1
+                    if left[vl] > floor:
+                        break
+                else:
+                    break
+                left[vl] -= 1
+                left[cl] += 1
+                plan.append((self.moe_layers[cl], ce, self.moe_layers[vl], ve))
+        plan = self.comm.broadcast_obj(plan)
+        if not hasattr(self, "_pool"):
+            self._read_many(self.moe_layers[0], [])
+        self.bg_pending = [(L, e, VL, ve, self._pool.submit(self._expert_parts, L, e)) for L, e, VL, ve in plan]
+        st["planned"] += len(plan)
 
     # ------------------------------------------------------------------ attention
     def _indexer(self, L, x, q_resid, positions, cos, sin, S):
@@ -697,8 +807,65 @@ class GlmTP:
                                                num_warps=nw2, num_stages=ns2)
         return parts.view(k, T, A.Hl)
 
+    def _pf_next(self, L):
+        N = L + 1
+        return N if N < self.cfg.layers and not self.dense(N) else None
+
+    def _pf_predict(self, L, x):
+        """Prefill: run the next layer's router on this layer's MLP input, sum the router mass
+        over the chunk's rows, and read the heaviest non-resident experts (up to MUSE_PF_SLOTS)
+        into the next layer's transient buffer while this layer and the next attention compute.
+        Rank 0 decides (the same experts must land on both ranks); a misprediction only costs the
+        read -- the next layer's router still decides, over resident + prefetched experts."""
+        N = self._pf_next(L)
+        if N is None:
+            return
+        from .ref import route
+        plan = None
+        if self.rank == 0:
+            w, ids = route(self.cfg, x, self.L[N]["router"], self.L[N]["bias"], None)
+            mass = torch.zeros(self.cfg.experts, dtype=torch.float32, device=x.device)
+            mass.index_add_(0, ids.reshape(-1), w.reshape(-1))
+            mass.masked_fill_(self.lut[N] >= 0, 0.0)
+            top = torch.topk(mass, self.pf_n)
+            plan = [int(e) for e, m in zip(top.indices.tolist(), top.values.tolist()) if m > 0]
+        plan = self.comm.broadcast_obj(plan)
+        if not hasattr(self, "_pool"):
+            self._read_many(L, [])
+        buf = self.pf_slots[(N % 2) * self.pf_n:(N % 2 + 1) * self.pf_n]
+        self.pf_pending[N] = [(e, slot, self._pool.submit(self._expert_parts, N, e)) for e, slot in zip(plan, buf)]
+        self.pf_stats["planned"] += len(plan)
+
+    def _pf_install(self, L):
+        items = self.pf_pending.pop(L, None)
+        if not items:
+            return
+        t0 = time.perf_counter()
+        parts = [f.result() for _, _, f in items]
+        self.pf_stats["wait_s"] += time.perf_counter() - t0
+        for (e, slot, _), pr in zip(items, parts):
+            self.arena.put(slot, *pr)
+            self.lut[L, e] = slot
+        es = [e for e, _, _ in items]
+        self.allowed[L, es] = True
+        self.pf_live = (L, es)
+        self.pf_stats["reads"] += len(es)
+        if self.pf_stats["reads"] // 512 != (self.pf_stats["reads"] - len(es)) // 512:
+            self.ck.drop_cache()
+
+    def _pf_release(self):
+        if self.pf_live:
+            L, es = self.pf_live
+            self.lut[L, es] = -1
+            self.allowed[L, es] = False
+            self.pf_live = None
+
     def mlp(self, L, x):
         self._streamed = None
+        pf = self.pf_on and x.shape[0] >= self.pf_min_rows
+        if pf:
+            self._pf_install(L)
+            self._pf_predict(L, x)
         slots, w = self._route(L, x)
         T, k = slots.shape
         x = x.contiguous()
@@ -710,6 +877,8 @@ class GlmTP:
             sl, missing = self._streamed
             for e in missing:
                 self.lut[sl, e] = -1
+        if pf:
+            self._pf_release()
         y = (self.comm.cat_last(parts) * w.t()[:, :, None]).sum(0)
         return y.to(torch.bfloat16)
 
@@ -874,6 +1043,7 @@ class GlmTP:
         anchor = decide(self.sample(logits[-1], temperature, top_p, top_k, gen) if self.rank == 0 else None)
         h_last = self.last_hidden[-1:]
         next_adapt = self.adapt_every
+        rounds = 0
         while True:
             halt = decide(bool(should_stop and self.rank == 0 and should_stop()))
             if halt:
@@ -883,6 +1053,9 @@ class GlmTP:
                 n, sec = self.adapt(self.adapt_decode_swaps)
                 self.adapt_log.append((f"decode@{emitted}", n, round(sec, 2), self.last_churn))
                 next_adapt += self.adapt_every
+            rounds += 1
+            if self.bg_on and self.demand is not None and rounds % self.bg_every == 0:
+                self.bg_step()                    # same round on both ranks
             yield anchor
             emitted += 1
             if anchor in stop or emitted >= max_new:
