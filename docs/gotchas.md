@@ -2749,7 +2749,7 @@ hot 1, background 8), all 900 positions / first (fresh-topic) answer: 512 swaps 
 The fresh-topic answer is no better at 2,048 (its KL is the worst of the three); the overall gap
 is ~6% KL. A 2,048-swap adaptation costs ~4-6 s of TTFT on a short prompt: 512 stays.
 
-## Hot reads: fixed 0.2, kept resident, capped at 10 a step; one-row evals flatter the controller (2026-10-16)
+## Hot reads: fixed 0.2, kept resident, a per-step cap paced over the layers; one-row evals flatter the controller (2026-10-16)
 
 glm_quality on the three Tokyo prompts (900 positions), 7,000 slots, graphed, KL to exact /
 top-1; glm_probe tok/s at MTP depth 2 (400 tokens, same DB). `--rows 3` feeds the answer in
@@ -2763,7 +2763,7 @@ serving does; `--rows 1` steps one token at a time.
 | 0.2, no cap, bg 8, kept | -- | 0.152 / 90.2% | 7.9 |
 | 0.2, no cap, bg 8, kept, 2 a layer | -- | 0.161 / 90.7% | 7.5 |
 | 0.2, no cap, no bg, kept | 0.172 / 90.3% | -- | 8.24 |
-| **0.2, cap 10, no bg, kept** (default) | 0.235 / 88.7% | 0.164 / 89.6% | 9.19 |
+| 0.2, cap 10 first come, no bg, kept | 0.235 / 88.7% | 0.164 / 89.6% | 9.19 |
 | 0.25, cap 10, no bg, kept | -- | 0.257 / 87.0% | 10.39 |
 
 - One-token steps rarely find 4 heavy misses, so the controller sat at its 0.2 floor there (0.200);
@@ -2773,9 +2773,24 @@ serving does; `--rows 1` steps one token at a time.
   cut reads 29% and KL 0.178 -> 0.152 at one row. A second read a layer bought nothing.
 - 0.2 -> 0.25 halved the reads (2,552 -> 1,064) and gave back most of the gain (KL 0.164 -> 0.257):
   misses at 0.20-0.25 of a token's routed weight matter.
-- The cap is first-come: earlier layers spend it and later layers' misses go unread. Cap 10 hit
-  in 39% of 3-row steps and cost KL 0.172 -> 0.235 for 24% fewer reads (10% speed). A cap that
-  spreads the budget over the layers has not been tried.
+- A first-come cap lets earlier layers spend it and later layers' misses go unread. Cap 10 hit
+  in 39% of 3-row steps and cost KL 0.172 -> 0.235 for 24% fewer reads (10% speed). Pacing it
+  over the layers (MUSE_HOT_PACE=g: by the i-th of n MoE layers, at most ceil(cap*((i+1)/n)^g))
+  recovers most of that -- 3-row eval, reads by quarter of the MoE layers:
+
+  | cap 10 unless noted | KL / top-1 | reads | by quarter | tok/s |
+  | --- | --- | --- | --- | --- |
+  | no cap | 0.172 / 90.3% | 2,534 | 596 / 871 / 557 / 441 | 8.24 |
+  | first come | 0.235 / 88.7% | 2,043 | 581 / 778 / 359 / 250 | 9.19 |
+  | g=0.5 (front-loaded) | 0.220 / 89.0% | 2,024 | 540 / 674 / 410 / 327 | -- |
+  | **g=1 (even)** | 0.212 / 89.9% | 1,862 | 425 / 566 / 432 / 367 | 9.29 |
+  | g=2 (back-loaded) | 0.231 / 89.1% | 1,500 | 234 / 376 / 412 / 407 | -- |
+  | g=1, may run 2 ahead (MUSE_HOT_PACE_LEAD=2) | 0.210 / 89.2% | 2,013 | 529 / 671 / 451 / 292 | -- |
+  | **g=1, cap 12** (default) | 0.189 / 89.2% | 2,022 | 466 / 617 / 470 / 398 | 9.03 |
+
+  Heavy misses are densest in the second quarter and sparsest in the last; holding budget for
+  the last layers (g=2) starves the middle and leaves it unspent (5 reads a step against 10).
+  Even pacing at cap 12 reads what first-come cap 10 did, at its speed, for KL 0.235 -> 0.189.
 - A rank gate on keeping (adapt()'s rule: the newcomer's score must beat the victim's by 1.5)
   would have dropped 817 of 1,969 kept reads, 418 of them below the victim outright; kept experts
   outrank 29% of residents on average. Not built: the single-topic eval cannot show what it

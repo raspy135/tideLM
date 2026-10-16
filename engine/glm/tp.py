@@ -149,6 +149,14 @@ class GlmTP:
         # MUSE_HOT_MAX: at most this many graphed hot reads a step, whatever the threshold
         # (0: twice MUSE_HOT_TARGET, or no cap without a target). Earlier layers take it first.
         self.hot_max = int(env("MUSE_HOT_MAX", "0"))
+        # MUSE_HOT_PACE=g (with a cap): the i-th of n MoE layers may bring the step's reads up to
+        # ceil(cap * ((i+1)/n)^g) -- unspent budget carries forward, g=1 spreads it evenly, g>1
+        # holds more of it for the last layers. 0: first come, first served.
+        self.hot_pace = float(env("MUSE_HOT_PACE", "0"))
+        self.hot_pace_lead = int(env("MUSE_HOT_PACE_LEAD", "0"))   # reads a layer may run ahead of the pace
+        dec = [L for L in self.moe_layers if L < cfg.layers]
+        self._hot_frac = {L: ((i + 1) / len(dec)) ** self.hot_pace for i, L in enumerate(dec)}
+        self._hot_quarter = {L: 4 * i // len(dec) for i, L in enumerate(dec)}
         self.hot_thr = {}
         # MUSE_HOT_KEEP=N: hot reads stay resident instead of being dropped after their layer. Each
         # background period (MUSE_BG=1) rank 0 queues up to N victims after its own plan's -- cold,
@@ -184,7 +192,7 @@ class GlmTP:
         first_t = fixed + self.slots_resident
         self.transient = list(range(first_t, first_t + transient))
         self.pf_slots = self.transient if self.pf_on else []
-        self.hot_stats = {"reads": 0, "layers": 0, "s": 0.0, "kept": 0, "unkept": 0}
+        self.hot_stats = {"reads": 0, "layers": 0, "s": 0.0, "kept": 0, "unkept": 0, "quarters": [0, 0, 0, 0]}
         self.pf_pending = {}            # layer -> [(e, slot, future)] submitted by the layer before
         self.pf_live = None             # (layer, [experts]) installed for the layer being computed
         self.pf_stats = {"chunks": 0, "planned": 0, "used_mass": 0.0, "wait_s": 0.0, "reads": 0}
@@ -247,7 +255,8 @@ class GlmTP:
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"), "db": env("MUSE_STATS_DB", ""),
                 "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_PF_KEEP", "MUSE_PF_KEEP_MARGIN", "MUSE_HOT", "MUSE_HOT_MIN",
-                                            "MUSE_HOT_TARGET", "MUSE_HOT_KEEP", "MUSE_HOT_MAX", "MUSE_HOT_KEEP_AUDIT")],
+                                            "MUSE_HOT_TARGET", "MUSE_HOT_KEEP", "MUSE_HOT_MAX", "MUSE_HOT_KEEP_AUDIT", "MUSE_HOT_PACE",
+                                            "MUSE_HOT_PACE_LEAD")],
                 "adapt": [env(k, "") for k in ("MUSE_ADAPT", "MUSE_ADAPT_EVERY", "MUSE_ADAPT_PREFILL_SWAPS",
                                                "MUSE_ADAPT_DECODE_SWAPS", "MUSE_ADAPT_DECAY", "MUSE_ADAPT_CROSS_LAYER",
                                                "MUSE_ADAPT_MARGIN", "MUSE_BG", "MUSE_BG_EVERY", "MUSE_BG_READS",
@@ -1223,15 +1232,19 @@ class GlmTP:
             # same values (replicated x), so they read the same experts.
             torch.cuda.current_stream().synchronize()
             row = self._hot_host[L].tolist()
+            room = cap - reads
+            if self.hot_pace and cap < 1 << 30:
+                room = min(room, -int(-cap * self._hot_frac[L] // 1) + self.hot_pace_lead - reads)
             es = []
             for v, e in zip(row[:2 * n], row[2 * n:]):
-                if v < thr or len(es) >= min(n, cap - reads):
+                if v < thr or len(es) >= min(n, room):
                     break
                 if int(e) not in es:
                     es.append(int(e))
             if not es:
                 continue
             reads += len(es)
+            st["quarters"][self._hot_quarter[L]] += len(es)
             t0 = time.perf_counter()
             for e, slot, pr in zip(es, self.transient, self._read_urgent(L, es)):
                 self.arena.put(slot, *pr)
