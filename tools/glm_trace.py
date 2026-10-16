@@ -16,6 +16,7 @@ the router's own), records every layer's top-8 and router weights, and writes (r
 
 import argparse
 import json
+import re
 import os
 import sys
 import time
@@ -78,6 +79,7 @@ def main():
     n_tok = 0
     for i, (cat, text) in enumerate(docs):
         prefix = [] if isinstance(tok, _Bytes) else [154822, 154824]   # [gMASK]<sop>
+        text = re.sub(r"<｜[^｜]*｜>", "\n", text)   # the corpus carries V4.1's chat markers
         ids = prefix + tok.encode(text, add_special_tokens=False).ids
         ids = ids[:args.tokens]
         if len(ids) < 16:

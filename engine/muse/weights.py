@@ -27,7 +27,10 @@ from pathlib import Path
 
 import torch
 
+import threading
+
 GROUP = 32
+_OPEN_LOCK = threading.Lock()
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
                      -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
 PREFIX = "model.language_model."
@@ -151,6 +154,15 @@ class Checkpoint:
         f = self.map[name]
         hdr = self._headers.get(f) if hasattr(self, "_headers") else None
         if hdr is None:
+            with _OPEN_LOCK:
+                return self._meta_locked(name, f)
+        base, meta = hdr
+        m = meta[name]
+        return self.dir / f, base + m["data_offsets"][0], self._DTYPES[m["dtype"]], m["shape"]
+
+    def _meta_locked(self, name: str, f: str):
+        hdr = self._headers.get(f) if hasattr(self, "_headers") else None
+        if hdr is None:
             import struct
             if not hasattr(self, "_headers"):
                 self._headers = {}
@@ -181,9 +193,12 @@ class Checkpoint:
         buf = memoryview(out.view(torch.uint8).numpy()).cast("B") if out.numel() else memoryview(b"")
         fd = self._fds.get(path) if hasattr(self, "_fds") else None
         if fd is None:
-            if not hasattr(self, "_fds"):
-                self._fds = {}
-            fd = self._fds[path] = os.open(path, os.O_RDONLY)
+            with _OPEN_LOCK:               # reads run from a thread pool (positional preadv is safe)
+                if not hasattr(self, "_fds"):
+                    self._fds = {}
+                fd = self._fds.get(path)
+                if fd is None:
+                    fd = self._fds[path] = os.open(path, os.O_RDONLY)
         done = 0
         while done < len(buf):
             got = os.preadv(fd, [buf[done:]], off + done)

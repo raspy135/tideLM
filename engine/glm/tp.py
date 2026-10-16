@@ -327,17 +327,26 @@ class GlmTP:
         slot = self.first_routed
         t0 = time.perf_counter()
         for L in self.moe_layers:
-            for e in resident.get(L, []):
-                if slot >= self.first_routed + self.slots_resident:
-                    raise ValueError("resident set larger than the slots")
-                self._load(L, e, slot)
+            experts = resident.get(L, [])
+            if slot + len(experts) > self.first_routed + self.slots_resident:
+                raise ValueError("resident set larger than the slots")
+            for e, parts in zip(experts, self._read_many(L, experts)):
+                self._load(L, e, slot, parts)
                 slot += 1
             self.ck.drop_cache()
         self.log(f"[glm] placed {slot - self.first_routed} routed experts in {time.perf_counter() - t0:.1f}s; "
                  f"{mem_available() / 1e9:.1f} GB available, {rss_anon() / 1e9:.1f} GB anon")
 
-    def _load(self, L, e, slot):
-        self.arena.put(slot, *self._expert_parts(L, e))
+    def _read_many(self, L, experts):
+        """Read several experts' parts at once: preadv releases the GIL, so a thread pool keeps
+        the NVMe queue full (one at a time ran at ~0.7 GB/s)."""
+        if not hasattr(self, "_pool"):
+            from concurrent.futures import ThreadPoolExecutor
+            self._pool = ThreadPoolExecutor(max_workers=int(env("MUSE_READ_THREADS", "12")))
+        return list(self._pool.map(lambda e: self._expert_parts(L, e), experts))
+
+    def _load(self, L, e, slot, parts=None):
+        self.arena.put(slot, *(parts or self._expert_parts(L, e)))
         old = self.owner[slot]
         if old is not None and int(self.lut[old[0], old[1]]) == slot:
             self.lut[old[0], old[1]] = -1
@@ -456,9 +465,11 @@ class GlmTP:
         if len(missing) > len(self.transient):
             raise RuntimeError(f"{len(missing)} misses exceed {len(self.transient)} transient slots")
         t0 = time.perf_counter()
-        for e, slot in zip(missing, self.transient):
-            self._load(L, e, slot)
+        for (e, slot), parts in zip(zip(missing, self.transient), self._read_many(L, missing)):
+            self._load(L, e, slot, parts)
         self._streamed = (L, missing)
+        if self.stats["stream_loads"] % 2048 < len(missing):
+            self.ck.drop_cache()
         self.stats["stream_loads"] += len(missing)
         self.stats["stream_s"] += time.perf_counter() - t0
 

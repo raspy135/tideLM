@@ -26,10 +26,11 @@ def main():
     ap.add_argument("--tokens", type=int, default=128)
     ap.add_argument("--depths", default="0,1,2,3")
     ap.add_argument("--effort", default="low")
+    ap.add_argument("--prompts", type=int, default=3)
     args = ap.parse_args()
     tpl = GlmTemplate(args.model)
     eng = GlmTP(args.model)
-    prompts = [tpl.encode(tpl.render(m, None, args.effort)) for m in PROMPTS]
+    prompts = [tpl.encode(tpl.render(m, None, args.effort)) for m in PROMPTS[:args.prompts]]
     rows = []
     for depth in [int(x) for x in args.depths.split(",")]:
         if depth and not eng.mtp_on:
