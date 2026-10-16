@@ -47,6 +47,9 @@ def main():
     ap.add_argument("--name", default="")
     ap.add_argument("--tokens", type=int, default=300)
     ap.add_argument("--out", default="/app/results/glm-quality")
+    ap.add_argument("--rows", type=int, default=1,
+                    help="eval: feed the answer N tokens a step (3 = an MTP depth-2 verify block, graphed "
+                         "when MUSE_MTP_DEPTH=N-1), so per-step read caps and thresholds act as in serving")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -96,7 +99,9 @@ def main():
         z = eng.prefill(list(p))[-1]
         eng.adapt(eng.adapt_prefill_swaps)
         steps, next_adapt = 0, eng.adapt_every
+        zs, fed = [z], 0
         for i, tok in enumerate(a):
+            z = zs[i - fed]
             lp = torch.log_softmax(z.float(), -1)
             ids = torch.tensor(er["top_ids"][i], device=lp.device)
             q = torch.log_softmax(lp[ids], -1)                                  # this, on exact's top-20
@@ -106,13 +111,17 @@ def main():
                          "kl": float((pe.exp() * (pe - q)).sum())})
             if i + 1 == len(a):
                 break
-            steps += 1
-            if eng.adapt_every and steps >= next_adapt:
+            if i + 1 < fed + len(zs):
+                continue                                  # the last block still has rows to score
+            if eng.adapt_every and i + 1 >= next_adapt:   # by tokens, as stream() counts emitted
                 eng.adapt(eng.adapt_decode_swaps)
                 next_adapt += eng.adapt_every
+            steps += 1                                    # by steps, as stream() counts rounds
             if eng.bg_on and steps % eng.bg_every == 0:
                 eng.bg_step()
-            z = eng.forward([tok], all_logits=False)[-1]
+            block = a[i:i + args.rows][:len(a) - 1 - i]   # a[i] on; the last answer token is never fed
+            zs, fed = list(eng.forward(block, all_logits=True)), i + 1
+    eng.miss_totals()
     if eng.rank == 0:
         n = len(rows)
         summary = {"name": args.name, "positions": n,

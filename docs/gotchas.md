@@ -2748,3 +2748,38 @@ hot 1, background 8), all 900 positions / first (fresh-topic) answer: 512 swaps 
 85.3%, KL 0.189 / 0.276; 1,024 89.7% / 88.0%, 0.186 / 0.269; 2,048 90.7% / 88.0%, 0.178 / 0.287.
 The fresh-topic answer is no better at 2,048 (its KL is the worst of the three); the overall gap
 is ~6% KL. A 2,048-swap adaptation costs ~4-6 s of TTFT on a short prompt: 512 stays.
+
+## Hot reads: fixed 0.2, kept resident, capped at 10 a step; one-row evals flatter the controller (2026-10-16)
+
+glm_quality on the three Tokyo prompts (900 positions), 7,000 slots, graphed, KL to exact /
+top-1; glm_probe tok/s at MTP depth 2 (400 tokens, same DB). `--rows 3` feeds the answer in
+3-token blocks, so decode runs the 3-row verify graphs and their per-step thresholds and caps as
+serving does; `--rows 1` steps one token at a time.
+
+| config | rows 3 | rows 1 | tok/s |
+| --- | --- | --- | --- |
+| target-4 controller (old default), bg 8, not kept | 0.299 / 86.4% | 0.200 / 89.2% | 10.7 |
+| 0.2, no cap, bg 8, not kept | -- | 0.178 / 90.7% (eager) | 7.64 |
+| 0.2, no cap, bg 8, kept | -- | 0.152 / 90.2% | 7.9 |
+| 0.2, no cap, bg 8, kept, 2 a layer | -- | 0.161 / 90.7% | 7.5 |
+| 0.2, no cap, no bg, kept | 0.172 / 90.3% | -- | 8.24 |
+| **0.2, cap 10, no bg, kept** (default) | 0.235 / 88.7% | 0.164 / 89.6% | 9.19 |
+| 0.25, cap 10, no bg, kept | -- | 0.257 / 87.0% | 10.39 |
+
+- One-token steps rarely find 4 heavy misses, so the controller sat at its 0.2 floor there (0.200);
+  in 3-row steps it rose (0.25 at the end of this eval, 0.37 in the probe) and the same config
+  scored 0.299. Judge per-step policies with `--rows 3`.
+- Keeping a hot read (MUSE_HOT_KEEP: copied over a cold, lowest-ranked resident after its layer)
+  cut reads 29% and KL 0.178 -> 0.152 at one row. A second read a layer bought nothing.
+- 0.2 -> 0.25 halved the reads (2,552 -> 1,064) and gave back most of the gain (KL 0.164 -> 0.257):
+  misses at 0.20-0.25 of a token's routed weight matter.
+- The cap is first-come: earlier layers spend it and later layers' misses go unread. Cap 10 hit
+  in 39% of 3-row steps and cost KL 0.172 -> 0.235 for 24% fewer reads (10% speed). A cap that
+  spreads the budget over the layers has not been tried.
+- A rank gate on keeping (adapt()'s rule: the newcomer's score must beat the victim's by 1.5)
+  would have dropped 817 of 1,969 kept reads, 418 of them below the victim outright; kept experts
+  outrank 29% of residents on average. Not built: the single-topic eval cannot show what it
+  protects (long-run residents for the next topic), and kept experts that go cold are the first
+  victims anyway since their long-term score is low.
+- First request after boot is still the weak one: "浅浅浅..." at 200 tokens on a fresh boot with
+  this config, typos on the second, clean by the fourth.

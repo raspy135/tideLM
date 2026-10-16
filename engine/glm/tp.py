@@ -146,7 +146,19 @@ class GlmTP:
         # step (an MTP verify step of 3 rows finds a >= 0.2 miss in about half the layers), and
         # never more than twice that. Both ranks count the same reads, so they keep the same one.
         self.hot_target = float(env("MUSE_HOT_TARGET", "4"))
+        # MUSE_HOT_MAX: at most this many graphed hot reads a step, whatever the threshold
+        # (0: twice MUSE_HOT_TARGET, or no cap without a target). Earlier layers take it first.
+        self.hot_max = int(env("MUSE_HOT_MAX", "0"))
         self.hot_thr = {}
+        # MUSE_HOT_KEEP=N: hot reads stay resident instead of being dropped after their layer. Each
+        # background period (MUSE_BG=1) rank 0 queues up to N victims after its own plan's -- cold,
+        # lowest long-term score first -- and each hot read takes the next one (_hot_keep).
+        self.hot_keep = int(env("MUSE_HOT_KEEP", "0")) if self.hot_n else 0
+        # MUSE_HOT_KEEP_AUDIT=1 (measurement only, rank 0, syncs per keep): how many kept reads a
+        # rank gate -- adapt()'s rule, score beats the victim's by MUSE_ADAPT_MARGIN -- would drop.
+        self.hot_audit = env("MUSE_HOT_KEEP_AUDIT", "0") == "1" and self.rank == 0
+        self.hot_q = []                 # [(VL, ve, slot)] victims for kept hot reads, weakest last
+        self.hot_live = None            # [(e, transient slot)] hot reads of the layer being computed
         transient = cfg.experts if self.miss == "stream" else max(2 * self.pf_n, self.hot_n)
         t0 = time.perf_counter()
         self._load_dense()
@@ -172,7 +184,7 @@ class GlmTP:
         first_t = fixed + self.slots_resident
         self.transient = list(range(first_t, first_t + transient))
         self.pf_slots = self.transient if self.pf_on else []
-        self.hot_stats = {"reads": 0, "layers": 0, "s": 0.0}
+        self.hot_stats = {"reads": 0, "layers": 0, "s": 0.0, "kept": 0, "unkept": 0}
         self.pf_pending = {}            # layer -> [(e, slot, future)] submitted by the layer before
         self.pf_live = None             # (layer, [experts]) installed for the layer being computed
         self.pf_stats = {"chunks": 0, "planned": 0, "used_mass": 0.0, "wait_s": 0.0, "reads": 0}
@@ -235,7 +247,7 @@ class GlmTP:
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"), "db": env("MUSE_STATS_DB", ""),
                 "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_PF_KEEP", "MUSE_PF_KEEP_MARGIN", "MUSE_HOT", "MUSE_HOT_MIN",
-                                            "MUSE_HOT_TARGET")],
+                                            "MUSE_HOT_TARGET", "MUSE_HOT_KEEP", "MUSE_HOT_MAX", "MUSE_HOT_KEEP_AUDIT")],
                 "adapt": [env(k, "") for k in ("MUSE_ADAPT", "MUSE_ADAPT_EVERY", "MUSE_ADAPT_PREFILL_SWAPS",
                                                "MUSE_ADAPT_DECODE_SWAPS", "MUSE_ADAPT_DECAY", "MUSE_ADAPT_CROSS_LAYER",
                                                "MUSE_ADAPT_MARGIN", "MUSE_BG", "MUSE_BG_EVERY", "MUSE_BG_READS",
@@ -641,19 +653,20 @@ class GlmTP:
         window = self.demand - self.bg_last
         self.bg_last.copy_(self.demand)
         self.bg_score.mul_(self.bg_decay).add_(window)
-        plan = None
-        if self.rank == 0 and self.bg_reads > 0:
+        plan, hot_q = None, None
+        if self.rank == 0 and (self.bg_reads > 0 or self.hot_keep):
             # One pass on the GPU, one copy back: candidates, victims, per-layer counts.
             lay = self._bg_layers
             res = self.lut[lay] >= 0
             short = self.bg_score[lay]
             cold = res & (short < self.bg_cold) & (self.bg_until[lay] <= self.bg_period)
             cs = torch.topk(short.masked_fill(res, -1.0).reshape(-1), self.bg_reads)
-            nv = min(4 * self.bg_reads, cold.numel())
+            nv = min(4 * (self.bg_reads + self.hot_keep), cold.numel())
             vs = torch.topk((self.score + self.demand)[lay].masked_fill(~cold, float("inf")).reshape(-1), nv,
                             largest=False)
-            c_val, c_idx, v_val, v_idx, left = (t.cpu().tolist() for t in (cs.values, cs.indices, vs.values,
-                                                                           vs.indices, res.sum(1)))
+            c_val, c_idx, v_val, v_idx, v_slot, left = (
+                t.cpu().tolist() for t in (cs.values, cs.indices, vs.values, vs.indices,
+                                           self.lut[lay].reshape(-1)[vs.indices], res.sum(1)))
             E, floor = self.cfg.experts, 2 * self.cfg.topk
             plan, vi = [], 0
             for cv, ci in zip(c_val, c_idx):
@@ -670,7 +683,15 @@ class GlmTP:
                 left[vl] -= 1
                 left[cl] += 1
                 plan.append((self.moe_layers[cl], ce, self.moe_layers[vl], ve))
-        plan = self.comm.broadcast_obj(plan)
+            hot_q = []
+            while len(hot_q) < self.hot_keep and vi < nv and v_val[vi] != float("inf"):
+                vl, ve = divmod(v_idx[vi], E)
+                if left[vl] > floor:
+                    left[vl] -= 1
+                    hot_q.append((self.moe_layers[vl], ve, v_slot[vi]))
+                vi += 1
+        plan, hot_q = self.comm.broadcast_obj((plan, hot_q))
+        self.hot_q = hot_q[::-1] if hot_q else []
         if not hasattr(self, "_pool"):
             self._read_many(self.moe_layers[0], [])
         self.bg_pending = [(L, e, VL, ve, self._pool.submit(self._expert_parts, L, e)) for L, e, VL, ve in plan]
@@ -745,6 +766,19 @@ class GlmTP:
         return self.comm.all_reduce(partial).to(torch.bfloat16), topk
 
     # ------------------------------------------------------------------ MoE
+    def miss_totals(self):
+        """miss_stats with the graph replays' device counts folded in."""
+        ms = self.miss_stats
+        acc = ms.get("dev") if ms else None
+        if acc is not None:
+            p, m, a, b = acc.tolist()
+            acc.zero_()
+            ms["picks"] += int(p)
+            ms["missed"] += int(m)
+            ms["mass"] += a
+            ms["mass_missed"] += b
+        return ms
+
     def _route(self, L, x):
         """(slots int32 [T, k'], weights fp32 [T, k']) including the shared expert or the
         dense layer's pseudo-experts."""
@@ -766,10 +800,21 @@ class GlmTP:
             w0, ids0 = route(cfg, x, lw["router"], lw["bias"], None)
             missed = ~allowed[ids0]
             ms = self.miss_stats
-            ms["picks"] += ids0.numel()
-            ms["missed"] += int(missed.sum())
-            ms["mass"] += float(w0.sum())
-            ms["mass_missed"] += float((w0 * missed).sum())
+            if torch.cuda.is_current_stream_capturing():
+                # Graph replays count on the device (no host reads under capture); miss_totals()
+                # folds them into the dict.
+                acc = ms["dev"]
+                acc[0].add_(ids0.numel())
+                acc[1].add_(missed.sum())
+                acc[2].add_(w0.sum())
+                acc[3].add_((w0 * missed).sum())
+            else:
+                if "dev" not in ms:                    # eager calls (prefill, capture warm-up) come first
+                    ms["dev"] = torch.zeros(4, dtype=torch.float64, device=x.device)
+                ms["picks"] += ids0.numel()
+                ms["missed"] += int(missed.sum())
+                ms["mass"] += float(w0.sum())
+                ms["mass_missed"] += float((w0 * missed).sum())
         if self.route_dump is not None and allowed is not None:
             w0, ids0 = route(cfg, x, lw["router"], lw["bias"], None)
             ahead = {}
@@ -942,6 +987,9 @@ class GlmTP:
             self.lut[L, es] = -1
             self.allowed[L, es] = False
             self.pf_live = None
+            if self.hot_live:
+                self._hot_keep(L, self.hot_live)
+                self.hot_live = None
         items, self.pf_promote = getattr(self, "pf_promote", None), None
         if not items:
             return
@@ -961,6 +1009,37 @@ class GlmTP:
             self.allowed[L, e] = True
             self.pf_kept[L, e] = True
             self.pf_stats["promoted"] = self.pf_stats.get("promoted", 0) + 1
+
+    def _hot_keep(self, L, items):
+        """MUSE_HOT_KEEP: copy each hot read from its transient slot over the next queued victim that
+        still holds its slot (stream-ordered after this layer's MLP), repoint the lut, and protect it
+        from background eviction like a background install. The queue, the hot reads and owner are
+        the same on both ranks, so both keep the same experts in the same slots."""
+        A, q, st = self.arena, self.hot_q, self.hot_stats
+        for e, src in items:
+            while q:
+                VL, ve, vs = q.pop()
+                if self.owner[vs] == (VL, ve):
+                    break
+            else:
+                st["unkept"] += 1
+                continue
+            if self.hot_audit:
+                sc = self.score + self.demand
+                c, v = float(sc[L, e]), float(sc[VL, ve])
+                res = sc[self._bg_layers][self.lut[self._bg_layers] >= 0]
+                st["gate_drop"] = st.get("gate_drop", 0) + (c <= v * self.adapt_margin)
+                st["gate_below_victim"] = st.get("gate_below_victim", 0) + (c <= v)
+                st["pct_sum"] = st.get("pct_sum", 0.0) + float((res < c).float().mean())   # share of residents it outranks
+            for t in (A.w1, A.s1, A.w3, A.s3, A.w2, A.s2):
+                t[vs].copy_(t[src])
+            self.lut[VL, ve] = -1
+            self.allowed[VL, ve] = False
+            self.owner[vs] = (L, e)
+            self.lut[L, e] = vs
+            self.allowed[L, e] = True
+            self.bg_until[L, e] = self.bg_period + self.bg_protect
+            st["kept"] += 1
 
     def _hot_stream(self, L, x):
         """Decode: read this layer's heaviest missed picks (weight share >= MUSE_HOT_MIN, up to
@@ -986,6 +1065,8 @@ class GlmTP:
             self.lut[L, e] = slot
         self.allowed[L, es] = True
         self.pf_live = (L, es)
+        if self.hot_keep:
+            self.hot_live = list(zip(es, self.transient))
         st = self.hot_stats
         st["reads"] += len(es)
         st["layers"] += 1
@@ -1130,7 +1211,7 @@ class GlmTP:
         st_ids.copy_(ids)
         n, st = self.hot_n, self.hot_stats
         thr = self.hot_thr.get(T, self.hot_min)
-        cap = max(1, int(2 * self.hot_target)) if self.hot_target > 0 else 1 << 30
+        cap = self.hot_max or (max(1, int(2 * self.hot_target)) if self.hot_target > 0 else 1 << 30)
         reads = 0
         for kind, L, g in segs:
             g.replay()
@@ -1157,11 +1238,15 @@ class GlmTP:
                 self.lut[L, e] = slot
             self.allowed[L, es] = True
             self.pf_live = (L, es)
+            if self.hot_keep:
+                self.hot_live = list(zip(es, self.transient))
             st["reads"] += len(es)
             st["layers"] += 1
             st["s"] += time.perf_counter() - t0
             if st["reads"] // 512 != (st["reads"] - len(es)) // 512:
                 self.ck.drop_cache()
+        if reads >= cap:
+            st["capped"] = st.get("capped", 0) + 1      # later layers' misses went unread
         if self.hot_target > 0:
             # Multiplicative step toward the target; float math on identical counts on both ranks.
             thr *= 1.1 ** ((reads - self.hot_target) / self.hot_target)
