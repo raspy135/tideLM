@@ -429,6 +429,16 @@ class GlmTP:
         from .ref import route
         allowed = self.allowed[L] if self.allowed is not None else None
         w, ids = route(cfg, x, lw["router"], lw["bias"], allowed)
+        if self.record is not None:
+            self.record.append((L, ids.cpu(), w.cpu()))
+        if self.miss_stats is not None and allowed is not None:
+            w0, ids0 = route(cfg, x, lw["router"], lw["bias"], None)
+            missed = ~allowed[ids0]
+            ms = self.miss_stats
+            ms["picks"] += ids0.numel()
+            ms["missed"] += int(missed.sum())
+            ms["mass"] += float(w0.sum())
+            ms["mass_missed"] += float((w0 * missed).sum())
         if self.miss == "stream":
             self._stream_misses(L, ids)
         slots = self.lut[L][ids]
