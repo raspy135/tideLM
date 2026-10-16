@@ -161,6 +161,11 @@ class Arena:
     def bytes_per_slot(self) -> int:
         return sum(t[0].numel() for t in (self.w1, self.s1, self.w3, self.s3, self.w2, self.s2))
 
+    @staticmethod
+    def slot_bytes(cfg: MuseConfig, world: int) -> int:
+        I, M = cfg.moe_inter, cfg.moe_hidden
+        return (2 * (I // world) * (M // 2 + M // GROUP)) + (M // world) * (I // 2 + I // GROUP)
+
     def load(self, ck: Checkpoint, L: int, e: int, slot: int) -> None:
         """Read this rank's rows of expert (L, e) and place them in ``slot``."""
         cfg, r = self.cfg, self.rank
@@ -174,9 +179,20 @@ class Arena:
                 parts[p] = (ck.get_rows(f"{base}{e}.{p}_proj.weight", a, b),
                             ck.get_rows(f"{base}{e}.{p}_proj.weight_scale", a, b))
         else:
-            gate, up, down = ck.expert_float(L, e)
-            parts = {"gate": quantize_mxfp4(gate[i0:i1]), "up": quantize_mxfp4(up[i0:i1]),
-                     "down": quantize_mxfp4(down[m0:m1])}
+            # BF16 experts (layers 0 and 61 in both 4-bit releases): quantize this rank's rows
+            # on the GPU (a CPU quantizer takes seconds per matrix). Rows split before
+            # quantizing give the same codes as splitting after: groups run along K.
+            base_bf16 = f"{PREFIX}layers.{L}.mlp.experts."
+            if ck.expert_layer_format(L) == "bf16-split":
+                g = ck.get_rows(f"{base_bf16}{e}.gate_proj.weight", i0, i1)
+                u = ck.get_rows(f"{base_bf16}{e}.up_proj.weight", i0, i1)
+                dn = ck.get_rows(f"{base_bf16}{e}.down_proj.weight", m0, m1)
+            else:
+                gate, up, down = ck.expert_float(L, e)
+                g, u, dn = gate[i0:i1], up[i0:i1], down[m0:m1]
+            dev = self.w1.device
+            parts = {"gate": quantize_mxfp4(g.to(dev)), "up": quantize_mxfp4(u.to(dev)),
+                     "down": quantize_mxfp4(dn.to(dev))}
         for (w, s), (dw, ds) in ((parts["gate"], (self.w1, self.s1)),
                                  (parts["up"], (self.w3, self.s3)),
                                  (parts["down"], (self.w2, self.s2))):
@@ -222,19 +238,31 @@ class MuseTP:
         self.vl = cfg.vocab // W
         total = cfg.layers * cfg.experts
         transient = cfg.experts if self.miss == "stream" else 0
-        self.slots_resident = min(int(slots or env("MUSE_SLOTS", str(total))), total)
-        self._boot_guard(transient)
+        want = slots or env("MUSE_SLOTS", "auto")
         t0 = time.perf_counter()
         self._load_dense()
+        self._alloc_cache()
+        if want == "auto":
+            # Whatever is free after dense weights and caches, less a reserve for activations,
+            # graph pools and the host; the smaller rank decides for both.
+            free = torch.cuda.mem_get_info(self.dev)[0]
+            reserve = float(env("MUSE_RESERVE_GB", "12")) * 1e9
+            per = Arena.slot_bytes(cfg, W)
+            mine = max(0, int((free - reserve) // per) - transient)
+            want = min(self.comm.gather_objects(mine))
+            self.log(f"[muse] auto slots: {want} ({free / 1e9:.1f} GB free, {reserve / 1e9:.0f} GB reserve,"
+                     f" {per / 1e6:.1f} MB a slot)")
+        self.slots_resident = min(int(want), total)
+        self._boot_guard(transient)
         self.arena = Arena(cfg, self.slots_resident + transient, r, W, self.dev)
         self.transient = list(range(self.slots_resident, self.slots_resident + transient))
         self._place_resident(resident)
         self.allowed = (self.arena.lut >= 0) if self.miss == "substitute" else None
-        self._alloc_cache()
         self.ones = torch.ones(512, dtype=torch.float32, device=self.dev)
         self.pos_t = torch.zeros(1, dtype=torch.long, device=self.dev)
         self.graphs: dict[int, tuple] = {}
         self.record: list | None = None
+        self.miss_stats: dict | None = None
         self.stats = {"stream_loads": 0, "stream_s": 0.0}
         torch.cuda.synchronize()
         self.log(f"[muse] rank {r}/{W} ready in {time.perf_counter() - t0:.1f}s: dense {self.dense_fmt}"
@@ -252,6 +280,8 @@ class MuseTP:
         mine = {"version": VERSION, "code": digest, "dense": self.dense_fmt, "miss": self.miss,
                 "native": self.native, "graphs": self.use_graphs, "prefill_moe": self.prefill_moe, "max_seq": self.max_seq, "chunk": self.chunk,
                 "slots": self.slots_resident, "transient": transient, "fast_comm": self.comm.fast,
+                "resident": hashlib.sha256(Path(env("MUSE_RESIDENT", "")).read_bytes()).hexdigest()[:16]
+                if env("MUSE_RESIDENT", "") else "",
                 "config": json.dumps(self.cfg.extra["raw"].get("text_config", {}), sort_keys=True)}
         allv = self.comm.gather_objects(mine)
         if any(v != allv[0] for v in allv):
@@ -311,6 +341,14 @@ class MuseTP:
         router under-uses, so a low bias marks a naturally popular expert). A routing trace
         replaces that guess (``resident`` = {layer: [experts]})."""
         cfg = self.cfg
+        if resident is None and env("MUSE_RESIDENT", ""):
+            raw = json.loads(Path(env("MUSE_RESIDENT", "")).read_text())
+            raw = raw.get("resident", raw)
+            resident = {int(k): [int(e) for e in v] for k, v in raw.items()}
+            n = sum(len(v) for v in resident.values())
+            if n > self.slots_resident:
+                # Keep the file's order within each layer and trim the layers evenly.
+                raise ValueError(f"MUSE_RESIDENT lists {n} experts, {self.slots_resident} slots")
         if resident is None:
             if self.slots_resident >= cfg.layers * cfg.experts:
                 resident = {L: list(range(cfg.experts)) for L in range(cfg.layers)}
@@ -520,7 +558,15 @@ class MuseTP:
         allowed = self.allowed[L] if self.allowed is not None else None
         w, ids = route(cfg, x, lw["router"], lw["bias"], allowed)
         if self.record is not None:
-            self.record.append((L, ids.cpu()))
+            self.record.append((L, ids.cpu(), w.cpu()))
+        if self.miss_stats is not None and allowed is not None:
+            # What the unmasked router would have picked, and how much of it was substituted.
+            w0, ids0 = route(cfg, x, lw["router"], lw["bias"], None)
+            missed = ~allowed[ids0]
+            self.miss_stats["picks"] += ids0.numel()
+            self.miss_stats["missed"] += int(missed.sum())
+            self.miss_stats["mass_missed"] += float((w0 * missed).sum())
+            self.miss_stats["mass"] += float(w0.sum())
         streamed = self._stream_misses(L, ids) if self.miss == "stream" else []
         slots = self.arena.lut[L][ids]
         z = self.comm.cat_last(lw["pre"](x))
