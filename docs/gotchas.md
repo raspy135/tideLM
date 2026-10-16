@@ -2742,3 +2742,9 @@ Prefetch is off by default; post-prefill swaps 512.
 Also measured here: 256 KB read pieces for every read (not just urgent ones) made the prefill
 7 s slower (32.8 vs 39.8 s TTFT with prefetch 16) -- hundreds of small Python tasks a layer
 contend for the GIL with an eager prefill. Bulk reads use whole tensors (MUSE_READ_BULK_CHUNK_KB=0).
+
+Post-prefill swaps on short prompts (glm_quality, the three Tokyo prompts, eager, 7,000 slots,
+hot 1, background 8), all 900 positions / first (fresh-topic) answer: 512 swaps top-1 88.8% /
+85.3%, KL 0.189 / 0.276; 1,024 89.7% / 88.0%, 0.186 / 0.269; 2,048 90.7% / 88.0%, 0.178 / 0.287.
+The fresh-topic answer is no better at 2,048 (its KL is the worst of the three); the overall gap
+is ~6% KL. A 2,048-swap adaptation costs ~4-6 s of TTFT on a short prompt: 512 stays.
