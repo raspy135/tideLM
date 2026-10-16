@@ -76,8 +76,14 @@ class Comm:
                 self.fast = comm._COMM is not None
 
     def all_reduce(self, t: torch.Tensor) -> torch.Tensor:
-        if self.world > 1:
-            dist.all_reduce(t)
+        """Sum over ranks. Decode-sized tensors go as an all-gather plus a local sum: the fast
+        RoCE gather instead of an NCCL all-reduce, and the sum runs rank 0 + rank 1 in the same
+        order on both ranks, so both hold the same bits."""
+        if self.world == 1:
+            return t
+        if self.fast and t.numel() * t.element_size() <= 256 * 1024:
+            return self.all_gather(t).sum(0)
+        dist.all_reduce(t)
         return t
 
     def all_gather(self, t: torch.Tensor) -> torch.Tensor:
