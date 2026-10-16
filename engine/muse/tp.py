@@ -54,6 +54,27 @@ def env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+def rss_anon() -> int:
+    try:
+        for line in open("/proc/self/status"):
+            if line.startswith("RssAnon:"):
+                return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
+def mem_available() -> int:
+    """/proc/meminfo MemAvailable in bytes (cudaMemGetInfo counts the page cache as used)."""
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
 class Comm:
     """Rank bookkeeping and the four collectives the model uses."""
 
@@ -224,6 +245,11 @@ class MuseTP:
         self.comm = Comm()
         self.rank, self.world, self.dev = self.comm.rank, self.comm.world, self.comm.device
         self.log = log if self.rank == 0 else (lambda *_: None)
+        need = float(env("MUSE_MIN_FREE_GB", "90"))
+        avail = mem_available()
+        if need and avail < need * 1e9:
+            raise RuntimeError(f"only {avail / 1e9:.1f} GB MemAvailable, need {need:.0f}: something else "
+                               "holds the unified pool (MUSE_MIN_FREE_GB=0 disables this guard)")
         self.cfg = cfg = MuseConfig.load(model_dir)
         self.ck = Checkpoint(model_dir)
         self.max_seq = int(max_seq or env("MUSE_MAX_SEQ", "32768"))
@@ -248,29 +274,30 @@ class MuseTP:
         want = slots or env("MUSE_SLOTS", "auto")
         t0 = time.perf_counter()
         self._load_dense()
+        if env("MUSE_MEMLOG", "0") == "1":
+            print(f"[mem r{self.rank}] after dense: MemAvailable {mem_available() / 1e9:.1f} GB, "
+                  f"{rss_anon() / 1e9:.1f} GB anon", flush=True)
         self._alloc_cache()
         if want == "auto":
             # Whatever is free after dense weights and caches, less a reserve for activations,
             # graph pools and the host; the smaller rank decides for both.
             # Unified memory: the page cache (a model download, the checkpoint just read) is
             # reclaimable but cudaMemGetInfo counts it as used. MemAvailable does not.
-            free = torch.cuda.mem_get_info(self.dev)[0]
-            try:
-                for line in open("/proc/meminfo"):
-                    if line.startswith("MemAvailable:"):
-                        free = max(free, int(line.split()[1]) * 1024)
-            except OSError:
-                pass
-            reserve = float(env("MUSE_RESERVE_GB", "12")) * 1e9
+            self.ck.drop_cache()
+            free = max(torch.cuda.mem_get_info(self.dev)[0], mem_available())
+            # V4.1's rule (docs/gotchas.md): a hard floor under MemAvailable, and only a share of
+            # the rest -- page cache and pinned memory come back lazily on this box.
+            reserve = float(env("MUSE_RESERVE_GB", "20")) * 1e9
             if env("MUSE_DRAFTER", ""):
                 # The drafter's weights split over the ranks, its caches, and headroom.
                 files = Path(env("MUSE_DRAFTER", "")).glob("*.safetensors")
                 reserve += sum(f.stat().st_size for f in files) / W + 1e9
             per = Arena.slot_bytes(cfg, W)
-            mine = max(0, int((free - reserve) // per) - transient)
+            share = float(env("MUSE_ARENA_SHARE", "0.88"))
+            mine = max(0, int(share * (free - reserve) // per) - transient)
             want = min(self.comm.gather_objects(mine))
-            self.log(f"[muse] auto slots: {want} ({free / 1e9:.1f} GB free, {reserve / 1e9:.0f} GB reserve,"
-                     f" {per / 1e6:.1f} MB a slot)")
+            self.log(f"[muse] auto slots: {want} ({free / 1e9:.1f} GB available, {reserve / 1e9:.0f} GB floor,"
+                     f" share {share}, {per / 1e6:.1f} MB a slot)")
         self.slots_resident = min(int(want), total)
         self._boot_guard(transient)
         self.arena = Arena(cfg, self.slots_resident + transient, r, W, self.dev)
@@ -394,7 +421,12 @@ class MuseTP:
                     raise ValueError("resident set larger than MUSE_SLOTS")
                 self.arena.load(self.ck, L, e, slot)
                 slot += 1
-        self.log(f"[muse] placed {slot} experts in {time.perf_counter() - t0:.1f}s")
+            self.ck.drop_cache()
+            if env("MUSE_MEMLOG", "0") == "1" and L % 8 == 0:
+                print(f"[mem r{self.rank}] layer {L}: {slot} placed, MemAvailable "
+                      f"{mem_available() / 1e9:.1f} GB, {rss_anon() / 1e9:.1f} GB anon", flush=True)
+        self.log(f"[muse] placed {slot} experts in {time.perf_counter() - t0:.1f}s; "
+                 f"{mem_available() / 1e9:.1f} GB available")
 
     def _alloc_cache(self) -> None:
         cfg = self.cfg
@@ -510,6 +542,8 @@ class MuseTP:
         for e, slot in zip(missing, self.transient):
             self.arena.load(self.ck, L, e, slot)
         self.stats["stream_loads"] += len(missing)
+        if self.stats["stream_loads"] % 256 < len(missing):
+            self.ck.drop_cache()
         self.stats["stream_s"] += time.perf_counter() - t0
         return missing
 

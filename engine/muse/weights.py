@@ -97,9 +97,10 @@ def dequant_nvfp4(packed: torch.Tensor, scale_fp8: torch.Tensor, scale2: float) 
 
 
 class Checkpoint:
-    """Lazy tensor access over a sharded safetensors checkpoint (index or single file)."""
+    """Lazy tensor access over a sharded safetensors checkpoint (index or single file).
+    ``detect=False`` skips the Muse expert-layout check (the drafter checkpoint)."""
 
-    def __init__(self, model_dir: str | Path):
+    def __init__(self, model_dir: str | Path, detect: bool = True):
         from safetensors import safe_open
         self.dir = Path(model_dir)
         self._open = safe_open
@@ -114,7 +115,7 @@ class Checkpoint:
                     for k in h.keys():
                         self.map[k] = f.name
         self._handles: dict[str, object] = {}
-        self.format = self._detect()
+        self.format = self._detect() if detect else None
 
     def _handle(self, name: str):
         f = self.map[name]
@@ -123,15 +124,80 @@ class Checkpoint:
             h = self._handles[f] = self._open(str(self.dir / f), "pt")
         return h
 
+    def drop_cache(self) -> None:
+        """Ask the kernel to drop this checkpoint's pages from the page cache. On GB10 the page
+        cache and GPU allocations share one pool and reclaim is lazy (docs/gotchas.md: the box
+        can hard-reset near zero MemAvailable); weights read once must not linger there."""
+        import os
+        for f in set(self._handles) | set(getattr(self, "_headers", {})):
+            try:
+                fd = os.open(str(self.dir / f), os.O_RDONLY)
+                try:
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
+
     def has(self, name: str) -> bool:
         return name in self.map
 
+    _DTYPES = {"BF16": torch.bfloat16, "F32": torch.float32, "F16": torch.float16,
+               "U8": torch.uint8, "I8": torch.int8, "I64": torch.int64, "I32": torch.int32,
+               "F8_E4M3": torch.float8_e4m3fn}
+
+    def _meta(self, name: str):
+        """(file path, absolute byte offset, dtype, shape) from the shard's header."""
+        f = self.map[name]
+        hdr = self._headers.get(f) if hasattr(self, "_headers") else None
+        if hdr is None:
+            import struct
+            if not hasattr(self, "_headers"):
+                self._headers = {}
+            with open(self.dir / f, "rb") as fh:
+                n = struct.unpack("<Q", fh.read(8))[0]
+                hdr = (8 + n, json.loads(fh.read(n)))
+            self._headers[f] = hdr
+        base, meta = hdr
+        m = meta[name]
+        return self.dir / f, base + m["data_offsets"][0], self._DTYPES[m["dtype"]], m["shape"]
+
+    def _read(self, name: str, start: int | None = None, end: int | None = None) -> torch.Tensor:
+        """Rows [start, end) of a tensor read with preadv into a fresh tensor. Not through
+        safetensors' slices: on this box those kept every expert's bytes in host memory after the
+        copy to the GPU (+15 MB a slot, +53 MB a BF16 expert), which over a full arena is the
+        out-of-memory kill seen on the first real load."""
+        import os
+        path, off, dtype, shape = self._meta(name)
+        shape = list(shape)
+        row = 1
+        for d in shape[1:]:
+            row *= d
+        itemsize = torch.empty((), dtype=dtype).element_size()
+        if start is not None:
+            off += start * row * itemsize
+            shape[0] = end - start
+        out = torch.empty(shape, dtype=dtype)
+        buf = memoryview(out.view(torch.uint8).numpy()).cast("B") if out.numel() else memoryview(b"")
+        fd = self._fds.get(path) if hasattr(self, "_fds") else None
+        if fd is None:
+            if not hasattr(self, "_fds"):
+                self._fds = {}
+            fd = self._fds[path] = os.open(path, os.O_RDONLY)
+        done = 0
+        while done < len(buf):
+            got = os.preadv(fd, [buf[done:]], off + done)
+            if got <= 0:
+                raise IOError(f"short read of {name}")
+            done += got
+        return out
+
     def get(self, name: str) -> torch.Tensor:
-        return self._handle(name).get_tensor(name)
+        return self._read(name)
 
     def get_rows(self, name: str, start: int, end: int) -> torch.Tensor:
         """Rows [start, end) of a 2D+ tensor without reading the rest."""
-        return self._handle(name).get_slice(name)[start:end]
+        return self._read(name, start, end)
 
     def _detect(self) -> str:
         if any(k.endswith("experts.gate_up_proj_weight_scale") for k in self.map):

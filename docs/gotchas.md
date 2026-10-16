@@ -2587,3 +2587,22 @@ why two streams together came out 14-16% *below* one after another there. The bo
 is per bucket, not per request: a lane now keeps one context bucket of core graphs and drops it
 only when it captures another (`BatchDecoder._drop_stale_core`).
 
+
+## safetensors slices kept every Muse expert in host memory (2026-10-15)
+
+The Muse engine's first real load (engine/muse/) read each expert's rank half with
+`safe_open(...).get_slice(name)[a:b]` and copied it into a preallocated GPU slot. Host anonymous
+memory then grew by the bytes read: +15 MB a MXFP4 slot, +53 MB a BF16 expert, never returned
+(measured: 128 experts +2.0 GB; 1,000 experts +16.5 GB; MemAvailable fell in step). The first
+load was OOM-killed at 40 GB anon; the second was stopped by `scripts/mem-watchdog.sh --kill` at
+3.5 GiB MemAvailable on rank 1. The same calls in a small standalone loop did not retain
+anything, so the trigger is not obvious; it was not chased further. `Checkpoint._read` now parses
+the shard header once and `preadv`s the row range into a fresh tensor: 128 experts +0.0 GB, and
+a full 5,098-slot load holds 1.2 GB anon with MemAvailable flat at 28 GB through placement. Any
+loader on this box should be checked the same way (log RssAnon per layer) before it fills an
+arena.
+
+Also from that load: size arenas the V4.1 way (a 20 GB floor under MemAvailable, then a share of
+the rest), drop the page cache of files read once (`posix_fadvise(DONTNEED)`), and refuse to start
+below ~90 GB available. GPU allocations themselves count once (8 GiB `torch.zeros` = 8.9 GB off
+MemAvailable, no further growth when written).

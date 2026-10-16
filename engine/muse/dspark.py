@@ -65,8 +65,8 @@ class DraftOptions:
 
 class DSpark:
     def __init__(self, eng, path: str, fmt: str | None = None, opts: DraftOptions | None = None):
-        from safetensors import safe_open
         from .tp import Dense
+        from .weights import Checkpoint
         self.eng, self.comm = eng, eng.comm
         self.opts = opts or DraftOptions.from_env()
         W, r, d = eng.world, eng.rank, eng.dev
@@ -85,18 +85,18 @@ class DSpark:
         metap = cfg.get("metap") or {}
         self.mult = (float(metap.get("base_width", 256)) / self.H) ** 0.5 if metap.get("use_metap") else 1.0
         fmt = fmt or os.environ.get("MUSE_DRAFT_DENSE", eng.dense_fmt)
-        h = safe_open(str(Path(path) / "model.safetensors"), "pt")
+        h = Checkpoint(path, detect=False)        # preadv reads (see Checkpoint._read)
 
         def rows(name, total):
             n = total // W
-            return h.get_slice(name)[r * n:(r + 1) * n].to(d)
+            return h.get_rows(name, r * n, (r + 1) * n).to(d)
 
         def cols(name, total):
             n = total // W
-            return h.get_slice(name)[:, r * n:(r + 1) * n].contiguous().to(d)
+            return h.get(name)[:, r * n:(r + 1) * n].contiguous().to(d)
 
         def full(name):
-            return h.get_tensor(name).to(d)
+            return h.get(name).to(d)
 
         self.fc = Dense(rows("fc.weight", self.H), fmt)
         self.hidden_norm = full("hidden_norm.weight")
@@ -130,9 +130,10 @@ class DSpark:
         self.shared_head = same
         del own, tgt
         self.markov_w1 = full("markov_head.markov_w1.weight")                 # [V, R], replicated
+        h.drop_cache()
         self.markov_w2 = Dense(rows("markov_head.markov_w2.weight", eng.cfg.vocab), "bf16")
         self.conf_w = full("confidence_head.proj.weight").float()[0]
-        self.conf_b = float(h.get_tensor("confidence_head.proj.bias").float()[0])
+        self.conf_b = float(h.get("confidence_head.proj.bias").float()[0])
         # Context K/V ring per draft layer: window plus the largest update (a prefill chunk).
         self.ring = self.window + eng.chunk
         kw = dict(dtype=torch.bfloat16, device=d)
