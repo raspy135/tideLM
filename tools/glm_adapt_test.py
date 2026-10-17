@@ -52,27 +52,27 @@ def main():
     for r in range(args.rounds):
         eng.reset()
         eng.adapt_log = []
-        s0 = dict(ms)
+        s0 = dict(eng.miss_totals())
         it = eng.stream(ids, args.tokens, depth=0)
         eng.miss_hist = None
         t_first = time.perf_counter()
         out = [next(it)]
         t_first = time.perf_counter() - t_first
-        s1 = dict(ms)
+        s1 = dict(eng.miss_totals())
         if args.hist:
             eng.miss_hist = torch.zeros((2, 50), dtype=torch.float32, device=eng.dev)
         if args.dump:
             eng.route_dump = []
         t0 = time.perf_counter()
-        windows, w0 = [], dict(ms)
+        windows, w0 = [], dict(eng.miss_totals())
         for t in it:
             out.append(t)
             if len(out) % args.window == 0:
-                w1 = dict(ms)
+                w1 = dict(eng.miss_totals())
                 windows.append(share(w0, w1)["mass"])
                 w0 = w1
         dt = time.perf_counter() - t0
-        s2 = dict(ms)
+        s2 = dict(eng.miss_totals())
         if eng.rank == 0:
             print(json.dumps({"round": r, "prefill_tokens": len(ids), "ttft_s": round(t_first, 2),
                               "prefetch": dict(getattr(eng, "pf_stats", {})), "prefill_missed": share(s0, s1),

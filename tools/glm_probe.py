@@ -38,6 +38,7 @@ def main():
         eng.miss_stats = ms
 
         def snap():
+            eng.miss_totals()
             return dict(ms)
 
         def share(a, b):

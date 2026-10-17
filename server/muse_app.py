@@ -212,12 +212,15 @@ def engine_loop(engine, jobs: "queue.Queue[Job]", log, tpl: Template, stop: tupl
         t0 = time.perf_counter()
         n = 0
         first = None
+        snap = getattr(engine, "request_snapshot", None)     # engines that count misses (GLM)
+        s0 = s1 = snap() if snap else None
         try:
             for tok in engine.stream(job.prompt, cmd["max_new"], temperature=cmd["temperature"],
                                      top_p=cmd["top_p"], top_k=cmd["top_k"], seed=cmd["seed"],
                                      stop=stop, should_stop=job.cancelled.is_set):
                 if first is None:
                     first = time.perf_counter()
+                    s1 = snap() if snap else None
                 n += 1
                 job.out.put(tok)
                 # A new message header that is not the assistant's (a made-up tool result or
@@ -232,6 +235,8 @@ def engine_loop(engine, jobs: "queue.Queue[Job]", log, tpl: Template, stop: tupl
         job.stats = {"prompt_tokens": len(job.prompt), "reused_prefix": engine.last_reuse,
                      "completion_tokens": n, "ttft_s": round((first or end) - t0, 3),
                      "decode_tok_s": round((n - 1) / (end - first), 2) if first and n > 1 else None}
+        if snap:
+            job.stats.update(engine.request_stats(s0, s1, snap()))
         log(f"[muse] request: {json.dumps(job.stats)}")
         job.out.put(None)
 

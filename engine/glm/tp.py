@@ -270,6 +270,8 @@ class GlmTP:
         self.bg_cold = float(env("MUSE_BG_COLD", "0.01"))   # victims: recent router mass below this
         if env("MUSE_ADAPT", "1") == "1" and self.miss == "substitute":
             self.enable_adaptation(float(env("MUSE_ADAPT_DECAY", "0.9")))
+        if env("MUSE_MISS_LOG", "1") == "1" and self.miss == "substitute":
+            self.miss_stats = {"picks": 0, "missed": 0, "mass": 0.0, "mass_missed": 0.0}
         torch.cuda.synchronize()
         self.log(f"[glm] rank {r}/{W} ready in {time.perf_counter() - t0:.1f}s: dense {self.dense_bytes / 1e9:.2f} GB, "
                  f"{self.slots_resident} of {total} routed experts resident + {fixed} fixed "
@@ -300,7 +302,7 @@ class GlmTP:
                 "xfmt": self.xfmt, "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
                 "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_PF_KEEP", "MUSE_PF_KEEP_MARGIN", "MUSE_HOT", "MUSE_HOT_MIN",
                                             "MUSE_HOT_TARGET", "MUSE_HOT_KEEP", "MUSE_HOT_MAX", "MUSE_HOT_KEEP_AUDIT", "MUSE_HOT_PACE",
-                                            "MUSE_HOT_PACE_LEAD", "MUSE_SUB_WEIGHT", "MUSE_MTP_FULL")],
+                                            "MUSE_HOT_PACE_LEAD", "MUSE_SUB_WEIGHT", "MUSE_MTP_FULL", "MUSE_MISS_LOG")],
                 "adapt": [env(k, "") for k in ("MUSE_ADAPT", "MUSE_ADAPT_EVERY", "MUSE_ADAPT_PREFILL_SWAPS",
                                                "MUSE_ADAPT_DECODE_SWAPS", "MUSE_ADAPT_DECAY", "MUSE_ADAPT_CROSS_LAYER",
                                                "MUSE_ADAPT_MARGIN", "MUSE_BG", "MUSE_BG_EVERY", "MUSE_BG_READS",
@@ -844,6 +846,28 @@ class GlmTP:
         return self.comm.all_reduce(partial).to(torch.bfloat16), topk
 
     # ------------------------------------------------------------------ MoE
+    def request_snapshot(self):
+        """Rank 0, for the server's per-request line: routing and hot-read counters so far."""
+        ms = self.miss_totals() or {}
+        h = self.hot_stats
+        return {"picks": ms.get("picks", 0), "missed": ms.get("missed", 0), "mass": ms.get("mass", 0.0),
+                "mass_missed": ms.get("mass_missed", 0.0), "hot": h["reads"], "kept": h.get("kept", 0),
+                "swaps": self.adapt_totals["swaps"] if self.demand is not None else 0, "tokens": len(self.tokens)}
+
+    @staticmethod
+    def request_stats(s0, s1, s2):
+        """Prefill (s0 -> first token s1) and decode (s1 -> end s2): share of routed weight and of
+        picks that ran on a substitute, hot reads (kept), adaptation swaps."""
+        def miss(a, b):
+            m = b["mass"] - a["mass"]
+            return round((b["mass_missed"] - a["mass_missed"]) / m, 3) if m > 0 else None
+        p = s2["picks"] - s1["picks"]
+        return {"prefill_miss": miss(s0, s1), "decode_miss": miss(s1, s2),
+                "decode_miss_picks": round((s2["missed"] - s1["missed"]) / p, 3) if p > 0 else None,
+                "hot_reads": s2["hot"] - s1["hot"], "hot_kept": s2["kept"] - s1["kept"],
+                "hot_per_tok": round((s2["hot"] - s1["hot"]) / max(1, s2.get("tokens", 0) - s1.get("tokens", 0)), 2),
+                "swaps": s2["swaps"] - s0["swaps"]}
+
     def miss_totals(self):
         """miss_stats with the graph replays' device counts folded in."""
         ms = self.miss_stats
@@ -880,21 +904,16 @@ class GlmTP:
             w0, ids0 = route(cfg, x, lw["router"], lw["bias"], None)
             missed = ~allowed[ids0]
             ms = self.miss_stats
-            if torch.cuda.is_current_stream_capturing():
-                # Graph replays count on the device (no host reads under capture); miss_totals()
-                # folds them into the dict.
-                acc = ms["dev"]
-                acc[0].add_(ids0.numel())
-                acc[1].add_(missed.sum())
-                acc[2].add_(w0.sum())
-                acc[3].add_((w0 * missed).sum())
-            else:
-                if "dev" not in ms:                    # eager calls (prefill, capture warm-up) come first
-                    ms["dev"] = torch.zeros(4, dtype=torch.float64, device=x.device)
-                ms["picks"] += ids0.numel()
-                ms["missed"] += int(missed.sum())
-                ms["mass"] += float(w0.sum())
-                ms["mass_missed"] += float((w0 * missed).sum())
+            # Counted on the device only (no host sync a layer, and graph replays count too);
+            # miss_totals() folds them into the dict. The first call is never under capture
+            # (prefill and the capture's warm-up run eagerly first).
+            if "dev" not in ms:
+                ms["dev"] = torch.zeros(4, dtype=torch.float64, device=x.device)
+            acc = ms["dev"]
+            acc[0].add_(ids0.numel())
+            acc[1].add_(missed.sum())
+            acc[2].add_(w0.sum())
+            acc[3].add_((w0 * missed).sum())
         if self.route_dump is not None and allowed is not None:
             w0, ids0 = route(cfg, x, lw["router"], lw["bias"], None)
             ahead = {}
