@@ -126,7 +126,21 @@ class GlmTP:
         self.moe_layers = [L for L in range(self.nL) if not self.dense(L)]
         self.n_pseudo = cfg.inter // cfg.moe_inter
         fixed = len(self.moe_layers) * cfg.shared_experts + sum(cfg.dense_mlp) * self.n_pseudo
-        total = len(self.moe_layers) * cfg.experts
+        # MUSE_EXPERT_FORMAT=exl3: the decoder layers' routed experts come from the EXL3 pack at
+        # MUSE_EXL3_PACK ({rank} filled in) into their own arena (engine/glm/exl3.py). The shared
+        # experts, the dense layers and the MTP layer's experts (4-bit in that checkpoint, a width
+        # the routed arena does not hold) stay MXFP4, the MTP layer's all resident. Slot numbers
+        # run through both: MXFP4 [0, x3_off), EXL3 from x3_off on.
+        self.xfmt = env("MUSE_EXPERT_FORMAT", "mxfp4")
+        assert self.xfmt in ("mxfp4", "exl3"), self.xfmt
+        self.x3 = self.x3pack = None
+        if self.xfmt == "exl3":
+            from .exl3 import Exl3Pack
+            self.x3pack = Exl3Pack(env("MUSE_EXL3_PACK", "").format(rank=r), cfg.hidden, cfg.moe_inter)
+            if self.mtp_on:
+                fixed += cfg.experts
+        self.swap_layers = [L for L in self.moe_layers if not (self.x3pack and L == self.mtp_L)]
+        total = len(self.swap_layers) * cfg.experts
         # Prefill prefetch (MUSE_PF=1): two buffers of MUSE_PF_SLOTS transient slots, one per
         # alternate layer, taken from the resident budget. See _pf_predict.
         self.pf_on = env("MUSE_PF", "0") == "1" and self.miss == "substitute"
@@ -178,23 +192,41 @@ class GlmTP:
         self._load_dense()
         self._alloc_cache()
         per = Arena.slot_bytes(cfg.moe_inter, cfg.hidden, W)
+        mx_bytes = 0                       # MXFP4 bytes outside the routed budget (exl3: fixed + MTP)
+        if self.x3pack:
+            from .exl3 import slot_bytes
+            mx_bytes, per = fixed * per, slot_bytes(r, W, cfg.hidden, cfg.moe_inter)
         want = slots if slots is not None else env("MUSE_SLOTS", "auto")
         if want == "auto":
             self.ck.drop_cache()
             free = max(torch.cuda.mem_get_info(self.dev)[0], mem_available())
             reserve = float(env("MUSE_RESERVE_GB", "20")) * 1e9
             share = float(env("MUSE_ARENA_SHARE", "0.88"))
-            mine = max(0, int(share * (free - reserve) // per) - transient - fixed)
+            mine = max(0, int(share * (free - reserve - mx_bytes) // per) - transient - (0 if self.x3pack else fixed))
             want = min(self.comm.gather_objects(mine))
             self.log(f"[glm] auto slots: {want} routed + {fixed} fixed ({free / 1e9:.1f} GB available, "
                      f"{reserve / 1e9:.0f} GB floor, share {share}, {per / 1e6:.1f} MB a slot)")
         self.slots_resident = min(int(want), total)
         self._boot_guard(transient)
-        self.arena = Arena(cfg.moe_inter, cfg.hidden, fixed + self.slots_resident + transient, r, W, self.dev)
+        if self.x3pack:
+            from .exl3 import make_arena
+            self.arena = Arena(cfg.moe_inter, cfg.hidden, fixed, r, W, self.dev)
+            self.x3 = make_arena(self.slots_resident + transient, r, W, self.dev, cfg.hidden, cfg.moe_inter)
+            self.x3_off = fixed
+            self.n_slots = fixed + self.x3.slots
+            orig_drop = self.ck.drop_cache
+            self.ck.drop_cache = lambda: (orig_drop(), self.x3pack.drop_cache())
+        else:
+            self.arena = Arena(cfg.moe_inter, cfg.hidden, fixed + self.slots_resident + transient, r, W, self.dev)
+            self.x3_off = None
+            self.n_slots = self.arena.slots
         self.lut = torch.full((self.nL, cfg.experts), -1, dtype=torch.int32, device=self.dev)
-        self.owner: list[tuple[int, int] | None] = [None] * self.arena.slots
+        self.owner: list[tuple[int, int] | None] = [None] * self.n_slots
         self._place_fixed()
         self._place_resident()
+        if self.x3 is not None:
+            from .exl3 import warm
+            warm(self.x3)                  # nvcc build + pointer tables now, not inside a capture
         first_t = fixed + self.slots_resident
         self.transient = list(range(first_t, first_t + transient))
         self.pf_slots = self.transient if self.pf_on else []
@@ -237,7 +269,8 @@ class GlmTP:
         torch.cuda.synchronize()
         self.log(f"[glm] rank {r}/{W} ready in {time.perf_counter() - t0:.1f}s: dense {self.dense_bytes / 1e9:.2f} GB, "
                  f"{self.slots_resident} of {total} routed experts resident + {fixed} fixed "
-                 f"({self.arena.bytes_per_slot * self.arena.slots / 1e9:.2f} GB), miss={self.miss}, "
+                 f"({(self.arena.bytes_per_slot * self.arena.slots + (self.x3.total_bytes if self.x3 else 0)) / 1e9:.2f} GB"
+                 f"{', routed EXL3' if self.x3 else ''}), miss={self.miss}, "
                  f"max_seq {self.max_seq}; {mem_available() / 1e9:.1f} GB available")
         self.reset()
 
@@ -260,6 +293,7 @@ class GlmTP:
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"), "db": env("MUSE_STATS_DB", ""),
+                "xfmt": self.xfmt, "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
                 "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_PF_KEEP", "MUSE_PF_KEEP_MARGIN", "MUSE_HOT", "MUSE_HOT_MIN",
                                             "MUSE_HOT_TARGET", "MUSE_HOT_KEEP", "MUSE_HOT_MAX", "MUSE_HOT_KEEP_AUDIT", "MUSE_HOT_PACE",
                                             "MUSE_HOT_PACE_LEAD", "MUSE_SUB_WEIGHT")],
@@ -351,6 +385,8 @@ class GlmTP:
     def _expert_parts(self, L, e, urgent=False):
         """(gate, up, down) of this rank for routed expert e (or "shared") of layer L; the six
         tensors are read together (get_rows_many)."""
+        if self.x3pack and e != "shared" and L != self.mtp_L:
+            return self.x3pack.read(L, e, urgent)
         r, Il, Hl = self.rank, self.arena.Il, self.arena.Hl
         b = f"{P}layers.{L}.mlp." + ("shared_experts." if e == "shared" else f"experts.{e}.")
         specs = []
@@ -396,6 +432,13 @@ class GlmTP:
                 ids = [slot]
                 slot += 1
             self.fixed[L] = torch.tensor(ids, dtype=torch.int32, device=self.dev)
+        if self.x3pack and self.mtp_on:
+            L = self.mtp_L
+            for e, parts in zip(range(cfg.experts), self._read_many(L, list(range(cfg.experts)))):
+                self.arena.put(slot, *parts)
+                self.owner[slot] = (L, e)
+                self.lut[L, e] = slot
+                slot += 1
         self.first_routed = slot
         self.ck.drop_cache()
 
@@ -403,19 +446,19 @@ class GlmTP:
         """Cross-layer top-N by the stats DB's accumulated router mass (rank 0 reads, broadcasts)."""
         plan = None
         if self.rank == 0 and self.db_mass is not None and self.db_tokens > 0:
-            layers = torch.tensor(self.moe_layers)
+            layers = torch.tensor(self.swap_layers)
             m = self.db_mass[layers].clone()
             E, k2 = self.cfg.experts, 2 * self.cfg.topk
             plan = {int(L): [] for L in layers}
             # Every layer first gets its 2 x top-k best, then the rest goes by global mass.
-            for li, L in enumerate(self.moe_layers):
+            for li, L in enumerate(self.swap_layers):
                 top = torch.argsort(m[li], descending=True)[:k2].tolist()
                 plan[L] += top
                 m[li, top] = -1.0
             left = self.slots_resident - sum(len(v) for v in plan.values())
             for idx in torch.argsort(m.reshape(-1), descending=True)[:max(0, left)].tolist():
                 li, e = divmod(idx, E)
-                plan[self.moe_layers[li]].append(e)
+                plan[self.swap_layers[li]].append(e)
             plan = {L: sorted(v) for L, v in plan.items()}
         return self.comm.broadcast_obj(plan)
 
@@ -462,7 +505,7 @@ class GlmTP:
         if resident is not None:
             # A trace of prefill alone never routes through the MTP layer: give layers the file
             # leaves out the remaining slots by the placeholder ranking, at least top-k each.
-            absent = [L for L in self.moe_layers if L not in resident]
+            absent = [L for L in self.swap_layers if L not in resident]
             left = self.slots_resident - sum(len(v) for v in resident.values())
             if absent:
                 per = left // len(absent)
@@ -473,23 +516,23 @@ class GlmTP:
                     resident[L] = sorted(order[:per])
                 self.log(f"[glm] resident set lacks layers {absent}: {per} placeholder experts each")
         if resident is None:
-            total = len(self.moe_layers) * cfg.experts
+            total = len(self.swap_layers) * cfg.experts
             if self.slots_resident >= total:
-                resident = {L: list(range(cfg.experts)) for L in self.moe_layers}
+                resident = {L: list(range(cfg.experts)) for L in self.swap_layers}
             else:
-                per = self.slots_resident // len(self.moe_layers)
+                per = self.slots_resident // len(self.swap_layers)
                 if per < cfg.topk:
                     raise ValueError(f"{self.slots_resident} slots give {per} experts a layer, fewer than "
                                      f"top-{cfg.topk}: substitution could not fill the routing")
-                extra = self.slots_resident - per * len(self.moe_layers)
+                extra = self.slots_resident - per * len(self.swap_layers)
                 resident = {}
-                for k, L in enumerate(self.moe_layers):
+                for k, L in enumerate(self.swap_layers):
                     n = per + (1 if k < extra else 0)
                     order = torch.argsort(self.L[L]["bias"].cpu(), stable=True).tolist()
                     resident[L] = sorted(order[:n])
         slot = self.first_routed
         t0 = time.perf_counter()
-        for L in self.moe_layers:
+        for L in self.swap_layers:
             experts = resident.get(L, [])
             if slot + len(experts) > self.first_routed + self.slots_resident:
                 raise ValueError("resident set larger than the slots")
@@ -508,8 +551,24 @@ class GlmTP:
             self._pool = ThreadPoolExecutor(max_workers=int(env("MUSE_READ_THREADS", "12")))
         return list(self._pool.map(lambda e: self._expert_parts(L, e), experts))
 
+    def _put(self, slot, parts):
+        if self.x3 is not None and slot >= self.x3_off:
+            rec, bits = parts
+            self.x3.load_slot(slot - self.x3_off, rec, bits)
+        else:
+            self.arena.put(slot, *parts)
+
+    def _copy_slot(self, dst, src):
+        if self.x3 is not None and dst >= self.x3_off:
+            from .exl3 import copy_slot
+            copy_slot(self.x3, dst - self.x3_off, src - self.x3_off)
+        else:
+            A = self.arena
+            for t in (A.w1, A.s1, A.w3, A.s3, A.w2, A.s2):
+                t[dst].copy_(t[src])
+
     def _load(self, L, e, slot, parts=None):
-        self.arena.put(slot, *(parts or self._expert_parts(L, e)))
+        self._put(slot, parts or self._expert_parts(L, e))
         old = self.owner[slot]
         if old is not None and int(self.lut[old[0], old[1]]) == slot:
             self.lut[old[0], old[1]] = -1
@@ -523,7 +582,7 @@ class GlmTP:
     def enable_adaptation(self, decay: float = 0.9):
         self.demand_tokens = 0
         self.adapt_epoch = 0
-        self.slot_epoch = [-10] * self.arena.slots          # adaptation that last loaded a slot
+        self.slot_epoch = [-10] * self.n_slots              # adaptation that last loaded a slot
         self.adapt_totals = {"swaps": 0, "churn": 0}
         self.demand = torch.zeros((self.nL, self.cfg.experts), dtype=torch.float32, device=self.dev)
         self.score = torch.zeros_like(self.demand)        # decayed history the swaps rank by
@@ -534,7 +593,7 @@ class GlmTP:
         self.bg_period = 0
         self.bg_until = torch.zeros((self.nL, self.cfg.experts), dtype=torch.long, device=self.dev)  # no eviction before
         self.pf_kept = torch.zeros((self.nL, self.cfg.experts), dtype=torch.bool, device=self.dev)   # this prefill's promotions
-        self._bg_layers = torch.tensor(self.moe_layers, device=self.dev)
+        self._bg_layers = torch.tensor(self.swap_layers, device=self.dev)
         self.bg_stats = {"periods": 0, "planned": 0, "installed": 0, "stale": 0, "wait_s": 0.0, "install_s": 0.0}
 
     @torch.no_grad()
@@ -559,7 +618,7 @@ class GlmTP:
         if self.rank == 0:
             sc = self.score.cpu()
             lut = self.lut.cpu()
-            layers = torch.tensor(self.moe_layers)
+            layers = torch.tensor(self.swap_layers)
             res = lut[layers] >= 0                                   # [moe layers, E]
             s = sc[layers]
             if self.adapt_cross_layer:
@@ -591,7 +650,7 @@ class GlmTP:
                     plan.append((int(layers[cl]), ce, int(layers[vl]), ve))
             else:
                 plan = []
-                for li, L in enumerate(self.moe_layers):
+                for li, L in enumerate(self.swap_layers):
                     cand = torch.argsort(s[li].masked_fill(res[li], -1.0), descending=True).tolist()
                     vict = torch.argsort(s[li].masked_fill(~res[li], float("inf"))).tolist()
                     for c, v in zip(cand, vict):
@@ -697,18 +756,18 @@ class GlmTP:
                     break
                 left[vl] -= 1
                 left[cl] += 1
-                plan.append((self.moe_layers[cl], ce, self.moe_layers[vl], ve))
+                plan.append((self.swap_layers[cl], ce, self.swap_layers[vl], ve))
             hot_q = []
             while len(hot_q) < self.hot_keep and vi < nv and v_val[vi] != float("inf"):
                 vl, ve = divmod(v_idx[vi], E)
                 if left[vl] > floor:
                     left[vl] -= 1
-                    hot_q.append((self.moe_layers[vl], ve, v_slot[vi]))
+                    hot_q.append((self.swap_layers[vl], ve, v_slot[vi]))
                 vi += 1
         plan, hot_q = self.comm.broadcast_obj((plan, hot_q))
         self.hot_q = hot_q[::-1] if hot_q else []
         if not hasattr(self, "_pool"):
-            self._read_many(self.moe_layers[0], [])
+            self._read_many(self.swap_layers[0], [])
         self.bg_pending = [(L, e, VL, ve, self._pool.submit(self._expert_parts, L, e)) for L, e, VL, ve in plan]
         st["planned"] += len(plan)
 
@@ -994,8 +1053,8 @@ class GlmTP:
             if vi >= len(idx) or cand_scores[ci] <= vval[vi] * margin:
                 break
             left[vl] -= 1
-            out[ci] = (self.moe_layers[vl], ve)
-            self.pf_kept[self.moe_layers[vl], ve] = True        # not chosen twice
+            out[ci] = (self.swap_layers[vl], ve)
+            self.pf_kept[self.swap_layers[vl], ve] = True        # not chosen twice
             vi += 1
         return out
 
@@ -1007,7 +1066,7 @@ class GlmTP:
         parts = [f.result() for *_, f in items]
         self.pf_stats["wait_s"] += time.perf_counter() - t0
         for (e, slot, _, _), pr in zip(items, parts):
-            self.arena.put(slot, *pr)
+            self._put(slot, pr)
             self.lut[L, e] = slot
         es = [e for e, *_ in items]
         self.allowed[L, es] = True
@@ -1031,13 +1090,11 @@ class GlmTP:
             return
         # Promote: copy each prefetched expert from its transient slot over its victim's slot
         # (stream-ordered after this layer's MLP), then repoint the lut. Same plan on both ranks.
-        A = self.arena
         vslots = self.lut[[v[0] for _, _, v in items], [v[1] for _, _, v in items]].tolist()
         for (e, slot, (VL, ve)), vs in zip(items, vslots):
             if vs < 0 or self.owner[vs] != (VL, ve):
                 continue
-            for t in (A.w1, A.s1, A.w3, A.s3, A.w2, A.s2):
-                t[vs].copy_(t[slot])
+            self._copy_slot(vs, slot)
             self.lut[VL, ve] = -1
             self.owner[vs] = (L, e)
             self.lut[L, e] = vs
@@ -1051,7 +1108,7 @@ class GlmTP:
         still holds its slot (stream-ordered after this layer's MLP), repoint the lut, and protect it
         from background eviction like a background install. The queue, the hot reads and owner are
         the same on both ranks, so both keep the same experts in the same slots."""
-        A, q, st = self.arena, self.hot_q, self.hot_stats
+        q, st = self.hot_q, self.hot_stats
         for e, src in items:
             while q:
                 VL, ve, vs = q.pop()
@@ -1067,8 +1124,7 @@ class GlmTP:
                 st["gate_drop"] = st.get("gate_drop", 0) + (c <= v * self.adapt_margin)
                 st["gate_below_victim"] = st.get("gate_below_victim", 0) + (c <= v)
                 st["pct_sum"] = st.get("pct_sum", 0.0) + float((res < c).float().mean())   # share of residents it outranks
-            for t in (A.w1, A.s1, A.w3, A.s3, A.w2, A.s2):
-                t[vs].copy_(t[src])
+            self._copy_slot(vs, src)
             self.lut[VL, ve] = -1
             self.allowed[VL, ve] = False
             self.owner[vs] = (L, e)
@@ -1097,7 +1153,7 @@ class GlmTP:
             return False
         t0 = time.perf_counter()
         for e, slot, pr in zip(es, self.transient, self._read_urgent(L, es)):
-            self.arena.put(slot, *pr)
+            self._put(slot, pr)
             self.lut[L, e] = slot
         self.allowed[L, es] = True
         self.pf_live = (L, es)
@@ -1121,8 +1177,17 @@ class GlmTP:
               and not torch.cuda.is_current_stream_capturing()):
             pf = self._hot_stream(L, x)
         slots, w = self._route(L, x)
-        T, k = slots.shape
         x = x.contiguous()
+        y = None
+        if self.x3 is not None and not self.dense(L) and L != self.mtp_L:
+            from .exl3 import routed
+            k = self.cfg.topk
+            rs = slots[:, :k] - self.x3_off
+            bad = rs < 0                      # a slotless pick: zero weight on any loaded slot
+            y = routed(x, rs.clamp_min(0), torch.where(bad, torch.zeros_like(w[:, :k]), w[:, :k]),
+                       self.x3, self.comm)
+            slots, w = slots[:, k:].contiguous(), w[:, k:]
+        T, k = slots.shape
         if self.native and T * k <= 512:
             parts = self._experts_native(x, slots)
         else:
@@ -1133,8 +1198,8 @@ class GlmTP:
                 self.lut[sl, e] = -1
         if pf:
             self._pf_release()
-        y = (self.comm.cat_last(parts) * w.t()[:, :, None]).sum(0)
-        return y.to(torch.bfloat16)
+        z = (self.comm.cat_last(parts) * w.t()[:, :, None]).sum(0)
+        return (z if y is None else z + y).to(torch.bfloat16)
 
     # ------------------------------------------------------------------ model
     def _layers(self, h):
@@ -1274,7 +1339,7 @@ class GlmTP:
             st["quarters"][self._hot_quarter[L]] += len(es)
             t0 = time.perf_counter()
             for e, slot, pr in zip(es, self.transient, self._read_urgent(L, es)):
-                self.arena.put(slot, *pr)
+                self._put(slot, pr)
                 self.lut[L, e] = slot
             self.allowed[L, es] = True
             self.pf_live = (L, es)

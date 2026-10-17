@@ -2837,3 +2837,23 @@ where running out wedges the box instead of raising an OOM. At 8,600: ready at 1
 0 and rank 1's polkitd (5.3 GB) and bluetoothd (1.1 GB) leaking. Slots are the minimum over the
 ranks, so a leak on either node costs the pair. Watch with
 `NAME0=glm-serve-rank0 NAME1=glm-serve-rank1 PEER=ryan@10.0.0.2 scripts/mem-watchdog.sh --kill`.
+
+## EXL3 routed experts: same exact-model NLL as MXFP4 at 71% of the bytes (2026-10-16)
+
+bertholomus/GLM-5.3-EXL3-3.0bpw (exllamav3 1.5.3 from BF16, routed experts 3-bit mul1, MTP
+4-bit) packed per rank with tools/glm_pack_exl3.py: 139.1 GB a rank, 7.1 MB a slot against
+MXFP4's 10.0. Layout check (cosine of the dequantized rank slices against the Quark MXFP4 ones):
+0.981-0.984 at 3 bits, 0.991 for the 4-bit MTP experts, on both ranks -- a wrong slice or
+orientation would be ~0. Engine path (engine/glm/exl3.py, V4.1's CUDA kernels, GLM's Comm for the
+two gathers) against a dequantized fp32 reference: rel err 3.5e-4 at T = 1, 3, 256.
+
+Teacher-forced NLL on text neither checkpoint wrote (glm_quality --set natural: 12 of
+corpus/heldout_eval.jsonl, 64-token prompt, 300 scored, 3-row steps), every expert exact
+(MUSE_MISS=stream): MXFP4 1.6141, EXL3 1.6107. Serving config on MXFP4 (8,600 slots, hot 0.2
+paced cap 16, kept): 1.6697, +0.056 over its exact, KL 0.126, 23.8% of routed mass missed --
+code and docs miss more than the Tokyo set. The EXL3 serving run (11,756 slots, same memory) was
+stopped for serving before it finished. Caveat from the user, and fair: the corpus is mostly
+AI-written docs, close to what quantizers calibrate on, so an average NLL there cannot show the
+rare errors a 3-bit format makes; judge it in use.
+
+First live EXL3 requests: 8.66 tok/s fresh after boot, 9.99 on the second (MXFP4 at 8,600: 6.6-8.6).

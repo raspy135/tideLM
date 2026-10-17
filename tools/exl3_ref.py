@@ -51,6 +51,18 @@ KT13, NT13 = K13 // 16, N13 // 16      # 320, 144
 KT2, NT2 = K2 // 16, N2 // 16          # 144, 320
 
 
+def set_dims(hidden: int, inter: int) -> None:
+    """Point the record shapes at another model (GLM-5.3: 6,144 hidden, 2,048 intermediate). A
+    process holds one model, so module state is enough; a pack records its dims and PackReader
+    applies them."""
+
+    global K13, N13, K2, N2, KT13, NT13, KT2, NT2
+    K13, N13 = int(hidden), int(inter)
+    K2, N2 = int(inter), int(hidden)
+    KT13, NT13 = K13 // 16, N13 // 16
+    KT2, NT2 = K2 // 16, N2 // 16
+
+
 def check_bits(bits: float) -> float:
     b = float(bits)
     if b not in BITS:
@@ -267,7 +279,7 @@ def build_header(bits_map: dict[int, float], rank: int, world: int, codebook: st
         "rank": rank, "world": world, "codebook": codebook,
         "bits": {str(L): bits_map[L] for L in sorted(bits_map)},
         "record_align": ALIGN, "tensors": list(RECORD_TENSORS),
-        "source_sha256": source_sha256, "data_nbytes": data_nbytes,
+        "source_sha256": source_sha256, "data_nbytes": data_nbytes, "dims": [K13, N13],
         "records": {f"{L},{E}": r for (L, E), r in records.items()},
     }
     blob = json.dumps(header, separators=(",", ":"), sort_keys=True).encode()
@@ -318,6 +330,8 @@ class PackReader:
         self.header = json.loads(self.header_bytes)
         if self.header.get("format") != PACK_FORMAT:
             raise ValueError(f"{path}: not an {PACK_FORMAT} pack")
+        if "dims" in self.header:
+            set_dims(*self.header["dims"])
         self.data0 = _align_up(8 + len(self.header_bytes))
         self.records = {tuple(int(v) for v in k.split(",")): v
                         for k, v in self.header["records"].items()}

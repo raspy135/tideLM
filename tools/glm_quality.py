@@ -33,11 +33,44 @@ PROMPTS = [
     "東京で1日観光するモデルコースを、朝から夜まで時間つきで教えて。",
     "浅草と渋谷と新宿の見どころと、それぞれの街の雰囲気の違いを説明して。",
 ]
+# --set switch: a second turn on another topic after each Tokyo answer, prefilled as serving does
+# it (the history first, then only the new turn on top of the reused prefix).
+SWITCH = [
+    "簡単な棒グラフのHTMLを作って。カッコいいデザインがいいです。",
+    "腰痛になったらどうすれば良い？",
+    "PythonでCSVファイルを読み込んで、列ごとの平均を出すスクリプトを書いて。",
+]
 TOPN = 20
 
 
 def encode_prompts(tpl):
     return [tpl.encode(tpl.render([{"role": "user", "content": p}], None, "low")) for p in PROMPTS]
+
+
+def encode_natural(tpl, n_answer):
+    """--set natural: text neither model wrote (corpus/heldout_eval.jsonl, every 9th document, 12
+    of them): the first 64 tokens are the prompt, the next n_answer are scored. NLL here compares
+    formats fairly; the Tokyo answers were written by the MXFP4 model itself."""
+    docs = [json.loads(l) for l in open("/app/corpus/heldout_eval.jsonl")][::9][:12]
+    out = []
+    for d in docs:
+        ids = tpl.encode(d["text"])
+        out.append({"prompt": ids[:64], "answer": ids[64:64 + n_answer], "id": d["id"]})
+    return out
+
+
+def encode_switch(tpl, tokyo):
+    """(ids, cut) per SWITCH turn: the Tokyo exchange (reasoning dropped, as clients send it back)
+    then the new question; ids[:cut] is what a prefix cache would hold."""
+    out = []
+    for q, first, sq in zip(SWITCH, PROMPTS, tokyo):
+        ans = tpl.tok.decode(sq["answer"], skip_special_tokens=True).split("</think>")[-1].strip()
+        hist = [{"role": "user", "content": first}, {"role": "assistant", "content": ans}]
+        ids = tpl.encode(tpl.render(hist + [{"role": "user", "content": q}], None, "low"))
+        alt = tpl.encode(tpl.render(hist + [{"role": "user", "content": "x"}], None, "low"))
+        cut = next(i for i, (u, v) in enumerate(zip(ids, alt)) if u != v)
+        out.append((ids, cut))
+    return out
 
 
 def main():
@@ -47,6 +80,8 @@ def main():
     ap.add_argument("--name", default="")
     ap.add_argument("--tokens", type=int, default=300)
     ap.add_argument("--out", default="/app/results/glm-quality")
+    ap.add_argument("--set", choices=("tokyo", "switch", "natural"), default="tokyo")
+    ap.add_argument("--ref", default="", help="exact mode: written as exact<-set><-ref>.json; eval: the one to score against")
     ap.add_argument("--rows", type=int, default=1,
                     help="eval: feed the answer N tokens a step (3 = an MTP depth-2 verify block, graphed "
                          "when MUSE_MTP_DEPTH=N-1), so per-step read caps and thresholds act as in serving")
@@ -55,22 +90,32 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     tpl = GlmTemplate(args.model)
     eng = GlmTP(args.model)
-    prompts = encode_prompts(tpl)
+    suffix = "" if args.set == "tokyo" else f"-{args.set}"
+    if args.set == "natural":
+        prompts = None
+    elif args.set == "tokyo":
+        prompts = [(ids, 0) for ids in encode_prompts(tpl)]
+    else:
+        tokyo = eng.comm.broadcast_obj(json.loads((out / "seqs.json").read_text()) if eng.rank == 0 else None)
+        prompts = encode_switch(tpl, tokyo)
 
     if args.mode == "gen":
         seqs = []
-        for ids in prompts:
+        for ids, cut in prompts:
             eng.reset()
             ans = eng.generate(ids, args.tokens, depth=0)
-            seqs.append({"prompt": ids, "answer": ans})
+            seqs.append({"prompt": ids, "answer": ans, "cut": cut})
             if eng.rank == 0:
                 print("[gen]", repr(tpl.decode(ans)[:300]), flush=True)
         if eng.rank == 0:
-            (out / "seqs.json").write_text(json.dumps(seqs))
+            (out / f"seqs{suffix}.json").write_text(json.dumps(seqs))
         return
 
     # The files live on rank 0's host; rank 1 runs the same forwards from the broadcast copy.
-    seqs = eng.comm.broadcast_obj(json.loads((out / "seqs.json").read_text()) if eng.rank == 0 else None)
+    if args.set == "natural":
+        seqs = encode_natural(tpl, args.tokens)
+    else:
+        seqs = eng.comm.broadcast_obj(json.loads((out / f"seqs{suffix}.json").read_text()) if eng.rank == 0 else None)
     if args.mode == "exact":
         res = []
         for sq in seqs:
@@ -83,11 +128,14 @@ def main():
             res.append({"lp": lp.gather(1, tgt[:, None])[:, 0].tolist(), "top1": top.indices[:, 0].tolist(),
                         "top_ids": top.indices.tolist(), "top_lp": top.values.tolist()})
         if eng.rank == 0:
-            (out / "exact.json").write_text(json.dumps(res))
+            (out / f"exact{suffix}{'-' + args.ref if args.ref else ''}.json").write_text(json.dumps(res))
             print("[exact] mean NLL", sum(-x for r in res for x in r["lp"]) / sum(len(r["lp"]) for r in res))
         return
 
-    ex = eng.comm.broadcast_obj(json.loads((out / "exact.json").read_text()) if eng.rank == 0 else None)
+    ref = out / f"exact{suffix}{'-' + args.ref if args.ref else ''}.json"
+    ex = eng.comm.broadcast_obj(json.loads(ref.read_text()) if eng.rank == 0 and ref.exists() else None)
+    if ex is None:                       # NLL only (--set natural without an exact reference)
+        ex = [None] * len(seqs)
     if eng.demand is None:
         raise SystemExit("eval needs MUSE_ADAPT=1 and MUSE_MISS=substitute")
     ms = {"picks": 0, "missed": 0, "mass": 0.0, "mass_missed": 0.0}
@@ -96,19 +144,25 @@ def main():
     for sq, er in zip(seqs, ex):
         p, a = sq["prompt"], sq["answer"]
         eng.reset()
-        z = eng.prefill(list(p))[-1]
+        if sq.get("cut"):
+            eng.prefill(list(p[:sq["cut"]]))                 # the earlier turn, as it was served
+            eng.adapt(eng.adapt_prefill_swaps)
+        z = eng.prefill(list(p))[-1]                          # reuses p[:cut] when there is one
         eng.adapt(eng.adapt_prefill_swaps)
         steps, next_adapt = 0, eng.adapt_every
         zs, fed = [z], 0
         for i, tok in enumerate(a):
             z = zs[i - fed]
             lp = torch.log_softmax(z.float(), -1)
-            ids = torch.tensor(er["top_ids"][i], device=lp.device)
-            q = torch.log_softmax(lp[ids], -1)                                  # this, on exact's top-20
-            pe = torch.log_softmax(torch.tensor(er["top_lp"][i], device=lp.device), -1)
-            rows.append({"nll": -float(lp[tok]), "nll_exact": -er["lp"][i],
-                         "agree": int(lp.argmax()) == er["top1"][i],
-                         "kl": float((pe.exp() * (pe - q)).sum())})
+            if er is None:
+                rows.append({"nll": -float(lp[tok]), "nll_exact": 0.0, "agree": False, "kl": 0.0})
+            else:
+                ids = torch.tensor(er["top_ids"][i], device=lp.device)
+                q = torch.log_softmax(lp[ids], -1)                              # this, on exact's top-20
+                pe = torch.log_softmax(torch.tensor(er["top_lp"][i], device=lp.device), -1)
+                rows.append({"nll": -float(lp[tok]), "nll_exact": -er["lp"][i],
+                             "agree": int(lp.argmax()) == er["top1"][i],
+                             "kl": float((pe.exp() * (pe - q)).sum())})
             if i + 1 == len(a):
                 break
             if i + 1 < fed + len(zs):

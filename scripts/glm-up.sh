@@ -41,6 +41,7 @@ flags=(-d --network host --gpus all --device /dev/infiniband --cap-add IPC_LOCK 
        -v "$ROOT/results:/app/results" -v "$ROOT/.triton-cache:/app/.triton"
        -v "$MODEL_DIR:/models:ro"
        ${MUSE_DRAFTER_DIR:+-v "$MUSE_DRAFTER_DIR:/drafter:ro" -e MUSE_DRAFTER=/drafter}
+       ${MUSE_EXL3_DIR:+-v "$MUSE_EXL3_DIR:/packs:ro"}
        -e TRITON_CACHE_DIR=/app/.triton -e MUSE_MODEL=/models -e PYTHONUNBUFFERED=1
        -e WORLD_SIZE=2 -e MASTER_ADDR="$MASTER_ADDR" -e MASTER_PORT="$MASTER_PORT"
        -e NCCL_SOCKET_IFNAME="$IFACE" -e GLOO_SOCKET_IFNAME="$IFACE" -e NCCL_IB_DISABLE=0
