@@ -17,8 +17,10 @@ on this box, docs/gotchas.md).
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from engine.muse.weights import Checkpoint, ExpertMX, dequant_mxfp4, quantize_mxfp4  # noqa: F401
@@ -32,6 +34,56 @@ class GlmCheckpoint(Checkpoint):
     def __init__(self, model_dir: str | Path):
         super().__init__(model_dir, detect=False)
         self.format = "glm-quark"
+        # MUSE_CK_DIRECT=1: get_rows_many (the MXFP4 expert reads: hot reads, swaps, placement)
+        # with O_DIRECT into pooled aligned buffers, every range of a call in parallel. A rank-half
+        # expert is six ranges (weight + scale of gate, up, down), split by the other rank's rows.
+        self.direct = os.environ.get("MUSE_CK_DIRECT", "1") == "1"
+        self._dfds, self._dpool = {}, None
+
+    def get_rows_many(self, specs, urgent: bool = False) -> list[torch.Tensor]:
+        if not self.direct:
+            return super().get_rows_many(specs, urgent)
+        from engine.muse.weights import _OPEN_LOCK, _chunk_pool
+        from .direct_io import ALIGN, BufPool, align_up, pread_direct
+        spans, total = [], 0
+        for name, start, end in specs:
+            path, off, dtype, shape = self._meta(name)
+            shape = [end - start] + list(shape[1:])
+            row = int(np.prod(shape[1:])) if len(shape) > 1 else 1
+            item = torch.empty((), dtype=dtype).element_size()
+            off += start * row * item
+            n = (end - start) * row * item
+            a0 = off - off % ALIGN
+            spans.append((name, path, off, n, a0, align_up(off + n) - a0, dtype, shape, total))
+            total += align_up(off + n) - a0
+        if self._dpool is None:
+            with _OPEN_LOCK:
+                if self._dpool is None:
+                    self._dpool = BufPool(align_up(max(total, 1) + (1 << 20)), int(os.environ.get("MUSE_CK_BUFS", "8")))
+        lease = self._dpool.lease(total)
+        mv = memoryview(lease.mm)
+        jobs = []
+        for name, path, off, n, a0, length, dtype, shape, b in spans:
+            fd = self._dfds.get(path)
+            if fd is None:
+                with _OPEN_LOCK:
+                    fd = self._dfds.get(path)
+                    if fd is None:
+                        fd = self._dfds[path] = os.open(path, os.O_RDONLY | os.O_DIRECT)
+            jobs.append((name, fd, mv[b:b + length], a0, off + n - a0))
+        try:
+            got = list(_chunk_pool(urgent).map(lambda j: pread_direct(j[1], j[2], j[3], j[4]), jobs))
+        finally:
+            for j in jobs:
+                j[2].release()
+            mv.release()
+        outs = []
+        for (name, path, off, n, a0, length, dtype, shape, b), g, j in zip(spans, got, jobs):
+            if g < j[4]:
+                raise IOError(f"short read of {name}: {g} of {j[4]}")
+            t = torch.from_numpy(np.frombuffer(lease, dtype=np.uint8, count=n, offset=b + off - a0))
+            outs.append(t.view(dtype).view(shape))
+        return outs
 
     def fp8(self, name: str, rows: tuple[int, int] | None = None) -> FP8Block:
         """An FP8 block-scaled weight (optionally a 128-aligned row range)."""

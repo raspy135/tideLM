@@ -3035,3 +3035,20 @@ tools/glm_prefill_prof.py, 12K-token prompt, EXL3 serving config (repeat runs va
 
 Quality, long set, 3-row steps: 0.8863 with all of the above against 0.8815 (attention kernel only),
 paired +0.0048 +- 0.0065. MXFP4 (8,344 slots, BF16 KV, dynamic depth 7 / 0.9): glm_probe 9.8 tok/s.
+
+## MoE output gathers and MXFP4's expert reads (2026-10-17)
+
+- mlp() gathered every pick's fp32 output rows across the ranks and weighted and summed them after
+  the gather. The gather only concatenates (each column belongs to one rank), so the sum over
+  picks, the routed part and the BF16 cast can run first, per element the same arithmetic: the same
+  text, by hash, on EXL3 (6K-prompt decode) and MXFP4 (glm_probe, MUSE_GATHER_MERGE 0 vs 1). MXFP4
+  had gathered [9 picks, rows, 3,072] fp32 -- 332 KB at 3 rows, past the RoCE gather's 256 KB, so
+  NCCL on every MoE layer: 9.90 -> 10.08 tok/s. EXL3 12K prefill: gathers 2.88 -> 1.55 s of GPU
+  time, the total inside the run-to-run spread.
+- GlmCheckpoint.get_rows_many (MXFP4 hot reads, swaps, placement) reads with O_DIRECT
+  (MUSE_CK_DIRECT=1): a rank-half expert is six ranges (weight + scale of gate, up, down) split by
+  the other rank's rows, read in parallel into one pooled aligned buffer (engine/glm/direct_io.py,
+  shared with Exl3Pack). Cold expert 4.78 -> 3.09 ms through the reader (the bare reads 1.7-2.1 ms;
+  the rest is per-call Python). glm_probe, MXFP4 8,344 slots, dynamic depth 7 / 0.9: hot-read time
+  16.5 -> 9.4 s, 10.05 -> 11.70 tok/s, identical reads and acceptance. Bytes checked against
+  buffered reads on 33 experts of both ranks.

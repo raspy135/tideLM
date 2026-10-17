@@ -11,10 +11,8 @@ hidden slices after) go through GlmTP's Comm like the MXFP4 path's.
 
 from __future__ import annotations
 
-import mmap
 import os
 import sys
-import threading
 
 import numpy as np
 import torch
@@ -25,51 +23,10 @@ if _TOOLS not in sys.path:
 
 import exl3_ref as R  # noqa: E402
 
+from .direct_io import ALIGN, BufPool, align_up, pread_direct  # noqa: E402
+
 INF = float("inf")
 PIECE = 256 * 1024
-ALIGN = 4096
-
-
-class _Lease:
-    """A pooled page-aligned buffer lent to one record's numpy/torch views. It goes back to the pool
-    when the last view dies (the buffer protocol keeps it referenced until then), so a buffer is
-    never refilled under a live view, however long a caller holds the record."""
-
-    def __init__(self, mm, pool):
-        self.mm, self.pool = mm, pool
-
-    def __buffer__(self, flags):
-        return memoryview(self.mm)
-
-    def __release_buffer__(self, view):
-        view.release()
-
-    def __del__(self):
-        try:
-            self.pool.give(self.mm)
-        except Exception:               # interpreter shutdown
-            pass
-
-
-class _BufPool:
-    """Page-aligned buffers for O_DIRECT. A fresh 7 MB mmap costs ~3.7 ms of page faults per read
-    -- more than the read -- so up to `keep` idle ones are kept (faulted in) for reuse."""
-
-    def __init__(self, size, keep):
-        self.size, self.keep, self.free, self.lock = size, keep, [], threading.Lock()
-
-    def take(self):
-        with self.lock:
-            if self.free:
-                return self.free.pop()
-        return mmap.mmap(-1, self.size)
-
-    def give(self, mm):
-        with self.lock:
-            if len(self.free) < self.keep:
-                self.free.append(mm)
-                return
-        mm.close()
 
 
 class Exl3Pack:
@@ -97,8 +54,8 @@ class Exl3Pack:
             if self.data0 % ALIGN or any(m["off"] % ALIGN for m in self.records.values()):
                 raise ValueError(f"{path}: records not {ALIGN}-aligned for O_DIRECT")
             self.dfd = os.open(path, os.O_RDONLY | os.O_DIRECT)
-            size = -(-max(m["nbytes"] for m in self.records.values()) // ALIGN) * ALIGN
-            self.pool = _BufPool(size, int(os.environ.get("MUSE_EXL3_BUFS", "8")))
+            size = align_up(max(m["nbytes"] for m in self.records.values()))
+            self.pool = BufPool(size, int(os.environ.get("MUSE_EXL3_BUFS", "8")))
 
     def header_sha(self) -> str:
         return self.reader.header_sha256()
@@ -131,16 +88,14 @@ class Exl3Pack:
         bits = float(meta["bits"])
         n, base = meta["nbytes"], self.data0 + meta["off"]
         if self.dfd is not None:
-            buf = _Lease(self.pool.take(), self.pool)
-            mv, got, need = memoryview(buf.mm), 0, -(-n // ALIGN) * ALIGN
-            try:
-                while got < n:                  # whole aligned length; short only at the file's end
-                    r = os.preadv(self.dfd, [mv[got:need]], base + got)
-                    if r <= 0:
-                        raise IOError(f"{self.path}: short read {got} of {n} for {(L, e)}")
-                    got += r
+            buf = self.pool.lease(n)
+            mv = memoryview(buf.mm)
+            try:                                # whole aligned length; short only at the file's end
+                got = pread_direct(self.dfd, mv[:align_up(n)], base, n)
             finally:
                 mv.release()
+            if got < n:
+                raise IOError(f"{self.path}: short read {got} of {n} for {(L, e)}")
             return self._record(buf, bits), bits
         buf = bytearray(n)
         mv = memoryview(buf)

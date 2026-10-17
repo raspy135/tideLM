@@ -166,8 +166,8 @@ class GlmTP:
         # MUSE_ATTN_KERNEL=1: the sparse attention in one Triton kernel (engine/glm/sparse_attn.py)
         # instead of gathering each 32-row block's selected latents into BF16 copies.
         self.attn_kernel = env("MUSE_ATTN_KERNEL", "1") == "1"
-        # MUSE_GATHER_MERGE=1: decode MoE layers gather the routed and the shared expert's
-        # intermediate in one all-gather and their summed outputs in another (mlp()).
+        # MUSE_GATHER_MERGE=1: MoE layers gather the routed and the fixed experts' intermediates
+        # in one all-gather and their weighted, summed outputs (BF16) in another (mlp()).
         self.gather_merge = env("MUSE_GATHER_MERGE", "1") == "1"
         self.chunk = int(chunk or env("MUSE_CHUNK", "1024"))
         self.miss = miss or env("MUSE_MISS", "substitute")
@@ -361,7 +361,7 @@ class GlmTP:
         digest = hashlib.sha256(b"".join((src / f).read_bytes() for f in
                                          ("tp.py", "ref.py", "weights.py", "config.py", "fp8_block.py",
                                           "index_kernel.py", "exl3.py", "sparse_attn.py",
-                                          "norm_kernel.py"))).hexdigest()[:16]
+                                          "norm_kernel.py", "direct_io.py"))).hexdigest()[:16]
         mine = {"version": VERSION, "code": digest, "miss": self.miss, "native": self.native,
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
@@ -1107,6 +1107,10 @@ class GlmTP:
         return out
 
     def _experts_triton(self, x, slots):
+        h, rt = self._triton_up(x, slots)
+        return self._triton_down(self.comm.cat_last(h), rt)
+
+    def _triton_up(self, x, slots):
         import fp4_moe as K4
         A, cfg = self.arena, self.cfg
         T, k = slots.shape
@@ -1116,14 +1120,19 @@ class GlmTP:
         bs, bp, nb = K4.build_routing(inv.to(torch.int32).view_as(slots), int(uniq.numel()), BM)
         bs = torch.where(bs >= 0, uniq.to(torch.int32)[bs.clamp_min(0)], bs)
         bn1, nw1, ns1 = K4._UP_CFG[BM]
-        bn2, nw2, ns2 = K4._DOWN_CFG[BM]
         h = torch.empty((P_, A.Il), dtype=torch.bfloat16, device=x.device)
         ones = torch.ones(P_, dtype=torch.float32, device=x.device)
         K4._moe_up_kernel[(nb, A.Il // bn1)](x, A.w1, A.s1, A.w3, A.s3, h, ones, bs, bp, x.stride(0), h.stride(0),
                                              float("inf"), TOPK=k, N=A.Il, K=cfg.hidden, BM=BM, BN=bn1,
                                              SCALED=False, NULL_SLOT=-1, num_warps=nw1, num_stages=ns1)
-        full = self.comm.cat_last(h)
-        parts = torch.empty((P_, A.Hl), dtype=torch.float32, device=x.device)
+        return h, (bs, bp, nb, T, k, BM)
+
+    def _triton_down(self, full, rt):
+        import fp4_moe as K4
+        A, cfg = self.arena, self.cfg
+        bs, bp, nb, T, k, BM = rt
+        bn2, nw2, ns2 = K4._DOWN_CFG[BM]
+        parts = torch.empty((T * k, A.Hl), dtype=torch.float32, device=full.device)
         K4._moe_down_kernel[(nb, A.Hl // bn2)](full, A.w2, A.s2, parts, bs, bp, full.stride(0), parts.stride(0),
                                                TOPK=k, N=A.Hl, K=cfg.moe_inter, BM=BM, BN=bn2, NTOK=T,
                                                SCALED=False, NULL_SLOT=-1, PARTIAL=False, PARTS_WORLD=1,
@@ -1321,26 +1330,35 @@ class GlmTP:
         slots, w = self._route(L, x)
         x = x.contiguous()
         y = out = None
-        if self.x3 is not None and not self.dense(L) and L != self.mtp_L:
+        x3 = self.x3 is not None and not self.dense(L) and L != self.mtp_L
+        if x3:
             from .exl3 import routed, routed_down, routed_up
             k = self.cfg.topk
             rs = slots[:, :k] - self.x3_off
             bad = rs < 0                      # a slotless pick: zero weight on any loaded slot
             wr = torch.where(bad, torch.zeros_like(w[:, :k]), w[:, :k])
             slots, w = slots[:, k:].contiguous(), w[:, k:]
-            if self.native and slots.numel() <= 512 and self.gather_merge:
-                # One all-gather each way for the routed and the fixed (shared) experts, which
-                # took two each: the intermediates go together, and the shared expert's weighted
-                # rows (one pick, weight 1) are summed on each rank before the output gather --
-                # per element the same arithmetic as summing after it.
+        if self.gather_merge:
+            # One all-gather each way. The routed EXL3 and the fixed experts' intermediates go
+            # together; every pick's output rows are weighted and summed on the rank that owns
+            # their columns and gathered once as BF16 -- the gather only concatenates, so this is
+            # per element the old arithmetic (the sum over picks, + the routed part, the BF16
+            # cast), at a fraction of the bytes: MXFP4's 9 picks went over as fp32 [9, T, H/2]
+            # (332 KB at 3 rows, past the RoCE gather's 256 KB, so NCCL every MoE layer).
+            native = self.native and slots.numel() <= 512
+            h, rt = (self._native_up if native else self._triton_up)(x, slots)
+            local = None
+            if x3:
                 xd, ctx = routed_up(x, rs.clamp_min(0), wr, self.x3)
-                h, rt = self._native_up(x, slots)
                 xd_full, h_full = self._gather_pair(xd, h)
                 local = routed_down(xd_full.contiguous(), ctx, self.x3)
-                parts = self._native_down(h_full, rt)
-                out = self.comm.cat_last((parts * w.t()[:, :, None]).sum(0) + local)
             else:
-                y = routed(x, rs.clamp_min(0), wr, self.x3, self.comm)
+                h_full = self.comm.cat_last(h)
+            parts = (self._native_down if native else self._triton_down)(h_full, rt)
+            z = (parts * w.t()[:, :, None]).sum(0)
+            out = self.comm.cat_last((z if local is None else z + local).to(torch.bfloat16))
+        elif x3:
+            y = routed(x, rs.clamp_min(0), wr, self.x3, self.comm)
         if out is None:
             T, k = slots.shape
             if self.native and T * k <= 512:
@@ -1354,7 +1372,7 @@ class GlmTP:
         if pf:
             self._pf_release()
         if out is not None:
-            return out.to(torch.bfloat16)
+            return out
         z = (self.comm.cat_last(parts) * w.t()[:, :, None]).sum(0)
         return (z if y is None else z + y).to(torch.bfloat16)
 
