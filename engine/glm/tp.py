@@ -166,6 +166,7 @@ class GlmTP:
         # MUSE_ATTN_KERNEL=1: the sparse attention in one Triton kernel (engine/glm/sparse_attn.py)
         # instead of gathering each 32-row block's selected latents into BF16 copies.
         self.attn_kernel = env("MUSE_ATTN_KERNEL", "1") == "1"
+        self.exl3_attn = env("MUSE_EXL3_ATTN", "0") == "1"
         # MUSE_GATHER_MERGE=1: MoE layers gather the routed and the fixed experts' intermediates
         # in one all-gather and their weighted, summed outputs (BF16) in another (mlp()).
         self.gather_merge = env("MUSE_GATHER_MERGE", "1") == "1"
@@ -371,12 +372,12 @@ class GlmTP:
         digest = hashlib.sha256(b"".join((src / f).read_bytes() for f in
                                          ("tp.py", "ref.py", "weights.py", "config.py", "fp8_block.py",
                                           "index_kernel.py", "exl3.py", "sparse_attn.py",
-                                          "norm_kernel.py", "direct_io.py", "mxfp4_dense.py"))).hexdigest()[:16]
+                                          "norm_kernel.py", "direct_io.py", "mxfp4_dense.py", "exl3_attn.py"))).hexdigest()[:16]
         mine = {"version": VERSION, "code": digest, "miss": self.miss, "native": self.native,
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"), "db": env("MUSE_STATS_DB", ""),
-                "xfmt": self.xfmt, "kv": env("MUSE_KV", "bf16"), "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "fused_norm": FUSED_NORM, "h_ring": self.h_ring_n, "fixed_dense": self.fixed_dense, "draft_head": env("MUSE_DRAFT_HEAD", "same"), "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
+                "xfmt": self.xfmt, "kv": env("MUSE_KV", "bf16"), "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "fused_norm": FUSED_NORM, "h_ring": self.h_ring_n, "fixed_dense": self.fixed_dense, "exl3_attn": self.exl3_attn, "draft_head": env("MUSE_DRAFT_HEAD", "same"), "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
                 "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_PF_KEEP", "MUSE_PF_KEEP_MARGIN", "MUSE_HOT", "MUSE_HOT_MIN",
                                             "MUSE_HOT_TARGET", "MUSE_HOT_KEEP", "MUSE_HOT_MAX", "MUSE_HOT_KEEP_AUDIT", "MUSE_HOT_PACE",
                                             "MUSE_HOT_PACE_LEAD", "MUSE_SUB_WEIGHT", "MUSE_MTP_FULL", "MUSE_MISS_LOG",
@@ -411,6 +412,13 @@ class GlmTP:
         self.head = Lin(head, d)
         self.final_norm = ck.get(P + "norm.weight").to(d)
         self.L = []
+        # MUSE_EXL3_ATTN=1: the decoder layers' q_a, q_b, kv_a, o_proj and indexer wq_b from the EXL3
+        # checkpoint's 5-bit matrices (engine/glm/exl3_attn.py), mounted at MUSE_EXL3_ATTN_SRC; the
+        # MTP layer keeps FP8. Splits follow the FP8 ones: q_b by heads (N), o_proj by heads (K).
+        x3a = None
+        if self.exl3_attn:
+            from .exl3_attn import Exl3Source
+            x3a = Exl3Source(env("MUSE_EXL3_ATTN_SRC", "/exl3src"))
         nbytes = self.embed.numel() * 2 + self.head.nbytes + (
             sum(t.numel() for t in self.draft_head) if self.draft_head is not None else 0)
         for L in range(self.nL):
@@ -418,19 +426,24 @@ class GlmTP:
             a = p + "self_attn."
             kvb = ck.fp8(a + "kv_b_proj.weight", (r * self.hl * hv, (r + 1) * self.hl * hv)).dequant(torch.bfloat16)
             kvb = kvb.view(self.hl, hv, cfg.kv_lora)
-            o = ck.fp8(a + "o_proj.weight")
+            x3l = x3a is not None and L < cfg.layers
+            xa = f"model.layers.{L}.self_attn."
+            o = None if x3l else ck.fp8(a + "o_proj.weight")
             lw = {
                 "ln_in": ck.get(p + "input_layernorm.weight").to(d),
                 "ln_post": ck.get(p + "post_attention_layernorm.weight").to(d),
-                "q_a": Lin(ck.fp8(a + "q_a_proj.weight"), d),
+                "q_a": x3a.lin(xa + "q_a_proj", d, 8) if x3l else Lin(ck.fp8(a + "q_a_proj.weight"), d),
                 "q_norm": ck.get(a + "q_a_layernorm.weight").to(d),
-                "q_b": Lin(ck.fp8(a + "q_b_proj.weight", (r * self.hl * hq, (r + 1) * self.hl * hq)), d),
-                "kv_a": Lin(ck.fp8(a + "kv_a_proj_with_mqa.weight"), d),
+                "q_b": x3a.lin(xa + "q_b_proj", d, 1, r, W, "n") if x3l else
+                Lin(ck.fp8(a + "q_b_proj.weight", (r * self.hl * hq, (r + 1) * self.hl * hq)), d),
+                "kv_a": x3a.lin(xa + "kv_a_proj_with_mqa", d, 8, n_out=cfg.kv_lora + cfg.rope_dim) if x3l else
+                Lin(ck.fp8(a + "kv_a_proj_with_mqa.weight"), d),
                 "kv_norm": ck.get(a + "kv_a_layernorm.weight").to(d),
                 # Absorbed MLA: kv_b's key half [h, nope, c] and value half [h, v, c], BF16.
                 "w_uk": kvb[:, :cfg.nope].contiguous().to(d),
                 "w_uv": kvb[:, cfg.nope:].contiguous().to(d),
-                "o": Lin(o.cols(r * self.hl * cfg.v_dim, (r + 1) * self.hl * cfg.v_dim), d),
+                "o": x3a.lin(xa + "o_proj", d, 2, r, W, "k") if x3l else
+                Lin(o.cols(r * self.hl * cfg.v_dim, (r + 1) * self.hl * cfg.v_dim), d),
             }
             if L == self.mtp_L:
                 lw.update({"enorm": ck.get(p + "enorm.weight").to(d), "hnorm": ck.get(p + "hnorm.weight").to(d),
@@ -439,18 +452,21 @@ class GlmTP:
                            "eh": Lin(ck.get_rows(p + "eh_proj.weight", r * cfg.hidden // W, (r + 1) * cfg.hidden // W), d)})
             if self.full(L):
                 i = a + "indexer."
-                lw.update({"i_q": Lin(ck.fp8(i + "wq_b.weight"), d), "i_k": Lin(ck.fp8(i + "wk.weight"), d),
+                lw.update({"i_q": x3a.lin(xa + "indexer.wq_b", d, 1) if x3l else Lin(ck.fp8(i + "wq_b.weight"), d),
+                           "i_k": Lin(ck.fp8(i + "wk.weight"), d),
                            "i_kn_w": ck.get(i + "k_norm.weight").to(d).float(),
                            "i_kn_b": ck.get(i + "k_norm.bias").to(d).float(),
                            "i_w": ck.get(i + "weights_proj.weight").to(d).float()})
             if not self.dense(L):
                 lw["router"] = ck.get(p + "mlp.gate.weight").to(d).float()
                 lw["bias"] = ck.get(p + "mlp.gate.e_score_correction_bias").to(d).float()
-            nbytes += sum(v.nbytes for v in lw.values() if isinstance(v, Lin))
+            nbytes += sum(v.nbytes for v in lw.values() if hasattr(v, "nbytes") and not isinstance(v, torch.Tensor))
             nbytes += (lw["w_uk"].numel() + lw["w_uv"].numel()) * 2
             self.L.append(lw)
             del kvb, o
         self.dense_bytes = nbytes
+        if x3a is not None:
+            x3a.drop_cache()
         D = cfg.rope_dim
         inv = 1.0 / (cfg.rope_theta ** (torch.arange(0, D, 2, dtype=torch.float, device=d) / D))
         f = torch.arange(self.max_seq, device=d, dtype=torch.float)[:, None] * inv[None]

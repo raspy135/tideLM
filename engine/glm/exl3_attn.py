@@ -89,3 +89,86 @@ def rotate(x: torch.Tensor) -> torch.Tensor:
     """H/sqrt(128) over each 128-block of the last dim, fp32."""
     T, n = x.shape
     return (x.float().view(T * (n // 128), 128) @ _hadamard(str(x.device))).view(T, n)
+
+
+class Exl3Lin:
+    """One rank's EXL3 projection, Lin's interface: y = x @ W, W [K, N] from the trellis.
+
+    Decode (<= 16 rows): engine/exl3_dense.Exl3Matrix (rotate in, grouped split-K GEMV, combine +
+    rotate out). Prefill: the trellis unpacked to fp16 once a call, rotations on the activations,
+    cuBLAS with fp32 accumulation. `n_out` trims a padded N (kv_a: 576 of 640)."""
+
+    def __init__(self, trellis: torch.Tensor, suh: torch.Tensor, svh: torch.Tensor, split: int,
+                 n_out: int | None = None):
+        from engine.exl3_dense import Exl3Matrix
+        self.tr = trellis.contiguous()
+        self.bits = int(self.tr.shape[-1] // 16)
+        self.suh, self.svh = suh.half().contiguous(), svh.half().contiguous()
+        self.K, self.N = int(self.suh.numel()), int(self.svh.numel())
+        assert self.tr.shape[0] * 16 == self.K and self.tr.shape[1] * 16 == self.N, (self.tr.shape, self.K, self.N)
+        self.n_out = n_out or self.N
+        self.dec = Exl3Matrix([self.tr], self.suh, self.svh, [self.bits], split, _members(str(self.tr.device)))
+
+    @property
+    def nbytes(self) -> int:
+        return sum(t.numel() * t.element_size() for t in (self.tr, self.suh, self.svh))
+
+    def __call__(self, x: torch.Tensor, out_dtype=torch.bfloat16) -> torch.Tensor:
+        shape = x.shape
+        x2 = x.reshape(-1, self.K)
+        T = x2.shape[0]
+        if T <= 16:
+            y = self.dec(x2.to(torch.bfloat16), out_dtype=out_dtype)
+        else:
+            w = unpack(self.tr, self.bits)
+            xh = rotate(x2.float() * self.suh.float()).to(torch.float16)
+            y = rotate(torch.mm(xh, w, out_dtype=torch.float32)) * self.svh.float()
+            y = y.to(out_dtype)
+        if self.n_out != self.N:
+            y = y[:, :self.n_out]
+        return y.reshape(*shape[:-1], self.n_out)
+
+
+@functools.lru_cache(maxsize=2)
+def _members(device: str):
+    from engine.exl3_dense import _Members
+    return _Members(torch.device(device))
+
+
+class Exl3Source:
+    """The EXL3 checkpoint's attention tensors, sliced for one rank (MUSE_EXL3_SRC, mounted at
+    /exl3src). Splits are on 128 boundaries, so each rank's matrix is an exact slice."""
+
+    def __init__(self, path: str):
+        import json
+        self.dir = path
+        self.map = json.load(open(os.path.join(path, "model.safetensors.index.json")))["weight_map"]
+
+    def _get(self, name):
+        from safetensors import safe_open
+        with safe_open(os.path.join(self.dir, self.map[name]), "pt") as f:
+            return f.get_tensor(name)
+
+    def drop_cache(self):
+        """The safetensors reads went through the page cache, which on GB10 is the GPU's memory."""
+        for f in set(self.map.values()):
+            try:
+                fd = os.open(os.path.join(self.dir, f), os.O_RDONLY)
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                os.close(fd)
+            except OSError:
+                pass
+
+    def has(self, prefix) -> bool:
+        return prefix + ".trellis" in self.map
+
+    def lin(self, prefix: str, device, split: int, rank: int = 0, world: int = 1, cut: str | None = None,
+            n_out: int | None = None) -> Exl3Lin:
+        tr, suh, svh = self._get(prefix + ".trellis"), self._get(prefix + ".suh"), self._get(prefix + ".svh")
+        if cut == "n":          # output rows (heads): N tiles, svh
+            nt = tr.shape[1] // world
+            tr, svh = tr[:, rank * nt:(rank + 1) * nt], svh[rank * nt * 16:(rank + 1) * nt * 16]
+        elif cut == "k":        # input columns (heads): K tiles, suh; the output is a partial sum
+            kt = tr.shape[0] // world
+            tr, suh = tr[rank * kt:(rank + 1) * kt], suh[rank * kt * 16:(rank + 1) * kt * 16]
+        return Exl3Lin(tr.contiguous().to(device), suh.to(device), svh.to(device), split, n_out)

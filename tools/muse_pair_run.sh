@@ -46,6 +46,9 @@ fi
 if [[ -n "${MUSE_EXL3_DIR:-}" ]]; then         # EXL3 expert packs (tools/glm_pack_exl3.py), same path on both nodes
     flags+=(-v "$MUSE_EXL3_DIR:/packs:ro")
 fi
+if [[ -n "${MUSE_EXL3_SRC:-}" ]]; then         # the EXL3 checkpoint (MUSE_EXL3_ATTN=1), same path on both nodes
+    flags+=(-v "$MUSE_EXL3_SRC:/exl3src:ro")
+fi
 for kv in ${MUSE_ENV:-}; do
     [[ "$kv" =~ ^(MUSE|DSV41)_[A-Z0-9_]+=[^[:space:]]*$ ]] || { echo "MUSE_ENV: bad entry '$kv'" >&2; exit 1; }
     flags+=(-e "$kv")

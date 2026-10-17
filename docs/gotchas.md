@@ -3173,3 +3173,22 @@ MXFP4 draft head (MUSE_DRAFT_HEAD=mxfp4, a 4-bit copy of the head for the MTP dr
 at 221 GB/s): drafts 4.20 -> 3.27 ms, but its argmax disagreed with the main head's on 1.3% of
 drafts (6 of 460, eager MUSE_GRAPHS=0 run with --draft-agree): about the saving in lost acceptance,
 and 0.25 GB a rank. Off by default.
+
+## EXL3 5-bit attention, end to end: faster decode, slower prefill, KL up -- off (2026-10-17)
+
+MUSE_EXL3_ATTN=1 (engine/glm/exl3_attn.Exl3Lin; MUSE_EXL3_SRC mounts the EXL3 checkpoint at
+/exl3src) serves the decoder layers' q_a, q_b, kv_a, o_proj and indexer wq_b from the 5-bit
+matrices, sliced like the FP8 ones (checked: decode and prefill paths agree to 1e-5, cosine to the
+FP8 projections 0.9986-0.9989 on every matrix). Against FP8 attention, same night's code:
+
+| | FP8 | EXL3 |
+| --- | --- | --- |
+| decode round, 6K / short prompt | 175.6 / 167.5 ms | 166.4 / 166.1 ms |
+| decode attention layer (4 rows) | 0.76 ms | 0.69 ms |
+| 12K prefill | 27.8 s | 32.3 s (unpack + fp32 Hadamard rotations every chunk) |
+| natural set vs exact: KL / NLL | 0.0870 / 1.6464 | 0.0900 / 1.6497 (paired +0.0030 +- 0.0024 / +0.0034 +- 0.0061) |
+| MemAvailable after the run | ~8.5 GB | ~9.8 GB (+1.3, not the weights' 2.4: the prefill path's fp16 temporaries) |
+
+~5% off the decode round against 16% on prefill and a KL that leans the wrong way: off by
+default. To revisit: tensor-core rotations (H is +-1, exact in fp16), a faster unpack, and a
+draft-acceptance measurement across many prompts.
