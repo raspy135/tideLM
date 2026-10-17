@@ -10,6 +10,9 @@ loads their keys once (FP8 -> BF16 is exact; the row scale multiplies the dot af
 heads with one BF16 tensor-core dot per row, fp32 accumulation -- the same products as the fp32
 einsum, summed in another order. Blocks wholly past the last row's position only write -inf, so a
 6K context reads 6K keys whatever max_seq is.
+
+With the KV cache split across ranks by position (MUSE_KV_SPLIT), a rank's cache row s holds
+position s * stride + offset: the mask and the skip compare that position, not s.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ import triton.language as tl
 
 
 @triton.jit
-def _index_score_kernel(Q, W, K, KS, POS, OUT, T, S, inv_d,
+def _index_score_kernel(Q, W, K, KS, POS, OUT, T, S, inv_d, STRIDE, OFF,
                         H: tl.constexpr, D: tl.constexpr, BS: tl.constexpr, RB: tl.constexpr,
                         SCALED: tl.constexpr):
     pid_s = tl.program_id(0)
@@ -29,8 +32,9 @@ def _index_score_kernel(Q, W, K, KS, POS, OUT, T, S, inv_d,
     hh = tl.arange(0, H)
     dd = tl.arange(0, D)
     s_ok = s < S
+    gs = s * STRIDE + OFF                                      # the positions these rows hold
     pmax = tl.load(POS + tl.minimum(t0 + RB, T) - 1)          # rows' positions ascend
-    if pid_s * BS > pmax:
+    if pid_s * BS * STRIDE + OFF > pmax:
         for i in tl.static_range(RB):
             t = t0 + i
             tl.store(OUT + t * S + s, tl.full((BS,), float("-inf"), tl.float32), mask=s_ok & (t < T))
@@ -49,14 +53,15 @@ def _index_score_kernel(Q, W, K, KS, POS, OUT, T, S, inv_d,
             wt = tl.load(W + t * H + hh, mask=row & (hh < H), other=0.0)
             score = tl.sum(sc * wt[:, None], 0)
             p = tl.load(POS + t, mask=row, other=0)
-            score = tl.where(s <= p, score, float("-inf"))
+            score = tl.where(gs <= p, score, float("-inf"))
             tl.store(OUT + t * S + s, score, mask=s_ok & row)
 
 
 def index_scores(q: torch.Tensor, w: torch.Tensor, cache, positions: torch.Tensor, S: int,
-                 inv_d: float) -> torch.Tensor:
+                 inv_d: float, stride: int = 1, offset: int = 0) -> torch.Tensor:
     """q bf16 [T, H, D] (roped), w fp32 [T, H], cache a BF16 [>=S, D] tensor or an (fp8 [>=S, D],
-    fp32 [>=S, 1]) pair, positions int [T] ascending -> fp32 [T, S]. Graph-capturable."""
+    fp32 [>=S, 1]) pair whose row s holds position s * stride + offset, positions int [T]
+    ascending -> fp32 [T, S], -inf where the cached position is past the row's. Graph-capturable."""
     T, H, D = q.shape
     if isinstance(cache, torch.Tensor):
         K, KS, scaled = cache, cache, False
@@ -71,6 +76,6 @@ def index_scores(q: torch.Tensor, w: torch.Tensor, cache, positions: torch.Tenso
     RB = 1 if T == 1 else 4 if T <= 4 else 8
     BS = 64
     grid = (triton.cdiv(S, BS), triton.cdiv(T, RB))
-    _index_score_kernel[grid](q, w, K, KS, positions.contiguous(), out, T, S, inv_d,
+    _index_score_kernel[grid](q, w, K, KS, positions.contiguous(), out, T, S, inv_d, stride, offset,
                               H=H, D=D, BS=BS, RB=RB, SCALED=scaled, num_warps=4)
     return out

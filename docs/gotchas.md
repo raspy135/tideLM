@@ -3207,3 +3207,47 @@ skipped and the counters zeroed after, so residency and the stats DB are untouch
 temperature 1.0 / top-p 0.95 decodes at 14-14.6 tok/s warm (decode miss 5-7%), the English code
 prompt at 18-19 -- MTP acceptance, now in the per-request stats (accepted_per_round,
 drafted_per_round).
+
+## The KV cache split across the ranks by position: half the memory, decode at parity (2026-10-17)
+
+GLM's MLA latent is read by every head, so tensor parallelism over heads left both ranks holding
+the whole cache: 54.7 KB a position a rank in FP8 (latent 41.7, RoPE keys 10.1 in BF16, indexer keys
+2.9) -- 7.2 GB at 128K. MUSE_KV_SPLIT=1 (engine/glm/kv_split.py): rank r keeps the positions p with
+p % 2 == r, interleaved so both ranks hold and scan the same amount at any length; the MTP layer
+keeps its cache whole (1/79 of it, and its one-row draft steps are the latency-bound calls).
+Decode adds two all-gathers a layer: the queries (with, on the 22 indexer layers, each rank's
+local top-2048 scores -- the global top-k is a prefix of each list), then each rank's partials for
+the other rank's heads, merged like flash-decoding splits. Prefill gathers both ranks' rows for
+[0, S) once a layer and runs the unsplit path on them.
+
+EXL3 serving config (12,350 slots, 128K, FP8 KV): KV 7.2 -> 3.64 GB a rank; MemAvailable at ready
+8.3 -> 12.3 GB, after decode in the profiler 7.1-7.8 -> 10.3-11.1 GB.
+
+glm_decode_prof, dynamic depth 7 at 0.9, 200 warm-up tokens; tok/s, ms a round (drafted rows):
+
+| prompt | unsplit | split, first version | split, fused |
+| --- | --- | --- | --- |
+| 39 tokens | 20.34, 183.4 (2.91) | 17.18, 188.2 (2.58) | 18.36, 176.7 (2.44) |
+| 6K | 18.67, 173.7 (2.65) | 18.35, 192.4 (2.82) | 18.87, 174.8 (2.71) |
+| 51K | 17.85, 178.2 (2.50) | 17.11, 198.6 (2.83) | 17.87, 192.3 (2.87) |
+
+tok/s moves with acceptance (the split's rounding changes the greedy text, and the drafts with it);
+the cost is a segment's time at a given row count. Attention per layer at 51K, ms, unsplit / first
+/ fused: other layers 0.72-0.86 / 0.80-1.23 / 0.73-0.91, indexer layers 0.96-1.16 / 1.08-1.75 /
+1.00-1.26. The first version paid 0.08-0.14 ms a layer while both gathers fit the 256 KB RoCE slot
+and 0.4-0.6 ms at 6-8 verify rows, where they did not and went to NCCL (queries 37 KB a row, scores
+8 KB). Two fixes: a gather past the slot goes as several RoCE gathers (kv_split.gather_rows;
+raising the slot itself was a loss, 2026-10-14 above), and the ~40 small ops a layer that merged
+the splits, packed the partials and merged the other rank's became two Triton kernels
+(sparse_attn.split_partials / merge_received), with the gathered queries read where they landed.
+
+Prefill does not change: 12K 399-430 -> 410-429 tok/s, 51K TTFT 127.0 -> 123.2 s.
+
+Quality. Partials crossing in BF16 raised the attention's error against fp32 from 1.7e-3 to 2.1e-3
+(test_kv_split's case); in FP16 -- same bytes, and the outputs are averages of cache rows, so in
+range -- it is 1.68-1.74e-3, the unsplit kernel's. glm_quality --set long (paired, 900 positions):
+0.8912 unsplit, 0.8845 split; the eval resolves about +-0.013.
+
+MXFP4 at 128K with FP8 KV and the split (9,100 slots, 6K prompt): 13.64 tok/s, MemAvailable 7.46 GB,
+against its 32K BF16 config's 13.97 and 7.86 GB (both runs captured graphs while measuring): four
+times the context for 0.4 GB.

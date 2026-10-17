@@ -63,6 +63,26 @@ class IndexKernelTests(unittest.TestCase):
             self.check(300, 4096, 4096, fp8)
             self.check(64, 20000, 20000, fp8)
 
+    def test_split_rows(self):
+        # MUSE_KV_SPLIT: rank r's row s holds position 2 s + r; its scores are the unsplit ones there.
+        from engine.glm.kv_split import owner_rows
+        for fp8 in (True, False):
+            for T, n in ((1, 6000), (4, 6001), (300, 4096)):
+                g = torch.Generator(device="cuda").manual_seed(T + n)
+                S = 16384
+                keys = (torch.randn(n, D, generator=g, device="cuda") * 2).to(torch.bfloat16)
+                full = make_cache(S, 1, fp8, g)
+                kv_write(full, torch.arange(n, device="cuda"), keys)
+                q = torch.randn(T, H, D, generator=g, device="cuda").to(torch.bfloat16)
+                w = torch.randn(T, H, generator=g, device="cuda") * H ** -0.5
+                positions = torch.arange(n - T, n, device="cuda")
+                want = index_scores(q, w, full, positions, S, D ** -0.5)
+                for r in (0, 1):
+                    loc = make_cache(S // 2 + 1, 1, fp8, g)
+                    kv_write(loc, owner_rows(torch.arange(n, device="cuda"), r, 2, S // 2), keys)
+                    got = index_scores(q, w, loc, positions, S // 2, D ** -0.5, 2, r)
+                    self.assertTrue(torch.equal(got, want[:, r::2]), (fp8, T, n, r))
+
 
 if __name__ == "__main__":
     unittest.main()

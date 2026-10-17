@@ -86,6 +86,32 @@ class SparseAttnTests(unittest.TestCase):
         for bh, bn, w in ((32, 32, 8), (16, 64, 4), (8, 32, 4)):
             self.check(8, 8192, 8192, True, block_h=bh, block_n=bn, num_warps=w)
 
+    def test_count_and_partials(self):
+        # MUSE_KV_SPLIT: each half of the picks attended alone (partial=True, cnt limiting the
+        # rows' lists) and merged equals attending all of them.
+        from engine.glm.kv_split import merge
+        for fp8 in (True, False):
+            T = 4
+            g = torch.Generator(device="cuda").manual_seed(11)
+            q_lat, q_rope, C, R, sel, positions = make(T, 8192, fp8, g, 6000)
+            want = fp32_path(q_lat, q_rope, C, R, sel, positions)
+            cut = torch.tensor([700, 1024, 1500, 3], dtype=torch.int32, device="cuda")
+            j = torch.arange(K, device="cuda")[None]
+            first = torch.where(j < cut[:, None], sel, -1)
+            second = torch.where(j < cut[:, None], -1, sel)
+            second = second.gather(1, (second < 0).to(torch.int8).argsort(dim=1, stable=True))   # its picks first
+            o1, l1 = sparse_mla(q_lat, q_rope, C, R, first, positions, SCALE, cnt=cut, partial=True)
+            o2, l2 = sparse_mla(q_lat, q_rope, C, R, second, positions, SCALE,
+                                cnt=(K - cut).to(torch.int32), partial=True)
+            got = merge(o1, l1, o2, l2)
+            err = float((got - want).norm() / want.norm())
+            self.assertLess(err, 2e-3, (fp8, err))
+            # Nothing attended: lse -inf, and the merge takes the other side alone.
+            none = torch.zeros(T, dtype=torch.int32, device="cuda")
+            o0, l0 = sparse_mla(q_lat, q_rope, C, R, sel, positions, SCALE, cnt=none, partial=True)
+            self.assertTrue(torch.isneginf(l0).all())
+            self.assertTrue(torch.allclose(merge(o0, l0, o1, l1), o1))
+
 
 if __name__ == "__main__":
     unittest.main()

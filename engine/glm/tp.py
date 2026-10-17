@@ -166,6 +166,12 @@ class GlmTP:
         # MUSE_ATTN_KERNEL=1: the sparse attention in one Triton kernel (engine/glm/sparse_attn.py)
         # instead of gathering each 32-row block's selected latents into BF16 copies.
         self.attn_kernel = env("MUSE_ATTN_KERNEL", "1") == "1"
+        # MUSE_KV_SPLIT=1: each rank caches every other position (engine/glm/kv_split.py) instead
+        # of both holding all of them; decode exchanges queries and partials, prefill the rows.
+        self.kv_split = env("MUSE_KV_SPLIT", "0") == "1" and self.world == 2
+        if self.kv_split and not (self.index_kernel and self.attn_kernel):
+            raise ValueError("MUSE_KV_SPLIT=1 needs MUSE_INDEX_KERNEL=1 and MUSE_ATTN_KERNEL=1")
+        self.s_loc = -(-self.max_seq // self.world) if self.kv_split else self.max_seq
         self.exl3_attn = env("MUSE_EXL3_ATTN", "0") == "1"
         # MUSE_GATHER_MERGE=1: MoE layers gather the routed and the fixed experts' intermediates
         # in one all-gather and their weighted, summed outputs (BF16) in another (mlp()).
@@ -373,12 +379,13 @@ class GlmTP:
         digest = hashlib.sha256(b"".join((src / f).read_bytes() for f in
                                          ("tp.py", "ref.py", "weights.py", "config.py", "fp8_block.py",
                                           "index_kernel.py", "exl3.py", "sparse_attn.py",
-                                          "norm_kernel.py", "direct_io.py", "mxfp4_dense.py", "exl3_attn.py"))).hexdigest()[:16]
+                                          "norm_kernel.py", "direct_io.py", "mxfp4_dense.py", "exl3_attn.py",
+                                          "kv_split.py"))).hexdigest()[:16]
         mine = {"version": VERSION, "code": digest, "miss": self.miss, "native": self.native,
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"), "db": env("MUSE_STATS_DB", ""),
-                "xfmt": self.xfmt, "kv": env("MUSE_KV", "bf16"), "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "fused_norm": FUSED_NORM, "h_ring": self.h_ring_n, "fixed_dense": self.fixed_dense, "exl3_attn": self.exl3_attn, "draft_head": env("MUSE_DRAFT_HEAD", "same"), "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
+                "xfmt": self.xfmt, "kv": env("MUSE_KV", "bf16"), "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "fused_norm": FUSED_NORM, "h_ring": self.h_ring_n, "fixed_dense": self.fixed_dense, "exl3_attn": self.exl3_attn, "kv_split": self.kv_split, "draft_head": env("MUSE_DRAFT_HEAD", "same"), "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
                 "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_PF_KEEP", "MUSE_PF_KEEP_MARGIN", "MUSE_HOT", "MUSE_HOT_MIN",
                                             "MUSE_HOT_TARGET", "MUSE_HOT_KEEP", "MUSE_HOT_MAX", "MUSE_HOT_KEEP_AUDIT", "MUSE_HOT_PACE",
                                             "MUSE_HOT_PACE_LEAD", "MUSE_SUB_WEIGHT", "MUSE_MTP_FULL", "MUSE_MISS_LOG",
@@ -475,19 +482,30 @@ class GlmTP:
         self.cos, self.sin = emb.cos().to(torch.bfloat16), emb.sin().to(torch.bfloat16)
         self.ck.drop_cache()
 
+    def split(self, L):
+        """Whether layer L's KV cache is split across the ranks (MUSE_KV_SPLIT; never the MTP layer)."""
+        return self.kv_split and L != self.mtp_L
+
     def _alloc_cache(self):
         cfg, kw = self.cfg, dict(dtype=torch.bfloat16, device=self.dev)
-        S, f8 = self.max_seq, dict(dtype=torch.float8_e4m3fn, device=self.dev)
+        f8 = dict(dtype=torch.float8_e4m3fn, device=self.dev)
         f32 = dict(dtype=torch.float32, device=self.dev)
+        # A split layer holds this rank's s_loc positions and a spare last row (kv_split.owner_rows).
+        rows = [self.s_loc + 1 if self.split(L) else self.max_seq for L in range(self.nL)]
         if self.kv8:
-            self.c_cache = [(torch.zeros((S, cfg.kv_lora), **f8), torch.zeros((S, cfg.kv_lora // KV_BLOCK), **f32))
-                            for _ in range(self.nL)]
-            self.i_cache = {L: (torch.zeros((S, cfg.index_dim), **f8), torch.zeros((S, cfg.index_dim // KV_BLOCK), **f32))
+            self.c_cache = [(torch.zeros((rows[L], cfg.kv_lora), **f8),
+                             torch.zeros((rows[L], cfg.kv_lora // KV_BLOCK), **f32)) for L in range(self.nL)]
+            self.i_cache = {L: (torch.zeros((rows[L], cfg.index_dim), **f8),
+                                torch.zeros((rows[L], cfg.index_dim // KV_BLOCK), **f32))
                             for L in range(self.nL) if self.full(L)}
         else:
-            self.c_cache = [torch.zeros((S, cfg.kv_lora), **kw) for _ in range(self.nL)]
-            self.i_cache = {L: torch.zeros((S, cfg.index_dim), **kw) for L in range(self.nL) if self.full(L)}
-        self.r_cache = [torch.zeros((S, cfg.rope_dim), **kw) for _ in range(self.nL)]
+            self.c_cache = [torch.zeros((rows[L], cfg.kv_lora), **kw) for L in range(self.nL)]
+            self.i_cache = {L: torch.zeros((rows[L], cfg.index_dim), **kw) for L in range(self.nL) if self.full(L)}
+        self.r_cache = [torch.zeros((rows[L], cfg.rope_dim), **kw) for L in range(self.nL)]
+        nb = lambda c: sum(t.numel() * t.element_size() for t in (c if isinstance(c, tuple) else (c,)))
+        kv = sum(nb(c) for c in self.c_cache) + sum(nb(c) for c in self.i_cache.values()) + sum(map(nb, self.r_cache))
+        self.log(f"[glm] KV cache {kv / 1e9:.2f} GB a rank for {self.max_seq} positions"
+                 + (" (split across the ranks by position)" if self.kv_split else ""))
         # Post-norm target hidden of every position: the MTP layer's input when a follow-up
         # turn reuses the cache and its last reused position gets a new next token. It covers
         # max_seq (~12 KB a position, 400 MB at 32K): a ring of one chunk refused reuse whenever
@@ -905,8 +923,9 @@ class GlmTP:
         st["planned"] += len(plan)
 
     # ------------------------------------------------------------------ attention
-    def _indexer(self, L, x, q_resid, positions, cos, sin, S):
-        """Top-k cached positions for each row (both ranks compute the same)."""
+    def _index_qw(self, L, x, q_resid, cos, sin, rows):
+        """The indexer's roped queries bf16 [T, h, D] and head weights fp32 [T, h]; writes this
+        step's keys at cache rows `rows`."""
         cfg, lw = self.cfg, self.L[L]
         T = x.shape[0]
         q = lw["i_q"](q_resid).view(T, cfg.index_heads, cfg.index_dim)
@@ -915,17 +934,26 @@ class GlmTP:
         rd = cfg.rope_dim
         q = torch.cat([rope_interleave(q[..., :rd], cos, sin), q[..., rd:]], -1)
         k = torch.cat([rope_interleave(k[..., :rd], cos, sin), k[..., rd:]], -1)[:, 0]
-        kv_write(self.i_cache[L], positions, k)
-        w = F.linear(x.float(), lw["i_w"]) * cfg.index_heads ** -0.5                 # [T, h]
+        kv_write(self.i_cache[L], rows, k)
+        return q, F.linear(x.float(), lw["i_w"]) * cfg.index_heads ** -0.5
+
+    def _indexer(self, L, x, q_resid, positions, cos, sin, S, rows=None, cache=None, qw=None):
+        """Top-k cached positions for each row (both ranks compute the same). `cache`: the keys
+        to score instead of this rank's (a split cache gathered for prefill); `qw`: _index_qw's
+        result when the keys were written already."""
+        cfg = self.cfg
+        T = x.shape[0]
+        q, w = qw if qw is not None else self._index_qw(L, x, q_resid, cos, sin, positions if rows is None else rows)
+        cache = self.i_cache[L] if cache is None else cache
         if self.index_kernel:
             # engine/glm/index_kernel.py: same scores without the fp32 [T, h, S] intermediates.
             # Rows in chunks to bound the [rows, S] scores (prefill at long contexts).
             from .index_kernel import index_scores
             step = max(1, (32 << 20) // max(S, 1))
-            return torch.cat([index_scores(q[t0:t0 + step], w[t0:t0 + step], self.i_cache[L],
+            return torch.cat([index_scores(q[t0:t0 + step], w[t0:t0 + step], cache,
                                            positions[t0:t0 + step], S, cfg.index_dim ** -0.5)
                               .topk(min(cfg.index_topk, S), -1).indices for t0 in range(0, T, step)])
-        K = kv_span(self.i_cache[L], S, torch.float32)
+        K = kv_span(cache, S, torch.float32)
         kpos = torch.arange(S, device=x.device)
         out = []
         step = max(1, 4096 * 1024 // max(S, 1))
@@ -951,12 +979,28 @@ class GlmTP:
         ckv = lw["kv_a"](x)
         c = rms(ckv[:, :cfg.kv_lora], lw["kv_norm"], LATENT_EPS)
         kr = rope_interleave(ckv[:, None, cfg.kv_lora:], cos, sin)[:, 0]
-        kv_write(self.c_cache[L], positions, c)
-        self.r_cache[L].index_copy_(0, positions, kr)
-        topk = self._indexer(L, x, q_resid, positions, cos, sin, S) if self.full(L) else topk_prev
+        split = self.split(L)
+        if split:
+            from .kv_split import owner_rows
+            rows = owner_rows(positions, self.rank, self.world, self.s_loc)
+        else:
+            rows = positions
+        kv_write(self.c_cache[L], rows, c)
+        self.r_cache[L].index_copy_(0, rows, kr)
         q_lat = torch.einsum("thn,hnc->thc", q_nope, lw["w_uk"])                  # [T, h, kv_lora]
         scale = cfg.qk_dim ** -0.5
-        C, R = self.c_cache[L], self.r_cache[L]
+        if split and decode:
+            qw = self._index_qw(L, x, q_resid, cos, sin, rows) if self.full(L) else None
+            o_lat, topk = self._split_attn(L, qw, q_lat, q_rope, positions, topk_prev, scale)
+            o = torch.einsum("thc,hvc->thv", o_lat, lw["w_uv"]).reshape(T, self.hl * cfg.v_dim)
+            return self.comm.all_reduce(lw["o"](o, out_dtype=torch.float32)).to(torch.bfloat16), topk
+        C, R, I, qw = self.c_cache[L], self.r_cache[L], None, None
+        if split:
+            # Prefill: both ranks have written this chunk's rows; gather the layer's cache for
+            # [0, S) and run the unsplit path on it -- the bytes an unsplit cache would hold.
+            qw = self._index_qw(L, x, q_resid, cos, sin, rows) if self.full(L) else None
+            C, R, I = self._gathered(L, S)
+        topk = self._indexer(L, x, q_resid, positions, cos, sin, S, cache=I, qw=qw) if self.full(L) else topk_prev
         if not decode and S <= cfg.index_topk and not self.attn_kernel:
             C = kv_span(C, S)
             # Every cached position is selected: dense causal attention over [0, S).
@@ -987,6 +1031,51 @@ class GlmTP:
         o = torch.einsum("thc,hvc->thv", o_lat, lw["w_uv"]).reshape(T, self.hl * cfg.v_dim)
         partial = lw["o"](o, out_dtype=torch.float32)
         return self.comm.all_reduce(partial).to(torch.bfloat16), topk
+
+    def _gathered(self, L, S):
+        """Prefill on a split layer: its latent, RoPE and index caches for positions [0, S) (and a
+        row or so past it) from both ranks, in position order, shaped like the unsplit caches."""
+        from .kv_split import gather_spans
+        C, R, I = self.c_cache[L], self.r_cache[L], self.i_cache.get(L)
+        tup = lambda c: c if isinstance(c, tuple) else (c,)
+        parts = [*tup(C), R, *(tup(I) if I is not None else ())]
+        full = gather_spans(self.comm, parts, -(-S // self.world), self.world)
+        nc = len(tup(C))
+        C2 = tuple(full[:nc]) if nc > 1 else full[0]
+        I2 = None if I is None else (tuple(full[nc + 1:]) if isinstance(I, tuple) else full[nc + 1])
+        return C2, full[nc], I2
+
+    def _split_attn(self, L, qw, q_lat, q_rope, positions, topk_prev, scale):
+        """Decode attention on a split layer (engine/glm/kv_split.py) -> (o_lat bf16 [T, hl,
+        kv_lora] for this rank's heads, the picks (rows, count) the layers sharing this indexer
+        reuse). Two all-gathers: this rank's queries (and on an indexer layer its top-k scores),
+        then the partials each rank computed for the other's heads (sparse_attn.split_partials:
+        outputs as FP16 -- an average of cache rows, so in range, and 3 bits more than BF16 for
+        the same bytes: against fp32 the split's error is then the unsplit kernel's, 1.7e-3 either
+        way where BF16 made it 2.1e-3 -- and log-sum-exps as fp32). Graph-capturable."""
+        from .index_kernel import index_scores
+        from .kv_split import gather_rows, local_bound, share
+        from .sparse_attn import merge_received, split_partials
+        cfg, r, W, hl = self.cfg, self.rank, self.world, self.hl
+        T = q_lat.shape[0]
+        q = torch.cat([q_lat, q_rope], -1).reshape(T, -1)                      # [T, hl * 576] bf16
+        send = q.view(torch.uint8)
+        if qw is not None:
+            vals, sel = index_scores(qw[0], qw[1], self.i_cache[L], positions, self.s_loc, cfg.index_dim ** -0.5,
+                                     W, r).topk(min(cfg.index_topk, self.s_loc), -1)
+            send = torch.cat([send, vals.view(torch.uint8)], 1)
+        g = gather_rows(self.comm, send)                                       # [W, T, bytes]
+        qb = q.shape[1] * 2
+        # Rank-major heads, read where they landed: [W, T, hl, 576] -> head w * hl + h.
+        q_all = g[:, :, :qb].view(torch.bfloat16).view(W, T, hl, -1)
+        if qw is not None:
+            topk = (sel, share(g[:, :, qb:].contiguous().view(torch.float32), r))
+        else:
+            topk = topk_prev
+        own_o, own_l, out = split_partials(q_all[..., :cfg.kv_lora], q_all[..., cfg.kv_lora:], self.c_cache[L],
+                                           self.r_cache[L], topk[0], local_bound(positions, r, W), topk[1],
+                                           scale, r, hl)
+        return merge_received(own_o, own_l, gather_rows(self.comm, out)[1 - r]), topk
 
     # ------------------------------------------------------------------ MoE
     def request_snapshot(self):
