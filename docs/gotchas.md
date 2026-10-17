@@ -2899,3 +2899,78 @@ between a request's broadcast and its generate.
 Side effect worth knowing: with GLM gone from its model list, Open WebUI fell back to an Ollama
 model (qwen3.5:122b, 87 GB on rank 0, keep-alive 3 h). Restarting the pair while that is loaded
 overcommits rank 0; `ollama stop` it first.
+
+## Decode speed: where an MTP round went, and what took it from 8.6 to 16 tok/s (2026-10-16)
+
+tools/glm_decode_prof.py times every split-graph segment with CUDA events (no added syncs) and the
+host phases with wall clocks, then optionally prints a torch.profiler kernel table. Workload: the
+serving config (EXL3, 11,650 slots, 128K max_seq, FP8 KV, hot 0.2 paced cap 16 kept), a 6,027-token
+prompt (held-out docs + "summarize section by section"), 400 measured decode tokens, greedy.
+
+| step | tok/s | ms a round | accepted / round |
+| --- | --- | --- | --- |
+| serving config as it was (depth 2) | 8.61 | 309 | 1.66 |
+| + indexer kernel, one router matmul a layer, tensor decisions, headless MTP fills | 12.28 | 221 | 1.71 |
+| + O_DIRECT expert reads | 14.25 | 190 | 1.71 |
+| same, MTP depth 3 | 15.58 | 213 | 2.32 |
+| + one all-gather each way in the MoE (bit-identical text) | 15.68 | 212 | 2.32 |
+| + dynamic depth: max 5, MUSE_MTP_DYN=0.8 | 16.23 | 202 | 2.27 of 2.66 drafted |
+| dynamic, max 5, tau 0.9 | 16.82 | 206 | 2.44 of 2.70 |
+| **dynamic, max 7, tau 0.9** | **17.59** | 227 | 2.98 of 3.42 |
+| dynamic, max 5, tau 0.95 | 16.26 | 192 | 2.12 of 2.26 |
+
+What the first profile showed (309 ms): the 21 indexer layers' attention took 87 ms against 52 ms
+for the other 57 layers. Decode scored every one of max_seq = 131,072 positions with fp32 einsums
+over [rows, 32 heads, S] whatever the context (a fixed S for the graph), plus the FP8 key cache
+dequantized to fp32 each step: 3.25 ms a layer at a 6K context. engine/glm/index_kernel.py does the
+scores in one Triton kernel (BF16 tensor-core dots, fp32 accumulation, the row scale after the
+dot; blocks past the last row's position only write -inf): 0.10 ms with the top-k, 0.014 without.
+Same scores to 1e-5 relative, top-2048 sets > 99.9% equal (engine/glm/test_index_kernel.py).
+
+Smaller items in that step: _route ran the fp32 router matmul up to four times a layer (the
+pick, demand, miss stats, and the hot candidate in the attention graph) -- now once, the masked
+and unmasked picks from the same scores (bit-identical); stream()'s per-round decisions went
+through broadcast_obj (gloo pickling, ~1.9 ms each) -- now a small int tensor on the RoCE gather;
+the MTP cache fills (accepted drafts, prefill chunks) computed the head and gathered [rows, vocab]
+logits nobody read (~10 ms eager a round) -- now headless and graphed up to depth rows.
+
+Expert reads: Exl3Pack read buffered, 256 KB pieces on 16 threads, 3.1 ms an expert; one O_DIRECT
+preadv of the whole 7.1 MB record takes 0.83 ms (8.5 GB/s), eight at once 9.5 GB/s. Fresh buffers
+cost 3.7 ms of page faults a read, so aligned buffers are pooled and lent (exl3._Lease: back to
+the pool only when the record's last view dies). Hot reads 22 -> 9 ms a round, adaptation's
+synchronous swaps 20 -> 5 ms amortized.
+
+MTP depth, fixed (same workload, O_DIRECT not yet in): depth 1 10.65 tok/s (0.88 accepted), 2
+12.28 (1.71), 3 13.33 (2.32), 4 12.89 (2.72), 5 12.51 (2.89). An extra verify row costs 30-45 ms
+(the MoE reads more experts, one more draft, more hot reads); a draft pays only above ~0.55
+acceptance. The MTP's own probability predicts it: with the product of the drafts' probabilities
+>= 0.9, 80-97% are accepted; 0.7-0.9 about half; 0.5-0.7 a third. MUSE_MTP_DYN=tau keeps drafting
+while that product is >= tau (rank 0 decides each step and broadcasts it, so both ranks verify the
+same rows): 0.3 12.84 and 0.5 12.68 (both before O_DIRECT, too permissive), 0.7 15.36, 0.8 16.23.
+Each verify row count captures its own split set; capture inside a measured window cost ~20 ms a
+round in the first dynamic runs (the profiler now warms 200 tokens and reports late captures).
+
+Quality of the indexer kernel (the only change above that is not bit-identical or byte-identical):
+glm_quality --set long (6K/12K/18K prompts, 900 positions, 3-row steps), kernel on 0.8866, off
+0.8826 NLL; paired per position +0.0040 +- 0.0068 (0.6 SE). For scale, the same FP8 config run
+twice differed by -0.0015 +- 0.0067 and BF16 vs FP8 KV by -0.0049 +- 0.0068: two runs share 1-2 of
+900 positions bit for bit (a flipped near-tie changes routing, hot reads, everything after), so
+this eval resolves about +-0.013 and the kernel is inside it.
+
+Memory of dynamic depth: each verify row count captures its own split set (158 graphs). One
+capture pool for all sets and MTP graphs saved 0.3 GB; one warm-up stream plus empty_cache() after
+a capture another 0.5 GB (a fresh stream per capture stranded each warm-up's cached blocks). What
+is left is ~0.23 GB a set -- CUDA's own executable graphs, not tensors: max 7 holds 9.11 GB
+available after the run against fixed depth 3's 10.32.
+
+Not worth it: tuning the decode FP8 GEMV tiles. A sweep over BN / warps / stages and a
+deterministic split-K (partials summed in order, so both ranks keep identical bits) found 670-1054
+GB/s on the small projections -- L2-resident in a microbenchmark, not in a forward -- and only
+o_proj (50 MB) is honest: 214 -> 223 GB/s. Split-K helps kv_a (N=576, 13 -> 8 us) and the
+indexer key (N=128, 13 -> 6 us): ~1 ms a forward.
+
+Prefill (tools/glm_prefill_prof.py, same 6K prompt, chunk 1024): 42 s, 143 tok/s, of which
+attention is 30 s of GPU time and the MLP 10 s. Past 2,048 positions the attention goes sparse:
+per 32-row block it gathers each row's 2,048 selected latents into BF16 copies ([32, 2048, 512])
+and runs einsums, ~5 s a chunk. The indexer is 0.26 s, the MTP fill 0.7 s, the post-prefill
+adaptation 0.8 s.

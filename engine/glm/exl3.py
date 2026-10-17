@@ -11,8 +11,10 @@ hidden slices after) go through GlmTP's Comm like the MXFP4 path's.
 
 from __future__ import annotations
 
+import mmap
 import os
 import sys
+import threading
 
 import numpy as np
 import torch
@@ -25,11 +27,57 @@ import exl3_ref as R  # noqa: E402
 
 INF = float("inf")
 PIECE = 256 * 1024
+ALIGN = 4096
+
+
+class _Lease:
+    """A pooled page-aligned buffer lent to one record's numpy/torch views. It goes back to the pool
+    when the last view dies (the buffer protocol keeps it referenced until then), so a buffer is
+    never refilled under a live view, however long a caller holds the record."""
+
+    def __init__(self, mm, pool):
+        self.mm, self.pool = mm, pool
+
+    def __buffer__(self, flags):
+        return memoryview(self.mm)
+
+    def __release_buffer__(self, view):
+        view.release()
+
+    def __del__(self):
+        try:
+            self.pool.give(self.mm)
+        except Exception:               # interpreter shutdown
+            pass
+
+
+class _BufPool:
+    """Page-aligned buffers for O_DIRECT. A fresh 7 MB mmap costs ~3.7 ms of page faults per read
+    -- more than the read -- so up to `keep` idle ones are kept (faulted in) for reuse."""
+
+    def __init__(self, size, keep):
+        self.size, self.keep, self.free, self.lock = size, keep, [], threading.Lock()
+
+    def take(self):
+        with self.lock:
+            if self.free:
+                return self.free.pop()
+        return mmap.mmap(-1, self.size)
+
+    def give(self, mm):
+        with self.lock:
+            if len(self.free) < self.keep:
+                self.free.append(mm)
+                return
+        mm.close()
 
 
 class Exl3Pack:
-    """One rank's pack: O_DIRECT-free positional reads (pread releases the GIL; the engine's pools
-    issue them in parallel), one preadv an expert."""
+    """One rank's pack: one positional read an expert (pread releases the GIL; the engine's pools
+    issue them in parallel). MUSE_EXL3_DIRECT=1 (default): O_DIRECT into pooled aligned buffers --
+    one 7.1 MB preadv took 0.83 ms (8.5 GB/s) where the buffered read in 16 parallel 256 KB pieces
+    took 3.1 ms and a single buffered preadv 7.8 ms; eight at once ran at 9.5 GB/s direct, 3.3
+    buffered. Records are 4096-aligned for this (tools/exl3_ref.py)."""
 
     def __init__(self, path: str, hidden: int, inter: int):
         R.set_dims(hidden, inter)
@@ -44,6 +92,13 @@ class Exl3Pack:
         self.rank, self.world = self.reader.rank, self.reader.world
         self.layers = sorted({L for L, _ in self.records})
         self._layout = {}
+        self.dfd = None
+        if os.environ.get("MUSE_EXL3_DIRECT", "1") == "1":
+            if self.data0 % ALIGN or any(m["off"] % ALIGN for m in self.records.values()):
+                raise ValueError(f"{path}: records not {ALIGN}-aligned for O_DIRECT")
+            self.dfd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+            size = -(-max(m["nbytes"] for m in self.records.values()) // ALIGN) * ALIGN
+            self.pool = _BufPool(size, int(os.environ.get("MUSE_EXL3_BUFS", "8")))
 
     def header_sha(self) -> str:
         return self.reader.header_sha256()
@@ -69,11 +124,24 @@ class Exl3Pack:
 
     def read(self, L: int, e: int, urgent: bool = False) -> tuple[dict, float]:
         """(record of CPU tensors in RECORD_TENSORS order, bits) for routed expert e of layer L.
-        Urgent reads (a decode step waits on them) go in 256 KB pieces on their own pool: one
-        preadv streams ~1 GB/s from a cold file, parallel pieces keep the NVMe queue deep."""
+        Direct: one O_DIRECT preadv into a pooled buffer, the tensors views of it. Buffered
+        (MUSE_EXL3_DIRECT=0): urgent reads (a decode step waits on them) go in 256 KB pieces on
+        their own pool -- one buffered preadv streams ~1 GB/s from a cold file."""
         meta = self.records[(L, e)]
         bits = float(meta["bits"])
         n, base = meta["nbytes"], self.data0 + meta["off"]
+        if self.dfd is not None:
+            buf = _Lease(self.pool.take(), self.pool)
+            mv, got, need = memoryview(buf.mm), 0, -(-n // ALIGN) * ALIGN
+            try:
+                while got < n:                  # whole aligned length; short only at the file's end
+                    r = os.preadv(self.dfd, [mv[got:need]], base + got)
+                    if r <= 0:
+                        raise IOError(f"{self.path}: short read {got} of {n} for {(L, e)}")
+                    got += r
+            finally:
+                mv.release()
+            return self._record(buf, bits), bits
         buf = bytearray(n)
         mv = memoryview(buf)
         if urgent and n > 2 * PIECE:
@@ -86,10 +154,11 @@ class Exl3Pack:
             got = os.preadv(self.fd, [buf], base)
         if got != n:
             raise IOError(f"{self.path}: short read {got} of {n} for {(L, e)}")
-        rec = {}
-        for name, dt, n, shape, off in self._offsets(bits):
-            rec[name] = torch.from_numpy(np.frombuffer(buf, dtype=dt, count=n, offset=off).reshape(shape))
-        return rec, bits
+        return self._record(buf, bits), bits
+
+    def _record(self, buf, bits) -> dict:
+        return {name: torch.from_numpy(np.frombuffer(buf, dtype=dt, count=n, offset=off).reshape(shape))
+                for name, dt, n, shape, off in self._offsets(bits)}
 
 
 def make_arena(slots: int, rank: int, world: int, device, hidden: int, inter: int):
@@ -125,6 +194,14 @@ def routed(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, arena, c
     """sum_k weights[:, k] * expert_{slots[:, k]}(x) over the routed picks, fp32 [T, hidden], both
     ranks' halves gathered. x bf16 [T, hidden]; slots int [T, k] arena indices (a zero-weight
     pick may name any loaded slot); weights fp32 [T, k]. Graph-capturable for decode shapes."""
+    xd, ctx = routed_up(x, slots, weights, arena)
+    return comm.cat_last(routed_down(comm.cat_last(xd).contiguous(), ctx, arena))
+
+
+@torch.no_grad()
+def routed_up(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, arena):
+    """routed()'s first half: (this rank's intermediate [T * k, inter / world] fp16, the routing
+    for routed_down). The caller gathers the intermediate, so it can share one all-gather."""
     import exl3_moe_cuda as C
     T, K = slots.shape
     P = T * K
@@ -147,6 +224,13 @@ def routed(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, arena, c
         tile = tuple(int(v) for v in C.PREFILL_TILE.split("x"))
     xd = torch.empty((P, arena.inter), dtype=torch.float16, device=x.device)
     C._up(x.contiguous(), pick, uids, ucount, members, arena, T, K, maxm, nexp, INF, xd, nt, warps, pf, tile)
-    xd_full = comm.cat_last(xd).contiguous()                  # [P, world * inter], rank-major columns
-    local = C._down(xd_full, pick, uids, ucount, members, wts, arena, T, K, maxm, nexp, nt, warps, pf, tile)
-    return comm.cat_last(local)                               # [T, hidden]
+    return xd, (pick, uids, ucount, members, wts, T, K, maxm, nexp, nt, warps, pf, tile)
+
+
+@torch.no_grad()
+def routed_down(xd_full: torch.Tensor, ctx, arena) -> torch.Tensor:
+    """routed()'s second half: the gathered intermediate [T * k, world * inter] (rank-major
+    columns) -> this rank's hidden slice of the weighted sum, fp32 [T, hidden / world]."""
+    import exl3_moe_cuda as C
+    pick, uids, ucount, members, wts, T, K, maxm, nexp, nt, warps, pf, tile = ctx
+    return C._down(xd_full, pick, uids, ucount, members, wts, arena, T, K, maxm, nexp, nt, warps, pf, tile)

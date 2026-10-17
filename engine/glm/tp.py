@@ -151,6 +151,12 @@ class GlmTP:
         # one fp32 scale per 128 values, the MTP hidden ring as FP8 with one per row; the RoPE keys
         # (64) stay BF16. ~54 KB a position a rank instead of ~97 (+ 6 KB of ring instead of 12).
         self.kv8 = env("MUSE_KV", "bf16") == "fp8"
+        # MUSE_INDEX_KERNEL=1: the indexer's scores in one Triton kernel (engine/glm/index_kernel.py)
+        # instead of fp32 einsums over [T, 32, S]; decode scored all max_seq positions that way.
+        self.index_kernel = env("MUSE_INDEX_KERNEL", "1") == "1"
+        # MUSE_GATHER_MERGE=1: decode MoE layers gather the routed and the shared expert's
+        # intermediate in one all-gather and their summed outputs in another (mlp()).
+        self.gather_merge = env("MUSE_GATHER_MERGE", "1") == "1"
         self.chunk = int(chunk or env("MUSE_CHUNK", "1024"))
         self.miss = miss or env("MUSE_MISS", "substitute")
         self.native = env("MUSE_NATIVE_MOE", "1") == "1"
@@ -233,6 +239,7 @@ class GlmTP:
         self.hot_audit = env("MUSE_HOT_KEEP_AUDIT", "0") == "1" and self.rank == 0
         self.hot_q = []                 # [(VL, ve, slot)] victims for kept hot reads, weakest last
         self.hot_live = None            # [(e, transient slot)] hot reads of the layer being computed
+        self._pre_route = {}            # L -> (x, scores, choice) from _hot_candidate, for _route
         transient = cfg.experts if self.miss == "stream" else max(2 * self.pf_n, self.hot_n)
         t0 = time.perf_counter()
         self._load_dense()
@@ -291,8 +298,12 @@ class GlmTP:
         self.demand = None             # [layers, E] router mass wanted since the last adapt()
         self.mtp_fill = True
         self.spec_stats = {"rounds": 0, "accepted": 0}
+        self.spec_cal = None            # [(draft index, confidence product, accepted)] when a tool asks
+        self.mtp_dyn = float(env("MUSE_MTP_DYN", "0"))
+        self.mtp_graph_rows = 1
         if self.mtp_on:
             self.graph_rows = {1, int(env("MUSE_MTP_DEPTH", "3")) + 1}
+            self.mtp_graph_rows = max(1, int(env("MUSE_MTP_DEPTH", "3")))
         self.adapt_every = int(env("MUSE_ADAPT_EVERY", "200"))
         self.adapt_prefill_swaps = int(env("MUSE_ADAPT_PREFILL_SWAPS", "2048"))
         self.adapt_decode_swaps = int(env("MUSE_ADAPT_DECODE_SWAPS", "256"))
@@ -336,15 +347,17 @@ class GlmTP:
     def _boot_guard(self, transient):
         src = Path(__file__).resolve().parent
         digest = hashlib.sha256(b"".join((src / f).read_bytes() for f in
-                                         ("tp.py", "ref.py", "weights.py", "config.py", "fp8_block.py"))).hexdigest()[:16]
+                                         ("tp.py", "ref.py", "weights.py", "config.py", "fp8_block.py",
+                                          "index_kernel.py", "exl3.py"))).hexdigest()[:16]
         mine = {"version": VERSION, "code": digest, "miss": self.miss, "native": self.native,
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"), "db": env("MUSE_STATS_DB", ""),
-                "xfmt": self.xfmt, "kv": env("MUSE_KV", "bf16"), "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
+                "xfmt": self.xfmt, "kv": env("MUSE_KV", "bf16"), "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
                 "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_PF_KEEP", "MUSE_PF_KEEP_MARGIN", "MUSE_HOT", "MUSE_HOT_MIN",
                                             "MUSE_HOT_TARGET", "MUSE_HOT_KEEP", "MUSE_HOT_MAX", "MUSE_HOT_KEEP_AUDIT", "MUSE_HOT_PACE",
-                                            "MUSE_HOT_PACE_LEAD", "MUSE_SUB_WEIGHT", "MUSE_MTP_FULL", "MUSE_MISS_LOG")],
+                                            "MUSE_HOT_PACE_LEAD", "MUSE_SUB_WEIGHT", "MUSE_MTP_FULL", "MUSE_MISS_LOG",
+                                            "MUSE_MTP_DYN")],
                 "adapt": [env(k, "") for k in ("MUSE_ADAPT", "MUSE_ADAPT_EVERY", "MUSE_ADAPT_PREFILL_SWAPS",
                                                "MUSE_ADAPT_DECODE_SWAPS", "MUSE_ADAPT_DECAY", "MUSE_ADAPT_CROSS_LAYER",
                                                "MUSE_ADAPT_MARGIN", "MUSE_BG", "MUSE_BG_EVERY", "MUSE_BG_READS",
@@ -457,6 +470,8 @@ class GlmTP:
     def _read_urgent(self, L, experts):
         """Hot-miss reads: a decode step is waiting, so neither the expert pool nor the piece
         pool is shared with background reads (those can hold 48 experts in the queue)."""
+        if len(experts) == 1:                    # no pool hop for the usual single read
+            return [self._expert_parts(L, experts[0], True)]
         if not hasattr(self, "_hot_pool"):
             from concurrent.futures import ThreadPoolExecutor
             self._hot_pool = ThreadPoolExecutor(max_workers=4)
@@ -841,8 +856,16 @@ class GlmTP:
         q = torch.cat([rope_interleave(q[..., :rd], cos, sin), q[..., rd:]], -1)
         k = torch.cat([rope_interleave(k[..., :rd], cos, sin), k[..., rd:]], -1)[:, 0]
         kv_write(self.i_cache[L], positions, k)
-        K = kv_span(self.i_cache[L], S, torch.float32)
         w = F.linear(x.float(), lw["i_w"]) * cfg.index_heads ** -0.5                 # [T, h]
+        if self.index_kernel:
+            # engine/glm/index_kernel.py: same scores without the fp32 [T, h, S] intermediates.
+            # Rows in chunks to bound the [rows, S] scores (prefill at long contexts).
+            from .index_kernel import index_scores
+            step = max(1, (32 << 20) // max(S, 1))
+            return torch.cat([index_scores(q[t0:t0 + step], w[t0:t0 + step], self.i_cache[L],
+                                           positions[t0:t0 + step], S, cfg.index_dim ** -0.5)
+                              .topk(min(cfg.index_topk, S), -1).indices for t0 in range(0, T, step)])
+        K = kv_span(self.i_cache[L], S, torch.float32)
         kpos = torch.arange(S, device=x.device)
         out = []
         step = max(1, 4096 * 1024 // max(S, 1))
@@ -943,18 +966,24 @@ class GlmTP:
         ones = torch.ones(fixed.shape, dtype=torch.float32, device=x.device)
         if self.dense(L):
             return fixed.contiguous(), ones
-        from .ref import route
+        from .ref import route, route_pick, route_scores
         allowed = self.allowed[L] if self.allowed is not None else None
-        w, ids = route(cfg, x, lw["router"], lw["bias"], allowed)
+        # One router matmul serves every pick below; under split graphs the attention segment's
+        # hot candidate already ran it on this same x (_hot_candidate).
+        pre = self._pre_route.pop(L, None)
+        sc = pre[1:] if pre is not None and pre[0] is x else route_scores(cfg, x, lw["router"], lw["bias"])
+        w, ids = route_pick(cfg, *sc, allowed)
+        w0 = ids0 = None
+        if allowed is not None and (self.demand is not None or self.miss_stats is not None
+                                    or self.route_dump is not None or self.miss_hist is not None):
+            w0, ids0 = route_pick(cfg, *sc, None)
         if allowed is not None and self.sub_weight != "renorm":
             w = self._sub_weights(cfg, lw, x, ids)
         if self.record is not None:
             self.record.append((L, ids.cpu(), w.cpu()))
         if self.demand is not None and allowed is not None:
-            w0, ids0 = route(cfg, x, lw["router"], lw["bias"], None)
             self.demand[L].index_add_(0, ids0.reshape(-1), w0.reshape(-1))
         if self.miss_stats is not None and allowed is not None:
-            w0, ids0 = route(cfg, x, lw["router"], lw["bias"], None)
             missed = ~allowed[ids0]
             ms = self.miss_stats
             # Counted on the device only (no host sync a layer, and graph replays count too);
@@ -968,7 +997,6 @@ class GlmTP:
             acc[2].add_(w0.sum())
             acc[3].add_((w0 * missed).sum())
         if self.route_dump is not None and allowed is not None:
-            w0, ids0 = route(cfg, x, lw["router"], lw["bias"], None)
             ahead = {}
             for d in (1, 2, 4, 8):
                 N = L + d
@@ -976,7 +1004,6 @@ class GlmTP:
                     ahead[N] = route(cfg, x, self.L[N]["router"], self.L[N]["bias"], None)[1].to(torch.int16)
             self.route_dump.append((L, ids0.to(torch.int16), w0.half(), ~allowed[ids0], ahead))
         if self.miss_hist is not None and allowed is not None:
-            w0, ids0 = route(cfg, x, lw["router"], lw["bias"], None)
             m = (~allowed[ids0]).float().reshape(-1)
             wn = (w0 / cfg.routed_scaling).reshape(-1)
             b = (wn * self.miss_hist.shape[1]).long().clamp_(0, self.miss_hist.shape[1] - 1)
@@ -1027,6 +1054,10 @@ class GlmTP:
         self.stats["stream_s"] += time.perf_counter() - t0
 
     def _experts_native(self, x, slots):
+        h, rt = self._native_up(x, slots)
+        return self._native_down(self.comm.cat_last(h), rt)
+
+    def _native_up(self, x, slots):
         import fp4_moe_cuda as CUDA
         A, cfg = self.arena, self.cfg
         T, k = slots.shape
@@ -1035,10 +1066,25 @@ class GlmTP:
         h = torch.empty((P_, A.Il), dtype=torch.bfloat16, device=x.device)
         ones = torch.ones(P_, dtype=torch.float32, device=x.device)
         CUDA.up(x, A.w1, A.s1, A.w3, A.s3, h, ones, bs, br, float("inf"), k, A.Il, cfg.hidden, nb, -1)
-        full = self.comm.cat_last(h)
-        parts = torch.empty((P_, A.Hl), dtype=torch.float32, device=x.device)
+        return h, (bs, bp, nb, T, k)
+
+    def _native_down(self, full, rt):
+        import fp4_moe_cuda as CUDA
+        A, cfg = self.arena, self.cfg
+        bs, bp, nb, T, k = rt
+        parts = torch.empty((T * k, A.Hl), dtype=torch.float32, device=full.device)
         CUDA.down(full, A.w2, A.s2, parts, bs, bp, k, A.Hl, cfg.moe_inter, T, nb, -1, False, 1)
         return parts.view(k, T, A.Hl)
+
+    def _gather_pair(self, a, b):
+        """(cat_last(a), cat_last(b)) for two 2-D tensors of any dtypes in one all-gather."""
+        W, na = self.world, a.numel() * a.element_size()
+        g = self.comm.all_gather(torch.cat([a.reshape(-1).view(torch.uint8), b.reshape(-1).view(torch.uint8)]))
+        out = []
+        for t, part in ((a, g[:, :na]), (b, g[:, na:])):
+            v = part.contiguous().view(t.dtype).view(W, *t.shape)
+            out.append(v.movedim(0, -2).reshape(*t.shape[:-1], W * t.shape[-1]))
+        return out
 
     def _experts_triton(self, x, slots):
         import fp4_moe as K4
@@ -1254,26 +1300,41 @@ class GlmTP:
             pf = self._hot_stream(L, x)
         slots, w = self._route(L, x)
         x = x.contiguous()
-        y = None
+        y = out = None
         if self.x3 is not None and not self.dense(L) and L != self.mtp_L:
-            from .exl3 import routed
+            from .exl3 import routed, routed_down, routed_up
             k = self.cfg.topk
             rs = slots[:, :k] - self.x3_off
             bad = rs < 0                      # a slotless pick: zero weight on any loaded slot
-            y = routed(x, rs.clamp_min(0), torch.where(bad, torch.zeros_like(w[:, :k]), w[:, :k]),
-                       self.x3, self.comm)
+            wr = torch.where(bad, torch.zeros_like(w[:, :k]), w[:, :k])
             slots, w = slots[:, k:].contiguous(), w[:, k:]
-        T, k = slots.shape
-        if self.native and T * k <= 512:
-            parts = self._experts_native(x, slots)
-        else:
-            parts = self._experts_triton(x, slots)
+            if self.native and slots.numel() <= 512 and self.gather_merge:
+                # One all-gather each way for the routed and the fixed (shared) experts, which
+                # took two each: the intermediates go together, and the shared expert's weighted
+                # rows (one pick, weight 1) are summed on each rank before the output gather --
+                # per element the same arithmetic as summing after it.
+                xd, ctx = routed_up(x, rs.clamp_min(0), wr, self.x3)
+                h, rt = self._native_up(x, slots)
+                xd_full, h_full = self._gather_pair(xd, h)
+                local = routed_down(xd_full.contiguous(), ctx, self.x3)
+                parts = self._native_down(h_full, rt)
+                out = self.comm.cat_last((parts * w.t()[:, :, None]).sum(0) + local)
+            else:
+                y = routed(x, rs.clamp_min(0), wr, self.x3, self.comm)
+        if out is None:
+            T, k = slots.shape
+            if self.native and T * k <= 512:
+                parts = self._experts_native(x, slots)
+            else:
+                parts = self._experts_triton(x, slots)
         if self._streamed:
             sl, missing = self._streamed
             for e in missing:
                 self.lut[sl, e] = -1
         if pf:
             self._pf_release()
+        if out is not None:
+            return out.to(torch.bfloat16)
         z = (self.comm.cat_last(parts) * w.t()[:, :, None]).sum(0)
         return (z if y is None else z + y).to(torch.bfloat16)
 
@@ -1305,7 +1366,7 @@ class GlmTP:
         entry = self.graphs.get(T)
         if entry is None:
             static_ids = ids.clone()
-            side = torch.cuda.Stream()
+            side = self._side_stream()
             side.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side):
                 for _ in range(2):
@@ -1315,6 +1376,7 @@ class GlmTP:
             with torch.cuda.graph(graph):
                 static_out, static_h = self._step(static_ids)
             entry = self.graphs[T] = (graph, static_ids, static_out, static_h)
+            torch.cuda.empty_cache()
             self.log(f"[glm] captured decode graph for {T} rows")
         graph, static_ids, static_out, static_h = entry
         static_ids.copy_(ids)
@@ -1324,15 +1386,36 @@ class GlmTP:
     def _hot_candidate(self, L, x):
         """Graph-safe: this layer's heaviest missed picks (weight share, expert) into the pinned
         host buffer, read by _replay_split between this layer's two graphs."""
-        from .ref import route
+        from .ref import route_pick, route_scores
         cfg, n = self.cfg, self.hot_n
-        w0, ids0 = route(cfg, x, self.L[L]["router"], self.L[L]["bias"], None)
+        sc = route_scores(cfg, x, self.L[L]["router"], self.L[L]["bias"])
+        self._pre_route[L] = (x, *sc)          # the MLP segment's _route reuses the matmul
+        w0, ids0 = route_pick(cfg, *sc, None)
         share = (w0 / cfg.routed_scaling) * (~self.allowed[L][ids0])
         k = min(share.numel(), 2 * n)
         v, i = share.reshape(-1).topk(k)
         self._hot_dev[L, :k] = v
         self._hot_dev[L, 2 * n:2 * n + k] = ids0.reshape(-1)[i].float()
         self._hot_host[L].copy_(self._hot_dev[L], non_blocking=True)
+        return sc
+
+    def _side_stream(self):
+        """The stream every capture's eager warm-up runs on. The caching allocator keeps blocks per
+        stream, so a fresh stream per capture left each warm-up's blocks stranded (a dozen
+        captures under dynamic MTP depth); empty_cache() after a capture returns them."""
+        if getattr(self, "_side", None) is None:
+            self._side = torch.cuda.Stream()
+        return self._side
+
+    def _graph_pool(self):
+        """One capture pool for every split set and MTP graph. They never replay concurrently,
+        each replay rewrites every boundary tensor it reads (in segment order, from its inputs),
+        and the outputs a caller reads are kept alive by their entries -- so one graph's
+        temporaries may land on another's: dynamic MTP depth captures a split set per verify
+        row count, ~230 MB each in pools of their own."""
+        if getattr(self, "_graph_pool_h", None) is None:
+            self._graph_pool_h = torch.cuda.graph_pool_handle()
+        return self._graph_pool_h
 
     def _capture_split(self, ids):
         """Decode for T rows as per-layer graphs: [embed], then per layer (attention + the hot
@@ -1343,13 +1426,13 @@ class GlmTP:
             self._hot_dev = torch.zeros((self.nL, 4 * self.hot_n), dtype=torch.float32, device=self.dev)
             self._hot_host = torch.zeros((self.nL, 4 * self.hot_n), dtype=torch.float32).pin_memory()
         st_ids = ids.clone()
-        side = torch.cuda.Stream()
+        side = self._side_stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
             for _ in range(2):
                 self._step(st_ids)
         torch.cuda.current_stream().wait_stream(side)
-        pool = torch.cuda.graph_pool_handle()
+        pool = self._graph_pool()
         segs, keep = [], []
 
         def cap(fn):
@@ -1367,15 +1450,15 @@ class GlmTP:
                 a, tk = self.attention(L, rms(h, self.L[L]["ln_in"], cfg.rms_eps), topk)
                 h1 = h + a
                 x = rms(h1, self.L[L]["ln_post"], cfg.rms_eps)
-                if not self.dense(L):
-                    self._hot_candidate(L, x)
-                return h1, x, tk
-            g, (h1, x, topk) = cap(attn)
+                sc = self._hot_candidate(L, x) if not self.dense(L) else None
+                return h1, x, tk, sc            # sc: kept alive for the MLP graph that reads it
+            g, (h1, x, topk, _) = cap(attn)
             segs.append(("attn", L, g))
             g, h = cap(lambda L=L, h1=h1, x=x: h1 + self.mlp(L, x))
             segs.append(("mlp", L, g))
         g, (st_out, st_h) = cap(lambda: self.logits(h))
         segs.append(("head", -1, g))
+        torch.cuda.empty_cache()
         self.log(f"[glm] captured split decode graphs for {ids.numel()} rows ({len(segs)} segments)")
         return segs, st_ids, st_out, st_h, keep
 
@@ -1436,8 +1519,9 @@ class GlmTP:
         st[f"thr_{T}"] = round(self.hot_thr.get(T, self.hot_min), 3)
         return st_out.clone(), st_h.clone()
 
-    def _mtp_core(self, next_ids, h_prev):
-        """The MTP layer at positions pos_t.. (device) -- graph-capturable for one row."""
+    def _mtp_core(self, next_ids, h_prev, logits=True):
+        """The MTP layer at positions pos_t.. (device) -- graph-capturable. logits=False: the
+        cache fill only (the hidden is returned, the head and its gather skipped)."""
         cfg, L = self.cfg, self.mtp_L
         lw = self.L[L]
         T = next_ids.numel()
@@ -1450,40 +1534,46 @@ class GlmTP:
         h = x + a
         h = h + self.mlp(L, rms(h, lw["ln_post"], cfg.rms_eps))
         hn = rms(h, lw["sh_norm"], cfg.rms_eps)
+        if not logits:
+            return hn, None
         return hn, self.comm.cat_last(self.head(hn, out_dtype=torch.float32))
 
     @torch.no_grad()
-    def mtp_forward(self, next_ids, h_prev, pos0):
+    def mtp_forward(self, next_ids, h_prev, pos0, logits=True):
         """The MTP layer at positions pos0..: (token i+1, post-norm hidden at i) -> (its
-        post-norm hidden, logits for token i+2). Writes the MTP layer's caches. One-row calls
-        (the draft chain) replay a captured graph."""
+        post-norm hidden, logits for token i+2, or None with logits=False). Writes the MTP
+        layer's caches. Calls of up to depth rows replay a captured graph: the one-row draft
+        chain, and the cache fills of accepted drafts (no head: a 0.95 GB read a call that
+        nothing used, and in prefill a [chunk, vocab] gather)."""
         next_ids = torch.as_tensor(next_ids, dtype=torch.long, device=self.dev).reshape(-1)
         T = next_ids.numel()
         saved, saved_t = self.pos, self.pos_t.clone()
         self.pos = pos0
         self.pos_t.fill_(pos0)
-        if T == 1 and self.use_graphs and self.miss == "substitute":
-            entry = self.graphs.get("mtp")
+        if T <= self.mtp_graph_rows and self.use_graphs and self.miss == "substitute":
+            key = ("mtp", T, logits)
+            entry = self.graphs.get(key)
             if entry is None:
                 st_ids, st_h = next_ids.clone(), h_prev.to(torch.bfloat16).clone()
-                side = torch.cuda.Stream()
+                side = self._side_stream()
                 side.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(side):
                     for _ in range(2):
-                        self._mtp_core(st_ids, st_h)
+                        self._mtp_core(st_ids, st_h, logits)
                 torch.cuda.current_stream().wait_stream(side)
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    st_hn, st_z = self._mtp_core(st_ids, st_h)
-                entry = self.graphs["mtp"] = (graph, st_ids, st_h, st_hn, st_z)
-                self.log("[glm] captured MTP graph")
+                with torch.cuda.graph(graph, pool=self._graph_pool()):
+                    st_hn, st_z = self._mtp_core(st_ids, st_h, logits)
+                entry = self.graphs[key] = (graph, st_ids, st_h, st_hn, st_z)
+                torch.cuda.empty_cache()
+                self.log(f"[glm] captured MTP graph for {T} row(s){'' if logits else ', cache fill'}")
             graph, st_ids, st_h, st_hn, st_z = entry
             st_ids.copy_(next_ids)
             st_h.copy_(h_prev)
             graph.replay()
-            out = st_hn.clone(), st_z.clone()
+            out = st_hn.clone(), (st_z.clone() if logits else None)
         else:
-            out = self._mtp_core(next_ids, h_prev)
+            out = self._mtp_core(next_ids, h_prev, logits)
         self.pos = saved
         self.pos_t.copy_(saved_t)
         return out
@@ -1503,7 +1593,7 @@ class GlmTP:
             if self.mtp_on:
                 # Position n-1's MTP entry was made with the old next token; redo it.
                 h = kv_read(self.h_ring, (n - 1) % self.h_ring_n)[None]
-                self.mtp_forward(torch.tensor([prompt[n]], device=self.dev), h, n - 1)
+                self.mtp_forward(torch.tensor([prompt[n]], device=self.dev), h, n - 1, logits=False)
         else:
             self.reset()
         self.last_reuse = n
@@ -1535,6 +1625,10 @@ class GlmTP:
         every token and broadcasts; both ranks run the same calls."""
         stop = self.cfg.eos if stop is None else stop
         depth = int(env("MUSE_MTP_DEPTH", "3")) if depth is None else depth
+        # MUSE_MTP_DYN=tau: depth is the most drafts a round; a draft is kept only while the
+        # product of the drafts' own probabilities (the MTP's softmax at the drafted token) stays
+        # at or above tau, so the verify step takes 1 + kept rows. 0: always `depth` drafts.
+        dyn = self.mtp_dyn
         gen = torch.Generator(device=self.dev).manual_seed(seed)
         self.mtp_fill = True
         logits = self.prefill(list(prompt))
@@ -1546,18 +1640,22 @@ class GlmTP:
         spec = self.mtp_on and depth > 0
         self.mtp_fill = not spec
         if spec:
-            self.graph_rows.add(depth + 1)
+            self.graph_rows |= set(range(1, depth + 2)) if dyn else {depth + 1}
         emitted = 0
 
-        def decide(x):
-            return self.comm.broadcast_obj(x)
+        def decide(v, n=1):
+            """Rank 0's int(s) to both ranks as a small tensor over the fast gather: broadcast_obj
+            pickles through gloo's TCP pair, ~1.9 ms a call at 2-3 calls a round."""
+            vals = ([int(v)] if n == 1 else [int(a) for a in v]) if self.rank == 0 else [0] * n
+            out = self.comm.all_gather(torch.tensor(vals, dtype=torch.long, device=self.dev))[0].tolist()
+            return out[0] if n == 1 else out
 
         anchor = decide(self.sample(logits[-1], temperature, top_p, top_k, gen) if self.rank == 0 else None)
         h_last = self.last_hidden[-1:]
         next_adapt = self.adapt_every
         rounds = 0
         while True:
-            halt = decide(bool(should_stop and self.rank == 0 and should_stop()))
+            halt = bool(decide(bool(should_stop and self.rank == 0 and should_stop())))
             if halt:
                 return
             if self.demand is not None and self.adapt_every and emitted >= next_adapt:
@@ -1580,26 +1678,44 @@ class GlmTP:
                 anchor = decide(self.sample(logits[-1], temperature, top_p, top_k, gen) if self.rank == 0 else None)
                 continue
             # Drafts: the MTP layer at P-1 (anchor, target hidden at P-1), then on its own output.
-            drafts, qs = [], []
+            # Under MUSE_MTP_DYN rank 0 decides whether each draft is kept (and which it is), so
+            # both ranks run the same MTP calls and verify the same rows.
+            drafts, qs, confs, conf = [], [], [], 1.0
             hm, z = self.mtp_forward(torch.tensor([anchor], device=self.dev), h_last, P - 1)
             for k in range(depth):
+                q, p = None, 1.0
                 if temperature <= 0:
-                    d = int(z[-1].float().argmax())
-                    qs.append(None)
+                    if dyn:
+                        zl = z[-1].float()
+                        p, d = torch.stack([(zl.max() - torch.logsumexp(zl, 0)).exp(), zl.argmax().float()]).tolist()
+                        d = int(d)
+                    else:
+                        d = int(z[-1].float().argmax())
                 else:
                     q = self.sample_probs(z[-1], temperature, top_p, top_k)
-                    d = decide(int(torch.multinomial(q, 1, generator=gen)) if self.rank == 0 else None)
-                    qs.append(q)
+                    d = int(torch.multinomial(q, 1, generator=gen)) if self.rank == 0 else 0
+                    if dyn and self.rank == 0:
+                        p = float(q[d])
+                    if not dyn:
+                        d = decide(d)
+                if dyn:
+                    conf *= p
+                    keep, d = decide([conf >= dyn, d], 2)
+                    if not keep:
+                        break
+                qs.append(q)
                 drafts.append(d)
+                confs.append(conf)
                 if k + 1 < depth:
                     hm, z = self.mtp_forward(torch.tensor([d], device=self.dev), hm, P + k)
+            nd = len(drafts)
             rows = [anchor] + drafts
-            tl = self.forward(rows)                                  # [depth+1, V]
-            th = self.last_hidden                                    # [depth+1, H]
+            tl = self.forward(rows)                                  # [nd+1, V]
+            th = self.last_hidden                                    # [nd+1, H]
             decision = None
             if self.rank == 0:
-                n_acc, nxt = depth, None
-                for k in range(depth):
+                n_acc, nxt = nd, None
+                for k in range(nd):
                     if temperature <= 0:
                         t = int(tl[k].float().argmax())
                         if t != drafts[k]:
@@ -1615,17 +1731,20 @@ class GlmTP:
                             n_acc, nxt = k, int(torch.multinomial(resid / resid.sum(), 1, generator=gen))
                             break
                 if nxt is None:
-                    nxt = self.sample(tl[depth], temperature, top_p, top_k, gen)
+                    nxt = self.sample(tl[nd], temperature, top_p, top_k, gen)
                 decision = (n_acc, nxt)
-            n_acc, nxt = decide(decision)
+            n_acc, nxt = decide(decision, 2)
             self.spec_stats["rounds"] += 1
             self.spec_stats["accepted"] += n_acc
+            self.spec_stats["drafted"] = self.spec_stats.get("drafted", 0) + nd
+            if self.spec_cal is not None and dyn:
+                self.spec_cal.extend((k, c, k < n_acc) for k, c in enumerate(confs))
             self.pos = P + 1 + n_acc
             self.tokens = self.tokens[:self.pos]
             # The MTP cache for positions P..P+n_acc-1 gets the accepted tokens as next tokens
             # (position P+n_acc is redone with the next anchor at the start of the next round).
             if n_acc:
-                self.mtp_forward(torch.tensor(drafts[:n_acc], device=self.dev), th[:n_acc], P)
+                self.mtp_forward(torch.tensor(drafts[:n_acc], device=self.dev), th[:n_acc], P, logits=False)
             h_last = th[n_acc:n_acc + 1]
             for d in drafts[:n_acc]:
                 yield d
@@ -1678,4 +1797,4 @@ class GlmTP:
         self.last_hidden = hn
         if self.mtp_on and self.mtp_fill and next_ids is not None and next_ids.numel():
             n = min(T, next_ids.numel())
-            self.mtp_forward(next_ids[:n], hn[:n], pos0)
+            self.mtp_forward(next_ids[:n], hn[:n], pos0, logits=False)

@@ -49,6 +49,12 @@ def rope_interleave(x, cos, sin):
 def route(cfg: GlmConfig, x, weight, bias, allowed=None):
     """GlmMoeDsaTopkRouter -> (weights fp32 [T, k], ids [T, k]). ``allowed`` (bool [E]) masks
     non-resident experts out of the choice (substitution)."""
+    return route_pick(cfg, *route_scores(cfg, x, weight, bias), allowed)
+
+
+def route_scores(cfg: GlmConfig, x, weight, bias):
+    """The router matmul and group limit: (scores, choice) for route_pick. One call serves the
+    masked and the unmasked pick of the same rows."""
     logits = F.linear(x.float(), weight.float())
     scores = logits.sigmoid()
     choice = scores + bias.float()
@@ -59,6 +65,10 @@ def route(cfg: GlmConfig, x, weight, bias, allowed=None):
         gm = torch.zeros_like(g).scatter_(1, gi, 1)
         sm = gm.unsqueeze(-1).expand(-1, cfg.n_group, E // cfg.n_group).reshape(-1, E)
         choice = choice.masked_fill(~sm.bool(), float("-inf"))
+    return scores, choice
+
+
+def route_pick(cfg: GlmConfig, scores, choice, allowed=None):
     if allowed is not None:
         choice = choice.masked_fill(~allowed.to(choice.device), float("-inf"))
     ids = torch.topk(choice, cfg.topk, -1, sorted=False)[1]
