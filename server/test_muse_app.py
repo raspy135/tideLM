@@ -82,5 +82,17 @@ class TemplateParserTests(unittest.TestCase):
         self.assertEqual("".join(t for _, t in events), "Partial ans")
 
 
+class RequestEffortTests(unittest.TestCase):
+    def test_precedence_and_default(self):
+        from server.muse_app import request_effort as f
+        ctk = {"chat_template_kwargs": {"reasoning_effort": "high"}}
+        self.assertEqual(f({}, "low"), "low")
+        self.assertEqual(f(ctk, "low"), "high")
+        self.assertEqual(f({**ctk, "reasoning_effort": "max"}, "low"), "max")
+        self.assertEqual(f({**ctk, "reasoning_effort": "max", "reasoning": {"effort": "low"}}, "high"), "low")
+        self.assertEqual(f({"reasoning_effort": None, "chat_template_kwargs": {"reasoning_effort": ""}}, "low"), "low")
+        self.assertEqual(f({"reasoning": "high", "chat_template_kwargs": None}, "low"), "low")
+
+
 if __name__ == "__main__":
     unittest.main()

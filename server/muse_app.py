@@ -186,6 +186,19 @@ def _unescape(s: str) -> str:
             .replace("&gt;", ">").replace("&amp;", "&"))
 
 
+def request_effort(req: dict, default):
+    """The request's reasoning effort, first match wins (DS V4.1's server/app.py order):
+    `reasoning.effort`, top-level `reasoning_effort`, `chat_template_kwargs.reasoning_effort`, then
+    the server default. Only the top-level field was read before, so an effort sent inside
+    chat_template_kwargs (vLLM/SGLang style) silently got the default."""
+    reasoning, ctk = req.get("reasoning"), req.get("chat_template_kwargs")
+    for v in (reasoning.get("effort") if isinstance(reasoning, dict) else None, req.get("reasoning_effort"),
+              ctk.get("reasoning_effort") if isinstance(ctk, dict) else None):
+        if v is not None and v != "":
+            return v
+    return default
+
+
 # ---------------------------------------------------------------------------------- serving
 class Job:
     def __init__(self, prompt: list[int], params: dict):
@@ -294,7 +307,7 @@ def make_handler(tpl: Template, jobs, model_name: str, defaults: dict, parser_cl
                 path = self.path.rstrip("/")
                 if path == "/v1/chat/completions":
                     text = tpl.render(req.get("messages", []), req.get("tools"),
-                                      req.get("reasoning_effort") or defaults["reasoning_effort"])
+                                      request_effort(req, defaults["reasoning_effort"]))
                     chat = True
                 elif path == "/v1/completions":
                     text, chat = req.get("prompt", ""), False
