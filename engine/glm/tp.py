@@ -169,6 +169,10 @@ class GlmTP:
         # MUSE_GATHER_MERGE=1: MoE layers gather the routed and the fixed experts' intermediates
         # in one all-gather and their weighted, summed outputs (BF16) in another (mlp()).
         self.gather_merge = env("MUSE_GATHER_MERGE", "1") == "1"
+        # MUSE_FIXED_DENSE=1: in prefill the fixed experts (shared, dense layers) as BF16 GEMMs on
+        # weights dequantized once (engine/glm/mxfp4_dense.py) -- only where they are all of the
+        # call's slots (EXL3 config, dense layers); MXFP4's routed picks share the MoE kernel.
+        self.fixed_dense = env("MUSE_FIXED_DENSE", "1") == "1"
         self.chunk = int(chunk or env("MUSE_CHUNK", "1024"))
         self.miss = miss or env("MUSE_MISS", "substitute")
         self.native = env("MUSE_NATIVE_MOE", "1") == "1"
@@ -363,12 +367,12 @@ class GlmTP:
         digest = hashlib.sha256(b"".join((src / f).read_bytes() for f in
                                          ("tp.py", "ref.py", "weights.py", "config.py", "fp8_block.py",
                                           "index_kernel.py", "exl3.py", "sparse_attn.py",
-                                          "norm_kernel.py", "direct_io.py"))).hexdigest()[:16]
+                                          "norm_kernel.py", "direct_io.py", "mxfp4_dense.py"))).hexdigest()[:16]
         mine = {"version": VERSION, "code": digest, "miss": self.miss, "native": self.native,
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"), "db": env("MUSE_STATS_DB", ""),
-                "xfmt": self.xfmt, "kv": env("MUSE_KV", "bf16"), "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "fused_norm": FUSED_NORM, "h_ring": self.h_ring_n, "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
+                "xfmt": self.xfmt, "kv": env("MUSE_KV", "bf16"), "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "fused_norm": FUSED_NORM, "h_ring": self.h_ring_n, "fixed_dense": self.fixed_dense, "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
                 "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_PF_KEEP", "MUSE_PF_KEEP_MARGIN", "MUSE_HOT", "MUSE_HOT_MIN",
                                             "MUSE_HOT_TARGET", "MUSE_HOT_KEEP", "MUSE_HOT_MAX", "MUSE_HOT_KEEP_AUDIT", "MUSE_HOT_PACE",
                                             "MUSE_HOT_PACE_LEAD", "MUSE_SUB_WEIGHT", "MUSE_MTP_FULL", "MUSE_MISS_LOG",
@@ -1360,7 +1364,17 @@ class GlmTP:
             # cast), at a fraction of the bytes: MXFP4's 9 picks went over as fp32 [9, T, H/2]
             # (332 KB at 3 rows, past the RoCE gather's 256 KB, so NCCL every MoE layer).
             native = self.native and slots.numel() <= 512
-            h, rt = (self._native_up if native else self._triton_up)(x, slots)
+            # Prefill: every row picks the same fixed slots, a dense matrix of thousands of rows.
+            # Only where the call's slots are all fixed: an EXL3 layer (its routed picks went to
+            # routed_up) or a dense layer -- never MXFP4's routed MoE layers or the MTP layer.
+            dense = (self.fixed_dense and not native and slots.shape[0] >= 256
+                     and (x3 or self.dense(L)))
+            if dense:
+                from .mxfp4_dense import fixed_down, fixed_up
+                fs = self.fixed[L].tolist()
+                h, rt = fixed_up(x, self.arena, fs), None
+            else:
+                h, rt = (self._native_up if native else self._triton_up)(x, slots)
             local = None
             if x3:
                 xd, ctx = routed_up(x, rs.clamp_min(0), wr, self.x3)
@@ -1368,7 +1382,10 @@ class GlmTP:
                 local = routed_down(xd_full.contiguous(), ctx, self.x3)
             else:
                 h_full = self.comm.cat_last(h)
-            parts = (self._native_down if native else self._triton_down)(h_full, rt)
+            if dense:
+                parts = fixed_down(h_full, self.arena, fs, self.world)
+            else:
+                parts = (self._native_down if native else self._triton_down)(h_full, rt)
             z = (parts * w.t()[:, :, None]).sum(0)
             out = self.comm.cat_last((z if local is None else z + local).to(torch.bfloat16))
         elif x3:

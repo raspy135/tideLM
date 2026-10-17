@@ -3109,3 +3109,31 @@ Also: the MTP layer's eh_proj as FP8 (0.34 -> ~0.2 ms a draft) did not show in t
 (4.18 vs 4.21 ms); not kept. The MTP hidden ring is bounded to the last MUSE_H_RING (16,384)
 positions (0.8 GB a rank at 128K): a reuse boundary older than that skips the MTP redo, which can
 only cost that one draft's acceptance.
+
+## Prefill's fixed experts as BF16 GEMMs; EXL3 5-bit attention measured and parked (2026-10-17)
+
+The MXFP4 MoE kernel splits rows into 64-row blocks and decodes the weights again for each, so in
+prefill the shared expert (2,048 identical-slot rows) ran at ~20 TFLOPS. engine/glm/mxfp4_dense.py
+(MUSE_FIXED_DENSE=1) dequantizes the fixed slots to BF16 once a call (E2M1 x 2^(e-127) is exact in
+BF16; Triton, identical to dequant_mxfp4) and runs cuBLAS with the kernel's rounding points. Only
+where every slot of the call is fixed (EXL3 layers, the dense layers). Shared expert at 2,048
+rows 5.0 -> 4.1 ms, a dense layer 39 -> 26 ms (world 1 shapes); 12K prefill 28.4 -> 27.8 s; long-set
+NLL +0.0021 +- 0.0065 (paired).
+
+EXL3 5-bit attention (the EXL3 checkpoint stores q_a, q_b, kv_a, o_proj and the indexer's wq_b at
+5 bits: ~37% fewer bytes than the FP8 ones, 2.4 GB a rank). Decode, 4 rows, rank-0 shapes, L2-cold
+over 38 layers in one graph, V4.1's engine/exl3_dense.Exl3Matrix against fp8_block_linear:
+
+| | FP8 | EXL3 (best split) |
+| --- | --- | --- |
+| q_a 6,144 -> 2,048 | 61.9 us | 49.7 (8) |
+| kv_a 6,144 -> 576 | 26.2 | 22.1 (8) |
+| q_b 2,048 -> 8,192 | 78.4 | 63.0 (1) |
+| o_proj 8,192 -> 6,144 | 230.7 | 181.4 (2) |
+| a layer | 397 | 316 |
+
+-20%, not the bytes' -37% (three launches a matrix, lower bandwidth in the trellis GEMV): ~6.3 ms
+a verify forward, ~3.5% of a round. Prefill would unpack each matrix to FP16 per chunk:
+engine/glm/exl3_attn.unpack is exact against exl3_ref.unpack (output order, arithmetic mul1, 32-bit
+words) but ~29 G values/s, ~0.24 s a 2,048-row chunk on top of cuBLAS -- ~3.5% slower prefill. With
+V4.1's finding that the changed target cost draft acceptance, parked: not wired into the engine.
