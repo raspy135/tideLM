@@ -2974,3 +2974,29 @@ attention is 30 s of GPU time and the MLP 10 s. Past 2,048 positions the attenti
 per 32-row block it gathers each row's 2,048 selected latents into BF16 copies ([32, 2048, 512])
 and runs einsums, ~5 s a chunk. The indexer is 0.26 s, the MTP fill 0.7 s, the post-prefill
 adaptation 0.8 s.
+
+## Prefill attention: one kernel for the sparse MLA, 42 -> 19.6 s on a 6K prompt (2026-10-17)
+
+Past 2,048 cached positions GlmTP.attention gathered each 32-row block's selected latents into
+BF16 copies (kv_read(C, sel): [32, 2048, 512], 64 MB a block, plus the RoPE keys), then ran bf16
+einsums and a softmax over [32, heads, 2048] -- 32 blocks a 1,024-row chunk on every layer, 30 of
+the 6K prompt's 42 s. engine/glm/sparse_attn.py (MUSE_ATTN_KERNEL=1) gives a program BLOCK_H heads
+of one row, loads the selected rows by index (FP8 widened and scaled in BF16 as kv_read does),
+scores latent + RoPE parts with fp32 accumulation and folds them into an online softmax.
+
+| shape (one layer) | einsum path | kernel | rel. error vs fp32 |
+| --- | --- | --- | --- |
+| 1,024 prefill rows | 81.1 ms | 4.5 ms (32 heads x 64 keys, 8 warps) | 1.6e-2 -> 1.8e-3 |
+| 4 decode rows | 0.25 ms | 0.17 ms (16 x 64) | same |
+| 8 decode rows | 0.46 ms | 0.17 ms | same |
+
+The einsum path rounds its scores to BF16 twice; the kernel keeps them fp32, hence 9x closer to
+an fp32 reference. Long-set NLL on 0.8815, off 0.8881, paired -0.0066 +- 0.0073. The first try
+needed 104 KB of shared memory (limit 99 KB on GB10): the per-128 scales were gathered as a full
+[rows, 512] fp32 tile; loading [rows, 4] and broadcasting through a reshape fixed it.
+
+Prefill, 6K prompt: 143 -> 307 tok/s (attention 29.9 -> 7.4 s of GPU time; the MLP's 10.2 s is
+now the larger part). Decode did not move: a decode layer's attention is ~0.94 ms either way, the
+projections and the all-reduce being most of it. Decode tok/s under dynamic MTP depth also swings
+with the sample's acceptance (2.18 vs 2.98 accepted a round on two runs of the same prompt after a
+numerics change), so judge decode changes on several prompts, not one.

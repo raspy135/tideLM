@@ -24,6 +24,7 @@ def main():
     ap.add_argument("--model", default=os.environ.get("MUSE_MODEL", "/models"))
     ap.add_argument("--long-tokens", type=int, default=6000)
     ap.add_argument("--kernels", type=int, default=0, help="then profile this many chunks' kernels")
+    ap.add_argument("--kernels-after", type=int, default=4, help="... after this many unprofiled chunks")
     a = ap.parse_args()
     tpl = GlmTemplate(a.model)
     eng = GlmTP(a.model)
@@ -80,14 +81,18 @@ def main():
     if a.kernels:
         from torch.profiler import ProfilerActivity, profile
         eng.reset()
-        part = prompt[:eng.chunk * a.kernels]
+        lead = prompt[:eng.chunk * a.kernels_after]
+        part = prompt[len(lead):len(lead) + eng.chunk * a.kernels]
+        if lead:
+            eng.forward(lead, all_logits=False)            # context, so the chunk takes the sparse path
+        torch.cuda.synchronize()
         with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
             eng.forward(part, all_logits=False)
             torch.cuda.synchronize()
         if eng.rank == 0:
             rows = sorted((e for e in prof.key_averages() if e.device_time_total > 0), key=lambda e: -e.self_device_time_total)
             tot = sum(e.self_device_time_total for e in rows)
-            print(f"[kern] {len(part)} tokens: {tot / 1e6:.2f}s of kernels", flush=True)
+            print(f"[kern] {len(part)} tokens after {len(lead)}: {tot / 1e6:.2f}s of kernels", flush=True)
             for e in rows[:35]:
                 print(f"[kern]   {e.self_device_time_total / 1e3:9.1f} ms  {e.count:7d}x  {e.key[:110]}", flush=True)
 

@@ -154,6 +154,9 @@ class GlmTP:
         # MUSE_INDEX_KERNEL=1: the indexer's scores in one Triton kernel (engine/glm/index_kernel.py)
         # instead of fp32 einsums over [T, 32, S]; decode scored all max_seq positions that way.
         self.index_kernel = env("MUSE_INDEX_KERNEL", "1") == "1"
+        # MUSE_ATTN_KERNEL=1: the sparse attention in one Triton kernel (engine/glm/sparse_attn.py)
+        # instead of gathering each 32-row block's selected latents into BF16 copies.
+        self.attn_kernel = env("MUSE_ATTN_KERNEL", "1") == "1"
         # MUSE_GATHER_MERGE=1: decode MoE layers gather the routed and the shared expert's
         # intermediate in one all-gather and their summed outputs in another (mlp()).
         self.gather_merge = env("MUSE_GATHER_MERGE", "1") == "1"
@@ -348,12 +351,12 @@ class GlmTP:
         src = Path(__file__).resolve().parent
         digest = hashlib.sha256(b"".join((src / f).read_bytes() for f in
                                          ("tp.py", "ref.py", "weights.py", "config.py", "fp8_block.py",
-                                          "index_kernel.py", "exl3.py"))).hexdigest()[:16]
+                                          "index_kernel.py", "exl3.py", "sparse_attn.py"))).hexdigest()[:16]
         mine = {"version": VERSION, "code": digest, "miss": self.miss, "native": self.native,
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"), "db": env("MUSE_STATS_DB", ""),
-                "xfmt": self.xfmt, "kv": env("MUSE_KV", "bf16"), "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
+                "xfmt": self.xfmt, "kv": env("MUSE_KV", "bf16"), "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
                 "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_PF_KEEP", "MUSE_PF_KEEP_MARGIN", "MUSE_HOT", "MUSE_HOT_MIN",
                                             "MUSE_HOT_TARGET", "MUSE_HOT_KEEP", "MUSE_HOT_MAX", "MUSE_HOT_KEEP_AUDIT", "MUSE_HOT_PACE",
                                             "MUSE_HOT_PACE_LEAD", "MUSE_SUB_WEIGHT", "MUSE_MTP_FULL", "MUSE_MISS_LOG",
@@ -905,6 +908,13 @@ class GlmTP:
             sc = sc.masked_fill(kpos[None, None] > positions[:, None, None], float("-inf"))
             p = torch.softmax(sc, -1).to(torch.bfloat16)
             o_lat = torch.einsum("ths,sc->thc", p, C)
+        elif self.attn_kernel:
+            # engine/glm/sparse_attn.py: the selected latents read where they live, fp32 scores,
+            # online softmax. 1,024 rows: 4.5 ms a layer against the loop's 81; 4-8 rows 0.17 ms.
+            from .sparse_attn import sparse_mla
+            bh = 16 if T <= 16 else 32
+            o_lat = sparse_mla(q_lat, q_rope, C, R, topk, positions, scale, block_h=min(bh, self.hl),
+                               block_n=64, num_warps=8)
         else:
             outs = []
             for t0 in range(0, T, 32):
