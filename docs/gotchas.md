@@ -3251,3 +3251,41 @@ range -- it is 1.68-1.74e-3, the unsplit kernel's. glm_quality --set long (paire
 MXFP4 at 128K with FP8 KV and the split (9,100 slots, 6K prompt): 13.64 tok/s, MemAvailable 7.46 GB,
 against its 32K BF16 config's 13.97 and 7.86 GB (both runs captured graphs while measuring): four
 times the context for 0.4 GB.
+
+## Prompt prefixes on disk: a 6K-token prefix back in 0.2 s instead of 19 s of prefill (2026-10-17)
+
+GlmTP keeps one sequence's KV. Another conversation -- or one of Open WebUI's background requests
+(title, tags, follow-ups go to the same model unless a task model is set) -- replaced it, and the
+next turn of a long chat prefilled from scratch. MUSE_PREFIX_DISK=1 (engine/glm/prefix_store.py)
+saves each prompt's rows after its prefill and restores the longest saved prefix of a later prompt.
+A segment holds a prompt's rows past its deepest saved ancestor, so a growing conversation writes
+only each turn's new tokens; DS V4.1's bundles rewrite the whole prompt at every save, its
+documented limitation. Reads and writes are O_DIRECT: a restore must not fill the page cache, which
+on GB10 is the GPU's memory.
+
+Pair test (tools/glm_prefix_test.py; EXL3 config with the split, residency frozen, greedy): a
+6,020-token prompt was saved in 0.2 s in the background (168 MB a rank) and restored after another
+prompt in 0.20 s, where its prefill had taken 19.1 s. The restored rows are the bytes the prefill
+wrote, on both ranks, for a full restore and for one into the middle of a segment, and the
+continuation decoded the same tokens from memory, from disk, and from disk after a restart.
+
+The first pair run crashed: the background save's device-to-host copies ran while decode was
+capturing a graph for a new row count, and CUDA invalidated the capture (it refuses other threads'
+stream work while one is open). Graph captures and the save's GPU copies now share a lock.
+
+The MTP layer's row p is made with token p + 1, so a segment of positions [start, end) holds its
+rows [start - 1, end - 1), the ones its own tokens determine. A restore to a segment's end brings
+the hidden at end - 1 and redoes the last row, as the memory path does; one into the middle of a
+segment (no hidden) restarts the prefill a token early instead.
+
+Limitations, measured or not: a prompt that diverges inside a segment (an edited message, another
+chat with the same system prompt) saves its new segment from the deepest full match, so rows it
+shares inside that segment are stored again. There is no payload checksum -- sizes, headers and the
+chain's tokens are checked; hashing 2.8 GB per 100K-token restore would take seconds. Rows depend on
+the experts resident when they were computed, and a restored prefix is not recomputed because
+adaptation has changed them since (DS V4.1's default too). The namespace covers the engine's code
+digest, the KV format, the split, the expert format and the numerics switches: any engine change
+starts a new namespace, and old namespaces are evicted first.
+
+Disk: rank 0's drive had 62 GB free when this went in. The default budget is 20 GB a node, and no
+segment is written that would leave less than MUSE_PREFIX_DISK_FREE_GB (10) free.

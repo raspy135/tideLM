@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -155,6 +156,7 @@ class GlmTP:
             raise RuntimeError(f"only {mem_available() / 1e9:.1f} GB MemAvailable, need {need:.0f}")
         self.cfg = cfg = GlmConfig.load(model_dir)
         self.ck = GlmCheckpoint(model_dir)
+        self.model_dir = model_dir
         self.max_seq = int(max_seq or env("MUSE_MAX_SEQ", "32768"))
         # MUSE_KV=fp8: the MLA latent (512) and the indexer keys (128) are cached as FP8 E4M3 with
         # one fp32 scale per 128 values, the MTP hidden ring as FP8 with one per row; the RoPE keys
@@ -186,6 +188,10 @@ class GlmTP:
         self.prefill_moe = env("MUSE_PREFILL_MOE", "triton")
         self.use_graphs = env("MUSE_GRAPHS", "1") == "1"
         self.decode_rows, self.graph_rows = 16, {1}
+        # Held through every graph capture: CUDA refuses another thread's stream work while a
+        # capture is open (and invalidates the capture), and the prefix store's background save
+        # copies rows off the GPU while decode may capture a graph for a new row count.
+        self.capture_lock = threading.Lock()
         W, r = self.world, self.rank
         if cfg.heads % W or cfg.vocab % W or cfg.moe_inter % W or cfg.hidden % W:
             raise ValueError("dimensions must split evenly over the ranks")
@@ -361,6 +367,19 @@ class GlmTP:
                  f"({(self.arena.bytes_per_slot * self.arena.slots + (self.x3.total_bytes if self.x3 else 0)) / 1e9:.2f} GB"
                  f"{', routed EXL3' if self.x3 else ''}), miss={self.miss}, "
                  f"max_seq {self.max_seq}; {mem_available() / 1e9:.1f} GB available")
+        # MUSE_PREFIX_DISK=1: prompt prefixes saved to disk after each prefill and restored when a
+        # later prompt starts with one (engine/glm/prefix_store.py). Budget a node, decimal GB;
+        # no save while it would leave less than MUSE_PREFIX_DISK_FREE_GB free.
+        self.pstore, self.h_from = None, 0
+        self.prefix_min = int(env("MUSE_PREFIX_DISK_MIN", "256"))           # tokens a restore must gain
+        self.prefix_min_save = int(env("MUSE_PREFIX_DISK_MIN_SAVE", "256"))  # tokens a segment must add
+        if env("MUSE_PREFIX_DISK", "0") == "1":
+            from .prefix_store import PrefixStore
+            self.pstore = PrefixStore(env("MUSE_PREFIX_DISK_DIR", "/app/results/glm-prefix"), self._prefix_ns(), r, W,
+                                      int(float(env("MUSE_PREFIX_DISK_GB", "20")) * 1e9),
+                                      int(float(env("MUSE_PREFIX_DISK_FREE_GB", "10")) * 1e9),
+                                      log=lambda m: print(f"{m} (rank {r})", flush=True), gpu_lock=self.capture_lock)
+            self.log(f"[prefix] {len(self.pstore.segs())} saved segment(s) in {self.pstore.dir}")
         self.reset()
 
     # ------------------------------------------------------------------ setup
@@ -380,12 +399,13 @@ class GlmTP:
                                          ("tp.py", "ref.py", "weights.py", "config.py", "fp8_block.py",
                                           "index_kernel.py", "exl3.py", "sparse_attn.py",
                                           "norm_kernel.py", "direct_io.py", "mxfp4_dense.py", "exl3_attn.py",
-                                          "kv_split.py"))).hexdigest()[:16]
+                                          "kv_split.py", "prefix_store.py"))).hexdigest()[:16]
+        self.code_digest = digest
         mine = {"version": VERSION, "code": digest, "miss": self.miss, "native": self.native,
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"), "db": env("MUSE_STATS_DB", ""),
-                "xfmt": self.xfmt, "kv": env("MUSE_KV", "bf16"), "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "fused_norm": FUSED_NORM, "h_ring": self.h_ring_n, "fixed_dense": self.fixed_dense, "exl3_attn": self.exl3_attn, "kv_split": self.kv_split, "draft_head": env("MUSE_DRAFT_HEAD", "same"), "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
+                "xfmt": self.xfmt, "kv": env("MUSE_KV", "bf16"), "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "fused_norm": FUSED_NORM, "h_ring": self.h_ring_n, "fixed_dense": self.fixed_dense, "exl3_attn": self.exl3_attn, "kv_split": self.kv_split, "prefix_disk": env("MUSE_PREFIX_DISK", "0"), "draft_head": env("MUSE_DRAFT_HEAD", "same"), "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
                 "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_PF_KEEP", "MUSE_PF_KEEP_MARGIN", "MUSE_HOT", "MUSE_HOT_MIN",
                                             "MUSE_HOT_TARGET", "MUSE_HOT_KEEP", "MUSE_HOT_MAX", "MUSE_HOT_KEEP_AUDIT", "MUSE_HOT_PACE",
                                             "MUSE_HOT_PACE_LEAD", "MUSE_SUB_WEIGHT", "MUSE_MTP_FULL", "MUSE_MISS_LOG",
@@ -719,6 +739,7 @@ class GlmTP:
     def reset(self):
         self.pos = 0
         self.tokens: list[int] = []
+        self.h_from = 0             # the first position whose MTP ring entry is this sequence's
 
     def enable_adaptation(self, decay: float = 0.9):
         self.demand_tokens = 0
@@ -1564,7 +1585,7 @@ class GlmTP:
                     self._step(static_ids)
             torch.cuda.current_stream().wait_stream(side)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with self.capture_lock, torch.cuda.graph(graph):
                 static_out, static_h = self._step(static_ids)
             entry = self.graphs[T] = (graph, static_ids, static_out, static_h)
             torch.cuda.empty_cache()
@@ -1628,7 +1649,7 @@ class GlmTP:
 
         def cap(fn):
             g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g, pool=pool):
+            with self.capture_lock, torch.cuda.graph(g, pool=pool):
                 out = fn()
             keep.append(out)
             return g, out
@@ -1756,7 +1777,7 @@ class GlmTP:
                         self._mtp_core(st_ids, st_h, logits)
                 torch.cuda.current_stream().wait_stream(side)
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, pool=self._graph_pool()):
+                with self.capture_lock, torch.cuda.graph(graph, pool=self._graph_pool()):
                     st_hn, st_z = self._mtp_core(st_ids, st_h, logits)
                 entry = self.graphs[key] = (graph, st_ids, st_h, st_hn, st_z)
                 torch.cuda.empty_cache()
@@ -1781,20 +1802,126 @@ class GlmTP:
     def prefill(self, prompt):
         if getattr(self, "pf_kept", None) is not None:
             self.pf_kept.zero_()
+        disk = self.pstore is not None and not self._warming
+        if disk:
+            self.pstore.join()                  # a save still reading rows this prefill rewrites
         n = self.reusable_prefix(prompt)
-        if n:
+        got = self._disk_restore(prompt, n) if disk else None
+        self.last_disk = 0
+        if got is not None:
+            self.last_disk = got[0] - n
+            n, h_ok = got
+            self.pos, self.tokens = n, list(prompt[:n])
+            # The ring's entries before n are another sequence's (n - 1's came with the hidden).
+            self.h_from = n - 1 if h_ok else n
+            if self.mtp_on and h_ok:
+                h = kv_read(self.h_ring, (n - 1) % self.h_ring_n)[None]
+                self.mtp_forward(torch.tensor([prompt[n]], device=self.dev), h, n - 1, logits=False)
+        elif n:
             old_len = len(self.tokens)
             self.pos, self.tokens = n, self.tokens[:n]
             # Position n-1 still in the ring: verify steps also wrote up to depth rows past the
             # last kept token, so leave that much margin before a slot could have been reused.
-            if self.mtp_on and n - 1 >= old_len - self.h_ring_n + 16:
+            if self.mtp_on and n - 1 >= old_len - self.h_ring_n + 16 and n - 1 >= self.h_from:
                 # Position n-1's MTP entry was made with the old next token; redo it.
                 h = kv_read(self.h_ring, (n - 1) % self.h_ring_n)[None]
                 self.mtp_forward(torch.tensor([prompt[n]], device=self.dev), h, n - 1, logits=False)
         else:
             self.reset()
         self.last_reuse = n
-        return self.forward(prompt[n:], all_logits=False)
+        out = self.forward(prompt[n:], all_logits=False)
+        if disk:
+            self._disk_save(prompt)
+        return out
+
+    # ------------------------------------------------------------------ prefixes on disk
+    def _prefix_ns(self) -> str:
+        """Everything that changes what a cached row means (engine/glm/prefix_store.py)."""
+        cfg_bytes = (Path(self.model_dir) / "config.json").read_bytes()
+        key = {"code": self.code_digest, "kv": env("MUSE_KV", "bf16"), "split": self.kv_split, "world": self.world,
+               "xfmt": self.xfmt, "x3": self.x3pack.reader.header.get("dims") if self.x3pack else None,
+               "exl3_attn": self.exl3_attn, "model": hashlib.sha256(cfg_bytes).hexdigest(), "dir": str(self.model_dir),
+               "pack": env("MUSE_EXL3_PACK", ""),
+               "numerics": [FUSED_NORM, self.attn_kernel, self.index_kernel, self.fixed_dense, self.gather_merge,
+                            self.native, self.prefill_moe, self.miss]}
+        return hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:16]
+
+    def _kv_layout(self):
+        """(name, tensor, mode) for every cache tensor a prefix's rows live in (PrefixStore)."""
+        tup = lambda c: c if isinstance(c, tuple) else (c,)
+        out = []
+        for L in range(self.nL):
+            mode = "mtp" if self.mtp_on and L == self.mtp_L else "split" if self.split(L) else "full"
+            out += [(f"c{L}.{i}", t, mode) for i, t in enumerate(tup(self.c_cache[L]))]
+            out.append((f"r{L}", self.r_cache[L], mode))
+            if L in self.i_cache:
+                out += [(f"i{L}.{i}", t, mode) for i, t in enumerate(tup(self.i_cache[L]))]
+        return out
+
+    def _h_parts(self, p):
+        """The MTP input hidden of position p: its ring row (views)."""
+        slot = p % self.h_ring_n
+        h = self.h_ring if isinstance(self.h_ring, tuple) else (self.h_ring,)
+        return [(f"h.{i}", t[slot:slot + 1]) for i, t in enumerate(h)]
+
+    def _disk_restore(self, prompt, have):
+        """Both ranks: restore the longest saved prefix of `prompt` past the `have` positions the
+        caches hold -> (n, whether the hidden at n - 1 came with it), or None. Rank 0 plans; every
+        rank checks its files and tokens, and any rank's miss or failure is a miss on both."""
+        ps = self.pstore
+        plan = ps.plan_restore(prompt, have, self.prefix_min) if self.rank == 0 else None
+        plan = self.comm.broadcast_obj(plan)
+        if plan is None:
+            return None
+        bad = ps.missing(plan)
+        if not bad and not ps.verify_tokens(plan, prompt):
+            bad = [plan["chain"][-1][0]]
+        bad = sorted({s for b in self.comm.gather_objects(bad) for s in b})
+        if bad:
+            ps.drop(bad)                        # and their descendants, on every rank
+            self.log(f"[prefix] restore miss: {len(bad)} segment(s) dropped")
+            return None
+        t0 = time.perf_counter()
+        try:
+            ps.load(plan, have, self._kv_layout(), self._h_parts(plan["n"] - 1))
+            torch.cuda.synchronize()
+            ok = True
+        except Exception as e:                  # noqa: BLE001
+            print(f"[prefix] rank {self.rank} restore failed: {e!r}", flush=True)
+            ok = False
+        if not all(self.comm.gather_objects(ok)):
+            # Rows past `have` may be half-written; the prefill from `have` rewrites them.
+            return None
+        ps.touch([s for s, _, _ in plan["chain"]])
+        self.log(f"[prefix] restored [{have}, {plan['n']}) from {len(plan['chain'])} segment(s) in "
+                 f"{time.perf_counter() - t0:.2f}s")
+        # Without the hidden at n - 1 (a restore into the middle of a segment), the MTP row of
+        # n - 1 cannot be redone in place: prefill from n - 1, one row computed again.
+        return (plan["n"], True) if plan["h"] else (plan["n"] - 1, False)
+
+    def _disk_save(self, prompt):
+        """Both ranks: write the prompt's rows past its deepest saved prefix as a new segment, in
+        the background (rank 0 plans the segment and any evictions)."""
+        ps = self.pstore
+        plan = None
+        if self.rank == 0:
+            plan = ps.plan_save(prompt, self.prefix_min_save)
+            if plan is not None:
+                keep = set(ps.chain(plan["parent"])) if plan["parent"] else set()
+                ev = ps.plan_evict(ps.estimate(self._kv_layout(), plan["start"], plan["end"]), keep)
+                plan = None if ev is None else {**plan, "evict": ev}
+        plan = self.comm.broadcast_obj(plan)
+        if plan is None:
+            return
+        ps.drop(plan["evict"]["segs"], plan["evict"]["ns"])
+        if not all(self.comm.gather_objects(ps.room(ps.estimate(self._kv_layout(), plan["start"], plan["end"])))):
+            self.log("[prefix] save skipped: a disk is near its floor")
+            return
+        if plan["parent"]:
+            ps.touch(ps.chain(plan["parent"]))
+        ev = torch.cuda.Event()
+        ev.record()
+        ps.write_async(plan, prompt, self._kv_layout(), self._h_parts(plan["end"] - 1), ev)
 
     @staticmethod
     def sample_probs(z, temperature, top_p, top_k):

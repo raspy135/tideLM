@@ -255,6 +255,7 @@ def engine_loop(engine, jobs: "queue.Queue[Job]", log, tpl: Template, stop: tupl
             raise
         end = time.perf_counter()
         job.stats = {"prompt_tokens": len(job.prompt), "reused_prefix": engine.last_reuse,
+                     **({"from_disk": engine.last_disk} if getattr(engine, "last_disk", 0) else {}),
                      "completion_tokens": n, "ttft_s": round((first or end) - t0, 3),
                      "decode_tok_s": round((n - 1) / (end - first), 2) if first and n > 1 else None}
         if snap:
