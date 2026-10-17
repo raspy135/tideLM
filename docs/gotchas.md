@@ -3192,3 +3192,18 @@ FP8 projections 0.9986-0.9989 on every matrix). Against FP8 attention, same nigh
 ~5% off the decode round against 16% on prefill and a KL that leans the wrong way: off by
 default. To revisit: tensor-core rotations (H is +-1, exact in fp16), a faster unpack, and a
 draft-acceptance measurement across many prompts.
+
+## Graphs captured at boot; what the first request still pays (2026-10-17)
+
+With dynamic depth every verify row count (1-8) and MTP fill size (1-7) captures its graphs the
+first time it occurs, inside a request: the first request after boot decoded at 11.3 tok/s.
+GlmTP.warmup() (MUSE_WARMUP=1, called by both ranks in server/glm_app.py before serving) runs two
+48-token greedy generations on synthetic tokens -- a repeating 12-token pattern (confident, deep
+drafts) and an irregular run (shallow) -- which captured all 16 graphs in 14.8 s of boot. The
+demand and miss counters must stay live during the capture (a graph bakes in what runs: captured
+without them, decode would never record demand again); adaptation and the background step are
+skipped and the counters zeroed after, so residency and the stats DB are untouched. First request
+11.3 -> 12.9 tok/s, TTFT 2.2 -> 1.3 s. The rest is the workload: Japanese chat at the default
+temperature 1.0 / top-p 0.95 decodes at 14-14.6 tok/s warm (decode miss 5-7%), the English code
+prompt at 18-19 -- MTP acceptance, now in the per-request stats (accepted_per_round,
+drafted_per_round).

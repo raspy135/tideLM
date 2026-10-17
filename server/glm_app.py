@@ -161,6 +161,7 @@ def main(args):
     import signal
     from engine.glm.tp import GlmTP
     engine = GlmTP(args.model)
+    engine.warmup()                       # both ranks, before either takes a request
     if engine.rank != 0:
         follower_loop(engine)
         return

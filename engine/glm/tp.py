@@ -257,6 +257,7 @@ class GlmTP:
         self.hot_q = []                 # [(VL, ve, slot)] victims for kept hot reads, weakest last
         self.hot_live = None            # [(e, transient slot)] hot reads of the layer being computed
         self._pre_route = {}            # L -> (x, scores, choice) from _hot_candidate, for _route
+        self._warming = False           # warmup(): no adaptation or background step
         transient = cfg.experts if self.miss == "stream" else max(2 * self.pf_n, self.hot_n)
         t0 = time.perf_counter()
         self._load_dense()
@@ -385,7 +386,7 @@ class GlmTP:
                 "adapt": [env(k, "") for k in ("MUSE_ADAPT", "MUSE_ADAPT_EVERY", "MUSE_ADAPT_PREFILL_SWAPS",
                                                "MUSE_ADAPT_DECODE_SWAPS", "MUSE_ADAPT_DECAY", "MUSE_ADAPT_CROSS_LAYER",
                                                "MUSE_ADAPT_MARGIN", "MUSE_BG", "MUSE_BG_EVERY", "MUSE_BG_READS",
-                                               "MUSE_BG_DECAY", "MUSE_BG_PROTECT", "MUSE_BG_COLD")],
+                                               "MUSE_BG_DECAY", "MUSE_BG_PROTECT", "MUSE_BG_COLD", "MUSE_WARMUP")],
                 "fast_comm": self.comm.fast,
                 "config": json.dumps({k: v for k, v in self.cfg.extra["raw"].items()
                                       if k != "quantization_config"}, sort_keys=True)}
@@ -994,7 +995,9 @@ class GlmTP:
         h = self.hot_stats
         return {"picks": ms.get("picks", 0), "missed": ms.get("missed", 0), "mass": ms.get("mass", 0.0),
                 "mass_missed": ms.get("mass_missed", 0.0), "hot": h["reads"], "kept": h.get("kept", 0),
-                "swaps": self.adapt_totals["swaps"] if self.demand is not None else 0, "tokens": len(self.tokens)}
+                "swaps": self.adapt_totals["swaps"] if self.demand is not None else 0, "tokens": len(self.tokens),
+                "rounds": self.spec_stats.get("rounds", 0), "accepted": self.spec_stats.get("accepted", 0),
+                "drafted": self.spec_stats.get("drafted", 0)}
 
     @staticmethod
     def request_stats(s0, s1, s2):
@@ -1008,7 +1011,9 @@ class GlmTP:
                 "decode_miss_picks": round((s2["missed"] - s1["missed"]) / p, 3) if p > 0 else None,
                 "hot_reads": s2["hot"] - s1["hot"], "hot_kept": s2["kept"] - s1["kept"],
                 "hot_per_tok": round((s2["hot"] - s1["hot"]) / max(1, s2.get("tokens", 0) - s1.get("tokens", 0)), 2),
-                "swaps": s2["swaps"] - s0["swaps"]}
+                "swaps": s2["swaps"] - s0["swaps"],
+                "drafted_per_round": round((s2["drafted"] - s1["drafted"]) / max(1, s2["rounds"] - s1["rounds"]), 2),
+                "accepted_per_round": round((s2["accepted"] - s1["accepted"]) / max(1, s2["rounds"] - s1["rounds"]), 2)}
 
     def miss_totals(self):
         """miss_stats with the graph replays' device counts folded in."""
@@ -1776,7 +1781,7 @@ class GlmTP:
         gen = torch.Generator(device=self.dev).manual_seed(seed)
         self.mtp_fill = True
         logits = self.prefill(list(prompt))
-        if self.demand is not None:
+        if self.demand is not None and not self._warming:
             # After prefill: swap toward what this prompt routed to (decode benefits; the prompt's
             # KV is already computed with the substituted experts).
             n, sec = self.adapt(self.adapt_prefill_swaps)
@@ -1802,13 +1807,13 @@ class GlmTP:
             halt = bool(decide(bool(should_stop and self.rank == 0 and should_stop())))
             if halt:
                 return
-            if self.demand is not None and self.adapt_every and emitted >= next_adapt:
+            if self.demand is not None and self.adapt_every and emitted >= next_adapt and not self._warming:
                 # Both ranks reach this at the same token count (emitted is decided on rank 0).
                 n, sec = self.adapt(self.adapt_decode_swaps)
                 self.adapt_log.append((f"decode@{emitted}", n, round(sec, 2), self.last_churn))
                 next_adapt += self.adapt_every
             rounds += 1
-            if self.bg_on and self.demand is not None and rounds % self.bg_every == 0:
+            if self.bg_on and self.demand is not None and rounds % self.bg_every == 0 and not self._warming:
                 self.bg_step()                    # same round on both ranks
             yield anchor
             emitted += 1
@@ -1896,6 +1901,35 @@ class GlmTP:
                 if d in stop or emitted >= max_new:
                     return
             anchor = nxt
+
+    def warmup(self, tokens: int = 48):
+        """MUSE_WARMUP (default 1): capture the decode graphs before the first request. Dynamic MTP
+        depth captures a split set per verify row count and MTP graphs per fill size the first time
+        each occurs, so the first request after boot ran ~40% slower. Two short greedy generations
+        on synthetic tokens -- a repeating pattern (confident drafts, deep verify steps) and an
+        irregular run (shallow ones). The graphs must be captured with the demand and miss
+        counters live (a capture bakes in what runs), so those stay on and are zeroed after;
+        adaptation and the background step are skipped, so residency and the stats DB are
+        untouched. Both ranks run the same calls."""
+        if not tokens or not self.use_graphs or env("MUSE_WARMUP", "1") != "1":
+            return
+        t0 = time.perf_counter()
+        self._warming = True
+        try:
+            for prompt in ([1000 + (i % 12) for i in range(192)], [(i * 7919) % 50000 + 1000 for i in range(64)]):
+                for _ in self.stream(prompt, tokens):
+                    pass
+        finally:
+            self._warming = False
+            if self.demand is not None:
+                self.demand.zero_()
+                self.demand_tokens = 0
+            if self.miss_stats is not None:
+                self.miss_totals()
+                for k in ("picks", "missed", "mass", "mass_missed"):
+                    self.miss_stats[k] = 0 if k in ("picks", "missed") else 0.0
+            self.reset()
+        self.log(f"[glm] warm-up: {len(self.graphs)} graphs captured in {time.perf_counter() - t0:.1f}s")
 
     def generate(self, prompt, max_new, **kw):
         return list(self.stream(list(prompt), max_new, **kw))
