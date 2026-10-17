@@ -2857,3 +2857,26 @@ AI-written docs, close to what quantizers calibrate on, so an average NLL there 
 rare errors a 3-bit format makes; judge it in use.
 
 First live EXL3 requests: 8.66 tok/s fresh after boot, 9.99 on the second (MXFP4 at 8,600: 6.6-8.6).
+
+## 128K context: an FP8 KV cache costs +0.002-0.005 NLL and buys ~900 EXL3 slots (2026-10-16)
+
+The KV cache is preallocated for max_seq and both ranks hold all of it (the MLA latent is not
+split by TP): 96.6 KB a position a rank in BF16 -- 3.2 GB at 32K, 12.7 GB at 128K, 50.7 GB at
+512K -- plus the MTP hidden ring (12 KB a position). Decode's indexer also scans max_seq every
+step (CUDA graphs need a fixed S).
+
+MUSE_KV=fp8 caches the latent and the indexer keys as E4M3 with an fp32 scale per 128 values and
+the MTP ring with one per row; RoPE keys stay BF16 (~54 KB a position). FP8 has no index_copy_ or
+gather kernels: kv_write/kv_read move the bytes as uint8. EXL3 routed experts, 10,750 slots:
+
+| | BF16 KV | FP8 KV |
+| --- | --- | --- |
+| natural set, every expert exact, NLL | 1.6107 | 1.6131 |
+| long set (6K/12K/18K prompts, 300 scored, 3-row, served config) NLL | 0.8746 | 0.8795 |
+| long set wall time | 298 s | 373 s (494 s dequantizing through fp32) |
+| 128K, MemAvailable at ready (rank 0) | 10.9 GB | 17.5 GB |
+| 128K, probe tok/s (accepted/round) | 8.94 (1.70) | 8.25 (1.62); per round 301 -> 318 ms |
+
+Serving at 128K, FP8 KV, 11,650 slots (61%): minimum MemAvailable 5.1 / 6.6 GB (rank 0 / 1)
+through a 5.6K and a 20K prompt. Rank 0 binds: its engine process holds ~1.5 GB more (the HTTP
+server), so freeing rank 1 (polkitd 3.4 GB + bluetoothd 1.1 GB restarted) did not raise slots.

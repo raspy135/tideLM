@@ -62,6 +62,44 @@ def rms(x, weight, eps):
     return weight * (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)).to(x.dtype)
 
 
+KV_BLOCK = 128          # values per fp32 scale in an FP8 cache row
+
+
+def kv_write(cache, idx, x):
+    """Store rows x [n, d] at idx: a BF16 tensor directly, an (fp8, scale) pair quantized per
+    KV_BLOCK values (or per row when the scale has one column)."""
+    if isinstance(cache, torch.Tensor):
+        cache.index_copy_(0, idx, x)
+        return
+    q, sc = cache
+    n, d = x.shape
+    g = x.float().view(n, sc.shape[1], d // sc.shape[1])
+    s = (g.abs().amax(-1, keepdim=True) / 448.0).clamp_min(1e-12)
+    # FP8 has no index_copy_/gather kernels: move the bytes as uint8 (the same bits)
+    q.view(torch.uint8).index_copy_(0, idx, (g / s).to(torch.float8_e4m3fn).view(n, d).view(torch.uint8))
+    sc.index_copy_(0, idx, s.view(n, -1))
+
+
+def kv_read(cache, idx, dtype=torch.bfloat16):
+    """Rows at idx (a tensor of any shape, or an int) back in `dtype`."""
+    if isinstance(cache, torch.Tensor):
+        return cache[idx].to(dtype)
+    q, sc = cache
+    v, s = q.view(torch.uint8)[idx].view(torch.float8_e4m3fn), sc[idx]
+    d, b = v.shape[-1], s.shape[-1]
+    # Straight to `dtype`: an fp32 intermediate doubled the gather's traffic (long prefill 1.66x).
+    return (v.to(dtype).view(*v.shape[:-1], b, d // b) * s[..., None].to(dtype)).view(v.shape)
+
+
+def kv_span(cache, S, dtype=torch.bfloat16):
+    """Rows [0, S) in `dtype`."""
+    if isinstance(cache, torch.Tensor):
+        return cache[:S].to(dtype)
+    q, sc = cache
+    d, b = q.shape[1], sc.shape[1]
+    return (q[:S].to(dtype).view(S, b, d // b) * sc[:S, :, None].to(dtype)).view(S, d)
+
+
 class Arena:
     """This rank's half of resident experts (routed, shared, dense pseudo-experts) in MXFP4."""
 
@@ -109,6 +147,10 @@ class GlmTP:
         self.cfg = cfg = GlmConfig.load(model_dir)
         self.ck = GlmCheckpoint(model_dir)
         self.max_seq = int(max_seq or env("MUSE_MAX_SEQ", "32768"))
+        # MUSE_KV=fp8: the MLA latent (512) and the indexer keys (128) are cached as FP8 E4M3 with
+        # one fp32 scale per 128 values, the MTP hidden ring as FP8 with one per row; the RoPE keys
+        # (64) stay BF16. ~54 KB a position a rank instead of ~97 (+ 6 KB of ring instead of 12).
+        self.kv8 = env("MUSE_KV", "bf16") == "fp8"
         self.chunk = int(chunk or env("MUSE_CHUNK", "1024"))
         self.miss = miss or env("MUSE_MISS", "substitute")
         self.native = env("MUSE_NATIVE_MOE", "1") == "1"
@@ -299,7 +341,7 @@ class GlmTP:
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"), "db": env("MUSE_STATS_DB", ""),
-                "xfmt": self.xfmt, "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
+                "xfmt": self.xfmt, "kv": env("MUSE_KV", "bf16"), "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
                 "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_PF_KEEP", "MUSE_PF_KEEP_MARGIN", "MUSE_HOT", "MUSE_HOT_MIN",
                                             "MUSE_HOT_TARGET", "MUSE_HOT_KEEP", "MUSE_HOT_MAX", "MUSE_HOT_KEEP_AUDIT", "MUSE_HOT_PACE",
                                             "MUSE_HOT_PACE_LEAD", "MUSE_SUB_WEIGHT", "MUSE_MTP_FULL", "MUSE_MISS_LOG")],
@@ -375,17 +417,27 @@ class GlmTP:
 
     def _alloc_cache(self):
         cfg, kw = self.cfg, dict(dtype=torch.bfloat16, device=self.dev)
-        self.c_cache = [torch.zeros((self.max_seq, cfg.kv_lora), **kw) for _ in range(self.nL)]
-        self.r_cache = [torch.zeros((self.max_seq, cfg.rope_dim), **kw) for _ in range(self.nL)]
-        self.i_cache = {L: torch.zeros((self.max_seq, cfg.index_dim), **kw)
-                        for L in range(self.nL) if self.full(L)}
+        S, f8 = self.max_seq, dict(dtype=torch.float8_e4m3fn, device=self.dev)
+        f32 = dict(dtype=torch.float32, device=self.dev)
+        if self.kv8:
+            self.c_cache = [(torch.zeros((S, cfg.kv_lora), **f8), torch.zeros((S, cfg.kv_lora // KV_BLOCK), **f32))
+                            for _ in range(self.nL)]
+            self.i_cache = {L: (torch.zeros((S, cfg.index_dim), **f8), torch.zeros((S, cfg.index_dim // KV_BLOCK), **f32))
+                            for L in range(self.nL) if self.full(L)}
+        else:
+            self.c_cache = [torch.zeros((S, cfg.kv_lora), **kw) for _ in range(self.nL)]
+            self.i_cache = {L: torch.zeros((S, cfg.index_dim), **kw) for L in range(self.nL) if self.full(L)}
+        self.r_cache = [torch.zeros((S, cfg.rope_dim), **kw) for _ in range(self.nL)]
         # Post-norm target hidden of every position: the MTP layer's input when a follow-up
         # turn reuses the cache and its last reused position gets a new next token. It covers
         # max_seq (~12 KB a position, 400 MB at 32K): a ring of one chunk refused reuse whenever
         # the previous turn ran a chunk past the shared prefix -- every chat turn whose answer
         # (reasoning included) passed 1,024 tokens re-prefilled the whole conversation.
         self.h_ring_n = self.max_seq
-        self.h_ring = torch.zeros((self.h_ring_n, cfg.hidden), **kw)
+        if self.kv8:
+            self.h_ring = (torch.zeros((self.h_ring_n, cfg.hidden), **f8), torch.zeros((self.h_ring_n, 1), **f32))
+        else:
+            self.h_ring = torch.zeros((self.h_ring_n, cfg.hidden), **kw)
 
     # ------------------------------------------------------------------ experts
     def _expert_parts(self, L, e, urgent=False):
@@ -788,8 +840,8 @@ class GlmTP:
         rd = cfg.rope_dim
         q = torch.cat([rope_interleave(q[..., :rd], cos, sin), q[..., rd:]], -1)
         k = torch.cat([rope_interleave(k[..., :rd], cos, sin), k[..., rd:]], -1)[:, 0]
-        self.i_cache[L].index_copy_(0, positions, k)
-        K = self.i_cache[L][:S]
+        kv_write(self.i_cache[L], positions, k)
+        K = kv_span(self.i_cache[L], S, torch.float32)
         w = F.linear(x.float(), lw["i_w"]) * cfg.index_heads ** -0.5                 # [T, h]
         kpos = torch.arange(S, device=x.device)
         out = []
@@ -816,24 +868,25 @@ class GlmTP:
         ckv = lw["kv_a"](x)
         c = rms(ckv[:, :cfg.kv_lora], lw["kv_norm"], LATENT_EPS)
         kr = rope_interleave(ckv[:, None, cfg.kv_lora:], cos, sin)[:, 0]
-        self.c_cache[L].index_copy_(0, positions, c)
+        kv_write(self.c_cache[L], positions, c)
         self.r_cache[L].index_copy_(0, positions, kr)
         topk = self._indexer(L, x, q_resid, positions, cos, sin, S) if self.full(L) else topk_prev
         q_lat = torch.einsum("thn,hnc->thc", q_nope, lw["w_uk"])                  # [T, h, kv_lora]
         scale = cfg.qk_dim ** -0.5
         C, R = self.c_cache[L], self.r_cache[L]
         if not decode and S <= cfg.index_topk:
+            C = kv_span(C, S)
             # Every cached position is selected: dense causal attention over [0, S).
-            sc = (torch.einsum("thc,sc->ths", q_lat, C[:S]) + torch.einsum("thr,sr->ths", q_rope, R[:S])).float() * scale
+            sc = (torch.einsum("thc,sc->ths", q_lat, C) + torch.einsum("thr,sr->ths", q_rope, R[:S])).float() * scale
             kpos = torch.arange(S, device=x.device)
             sc = sc.masked_fill(kpos[None, None] > positions[:, None, None], float("-inf"))
             p = torch.softmax(sc, -1).to(torch.bfloat16)
-            o_lat = torch.einsum("ths,sc->thc", p, C[:S])
+            o_lat = torch.einsum("ths,sc->thc", p, C)
         else:
             outs = []
             for t0 in range(0, T, 32):
                 sel = topk[t0:t0 + 32].long()
-                cg, rg = C[sel], R[sel]                                            # [t, k, c|r]
+                cg, rg = kv_read(C, sel), R[sel]                                   # [t, k, c|r]
                 sc = (torch.einsum("thc,tkc->thk", q_lat[t0:t0 + 32], cg)
                       + torch.einsum("thr,tkr->thk", q_rope[t0:t0 + 32], rg)).float() * scale
                 valid = sel <= positions[t0:t0 + 32, None]
@@ -1449,7 +1502,7 @@ class GlmTP:
             self.pos, self.tokens = n, self.tokens[:n]
             if self.mtp_on:
                 # Position n-1's MTP entry was made with the old next token; redo it.
-                h = self.h_ring[(n - 1) % self.h_ring_n][None]
+                h = kv_read(self.h_ring, (n - 1) % self.h_ring_n)[None]
                 self.mtp_forward(torch.tensor([prompt[n]], device=self.dev), h, n - 1)
         else:
             self.reset()
@@ -1621,7 +1674,7 @@ class GlmTP:
         whose next token is known (fills its cache; the last row waits for the sampled token)."""
         T = ids.numel()
         idx = (torch.arange(pos0, pos0 + T, device=self.dev)) % self.h_ring_n
-        self.h_ring.index_copy_(0, idx, hn)
+        kv_write(self.h_ring, idx, hn)
         self.last_hidden = hn
         if self.mtp_on and self.mtp_fill and next_ids is not None and next_ids.numel():
             n = min(T, next_ids.numel())

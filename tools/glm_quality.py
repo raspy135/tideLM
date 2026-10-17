@@ -59,6 +59,15 @@ def encode_natural(tpl, n_answer):
     return out
 
 
+def encode_long(tpl, n_answer):
+    """--set long: the held-out corpus joined into one text; the prompt is its first 6K / 12K /
+    18K tokens and the next n_answer are scored -- past index_topk (2,048), so the indexer picks
+    which positions attention reads (what an FP8 key cache or the decode range can change)."""
+    docs = [json.loads(l)["text"] for l in open("/app/corpus/heldout_eval.jsonl")]
+    ids = tpl.encode("\n\n".join(docs))
+    return [{"prompt": ids[:w], "answer": ids[w:w + n_answer], "id": f"long-{w}"} for w in (6000, 12000, 18000)]
+
+
 def encode_switch(tpl, tokyo):
     """(ids, cut) per SWITCH turn: the Tokyo exchange (reasoning dropped, as clients send it back)
     then the new question; ids[:cut] is what a prefix cache would hold."""
@@ -80,7 +89,7 @@ def main():
     ap.add_argument("--name", default="")
     ap.add_argument("--tokens", type=int, default=300)
     ap.add_argument("--out", default="/app/results/glm-quality")
-    ap.add_argument("--set", choices=("tokyo", "switch", "natural"), default="tokyo")
+    ap.add_argument("--set", choices=("tokyo", "switch", "natural", "long"), default="tokyo")
     ap.add_argument("--ref", default="", help="exact mode: written as exact<-set><-ref>.json; eval: the one to score against")
     ap.add_argument("--rows", type=int, default=1,
                     help="eval: feed the answer N tokens a step (3 = an MTP depth-2 verify block, graphed "
@@ -91,7 +100,7 @@ def main():
     tpl = GlmTemplate(args.model)
     eng = GlmTP(args.model)
     suffix = "" if args.set == "tokyo" else f"-{args.set}"
-    if args.set == "natural":
+    if args.set in ("natural", "long"):
         prompts = None
     elif args.set == "tokyo":
         prompts = [(ids, 0) for ids in encode_prompts(tpl)]
@@ -114,6 +123,8 @@ def main():
     # The files live on rank 0's host; rank 1 runs the same forwards from the broadcast copy.
     if args.set == "natural":
         seqs = encode_natural(tpl, args.tokens)
+    elif args.set == "long":
+        seqs = encode_long(tpl, args.tokens)
     else:
         seqs = eng.comm.broadcast_obj(json.loads((out / f"seqs{suffix}.json").read_text()) if eng.rank == 0 else None)
     if args.mode == "exact":
