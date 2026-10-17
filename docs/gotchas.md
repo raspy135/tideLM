@@ -3137,3 +3137,39 @@ a verify forward, ~3.5% of a round. Prefill would unpack each matrix to FP16 per
 engine/glm/exl3_attn.unpack is exact against exl3_ref.unpack (output order, arithmetic mul1, 32-bit
 words) but ~29 G values/s, ~0.24 s a 2,048-row chunk on top of cuBLAS -- ~3.5% slower prefill. With
 V4.1's finding that the changed target cost draft acceptance, parked: not wired into the engine.
+
+## Dynamic depth re-tuned after the night's changes; EXL3 caps it at 7 (2026-10-17)
+
+Same profiler, 6K "summarize" prompt and the short ISO-8601 prompt, 400 tokens, 200 warm:
+
+| | long | short | mean |
+| --- | --- | --- | --- |
+| max 7, tau 0.85 | 18.21 | 18.93 | 18.57 |
+| max 7, tau 0.90 (kept) | 20.11 | 17.90 | 19.01 |
+| max 7, tau 0.95 | 19.06 | 16.42 | 17.74 |
+
+One prompt each, so +-1 tok/s is within the trajectory noise (acceptance moves with any numerics
+change). Max 10 cannot run with EXL3: an 11-row verify step is 88 routed picks, past
+exl3.routed's graph-safe decode path (<= 64 picks), so it took the prefill routing (host syncs)
+inside a graph capture and failed. GlmTP now refuses MUSE_MTP_DEPTH > 7 under EXL3 at boot.
+
+## Decode's sparse attention launched 8 programs; split the positions (2026-10-17)
+
+The decode kernel table (4-row verify, depth 3) had _sparse_mla_kernel at 16.7 ms a round, 0.2 ms
+a layer: a grid of (head blocks, rows) = 2 x 4 programs on 48 SMs, each walking all 2,048 selected
+positions in turn. Split the positions over a third grid axis to ~32 programs, each storing its
+unnormalized (max, sum, accumulator), and merge (flash-decoding; an all-masked split adds nothing).
+FP8 cache, L2-warm microbenchmark: 1 row 196 -> 32 us, 4 rows 196 -> 52, 8 rows 196 -> 73 (32 heads
+a program); BF16 4 rows 158 -> 57. Error vs fp32 unchanged (1.7e-3). In the engine a decode
+attention layer 0.94 -> 0.76 ms, rounds 7-8% shorter (6K prompt 175.6 ms at 2.78 drafted, short
+167.5 at 2.50); MXFP4 glm_probe 12.98 -> 13.46 tok/s.
+
+Quality across the night's kernels, natural set against the exact model (3,600 positions):
+indexer, attention, norm and fixed-dense kernels on: NLL 1.6464, KL 0.0870, top-1 87.50%; all off:
+1.6457, 0.0888, 87.58%. The long set's drift between runs (0.8815 ... 0.8912 over the night's
+commits, each step within +-0.0065) is the chaotic divergence those notes describe, not a trend.
+
+MXFP4 draft head (MUSE_DRAFT_HEAD=mxfp4, a 4-bit copy of the head for the MTP drafts, Triton GEMV
+at 221 GB/s): drafts 4.20 -> 3.27 ms, but its argmax disagreed with the main head's on 1.3% of
+drafts (6 of 460, eager MUSE_GRAPHS=0 run with --draft-agree): about the saving in lost acceptance,
+and 0.25 GB a rank. Off by default.

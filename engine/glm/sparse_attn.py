@@ -26,13 +26,16 @@ _NEG = tl.constexpr(-1e30)
 
 
 @triton.jit
-def _sparse_mla_kernel(QL, QR, C, CS, R, IDX, POS, OUT, H, K,
+def _sparse_mla_kernel(QL, QR, C, CS, R, IDX, POS, OUT, PM, PL, PACC, H, K, CHUNK, NS,
                        stride_qlt, stride_qlh, stride_qrt, stride_qrh, stride_c, stride_cs, stride_r,
                        stride_it, stride_ot, stride_oh, scale,
                        DC: tl.constexpr, DR: tl.constexpr, SB: tl.constexpr, BLOCK_H: tl.constexpr,
-                       BLOCK_N: tl.constexpr, SCALED: tl.constexpr):
+                       BLOCK_N: tl.constexpr, SCALED: tl.constexpr, SPLIT: tl.constexpr):
     pid_h = tl.program_id(0)
     t = tl.program_id(1).to(tl.int64)
+    sp = tl.program_id(2)
+    k_lo = sp * CHUNK
+    k_hi = tl.minimum(K, k_lo + CHUNK)
     offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     hm = offs_h < H
     dc = tl.arange(0, DC)
@@ -43,9 +46,9 @@ def _sparse_mla_kernel(QL, QR, C, CS, R, IDX, POS, OUT, H, K,
     m_i = tl.full((BLOCK_H,), _NEG, tl.float32)
     l_i = tl.zeros((BLOCK_H,), tl.float32)
     acc = tl.zeros((BLOCK_H, DC), tl.float32)
-    for n0 in range(0, K, BLOCK_N):
+    for n0 in range(k_lo, k_hi, BLOCK_N):
         offs_n = n0 + tl.arange(0, BLOCK_N)
-        nm = offs_n < K
+        nm = offs_n < k_hi
         idx = tl.load(IDX + t * stride_it + offs_n, mask=nm, other=0)
         keep = nm & (idx >= 0) & (idx <= pos)
         row = tl.maximum(idx, 0).to(tl.int64)
@@ -63,21 +66,32 @@ def _sparse_mla_kernel(QL, QR, C, CS, R, IDX, POS, OUT, H, K,
         l_i = l_i * alpha + tl.sum(p, 1)
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), c, out_dtype=tl.float32)
         m_i = m_new
-    out = acc / tl.maximum(l_i, 1e-30)[:, None]
-    tl.store(OUT + t * stride_ot + offs_h[:, None] * stride_oh + dc[None, :], out.to(tl.bfloat16), mask=hm[:, None])
+    if not SPLIT:
+        out = acc / tl.maximum(l_i, 1e-30)[:, None]
+        tl.store(OUT + t * stride_ot + offs_h[:, None] * stride_oh + dc[None, :], out.to(tl.bfloat16),
+                 mask=hm[:, None])
+    else:
+        # This split's unnormalized partials; sparse_mla merges the splits (flash-decoding).
+        b = (t * H + offs_h) * NS + sp
+        tl.store(PM + b, m_i, mask=hm)
+        tl.store(PL + b, l_i, mask=hm)
+        tl.store(PACC + b[:, None] * DC + dc[None, :], acc, mask=hm[:, None])
 
 
 # (block_h, block_n, num_warps, num_stages) by (FP8 cache, prefill rows): the fastest of a sweep on
 # GB10 that fits its 99 KB of shared memory -- a BF16 latent tile is twice an FP8 one, and 32 heads x
 # 64 keys x 8 warps over a BF16 cache needs 168 KB. FP8: 2,048 rows 8.78 ms, 4 rows 0.17 ms; BF16:
 # 9.29 / 0.14 ms.
-TILES = {(True, True): (32, 64, 8, 1), (True, False): (16, 64, 8, 1),
+# Decode adds a split of the selected positions (flash-decoding) to ~32 programs: 4 rows over an
+# FP8 cache 170 -> 49 us (32 heads a program, 8 splits), 1 row 170 -> 32 us; BF16 4 rows 157 -> 59.
+TILES = {(True, True): (32, 64, 8, 1), (True, False): (32, 64, 8, 1),
          (False, True): (32, 32, 4, 2), (False, False): (16, 32, 4, 2)}
 
 
 def sparse_mla(q_lat: torch.Tensor, q_rope: torch.Tensor, cache, rope: torch.Tensor, sel: torch.Tensor,
                positions: torch.Tensor, scale: float, block_h: int | None = None, block_n: int | None = None,
-               num_warps: int | None = None, num_stages: int | None = None) -> torch.Tensor:
+               num_warps: int | None = None, num_stages: int | None = None,
+               split: int | None = None) -> torch.Tensor:
     """q_lat bf16 [T, H, 512] (absorbed), q_rope bf16 [T, H, 64]; cache the latent cache, BF16
     [S, 512] or an (fp8 [S, 512], fp32 [S, 512 / 128]) pair; rope BF16 [S, 64]; sel int [T, K]
     (positions, attended where <= the row's position); positions int [T] -> o_lat bf16 [T, H, 512].
@@ -97,10 +111,29 @@ def sparse_mla(q_lat: torch.Tensor, q_rope: torch.Tensor, cache, rope: torch.Ten
     o = torch.empty((T, H, DC), dtype=torch.bfloat16, device=q_lat.device)
     if T == 0:
         return o
-    grid = (triton.cdiv(H, block_h), T)
-    _sparse_mla_kernel[grid](q_lat, q_rope, C, CS, rope, sel, positions.contiguous(), o, H, sel.shape[1],
+    K = sel.shape[1]
+    hb = triton.cdiv(H, block_h)
+    # Decode has a handful of rows: split the selected positions so the grid fills the GPU
+    # (4 rows x 2 head blocks were 8 programs on 48 SMs, 0.2 ms a layer), then merge.
+    nsplit = 1 if T > 16 else (split or max(1, min(32, triton.next_power_of_2(triton.cdiv(32, hb * T)))))
+    chunk = triton.cdiv(triton.cdiv(K, nsplit), block_n) * block_n
+    nsplit = triton.cdiv(K, chunk)
+    if nsplit > 1:
+        pm = torch.empty((T, H, nsplit), dtype=torch.float32, device=q_lat.device)
+        pl = torch.empty_like(pm)
+        pacc = torch.empty((T, H, nsplit, DC), dtype=torch.float32, device=q_lat.device)
+    else:
+        pm = pl = pacc = o
+    grid = (hb, T, nsplit)
+    _sparse_mla_kernel[grid](q_lat, q_rope, C, CS, rope, sel, positions.contiguous(), o, pm, pl, pacc, H, K, chunk,
+                             nsplit,
                              q_lat.stride(0), q_lat.stride(1), q_rope.stride(0), q_rope.stride(1),
                              C.stride(0), CS.stride(0), rope.stride(0), sel.stride(0), o.stride(0), o.stride(1),
                              scale, DC=DC, DR=DR, SB=sb, BLOCK_H=block_h, BLOCK_N=block_n, SCALED=scaled,
-                             num_warps=num_warps, num_stages=num_stages)
+                             SPLIT=nsplit > 1, num_warps=num_warps, num_stages=num_stages)
+    if nsplit > 1:
+        # Merge: a split with no attended position has m = -1e30, l = 0 and adds nothing.
+        m = pm.amax(-1, keepdim=True)
+        w = torch.exp(pm - m)
+        o.copy_((pacc * w[..., None]).sum(2) / (pl * w).sum(-1, keepdim=True).clamp_min(1e-30))
     return o

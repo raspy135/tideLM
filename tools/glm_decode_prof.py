@@ -86,9 +86,23 @@ def main():
     ap.add_argument("--warm", type=int, default=48, help="decode tokens before measuring (captures)")
     ap.add_argument("--depth", type=int, default=int(os.environ.get("MUSE_MTP_DEPTH", "2")))
     ap.add_argument("--kernels", type=int, default=0, help="then profile this many rounds' kernels")
+    ap.add_argument("--draft-agree", action="store_true",
+                    help="(MUSE_GRAPHS=0, MUSE_DRAFT_HEAD=mxfp4) count drafts whose argmax the main head would change")
     a = ap.parse_args()
     tpl = GlmTemplate(a.model)
     eng = GlmTP(a.model)
+    agree = [0, 0]
+    if a.draft_agree:
+        core = eng._mtp_core
+
+        def both(next_ids, h_prev, logits=True):
+            hn, z = core(next_ids, h_prev, logits)
+            if logits and eng.draft_head is not None:
+                zm = eng.comm.cat_last(eng.head(hn, out_dtype=torch.float32))
+                agree[0] += int((zm.argmax(-1) == z.argmax(-1)).sum())
+                agree[1] += z.shape[0]
+            return hn, z
+        eng._mtp_core = both
     if a.prompt == "long":
         docs = [json.loads(l)["text"] for l in open("/app/corpus/heldout_eval.jsonl")]
         body = tpl.tok.decode(tpl.encode("\n\n".join(docs))[:a.long_tokens])
@@ -178,6 +192,9 @@ def main():
                 print(f"[prof] pack reads on {k} thread: {len(v)}, p10 {q(.1):.2f} p50 {q(.5):.2f} p90 {q(.9):.2f} "
                       f"p99 {q(.99):.2f} max {v[-1] * 1e3:.1f} ms", flush=True)
         print("[prof] sample:", repr(tpl.decode(out)[:300]), flush=True)
+        if agree[1]:
+            print(f"[prof] draft argmax, 4-bit draft head vs main head: {agree[0]} of {agree[1]} agree "
+                  f"({100 * agree[0] / agree[1]:.2f}%)", flush=True)
 
     if a.kernels:
         from torch.profiler import ProfilerActivity, profile

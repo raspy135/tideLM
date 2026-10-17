@@ -317,6 +317,10 @@ class GlmTP:
         self.spec_cal = None            # [(draft index, confidence product, accepted)] when a tool asks
         self.mtp_dyn = float(env("MUSE_MTP_DYN", "0"))
         self.mtp_graph_rows = 1
+        if self.mtp_on and self.x3 is not None and int(env("MUSE_MTP_DEPTH", "3")) > 7:
+            # exl3.routed's graph-safe decode path takes <= 64 picks (8 rows x top-8); a deeper
+            # verify step would take the prefill routing (host syncs) inside a graph capture.
+            raise ValueError("MUSE_MTP_DEPTH > 7 is not supported with MUSE_EXPERT_FORMAT=exl3")
         if self.mtp_on:
             self.graph_rows = {1, int(env("MUSE_MTP_DEPTH", "3")) + 1}
             self.mtp_graph_rows = max(1, int(env("MUSE_MTP_DEPTH", "3")))
@@ -372,7 +376,7 @@ class GlmTP:
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"), "db": env("MUSE_STATS_DB", ""),
-                "xfmt": self.xfmt, "kv": env("MUSE_KV", "bf16"), "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "fused_norm": FUSED_NORM, "h_ring": self.h_ring_n, "fixed_dense": self.fixed_dense, "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
+                "xfmt": self.xfmt, "kv": env("MUSE_KV", "bf16"), "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "fused_norm": FUSED_NORM, "h_ring": self.h_ring_n, "fixed_dense": self.fixed_dense, "draft_head": env("MUSE_DRAFT_HEAD", "same"), "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
                 "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_PF_KEEP", "MUSE_PF_KEEP_MARGIN", "MUSE_HOT", "MUSE_HOT_MIN",
                                             "MUSE_HOT_TARGET", "MUSE_HOT_KEEP", "MUSE_HOT_MAX", "MUSE_HOT_KEEP_AUDIT", "MUSE_HOT_PACE",
                                             "MUSE_HOT_PACE_LEAD", "MUSE_SUB_WEIGHT", "MUSE_MTP_FULL", "MUSE_MISS_LOG",
@@ -393,6 +397,13 @@ class GlmTP:
         hq, hv = cfg.qk_dim, cfg.nope + cfg.v_dim
         self.embed = ck.get_rows(P + "embed_tokens.weight", r * self.vl, (r + 1) * self.vl).to(d)
         head = ck.get_rows("lm_head.weight", r * self.vl, (r + 1) * self.vl)
+        # MUSE_DRAFT_HEAD=mxfp4: the MTP drafts score with a 4-bit copy of the head (engine/glm/
+        # mxfp4_dense.gemv, ~0.25 GB a rank): the head is half of a draft's reads. Verification keeps
+        # the main head, so this can only move acceptance.
+        self.draft_head = None
+        if self.mtp_on and env("MUSE_DRAFT_HEAD", "same") == "mxfp4":
+            from .mxfp4_dense import quantize
+            self.draft_head = quantize(head.to(d))
         if env("MUSE_HEAD", "bf16") == "fp8":
             # Halves the largest single read of a decode step (vocab 154880: ~0.95 GB a rank).
             from .weights import _fp8_quant
@@ -400,7 +411,8 @@ class GlmTP:
         self.head = Lin(head, d)
         self.final_norm = ck.get(P + "norm.weight").to(d)
         self.L = []
-        nbytes = self.embed.numel() * 2 + self.head.nbytes
+        nbytes = self.embed.numel() * 2 + self.head.nbytes + (
+            sum(t.numel() for t in self.draft_head) if self.draft_head is not None else 0)
         for L in range(self.nL):
             p = f"{P}layers.{L}."
             a = p + "self_attn."
@@ -1605,6 +1617,9 @@ class GlmTP:
         hn = rms(h, lw["sh_norm"], cfg.rms_eps)
         if not logits:
             return hn, None
+        if self.draft_head is not None:
+            from .mxfp4_dense import gemv
+            return hn, self.comm.cat_last(gemv(hn, *self.draft_head))
         return hn, self.comm.cat_last(self.head(hn, out_dtype=torch.float32))
 
     @torch.no_grad()

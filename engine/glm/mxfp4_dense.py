@@ -69,3 +69,54 @@ def fixed_down(h_full: torch.Tensor, arena, slots: list[int], world: int) -> tor
         w2 = dequant(arena.w2[s], arena.s2[s])
         out.append(torch.mm(full, w2.t(), out_dtype=torch.float32))
     return torch.stack(out)
+
+
+@triton.jit
+def _gemv_kernel(X, P, S, Y, T, N, K, stride_x, stride_p, stride_s, stride_y,
+                 BN: tl.constexpr, BK: tl.constexpr, TP: tl.constexpr):
+    """Y[T, N] (fp32) = X[T, K] @ W^T for an MXFP4 W [N, K]: weights decoded in registers, one
+    pass over them (decode rows only; the rows pad to TP for the tensor-core dot)."""
+    rn = tl.program_id(0) * BN + tl.arange(0, BN)
+    rt = tl.arange(0, TP)
+    nm = rn < N
+    acc = tl.zeros((TP, BN), dtype=tl.float32)
+    for k0 in range(0, K, BK):
+        rk2 = k0 // 2 + tl.arange(0, BK // 2)
+        b = tl.load(P + rn[:, None] * stride_p + rk2[None, :], mask=nm[:, None], other=0).to(tl.int32)
+        e = tl.load(S + rn[:, None] * stride_s + (k0 // 32 + tl.arange(0, BK // 32))[None, :], mask=nm[:, None],
+                    other=127).to(tl.float32)
+        sc = tl.exp2(e - 127.0)
+        lo, hi = b & 15, b >> 4
+        mlo, mhi = lo & 7, hi & 7
+        vlo = tl.where(mlo < 4, mlo * 0.5, tl.where(mlo < 6, mlo - 2.0, 2.0 * mlo - 8.0))
+        vhi = tl.where(mhi < 4, mhi * 0.5, tl.where(mhi < 6, mhi - 2.0, 2.0 * mhi - 8.0))
+        vlo = tl.where(lo >= 8, -vlo, vlo)
+        vhi = tl.where(hi >= 8, -vhi, vhi)
+        w = tl.join(vlo, vhi).reshape(BN, BK // 32, 32) * sc[:, :, None]
+        w = w.reshape(BN, BK).to(tl.bfloat16)
+        rk = k0 + tl.arange(0, BK)
+        x = tl.load(X + rt[:, None] * stride_x + rk[None, :], mask=rt[:, None] < T, other=0.0)
+        acc += tl.dot(x, tl.trans(w), out_dtype=tl.float32)
+    tl.store(Y + rt[:, None] * stride_y + rn[None, :], acc, mask=(rt[:, None] < T) & nm[None, :])
+
+
+def gemv(x: torch.Tensor, packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """x bf16 [T <= 16, K] @ MXFP4 [N, K]^T -> fp32 [T, N]."""
+    T, K = x.shape
+    N = packed.shape[0]
+    assert T <= 16
+    x = x.to(torch.bfloat16).contiguous()
+    y = torch.empty((T, N), dtype=torch.float32, device=x.device)
+    BN, BK = 32, 256                      # sweep, L2-cold head: 1.14 ms (221 GB/s) vs 1.21 at 64 x 256
+    _gemv_kernel[(triton.cdiv(N, BN),)](x, packed, scale, y, T, N, K, x.stride(0), packed.stride(0),
+                                        scale.stride(0), y.stride(0), BN=BN, BK=BK, TP=16, num_warps=4,
+                                        num_stages=4)
+    return y
+
+
+def quantize(w: torch.Tensor, rows: int = 1024) -> tuple[torch.Tensor, torch.Tensor]:
+    """BF16 [N, K] on the GPU -> MXFP4 (packed, scale), engine/muse/weights.quantize_mxfp4 in
+    1,024-row pieces (its rounding search holds [rows, K, 8] fp32 at once)."""
+    from engine.muse.weights import quantize_mxfp4
+    parts = [quantize_mxfp4(w[i:i + rows]) for i in range(0, w.shape[0], rows)]
+    return torch.cat([p for p, _ in parts]), torch.cat([s for _, s in parts])
