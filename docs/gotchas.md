@@ -3088,3 +3088,24 @@ scores and dequantized key cache, the attention's gathered BF16 latents, the pre
 [chunk, vocab] logits, the BF16 head (FP8 now), and one capture pool. A 59.5K-token prompt at
 12,250: TTFT 147.7 s (403 tok/s), minimum 6.36 / 7.20 GiB -- ~1 GiB below the 22K run, so the
 slots stay at 12,250 until a near-128K prompt has been measured.
+
+## The expert drive sleeps between decode rounds: 10 ms on the first read after ~150 ms idle (2026-10-17)
+
+A hot read measured 2.5 ms inside decode against 0.9-1.0 ms in a booted engine read loop. The
+per-read distribution (tools/glm_decode_prof.py) was bimodal: p50 1.26 ms, p90 10.34. The NVMe
+(Samsung MZALC4T0HBL1, nvme_core default_ps_max_latency_us = 100000, so APST may use states with
+up to 100 ms exit latency) drops into a low-power state after 100-200 ms without commands: reads
+after 0/20/50/100 ms gaps took 0.85/1.30/1.35/1.31 ms, after 200 ms 10.31. Decode rounds are
+~190 ms and hot reads come a few a round, so many rounds' first read paid it.
+
+stream() now runs a thread that reads 4 KB with O_DIRECT every MUSE_NVME_KEEPALIVE_MS (50) while
+a request generates (none when idle): 200 ms gaps then read in 1.21 ms. Hot reads p90 10.34 ->
+1.49 ms, 9.4 -> 4.1 ms a round, 6K prompt 18.29 -> 18.98 tok/s (same acceptance); MXFP4, whose
+hot reads were frequent enough to keep the drive mostly awake, 12.87 -> 12.99. The system-level
+alternative needs root: a lower latency tolerance on the device
+(/sys/class/nvme/nvme0/power/pm_qos_latency_tolerance_us) or nvme_core.default_ps_max_latency_us.
+
+Also: the MTP layer's eh_proj as FP8 (0.34 -> ~0.2 ms a draft) did not show in the draft time
+(4.18 vs 4.21 ms); not kept. The MTP hidden ring is bounded to the last MUSE_H_RING (16,384)
+positions (0.8 GB a rank at 128K): a reuse boundary older than that skips the MTP redo, which can
+only cost that one draft's acceptance.

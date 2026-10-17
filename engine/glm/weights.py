@@ -38,13 +38,25 @@ class GlmCheckpoint(Checkpoint):
         # with O_DIRECT into pooled aligned buffers, every range of a call in parallel. A rank-half
         # expert is six ranges (weight + scale of gate, up, down), split by the other rank's rows.
         self.direct = os.environ.get("MUSE_CK_DIRECT", "1") == "1"
-        self._dfds, self._dpool = {}, None
+        self._dfds, self._dpool, self._spans = {}, None, {}
 
     def get_rows_many(self, specs, urgent: bool = False) -> list[torch.Tensor]:
         if not self.direct:
             return super().get_rows_many(specs, urgent)
         from engine.muse.weights import _OPEN_LOCK, _chunk_pool
         from .direct_io import ALIGN, BufPool, align_up, pread_direct
+        key = tuple(specs)
+        hit = self._spans.get(key)                  # the six ranges of an expert, worked out once
+        if hit is not None:
+            spans, total = hit
+        else:
+            spans, total = self._span_list(specs)
+            if len(self._spans) < 65536:
+                self._spans[key] = (spans, total)
+        return self._read_direct(spans, total, urgent)
+
+    def _span_list(self, specs):
+        from .direct_io import ALIGN, align_up
         spans, total = [], 0
         for name, start, end in specs:
             path, off, dtype, shape = self._meta(name)
@@ -56,6 +68,11 @@ class GlmCheckpoint(Checkpoint):
             a0 = off - off % ALIGN
             spans.append((name, path, off, n, a0, align_up(off + n) - a0, dtype, shape, total))
             total += align_up(off + n) - a0
+        return spans, total
+
+    def _read_direct(self, spans, total, urgent):
+        from engine.muse.weights import _OPEN_LOCK, _chunk_pool
+        from .direct_io import BufPool, align_up, pread_direct
         if self._dpool is None:
             with _OPEN_LOCK:
                 if self._dpool is None:

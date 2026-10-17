@@ -102,6 +102,19 @@ def main():
                       ("bg_step", "bg_step"), ("_read_urgent", "hot read"), ("_put", "hot put")):
         wrap(eng, name, key, wall, cnt, rec if name in ("mtp_forward",) else None)
     wrap(eng.comm, "broadcast_obj", "broadcast", wall, cnt)
+    reads = {"main": [], "pool": []}
+    if eng.x3pack is not None:
+        import threading
+        f_read = eng.x3pack.read
+
+        def timed_read(*args, **kw):
+            t = time.perf_counter()
+            r = f_read(*args, **kw)
+            reads["main" if threading.current_thread() is threading.main_thread() else "pool"].append(time.perf_counter() - t)
+            return r
+        eng.x3pack.read = timed_read
+    if getattr(eng, "x3", None) is not None:
+        wrap(eng.x3, "load_slot", "  arena load_slot (any)", wall, cnt)
 
     eng.spec_stats = {"rounds": 0, "accepted": 0}
     eng.spec_cal = []
@@ -116,7 +129,7 @@ def main():
         if n == a.warm:
             torch.cuda.synchronize()
             instrument_graphs(eng, rec)
-            rec.clear(), wall.clear(), cnt.clear()
+            rec.clear(), wall.clear(), cnt.clear(), reads["main"].clear(), reads["pool"].clear()
             r0, acc0 = eng.spec_stats["rounds"], eng.spec_stats["accepted"]
             dr0 = eng.spec_stats.get("drafted", 0)
             g0 = set(map(str, eng.graphs))
@@ -158,6 +171,12 @@ def main():
             print(f"[prof]   {k:28s} {1e3 * v / rounds:8.2f} ms  ({cnt[k] / rounds:.1f})", flush=True)
         hs = {k: eng.hot_stats[k] - h0.get(k, 0) for k in ("reads", "layers") if k in eng.hot_stats}
         print(f"[prof] hot reads a round: {hs.get('reads', 0) / rounds:.2f} in {hs.get('layers', 0) / rounds:.2f} layers", flush=True)
+        for k, v in reads.items():
+            if v:
+                v = sorted(v)
+                q = lambda f: v[min(len(v) - 1, int(f * len(v)))] * 1e3
+                print(f"[prof] pack reads on {k} thread: {len(v)}, p10 {q(.1):.2f} p50 {q(.5):.2f} p90 {q(.9):.2f} "
+                      f"p99 {q(.99):.2f} max {v[-1] * 1e3:.1f} ms", flush=True)
         print("[prof] sample:", repr(tpl.decode(out)[:300]), flush=True)
 
     if a.kernels:

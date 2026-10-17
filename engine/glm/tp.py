@@ -368,7 +368,7 @@ class GlmTP:
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"), "db": env("MUSE_STATS_DB", ""),
-                "xfmt": self.xfmt, "kv": env("MUSE_KV", "bf16"), "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "fused_norm": FUSED_NORM, "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
+                "xfmt": self.xfmt, "kv": env("MUSE_KV", "bf16"), "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "fused_norm": FUSED_NORM, "h_ring": self.h_ring_n, "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
                 "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_PF_KEEP", "MUSE_PF_KEEP_MARGIN", "MUSE_HOT", "MUSE_HOT_MIN",
                                             "MUSE_HOT_TARGET", "MUSE_HOT_KEEP", "MUSE_HOT_MAX", "MUSE_HOT_KEEP_AUDIT", "MUSE_HOT_PACE",
                                             "MUSE_HOT_PACE_LEAD", "MUSE_SUB_WEIGHT", "MUSE_MTP_FULL", "MUSE_MISS_LOG",
@@ -460,7 +460,10 @@ class GlmTP:
         # max_seq (~12 KB a position, 400 MB at 32K): a ring of one chunk refused reuse whenever
         # the previous turn ran a chunk past the shared prefix -- every chat turn whose answer
         # (reasoning included) passed 1,024 tokens re-prefilled the whole conversation.
-        self.h_ring_n = self.max_seq
+        # MUSE_H_RING (default 16,384) bounds it: a reuse boundary older than the ring skips the
+        # MTP redo -- that one draft position keeps its old entry, which can only cost
+        # acceptance (the target verifies every draft). At 128K the full ring was 0.8 GB a rank.
+        self.h_ring_n = min(self.max_seq, int(env("MUSE_H_RING", "16384")))
         if self.kv8:
             self.h_ring = (torch.zeros((self.h_ring_n, cfg.hidden), **f8), torch.zeros((self.h_ring_n, 1), **f32))
         else:
@@ -1638,8 +1641,11 @@ class GlmTP:
             self.pf_kept.zero_()
         n = self.reusable_prefix(prompt)
         if n:
+            old_len = len(self.tokens)
             self.pos, self.tokens = n, self.tokens[:n]
-            if self.mtp_on:
+            # Position n-1 still in the ring: verify steps also wrote up to depth rows past the
+            # last kept token, so leave that much margin before a slot could have been reused.
+            if self.mtp_on and n - 1 >= old_len - self.h_ring_n + 16:
                 # Position n-1's MTP entry was made with the old next token; redo it.
                 h = kv_read(self.h_ring, (n - 1) % self.h_ring_n)[None]
                 self.mtp_forward(torch.tensor([prompt[n]], device=self.dev), h, n - 1, logits=False)
@@ -1667,9 +1673,50 @@ class GlmTP:
             return int(z.float().argmax())
         return int(torch.multinomial(self.sample_probs(z, temperature, top_p, top_k), 1, generator=gen))
 
+    def _nvme_awake(self, on: bool):
+        """MUSE_NVME_KEEPALIVE_MS (default 50): while a request generates, a 4 KB O_DIRECT read that
+        often keeps the expert drive out of its power-saving states. Hot reads come a few a round
+        and rounds are ~190 ms apart; the Samsung drive here sleeps after ~100-200 ms idle and the
+        next read then takes 10.3 ms instead of 1.2 (hot reads: p50 1.3, p90 10.3 ms). Reads only,
+        on this rank's own drive; nothing numeric."""
+        ms = float(env("MUSE_NVME_KEEPALIVE_MS", "50"))
+        if not on or not ms:
+            ev = getattr(self, "_awake", None)
+            if ev is not None:
+                ev.set()
+                self._awake = None
+            return
+        if getattr(self, "_awake", None) is not None:
+            return
+        fd = self.x3pack.dfd if self.x3pack is not None and self.x3pack.dfd is not None else \
+            next(iter(self.ck._dfds.values()), None) if getattr(self.ck, "direct", False) else None
+        if fd is None:
+            return
+        import mmap
+        import threading
+        ev, buf, off = threading.Event(), mmap.mmap(-1, 4096), self.x3pack.data0 if self.x3pack is not None else 0
+
+        def loop():
+            while not ev.wait(ms / 1000):
+                try:
+                    os.preadv(fd, [buf], off)
+                except OSError:
+                    return
+        threading.Thread(target=loop, daemon=True, name="nvme-awake").start()
+        self._awake = ev
+
     @torch.no_grad()
     def stream(self, prompt, max_new, *, temperature=0.0, top_p=1.0, top_k=0, seed=0,
                stop=None, should_stop=None, depth=None):
+        self._nvme_awake(True)
+        try:
+            yield from self._stream(prompt, max_new, temperature=temperature, top_p=top_p, top_k=top_k,
+                                    seed=seed, stop=stop, should_stop=should_stop, depth=depth)
+        finally:
+            self._nvme_awake(False)
+
+    def _stream(self, prompt, max_new, *, temperature=0.0, top_p=1.0, top_k=0, seed=0,
+                stop=None, should_stop=None, depth=None):
         """Generate; with the MTP layer, speculative rounds of ``depth`` drafts. Rank 0 decides
         every token and broadcasts; both ranks run the same calls."""
         stop = self.cfg.eos if stop is None else stop
