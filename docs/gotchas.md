@@ -3070,3 +3070,21 @@ swap a device read of the lut plus two device writes). It also held all 256 pend
 kept. Instead adapt() changes the lut on a host copy and copies it back once, and reads and
 installs in waves of 16 so the pool's buffers are reused; drop_cache() after a swap is skipped
 when expert reads are direct (it opened all 141 shards to fadvise them).
+
+## Serving after the night's changes: 22K TTFT 180 -> 53 s, +600 slots from freed transients (2026-10-17)
+
+Serving (HTTP server on rank 0, watchdog at 1 s), EXL3, 128K max_seq, FP8 KV, dynamic depth 7 /
+0.9, FP8 head, 2,048-row chunks:
+
+| | 11,650 slots, this morning | 11,650, tonight | 12,250, tonight |
+| --- | --- | --- | --- |
+| 21.8K-token prompt, TTFT | 180.3 s | 53.0 s | 52.7 s |
+| 6.5K document (prefix hit), decode | ~7 tok/s | 17.58 (miss 21.3%) | 18.41 (miss 18.4%) |
+| short coding prompt, decode | ~10-11 | 17.16 (19.9%) | 18.34 (17.8%) |
+| MemAvailable minimum, rank 0 / 1 | 6.58 / 7.83 GiB | 10.93 / 12.14 | 7.33 / 7.64 |
+
+The 4.4 GB of headroom is the transients the kernels removed: the indexer's fp32 [rows, 32, S]
+scores and dequantized key cache, the attention's gathered BF16 latents, the prefill head's
+[chunk, vocab] logits, the BF16 head (FP8 now), and one capture pool. A 59.5K-token prompt at
+12,250: TTFT 147.7 s (403 tok/s), minimum 6.36 / 7.20 GiB -- ~1 GiB below the 22K run, so the
+slots stay at 12,250 until a near-128K prompt has been measured.
