@@ -322,6 +322,8 @@ class GlmTP:
         self.adapt_margin = float(env("MUSE_ADAPT_MARGIN", "1.5"))
         self.adapt_log = []
         self.adapt_cross_layer = env("MUSE_ADAPT_CROSS_LAYER", "1") == "1"
+        # Expert reads that bypass the page cache (O_DIRECT) need no drop_cache() after a swap.
+        self.reads_direct = self.ck.direct and (self.x3pack is None or self.x3pack.dfd is not None)
         # Background expert reads during decode (MUSE_BG=1): every MUSE_BG_EVERY decode rounds,
         # rank 0 ranks the non-resident experts by their recent router mass (decayed by
         # MUSE_BG_DECAY a period), picks up to MUSE_BG_READS of them and a cold resident victim
@@ -390,8 +392,7 @@ class GlmTP:
         if env("MUSE_HEAD", "bf16") == "fp8":
             # Halves the largest single read of a decode step (vocab 154880: ~0.95 GB a rank).
             from .weights import _fp8_quant
-            hq, hs = _fp8_quant(head.to(d))
-            head = FP8Block(hq, hs)
+            head = FP8Block(*_fp8_quant(head.to(d)))    # (not hq, hs: hq is the q head width below)
         self.head = Lin(head, d)
         self.final_norm = ck.get(P + "norm.weight").to(d)
         self.L = []
@@ -746,22 +747,31 @@ class GlmTP:
                 plan.sort(key=lambda t: -float(sc[t[0], t[1]] - sc[t[2], t[3]]))
                 plan = plan[:max_swaps]
         plan = self.comm.broadcast_obj(plan)
-        by_layer: dict[int, list] = {}
+        # The lut changes on a host copy and goes back once (per swap, a device read and two
+        # device writes); reads and installs go in waves, so the pooled read buffers are reused
+        # instead of 256 records (1.8 GB) being held at once.
+        lut, moves = self.lut.cpu(), []
         for L, c, VL, v in plan:
-            by_layer.setdefault(L, []).append((c, VL, v))
-        for L, items in by_layer.items():
-            parts = self._read_many(L, [c for c, _, _ in items])
-            for (c, VL, v), pr in zip(items, parts):
-                slot = int(self.lut[VL, v])
-                # Churn: evicting what one of the last two adaptations just brought in.
-                churn += self.adapt_epoch - self.slot_epoch[slot] <= 2
-                self.slot_epoch[slot] = self.adapt_epoch
-                self.lut[VL, v] = -1
-                self.owner[slot] = None
-                self._load(L, c, slot, pr)
+            slot = int(lut[VL, v])
+            # Churn: evicting what one of the last two adaptations just brought in.
+            churn += self.adapt_epoch - self.slot_epoch[slot] <= 2
+            self.slot_epoch[slot] = self.adapt_epoch
+            lut[VL, v] = -1
+            lut[L, c] = slot
+            moves.append((L, c, slot))
+        if moves:
+            if not hasattr(self, "_pool"):
+                self._read_many(self.swap_layers[0], [])
+            for i in range(0, len(moves), 16):
+                wave = moves[i:i + 16]
+                for (L, c, slot), pr in zip(wave, self._pool.map(lambda m: self._expert_parts(m[0], m[1]), wave)):
+                    self._put(slot, pr)
+                    self.owner[slot] = (L, c)
+            self.lut.copy_(lut)
         if self.allowed is not None:
             self.allowed.copy_(self.lut >= 0)
-        self.ck.drop_cache()
+        if not self.reads_direct:
+            self.ck.drop_cache()                  # direct reads leave nothing in the page cache
         self.save_db()
         torch.cuda.synchronize()
         self.adapt_totals["swaps"] += len(plan)
@@ -785,14 +795,15 @@ class GlmTP:
         st = self.bg_stats
         self.bg_period += 1
         st["periods"] += 1
-        if self.bg_pending:
+        items = self.bg_pending
+        if items:
             t0 = time.perf_counter()
-            parts = [f.result() for *_, f in self.bg_pending]
+            parts = [f.result() for *_, f in items]
             t1 = time.perf_counter()
             st["wait_s"] += t1 - t0
             torch.cuda.synchronize()
             lut = self.lut.cpu()
-            for (L, e, VL, ve, _), pr in zip(self.bg_pending, parts):
+            for (L, e, VL, ve, _), pr in zip(items, parts):
                 slot = int(lut[VL, ve])
                 if slot < 0 or int(lut[L, e]) >= 0 or self.owner[slot] != (VL, ve):
                     st["stale"] += 1

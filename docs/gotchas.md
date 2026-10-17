@@ -3052,3 +3052,21 @@ paired +0.0048 +- 0.0065. MXFP4 (8,344 slots, BF16 KV, dynamic depth 7 / 0.9): g
   the rest is per-call Python). glm_probe, MXFP4 8,344 slots, dynamic depth 7 / 0.9: hot-read time
   16.5 -> 9.4 s, 10.05 -> 11.70 tok/s, identical reads and acceptance. Bytes checked against
   buffered reads on 33 experts of both ranks.
+
+## FP8 LM head, and deferring adaptation's swaps (2026-10-17)
+
+MUSE_HEAD=fp8 (128-block FP8 of the BF16 head, quantized at load) had never run: `hq, hs =
+_fp8_quant(head)` rebound `hq`, the q head width the next lines use for q_b's rows, and boot
+failed in a CPU multiply on FP8. Fixed, and measured -- 6K prompt, dynamic depth 7 / 0.9: 191 ms a
+round against ~200 (each MTP draft 6.2 -> 4.4 ms; four head reads a round), 17.55 tok/s;
+0.48 GB a rank back (~67 EXL3 slots). Long-set NLL +0.0013 +- 0.0011 (paired, 900 positions):
+every position moves a little, by ~0.15% in perplexity. Taken for both configs.
+
+Deferring decode adaptations to the background period (read in the background, installed two
+periods later by bg_step's own rule) moved 6.0 ms a round out of adapt() and 7.5 into bg_step:
+after O_DIRECT the reads were not the cost, the installs were (nine copies an expert, and per
+swap a device read of the lut plus two device writes). It also held all 256 pending records --
+1.8 GB of host memory, on GB10 the GPU's -- for ~4 rounds, and faulted ~250 fresh buffers. Not
+kept. Instead adapt() changes the lut on a host copy and copies it back once, and reads and
+installs in waves of 16 so the pool's buffers are reused; drop_cache() after a swap is skipped
+when expert reads are direct (it opened all 141 shards to fadvise them).
