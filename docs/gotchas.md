@@ -2880,3 +2880,22 @@ gather kernels: kv_write/kv_read move the bytes as uint8. EXL3 routed experts, 1
 Serving at 128K, FP8 KV, 11,650 slots (61%): minimum MemAvailable 5.1 / 6.6 GB (rank 0 / 1)
 through a 5.6K and a 20K prompt. Rank 0 binds: its engine process holds ~1.5 GB more (the HTTP
 server), so freeing rank 1 (polkitd 3.4 GB + bluetoothd 1.1 GB restarted) did not raise slots.
+
+## An idle GLM pair took itself down at the process-group timeout (2026-10-16)
+
+muse_app's follower (rank 1) waits for the next command inside a gloo broadcast, and gloo bounds
+every wait by the process group's timeout (DSV41_DIST_TIMEOUT_S, 1,800 s from scripts/glm-up.sh).
+The 128K server sat idle for 34 min after its last request: rank 1 exited with "Timed out waiting
+1800000ms for recv operation", rank 0 kept answering /health, and the next request crashed it on
+the closed pair ("Connection closed by peer"). V4.1's server had already hit this and sends an
+idle ping (`_ep_heartbeat`); the GLM/Muse serve loop never got one. Raising the timeout only moves
+the cliff, since an idle server waits unboundedly by nature.
+
+engine_loop now waits for a job for at most MUSE_PING_S (default a quarter of the timeout, 450 s)
+and broadcasts {"op": "ping"} when none came; the follower skips it. The ping goes out from the
+engine thread itself, so unlike V4.1's heartbeat thread it needs no lock to stay out of the gap
+between a request's broadcast and its generate.
+
+Side effect worth knowing: with GLM gone from its model list, Open WebUI fell back to an Ollama
+model (qwen3.5:122b, 87 GB on rank 0, keep-alive 3 h). Restarting the pair while that is loaded
+overcommits rank 0; `ollama stop` it first.

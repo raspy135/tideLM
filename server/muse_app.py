@@ -198,8 +198,17 @@ class Job:
 def engine_loop(engine, jobs: "queue.Queue[Job]", log, tpl: Template, stop: tuple[int, ...]):
     """Rank 0: run jobs one at a time; every engine call is mirrored on rank 1."""
     start_id = tpl.special.get(START)          # Muse's header guard; None for other formats
+    # Idle keepalive. Rank 1 waits for the next command inside a gloo broadcast, which the process
+    # group's timeout bounds (DSV41_DIST_TIMEOUT_S): a GLM pair left idle for 30 min lost rank 1
+    # to that timeout and the next request crashed rank 0 on the closed pair. The ping is sent
+    # from this thread, so it can never land between a request's broadcast and its generate.
+    ping = float(os.environ.get("MUSE_PING_S", max(30.0, float(os.environ.get("DSV41_DIST_TIMEOUT_S", "600")) / 4)))
     while True:
-        job = jobs.get()
+        try:
+            job = jobs.get(timeout=ping)
+        except queue.Empty:
+            engine.comm.broadcast_obj({"op": "ping"})
+            continue
         if job is None:
             engine.comm.broadcast_obj({"op": "stop"})
             return
@@ -247,6 +256,8 @@ def follower_loop(engine):
         cmd = engine.comm.broadcast_obj(None)
         if cmd["op"] == "stop":
             return
+        if cmd["op"] == "ping":
+            continue
         for _ in engine.stream(cmd["prompt"], cmd["max_new"], temperature=cmd["temperature"],
                                top_p=cmd["top_p"], top_k=cmd["top_k"], seed=cmd["seed"],
                                stop=tuple(cmd["stop"])):
