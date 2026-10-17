@@ -67,9 +67,17 @@ def _sparse_mla_kernel(QL, QR, C, CS, R, IDX, POS, OUT, H, K,
     tl.store(OUT + t * stride_ot + offs_h[:, None] * stride_oh + dc[None, :], out.to(tl.bfloat16), mask=hm[:, None])
 
 
+# (block_h, block_n, num_warps, num_stages) by (FP8 cache, prefill rows): the fastest of a sweep on
+# GB10 that fits its 99 KB of shared memory -- a BF16 latent tile is twice an FP8 one, and 32 heads x
+# 64 keys x 8 warps over a BF16 cache needs 168 KB. FP8: 2,048 rows 8.78 ms, 4 rows 0.17 ms; BF16:
+# 9.29 / 0.14 ms.
+TILES = {(True, True): (32, 64, 8, 1), (True, False): (16, 64, 8, 1),
+         (False, True): (32, 32, 4, 2), (False, False): (16, 32, 4, 2)}
+
+
 def sparse_mla(q_lat: torch.Tensor, q_rope: torch.Tensor, cache, rope: torch.Tensor, sel: torch.Tensor,
-               positions: torch.Tensor, scale: float, block_h: int = 16, block_n: int = 32,
-               num_warps: int = 4, num_stages: int = 1) -> torch.Tensor:
+               positions: torch.Tensor, scale: float, block_h: int | None = None, block_n: int | None = None,
+               num_warps: int | None = None, num_stages: int | None = None) -> torch.Tensor:
     """q_lat bf16 [T, H, 512] (absorbed), q_rope bf16 [T, H, 64]; cache the latent cache, BF16
     [S, 512] or an (fp8 [S, 512], fp32 [S, 512 / 128]) pair; rope BF16 [S, 64]; sel int [T, K]
     (positions, attended where <= the row's position); positions int [T] -> o_lat bf16 [T, H, 512].
@@ -83,6 +91,9 @@ def sparse_mla(q_lat: torch.Tensor, q_rope: torch.Tensor, cache, rope: torch.Ten
         scaled, sb = True, DC // CS.shape[1]
     assert q_lat.stride(-1) == 1 and q_rope.stride(-1) == 1 and C.stride(-1) == 1 and rope.stride(-1) == 1
     sel = sel.contiguous()
+    th, tn, tw, ts = TILES[(scaled, T > 16)]
+    block_h, block_n = min(block_h or th, H), block_n or tn
+    num_warps, num_stages = num_warps or tw, num_stages or ts
     o = torch.empty((T, H, DC), dtype=torch.bfloat16, device=q_lat.device)
     if T == 0:
         return o

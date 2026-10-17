@@ -3000,3 +3000,38 @@ now the larger part). Decode did not move: a decode layer's attention is ~0.94 m
 projections and the all-reduce being most of it. Decode tok/s under dynamic MTP depth also swings
 with the sample's acceptance (2.18 vs 2.98 accepted a round on two runs of the same prompt after a
 numerics change), so judge decode changes on several prompts, not one.
+
+## Prefill after the attention kernel: norms, projection tiles, the unread head (2026-10-17)
+
+tools/glm_prefill_prof.py, 12K-token prompt, EXL3 serving config (repeat runs vary by ~1.5 s):
+
+| step | 12K prefill | tok/s |
+| --- | --- | --- |
+| attention kernel, chunk 1024 | 37.05 s | 324 |
+| + head only for the sampled row | 36.61 s | 328 |
+| same, chunk 2048 | 35.69 s | 337 |
+| + fused RMSNorm, prefill FP8 tiles, first chunk through the kernel | 29.83 s (32.74 on another run) | 403 |
+| same without the fused norm | 31.96 s | 376 |
+
+- forward() ran the head over every prompt row (a [chunk, vocab] fp32 product and gather) and kept
+  the last: 0.44 s of a 12K prompt at 1,024-row chunks, 1.4 s at 2,048, 2.5 GB of transient at 4,096.
+- rms() as seven eager kernels: 918 us at 1,024 x 6,144; engine/glm/norm_kernel.py 74 us, 99.999%
+  identical bits (max 1.35 BF16 ulp where not). Decode graphs carry a seventh of the kernels.
+- fp8_block_linear's prefill tile (64 x 128, 8 warps, 3 stages) ran o_proj (K = 8,192) at 26.5
+  TFLOPS; 128 x 128 / 8 warps / 2 stages 51; the other projections 64 x 128 / 4 / 2 (50-62 -> 60-77).
+  Per 1,024-row chunk forward 405 -> 238 ms. cuBLAS on BF16 weights is faster still (170 ms) but
+  needs either ~5 GB of resident BF16 copies a rank or a dequantization per call (1.5-6.5 ms each).
+- Within the first index_topk positions the indexer selects every position, so the dense einsum
+  case ([T, heads, S] fp32 scores) went to the sparse kernel too; it made 2,048-row chunks slower.
+- Chunk 4,096 dipped to 2.03 GiB on rank 0 (watchdog stop) before the head fix; 2,048 holds 5.8.
+- The EXL3 prefill MoE is at its kernel's limit: a sweep of every compiled (row block, tile) gave
+  the default (32 rows, 4x2x2) within 2% at GLM's shapes; 2,048-row chunks cost 20% less a token
+  than 1,024 (28.8 vs 18.1 ms a layer). Reconstructing experts to FP16 for tensor-core GEMMs (a
+  published GLM-5.2 EXL3 setup does it past 128 rows an expert) would move ~19 GB a layer at 4,096
+  rows -- ~87 ms at GB10's bandwidth against ~40 for the fused kernel.
+- sparse_mla's tile depends on the cache: 32 heads x 64 keys x 8 warps over a BF16 latent cache
+  needs 168 KB of shared memory (GB10 has 99), so MXFP4's BF16-KV config failed at its first
+  prefill. The wrapper now picks per cache type (TILES) and the test runs both.
+
+Quality, long set, 3-row steps: 0.8863 with all of the above against 0.8815 (attention kernel only),
+paired +0.0048 +- 0.0065. MXFP4 (8,344 slots, BF16 KV, dynamic depth 7 / 0.9): glm_probe 9.8 tok/s.

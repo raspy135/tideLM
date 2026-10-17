@@ -76,6 +76,12 @@ class SparseAttnTests(unittest.TestCase):
         for fp8 in (True, False):
             self.check(96, 6144, 6144, fp8)
 
+    def test_default_tiles_fit(self):
+        # The engine relies on sparse_mla's own tile choice for both cache types and row counts.
+        for fp8 in (True, False):
+            for T in (4, 64):
+                self.check(T, 8192, 8192, fp8)
+
     def test_block_shapes(self):
         for bh, bn, w in ((32, 32, 8), (16, 64, 4), (8, 32, 4)):
             self.check(8, 8192, 8192, True, block_h=bh, block_n=bn, num_warps=w)

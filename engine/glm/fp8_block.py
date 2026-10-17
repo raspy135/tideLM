@@ -77,14 +77,19 @@ def fp8_block_linear(x: torch.Tensor, W: FP8Block, out_dtype=torch.bfloat16) -> 
     x2 = x.reshape(-1, W.K).to(torch.bfloat16).contiguous()
     M = x2.shape[0]
     y = torch.empty((M, W.N), dtype=out_dtype, device=x.device)
+    stages = 3
     if M <= 16:
         BM, BN, warps = 16, 32, 4
     elif M <= 64:
         BM, BN, warps = 64, 64, 4
+    elif W.K >= 8192:
+        # o_proj at prefill sizes: 26.5 -> 51 TFLOPS at 1,024 rows on GB10 (3.89 -> 2.02 ms).
+        BM, BN, warps, stages = 128, 128, 8, 2
     else:
-        BM, BN, warps = 64, 128, 8
+        # The other prefill projections: 50-62 -> 60-77 TFLOPS (sweep of BM/BN/warps/stages).
+        BM, BN, warps, stages = 64, 128, 4, 2
     grid = (triton.cdiv(W.N, BN), triton.cdiv(M, BM))
     _fp8_block_kernel[grid](x2, W.w, W.s, y, M, W.N, W.K, x2.stride(0), W.w.stride(0),
                             W.s.stride(0), y.stride(0), BLOCK_M=BM, BLOCK_N=BN,
-                            num_warps=warps, num_stages=3)
+                            num_warps=warps, num_stages=stages)
     return y.view(*shape[:-1], W.N)

@@ -40,14 +40,15 @@ def main():
         f = getattr(obj, name)
 
         def w(*args, **kw):
+            k = key + (" [mtp layer]" if args and isinstance(args[0], int) and args[0] == eng.mtp_L else "")
             e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             e0.record()
             t = time.perf_counter()
             r = f(*args, **kw)
-            wall[key] += time.perf_counter() - t
+            wall[k] += time.perf_counter() - t
             e1.record()
-            pending.append((key, e0, e1))
-            calls[key] += 1
+            pending.append((k, e0, e1))
+            calls[k] += 1
             return r
         setattr(obj, name, w)
 
@@ -55,6 +56,8 @@ def main():
     wrap(eng, "_indexer", "  indexer")
     wrap(eng, "mlp", "mlp")
     wrap(eng, "_route", "  route")
+    wrap(eng, "_experts_triton", "  fixed/MXFP4 experts (triton)")
+    wrap(eng, "embed_ids", "embed")
     wrap(eng, "mtp_forward", "mtp fill")
     wrap(eng, "logits", "head")
     wrap(eng, "adapt", "adapt (post-prefill)")

@@ -57,7 +57,16 @@ class Lin:
         return self.q.nbytes if self.q is not None else self.w.numel() * 2
 
 
+# MUSE_FUSED_NORM=1: rms() in one kernel (engine/glm/norm_kernel.py) for 2-D BF16 rows: 12x faster
+# at a 1,024-row prefill chunk, a seventh of the kernels in a decode graph; 99.999% identical bits.
+FUSED_NORM = env("MUSE_FUSED_NORM", "1") == "1"
+
+
 def rms(x, weight, eps):
+    if FUSED_NORM and x.dim() == 2 and x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16 \
+            and x.stride(-1) == 1:
+        from .norm_kernel import rms_norm
+        return rms_norm(x, weight, eps)
     xf = x.float()
     return weight * (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)).to(x.dtype)
 
@@ -351,12 +360,13 @@ class GlmTP:
         src = Path(__file__).resolve().parent
         digest = hashlib.sha256(b"".join((src / f).read_bytes() for f in
                                          ("tp.py", "ref.py", "weights.py", "config.py", "fp8_block.py",
-                                          "index_kernel.py", "exl3.py", "sparse_attn.py"))).hexdigest()[:16]
+                                          "index_kernel.py", "exl3.py", "sparse_attn.py",
+                                          "norm_kernel.py"))).hexdigest()[:16]
         mine = {"version": VERSION, "code": digest, "miss": self.miss, "native": self.native,
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"), "db": env("MUSE_STATS_DB", ""),
-                "xfmt": self.xfmt, "kv": env("MUSE_KV", "bf16"), "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
+                "xfmt": self.xfmt, "kv": env("MUSE_KV", "bf16"), "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "fused_norm": FUSED_NORM, "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
                 "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_PF_KEEP", "MUSE_PF_KEEP_MARGIN", "MUSE_HOT", "MUSE_HOT_MIN",
                                             "MUSE_HOT_TARGET", "MUSE_HOT_KEEP", "MUSE_HOT_MAX", "MUSE_HOT_KEEP_AUDIT", "MUSE_HOT_PACE",
                                             "MUSE_HOT_PACE_LEAD", "MUSE_SUB_WEIGHT", "MUSE_MTP_FULL", "MUSE_MISS_LOG",
@@ -900,7 +910,7 @@ class GlmTP:
         q_lat = torch.einsum("thn,hnc->thc", q_nope, lw["w_uk"])                  # [T, h, kv_lora]
         scale = cfg.qk_dim ** -0.5
         C, R = self.c_cache[L], self.r_cache[L]
-        if not decode and S <= cfg.index_topk:
+        if not decode and S <= cfg.index_topk and not self.attn_kernel:
             C = kv_span(C, S)
             # Every cached position is selected: dense causal attention over [0, S).
             sc = (torch.einsum("thc,sc->ths", q_lat, C) + torch.einsum("thr,sr->ths", q_rope, R[:S])).float() * scale
@@ -911,10 +921,10 @@ class GlmTP:
         elif self.attn_kernel:
             # engine/glm/sparse_attn.py: the selected latents read where they live, fp32 scores,
             # online softmax. 1,024 rows: 4.5 ms a layer against the loop's 81; 4-8 rows 0.17 ms.
+            # Within the first index_topk positions the indexer's picks are every position, so the
+            # dense case goes here too (its [T, heads, S] fp32 scores made 2,048-row chunks slower).
             from .sparse_attn import sparse_mla
-            bh = 16 if T <= 16 else 32
-            o_lat = sparse_mla(q_lat, q_rope, C, R, topk, positions, scale, block_h=min(bh, self.hl),
-                               block_n=64, num_warps=8)
+            o_lat = sparse_mla(q_lat, q_rope, C, R, topk, positions, scale)
         else:
             outs = []
             for t0 in range(0, T, 32):
@@ -1789,13 +1799,18 @@ class GlmTP:
             part = ids[c0:c0 + self.chunk]
             self.pos_t.fill_(self.pos)
             h = self._layers(self.embed_ids(part))
-            z, hn = self.logits(h)
+            if all_logits:
+                z, hn = self.logits(h)
+                outs.append(z)
+            else:
+                # Only the prompt's last row is sampled from: the head over every row was a
+                # [chunk, vocab] fp32 product and gather nobody read (1.4 s of a 12K prompt at
+                # 2,048-row chunks, 2.5 GB of transient at 4,096).
+                hn = rms(h, self.final_norm, self.cfg.rms_eps)
+                if c0 + self.chunk >= T:
+                    outs.append(self.comm.cat_last(self.head(hn[-1:], out_dtype=torch.float32)))
             self._after_rows(part, hn, self.pos, next_ids=ids[c0 + 1:c0 + self.chunk + 1])
             self.pos += part.numel()
-            if all_logits:
-                outs.append(z)
-            elif c0 + self.chunk >= T:
-                outs.append(z[-1:])
         return torch.cat(outs)
 
     def _after_rows(self, ids, hn, pos0, next_ids=None):
