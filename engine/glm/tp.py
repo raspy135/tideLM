@@ -137,9 +137,13 @@ class GlmTP:
         if self.xfmt == "exl3":
             from .exl3 import Exl3Pack
             self.x3pack = Exl3Pack(env("MUSE_EXL3_PACK", "").format(rank=r), cfg.hidden, cfg.moe_inter)
-            if self.mtp_on:
-                fixed += cfg.experts
-        self.swap_layers = [L for L in self.moe_layers if not (self.x3pack and L == self.mtp_L)]
+        # MUSE_MTP_FULL=1: the MTP layer's routed experts are all resident (MXFP4, 2.5 GB a rank)
+        # and out of the swaps: drafts never substitute, and decode-layer residency no longer
+        # trades against the drafter. Always so under exl3 (the arena cannot hold their 4 bits).
+        self.mtp_full = self.mtp_on and (self.x3pack is not None or env("MUSE_MTP_FULL", "1") == "1")
+        if self.mtp_full:
+            fixed += cfg.experts
+        self.swap_layers = [L for L in self.moe_layers if not (self.mtp_full and L == self.mtp_L)]
         total = len(self.swap_layers) * cfg.experts
         # Prefill prefetch (MUSE_PF=1): two buffers of MUSE_PF_SLOTS transient slots, one per
         # alternate layer, taken from the resident budget. See _pf_predict.
@@ -296,7 +300,7 @@ class GlmTP:
                 "xfmt": self.xfmt, "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
                 "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_PF_KEEP", "MUSE_PF_KEEP_MARGIN", "MUSE_HOT", "MUSE_HOT_MIN",
                                             "MUSE_HOT_TARGET", "MUSE_HOT_KEEP", "MUSE_HOT_MAX", "MUSE_HOT_KEEP_AUDIT", "MUSE_HOT_PACE",
-                                            "MUSE_HOT_PACE_LEAD", "MUSE_SUB_WEIGHT")],
+                                            "MUSE_HOT_PACE_LEAD", "MUSE_SUB_WEIGHT", "MUSE_MTP_FULL")],
                 "adapt": [env(k, "") for k in ("MUSE_ADAPT", "MUSE_ADAPT_EVERY", "MUSE_ADAPT_PREFILL_SWAPS",
                                                "MUSE_ADAPT_DECODE_SWAPS", "MUSE_ADAPT_DECAY", "MUSE_ADAPT_CROSS_LAYER",
                                                "MUSE_ADAPT_MARGIN", "MUSE_BG", "MUSE_BG_EVERY", "MUSE_BG_READS",
@@ -432,7 +436,7 @@ class GlmTP:
                 ids = [slot]
                 slot += 1
             self.fixed[L] = torch.tensor(ids, dtype=torch.int32, device=self.dev)
-        if self.x3pack and self.mtp_on:
+        if self.mtp_full:
             L = self.mtp_L
             for e, parts in zip(range(cfg.experts), self._read_many(L, list(range(cfg.experts)))):
                 self.arena.put(slot, *parts)
