@@ -58,7 +58,11 @@ avail() {
     if [[ -z "$tgt" ]]; then
         v=$(awk '/^MemAvailable:/{printf "%.2f", $2/1048576}' /proc/meminfo)
     else
-        v=$(ssh -o BatchMode=yes -o ConnectTimeout=4 "$tgt" \
+        # One multiplexed connection for every sample: a fresh login a second opened a logind
+        # session each time, and polkitd on the peer grew with them (3.3 GB after ~2 days and
+        # 2.1M sessions, while node 0's stayed at 6 MB -- docs/gotchas.md).
+        v=$(ssh -o BatchMode=yes -o ConnectTimeout=4 -o ControlMaster=auto \
+              -o ControlPath="$HOME/.ssh/cm-watchdog-%r@%h:%p" -o ControlPersist=120 "$tgt" \
               'awk "/^MemAvailable:/{printf \"%.2f\", \$2/1048576}" /proc/meminfo' 2>/dev/null)
     fi
     [[ "$v" =~ ^[0-9]+\.[0-9]+$ ]] && printf '%s' "$v"

@@ -3507,3 +3507,13 @@ and stale rows past the sequence are masked on both paths (the indexer scores th
 attention kernel drops rows past each rank's bound). With the loop replay above, substitution at
 that miss rate is the likelier cause -- not shown. GLM_LOOP_BREAK does not catch it (a 10-token
 cycle, 3 times).
+
+## The memory watchdog fed rank 1's polkitd leak: a login a second (2026-10-18)
+
+polkitd on rank 1 had grown to 3.3 GB in under two days (and bluetoothd to 0.55 GB) while node 0's
+stayed at 6 MB after six; rank 1's logind had counted 2.1 million sessions. Rank 1 is the one other
+processes log into: scripts/mem-watchdog.sh opened a fresh ssh every second (often two or three
+watchdogs at once), and the sparkDash dashboard runs one ssh per metric every 2-5 s (~205 logins a
+minute). Each login is a logind session polkitd keeps something of. The watchdog now multiplexes one
+connection (ControlMaster), which took rank 1 from 265 new sessions a minute to the dashboard's
+~205; the memory already held only comes back with `systemctl restart polkit` (root).
