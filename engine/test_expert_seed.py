@@ -46,7 +46,7 @@ class ExpertSeedTest(unittest.TestCase):
         from engine import v41_engine as V
         from engine.adapt_config import resolve
         source = textwrap.dedent(inspect.getsource(V.V41Engine.__init__))
-        start = source.index('        self._prune_trace = (')
+        start = source.index('        self._prune_trace = {L: v.copy()')
         end = source.index('        per_layer =', start)
         block = compile(textwrap.dedent(source[start:end]), '<boot-ranking>', 'exec')
         config = resolve({'DSV41_ADAPT_SENSITIVITY':'medium',
@@ -61,7 +61,7 @@ class ExpertSeedTest(unittest.TestCase):
                 eng = SimpleNamespace(
                     _expert_seed=None, expert_seed_sha256=None,
                     ep=SimpleNamespace(rank=rank,broadcast_obj=broadcast),
-                    expert_profile=SimpleNamespace(static=False,measure_coverage=lambda _:None),
+                    expert_profile=SimpleNamespace(rank='sum'),
                     dynamic_experts=True,dynamic_layer_floor=6,resident_budget=None,
                     args=SimpleNamespace(n_layers=40,n_routed_experts=384,n_activated_experts=6))
                 ns=V.__dict__.copy()

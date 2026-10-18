@@ -1,5 +1,9 @@
 # Fixed topic expert profiles
 
+> **Removed 2026-10-17.** The code (`engine/expert_profiles.py`'s topic loader and maxmin ranker,
+> `DSV41_EXPERT_TOPICS`, `DSV41_PRUNE_SOURCE=saliency`, `DSV41_PRUNE_RANK=maxmin`) is gone; git
+> history has it. This page stays as the record of what was measured and why it was not adopted.
+
 The author published statistics for 39 topics, each containing 40 layers of 384
 expert frequencies and saliency values. This port uses that database to choose
 the resident expert IDs; it does not download, convert, or change expert weights.

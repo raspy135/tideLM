@@ -18,7 +18,6 @@ import torch
 sys.path[:0] = [os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")]
 import engine.v41_engine as V  # noqa: E402
 from engine.adapt_config import resolve  # noqa: E402
-from engine.urgent_adapt import UrgentAdaptWindow
 
 E, L = 16, 2
 
@@ -91,38 +90,7 @@ class DecodeAdaptTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             resolve({"DSV41_ADAPT_SENSITIVITY": "high", "DSV41_ADAPT_DECODE_TOKENS": "-1"})
 
-    def test_urgent_flag_cooldown_and_periodic_reset(self):
-        state = [0., 0.]
-        eng = types.SimpleNamespace(model=types.SimpleNamespace(miss_snapshot=lambda: tuple(state)),
-            _decode_adapt_mark=(1, (0., 0.)), _urgent_adapt=UrgentAdaptWindow(1, (0., 0.)))
-        for n in range(2, 32):
-            state[:] = [(n-1)*2, (n-1)*10]
-            due = V.V41Engine._decode_adapt_due(eng, n)
-        self.assertEqual(due, 2)
-        self.assertEqual(eng._decode_adapt_mark[0], 31)
-        for n in range(32, 181):
-            state[:] = [(n-1)*2, (n-1)*10]
-            self.assertEqual(V.V41Engine._decode_adapt_due(eng, n), 0)
-        state[:] = [360., 1800.]
-        self.assertEqual(V.V41Engine._decode_adapt_due(eng, 181), 2)
-        self.assertLessEqual(len(eng._decode_adapt_checks), 64)
-
-    def test_new_graph_does_not_trigger_on_warmup_counts(self):
-        eng = types.SimpleNamespace(model=types.SimpleNamespace(miss_snapshot=lambda: (1000., 1000.)),
-            _decode_adapt_mark=(1, (0., 0.)), _urgent_adapt=UrgentAdaptWindow(1, (0., 0.)),
-            fast=types.SimpleNamespace(graphs={1:None}), _urgent_graph_count=0)
-        self.assertEqual(V.V41Engine._decode_adapt_due(eng, 31), 0)
-        self.assertEqual(eng._urgent_adapt.samples[0][0], 31)
-
-    def test_urgent_plan_uses_small_cap_and_pending_request(self):
-        calls=[]
-        eng=types.SimpleNamespace(ep=types.SimpleNamespace(rank=0,control_flag=2,broadcast_obj=lambda x:x),
-            plan_swaps=lambda **kw: calls.append(kw) or [], _decode_adapt_passes=[])
-        self.assertEqual(V.V41Engine.maintain_decode(eng, 31), 0)
-        self.assertEqual(calls,[{'max_swaps':64,'pending_request':True}])
-        self.assertEqual(eng._decode_adapt_passes[0]['reason'],'urgent')
-
-    def test_urgent_planner_ignores_exhausted_streaming_budget(self):
+    def test_decode_planner_ignores_exhausted_streaming_budget(self):
         from engine.user_prompt import UserPrompt
         keep=[True]*8+[False]*8
         db=np.zeros((L,E));db[:,:8]=.05
@@ -130,7 +98,7 @@ class DecodeAdaptTest(unittest.TestCase):
         eng=fake_engine(db,req,keep)
         eng.user_prompt=UserPrompt(True,L,E,'cpu',100)
         eng.user_prompt.consume(100)
-        eng.ep.control_flag=2
+        eng.ep.control_flag=1
         eng.ep.broadcast_obj=lambda p:p
         eng.plan_swaps=lambda **kw:V.V41Engine.plan_swaps(eng,**kw)
         applied=[]
@@ -138,15 +106,15 @@ class DecodeAdaptTest(unittest.TestCase):
         eng._decode_adapt_passes=[];eng._decode_adapt_window=30
         self.assertGreater(V.V41Engine.maintain_decode(eng,31),0)
         self.assertTrue(any(s[2]==12 for s in applied))
-        self.assertEqual(eng._decode_adapt_passes[0]['reason'],'urgent')
+        self.assertEqual(eng._decode_adapt_passes[0]['reason'],'periodic')
         self.assertEqual(eng.user_prompt.remaining_loads,0)
 
     def test_eager_uses_aggregate_delta_not_unused_decode_counter(self):
         eng=types.SimpleNamespace(fast=None,
             model=types.SimpleNamespace(miss_snapshot=lambda:(20.,100.),
                                         decode_miss_snapshot=lambda:(0.,0.)),
-            _decode_adapt_mark=(1,(0.,0.)),_urgent_adapt=UrgentAdaptWindow(1,(0.,0.)))
-        self.assertEqual(V.V41Engine._decode_adapt_due(eng,31),2)
+            _decode_adapt_mark=(1,(0.,0.)))
+        self.assertEqual(V.V41Engine._decode_adapt_due(eng,601),1)
 
 
 if __name__ == "__main__":

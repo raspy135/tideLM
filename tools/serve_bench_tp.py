@@ -13,7 +13,7 @@ then Python + a story). Both ranks print MemAvailable every 2 s ("MEM rank=...")
 Rank 1 serves headless and exits when rank 0 shuts down. Rank 0 starts the server, waits for
 /health, runs tools/bench_concurrency_http.py, prints /health's concurrency block, sends SIGTERM.
 Everything else is the profile's own .env: dynamic experts, probe prefill, dynamic depth,
-decode-time and urgent adaptation, the prefix cache.
+decode-time adaptation, the prefix cache.
 """
 
 import argparse

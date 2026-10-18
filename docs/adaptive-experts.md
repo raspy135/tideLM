@@ -87,7 +87,7 @@ cache on both ranks are free. The selected cold set fits one transient batch,
 preventing eviction/reloads within that call. Once the budget is spent, later
 calls use ordinary resident routing. This is an online budget, not a global
 importance ranking across future layers or tokens.
-Normal prefill/decode/urgent/idle resident adaptation retains its existing rules
+Normal prefill/decode/idle resident adaptation retains its existing rules
 and does not spend this budget. The cap is inactive with `USER_PROMPT_STREAM=0`,
 as in the current production pilot. Resident prefill makes no discovery expert
 reads and avoids the extra priority rebuild. Uncapped full discovery can be very

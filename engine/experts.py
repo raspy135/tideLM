@@ -122,7 +122,7 @@ def _pread_chunk(fd: int, view: memoryview, off: int, need: int) -> None:
 class ExpertStore:
     def __init__(self, model_dir: str, index: dict, arena, n_layers: int, transient_slots: int = 400,
                  io_threads: int = 12, mtp_prefix: str | None = None, read_threads: int | None = None,
-                 read_chunk_mb: float | None = None, ep=None, replica_slots: int = 0):
+                 read_chunk_mb: float | None = None, ep=None):
         self.model_dir = model_dir
         self.arena = arena  # tools.fp4_moe.ExpertArena or a compatible object with .slots and load_slot_bytes
         # EP2 (engine/dist.py): with expert parallel active, this rank only resolves experts it
@@ -137,11 +137,7 @@ class ExpertStore:
         self.ep = ep
         ep_active = ep is not None and getattr(ep, "active", False)
         self.null_slot = None
-        if replica_slots < 0 or (replica_slots and not ep_active):
-            raise ValueError('replica slots require EP and a nonnegative capacity')
-        self.n_slots = (arena.slots - 1 if ep_active else arena.slots) - replica_slots
-        # Dedicated tail slots, never part of LRU eviction or the transient ring.
-        self.replica_slots = list(range(self.n_slots, self.n_slots + replica_slots))
+        self.n_slots = arena.slots - 1 if ep_active else arena.slots
         if ep_active:
             # Both arena formats can hold a zero expert now. The FP4 arena stores the zeros
             # verbatim; the CB3 arena packs them, which yields an all-zero codebook whose codes
@@ -397,6 +393,23 @@ class ExpertStore:
         self.transient_map[key] = slot
         self.slot_key[slot] = key
         return slot
+
+    def reserve_transient(self, n: int) -> list[int]:
+        """Take `n` slots out of the transient ring for a caller that manages them itself
+        (DSV41_HOT_ASYNC's ring): the store never allocates, promotes or reads into them again.
+        The ring keeps at least the 8 it asserts at construction."""
+        if len(self.transient_ring) - n < 8:
+            raise ValueError(f"TRANSIENT_SLOTS={self.transient_slots} cannot give {n} slots away and keep 8 "
+                             f"(raise TRANSIENT_SLOTS to at least {8 + n})")
+        taken = self.transient_ring[len(self.transient_ring) - n:]
+        del self.transient_ring[len(self.transient_ring) - n:]
+        self.transient_index = {s: i for i, s in enumerate(self.transient_ring)}
+        self.transient_pos %= len(self.transient_ring)
+        for s in taken:
+            old = self.slot_key.pop(s, None)
+            if old is not None:
+                self.transient_map.pop(old, None)
+        return taken
 
     def _promote_transient(self, key: tuple, slot: int, used: set) -> bool:
         """Give a transient-ring slot to the LRU without re-reading its 18.8 MB.

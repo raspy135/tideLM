@@ -3364,3 +3364,31 @@ fp32: 0.24 GB is ~24 MXFP4 slots, it moves expert choice directly, and it had th
 shift of the set (+0.0057, within noise) -- not worth a regression this eval could not see. The
 first served Japanese answer after the switch had broken tokens (decode misses 15.6%, the
 residency still English/code-shaped) and was clean once adaptation ran (misses 11.8 -> 9.9%).
+
+## Synchronous hot reads cost 8% for less than the asynchronous ones give free (2026-10-18)
+
+The GLM engine's hot reads (read a layer's heaviest missing expert before its MoE) were ported
+as-is first: each pruned layer's decode graph split at its router, a host sync per layer, the read
+on the critical path. On DeepSeek-V4.1-Flash-1017 at 0.3 / 2 reads a step that cost 8.4% of
+decode (37.61 vs 41.08 tok/s; the first version, which synced even after the step's budget was
+spent, cost the old model 16.5%). Reading after the step instead, and keeping each read routable
+until a ring of its own wraps, cost nothing measurable (41.21 tok/s at a 128-slot ring) and
+measured better on prose (-0.138 vs -0.032 nats held-out NLL) though worse on code (-0.0074 vs
+-0.0092): docs/hot-reads.md. The sync mode stays (`DSV41_HOT_ASYNC=0`), but it is not the one to
+serve.
+
+Two things that looked like the async mode's cost and were not: the marks, written a layer at a
+time to the resident masks, took 3.2 ms of host time a step; one [layers, experts] mask ORed into
+the router cut that to 1.0 ms and left 0.2 / 4's -4.5% exactly where it was (same tokens). And
+more reads are not more quality per cost: a longer hold at 0.3 / 2 beat doubling the reads.
+
+## The old model's demand history costs 1017 0.35 nats on prose (2026-10-18)
+
+DeepSeek-V4.1-Flash-1017 serves from its own demand DB (`results/prune_demand_req_score_1017.npz`,
+`.env.1017`), seeded from the old model's: same architecture, and a fine-tune's router should want
+mostly the same experts. The teacher-forced bench at serving residency says how far that is from
+exact routing: every missing pick read (`bench_miss_policy_tp.py` arm `exact`) is -0.0145 nats on
+code but -0.355 on prose, where substitutes are what the router least wanted. The history is
+code-heavy; serving adaptation (sensitivity high) re-ranks from 1017's own traffic, and hot reads
+cover part of the gap in the meantime. Re-measure `exact` after a few days of 1017 traffic before
+blaming the model for prose.

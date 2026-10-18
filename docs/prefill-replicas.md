@@ -1,5 +1,9 @@
 # Experimental prefill replicas (default off)
 
+> **Removed 2026-10-17.** `engine/prefill_replicas.py`, its tests and `DSV41_PREFILL_REPLICA_GB` /
+> `_BUDGET_MS` are gone (git history has them); a nonzero `DSV41_PREFILL_REPLICA_GB` now refuses to
+> boot. It was EP2-only and never enabled in a profile; serving is TP. This page stays as the record.
+
 This is whole-expert EP relocation for prefill, not TP. Original weights and decode lookup
 tables remain resident and unchanged. It is not yet a demonstrated performance improvement.
 

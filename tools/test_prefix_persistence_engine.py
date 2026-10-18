@@ -17,7 +17,6 @@ os.environ['DSV41_PREFIX_DISK_STRICT'] = '1'
 os.environ['DSV41_PREFIX_CACHE'] = '1'
 os.environ['DSV41_PRUNE_SWAP'] = '0'
 os.environ['DSV41_PRUNE_SWAP_PREFILL'] = '0'
-os.environ['DSV41_PREFILL_EP_OVERLAP'] = '0'
 
 import torch
 from tokenizers import Tokenizer

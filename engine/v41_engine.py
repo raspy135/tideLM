@@ -502,6 +502,14 @@ def blend_demand(trace_counts: dict, db, prior_slots: float):
     return out, (sum(ws) / len(ws) if ws else 0.0)
 
 
+def _hot_boot_fields(args):
+    """The boot-guard entry for DSV41_HOT_READS: every setting that changes routing, or "0"."""
+    from engine.hot_reads import HotReads
+    if not HotReads.enabled():
+        return "0"
+    return HotReads(args.n_layers, args.n_routed_experts, args.n_activated_experts).boot_fields()
+
+
 class V41Engine:
     #: this engine can constrain sampling with a decoding gate (``generate(grammar=...)``)
     supports_grammar = True
@@ -565,7 +573,6 @@ class V41Engine:
             self.args.n_routed_experts, self.args.n_activated_experts, prune_keep, prune_select)
         from engine.expert_profiles import ExpertProfile
         self.expert_profile = ExpertProfile(os.environ, self.args.n_layers, self.args.n_routed_experts)
-        self.expert_profile.validate(prune_keep, prune_select, self.prune_layer_counts, ADAPT)
         from engine.layer_stream import parse_layers
         self.stream_layers = parse_layers(os.environ.get('DSV41_STREAM_LAYERS', ''), self.args.n_layers)
         self.user_prompt_stream = os.environ.get('DSV41_USER_PROMPT_STREAM', '0') == '1'
@@ -583,7 +590,7 @@ class V41Engine:
         if self.dynamic_experts and (self.prune_layer_counts is not None or any(w != 1. for w in self.prune_layer_weights)):
             raise ValueError('fully dynamic allocation requires no fixed layer counts or layer discounts')
         if self.dynamic_experts:
-            if self.stream_layers or self.expert_profile.static or not prune_keep or not 0 < prune_keep < 1:
+            if self.stream_layers or not prune_keep or not 0 < prune_keep < 1:
                 raise ValueError('dynamic allocation requires adaptive pruned residency without layer streaming')
             # Concurrent lanes (DSV41_MAX_CONCURRENCY > 1) are fine: a cross-layer transfer edits the
             # shared slot table and masks in place, at a scheduler boundary where no lane is
@@ -605,7 +612,7 @@ class V41Engine:
                 raise ValueError('latest-user streaming requires bounded replay to refresh the first answer after admission')
             if os.environ.get('DSV41_PRUNE_MISS', '0') != '1':
                 raise ValueError('latest-user streaming requires DSV41_PRUNE_MISS=1')
-            if self.stream_layers or self.expert_profile.static or not prune_keep or not 0 < prune_keep < 1:
+            if self.stream_layers or not prune_keep or not 0 < prune_keep < 1:
                 raise ValueError('latest-user streaming requires adaptive pruned residency without layer streaming')
             if os.environ.get('DSV41_MAX_CONCURRENCY', '1') != '1':
                 raise ValueError('latest-user streaming requires concurrency 1')
@@ -619,7 +626,7 @@ class V41Engine:
         if self.layer_ablation.path:
             if self.stream_layers != frozenset(range(self.args.n_layers)):
                 raise ValueError('layer ablation diagnostics require all backbone layers streamed')
-            if ADAPT.swap or PREFILL_SWAP or ADAPT.decode_tokens or ADAPT.urgent:
+            if ADAPT.swap or PREFILL_SWAP or ADAPT.decode_tokens:
                 raise ValueError('layer ablation diagnostics require every adaptive swap trigger disabled')
         if self.stream_layers:
             if not prune_keep or not 0 < prune_keep < 1:
@@ -818,27 +825,18 @@ class V41Engine:
                 or os.environ.get('DSV41_TP_EXPERT_LAYOUT', 'output') != 'output'):
             raise ValueError('draft TP requires native FP4 TP2 with output layout')
         if self.ep.tensor_parallel:
-            if exl3_cls is not None:
-                if (os.environ.get('DSV41_PREFILL_EP_OVERLAP', '0') == '1'
-                        or float(os.environ.get('DSV41_PREFILL_REPLICA_GB', '0'))):
-                    raise ValueError('EXL3 expert TP forbids EP overlap and prefill replicas')
-            elif (self.kernel != 'triton-fp4' or cb3_cls is not None or sim_bits
-                    or os.environ.get('DSV41_PREFILL_EP_OVERLAP', '0') == '1'
-                    or float(os.environ.get('DSV41_PREFILL_REPLICA_GB', '0'))):
-                raise ValueError('expert TP requires native FP4, no replicas, no EP overlap')
+            if exl3_cls is None and (self.kernel != 'triton-fp4' or cb3_cls is not None or sim_bits):
+                raise ValueError('expert TP requires native FP4')
             if exl3_cls is None:
                 self.expert_bytes //= self.ep.world
-        replica_gb = float(os.environ.get("DSV41_PREFILL_REPLICA_GB", "0"))
-        self.replica_budget_ms = float(os.environ.get("DSV41_PREFILL_REPLICA_BUDGET_MS", "500"))
-        if not np.isfinite(replica_gb) or not 0 <= replica_gb <= 1:
-            raise ValueError('experimental prefill replica arena must be between 0 and 1 GB per rank')
-        if not np.isfinite(self.replica_budget_ms) or not 0 < self.replica_budget_ms <= 500:
-            raise ValueError('prefill replica admission budget must be in (0, 500] ms')
-        self.replica_slots = int(replica_gb * 1e9 / self.expert_bytes)
-        replica_bytes = self.replica_slots * self.expert_bytes
-        if self.replica_slots and (self.ep.world != 2 or self.kernel != "triton-fp4"
-                                   or self.fp4_dot_scaled or self.fp4_prefill_dot_scaled):
-            raise ValueError('prefill replicas currently require EP2 software-FP4')
+        # Experimental EP2 prefill replicas (DSV41_PREFILL_REPLICA_GB) and the prefill EP combine
+        # overlap (DSV41_PREFILL_EP_OVERLAP) were removed 2026-10-17: never enabled in a profile,
+        # and the overlap measured no reliable gain. docs/prefill-replicas.md and
+        # docs/prefill-ep-overlap.md keep what was measured.
+        if float(os.environ.get("DSV41_PREFILL_REPLICA_GB", "0") or 0):
+            raise ValueError('DSV41_PREFILL_REPLICA_GB: prefill replicas were removed (docs/prefill-replicas.md)')
+        if os.environ.get("DSV41_PREFILL_EP_OVERLAP", "0") not in ("", "0"):
+            raise ValueError('DSV41_PREFILL_EP_OVERLAP: the overlap was removed (docs/prefill-ep-overlap.md)')
         if self.ep.active:
             assert expert_format in ("", "fp4", "cb3", "exl3"), expert_format
             self.ep.init(device)
@@ -961,7 +959,7 @@ class V41Engine:
                 f"lanes and batched graphs")
             arena_gb = max(10.0, arena_gb - lane_bytes / 1e9)
         if host_avail is not None:
-            cap = (host_avail - keep_free_gb * 1e9 - replica_bytes - lane_bytes) / 1e9
+            cap = (host_avail - keep_free_gb * 1e9 - lane_bytes) / 1e9
             if cap < 10.0:
                 # Refuse rather than squeeze. A cap this low means the host has no memory to give:
                 # another engine is still resident, or the kernel has not finished reclaiming the
@@ -992,7 +990,7 @@ class V41Engine:
             # free -- rather than a pessimistic sum, because refusing a configuration that works is
             # its own failure. The MemoryWatchdog below is the backstop if this estimate is wrong.
             pack_scratch = 3e9 if self.expert_format != "fp4" else 1e9
-            need = arena_gb * 1e9 + replica_bytes + lane_bytes + pack_scratch + keep_free_gb * 1e9
+            need = arena_gb * 1e9 + lane_bytes + pack_scratch + keep_free_gb * 1e9
             if need > host_avail:
                 raise RuntimeError(
                     f"refusing to start: arena {arena_gb:.1f} GB + {pack_scratch / 1e9:.1f} GB "
@@ -1014,14 +1012,14 @@ class V41Engine:
         # the machine (see MemoryWatchdog)
         self.mem_watchdog = MemoryWatchdog(floor_gb=float(os.environ.get("DSV41_MEM_FLOOR_GB", "2.5")),
                                            log=log).start()
-        self.arena = make_expert_arena(slots + self.replica_slots)
+        self.arena = make_expert_arena(slots)
         if exl3_cls is not None:
             import exl3_store as _XS
             self.store = _XS.Exl3ExpertStore(
                 exl3_pack_path(model_dir, self.ep.rank if self.ep.tensor_parallel else 0,
                                self.ep.world if self.ep.tensor_parallel else 1),
                 self.arena, self.args.n_layers, transient_slots=transient_slots, io_threads=io_threads,
-                ep=self.ep, replica_slots=self.replica_slots)
+                ep=self.ep)
             # the DSpark drafter stays native FP4 and reads its 3x128 experts from the checkpoint
             self.dspark_reader = EX.ExpertStore(model_dir, index, self.W.dspark_arena, self.args.n_layers,
                                                 transient_slots=16, io_threads=2, read_threads=4)
@@ -1033,7 +1031,7 @@ class V41Engine:
                 log("EXL3 CUDA kernel warm")
         else:
             self.store = EX.ExpertStore(model_dir, index, self.arena, self.args.n_layers, transient_slots=transient_slots,
-                                        io_threads=io_threads, ep=self.ep, replica_slots=self.replica_slots)
+                                        io_threads=io_threads, ep=self.ep)
             self.dspark_reader = self.store
         if self.resident_budget == 'auto':
             from engine.expert_budget import auto_budget
@@ -1116,13 +1114,8 @@ class V41Engine:
         if prune_keep and prune_keep < 1.0:
             # pruned, all-resident mode: per layer only the top-N experts (by trace frequency) stay
             # routable, and exactly those are warm-started, so decode never touches NVMe
-            if self.expert_profile.static:
-                counts = self.expert_profile.scores(trace_stats, prune_keep)
-                log(f"fixed expert profile: {self.expert_profile.rank} on {self.expert_profile.source}; "
-                    f"topics: {', '.join(self.expert_profile.topics)}")
-            else:
-                cc, cg = EX.category_counts(trace_stats, "coding"), EX.category_counts(trace_stats, "general")
-                assert len(cc) == 40 and len(cg) == 40, "pruned mode needs the per-layer trace npz files next to trace_stats"
+            cc, cg = EX.category_counts(trace_stats, "coding"), EX.category_counts(trace_stats, "general")
+            assert len(cc) == 40 and len(cg) == 40, "pruned mode needs the per-layer trace npz files next to trace_stats"
             # How the two workloads are combined into one ranking. "sum" (the 0.2.0-wip default)
             # adds the per-layer-normalized frequencies, which favours experts moderately used by
             # both and drops each workload's specialists -- the coding and prose top sets overlap by
@@ -1131,9 +1124,7 @@ class V41Engine:
             # ranked on prose alone wrote clean text (NOTES 2026-09-12). "max" keeps an expert that
             # matters to EITHER workload, which is what a general-purpose server needs.
             rank = self.expert_profile.rank
-            if self.expert_profile.static:
-                pass  # admission priorities / saliency retain their own units
-            elif rank == "sum":
+            if rank == "sum":
                 counts = {L: cc[L] / cc[L].sum() + cg[L] / cg[L].sum() for L in range(40)}
             elif rank == "max":
                 counts = {L: np.maximum(cc[L] / cc[L].sum(), cg[L] / cg[L].sum()) for L in range(40)}
@@ -1143,10 +1134,9 @@ class V41Engine:
             # with the model; the demand DB is this box's own history and accumulates across
             # restarts, so a server used mostly for one kind of work drifts towards the experts
             # that work needs. DSV41_PRUNE_ADAPT=0 pins the shipped ranking.
-            self._prune_trace = (None if self.expert_profile.static else
-                                 {L: v.copy() for L, v in counts.items()})
+            self._prune_trace = {L: v.copy() for L, v in counts.items()}
             log(ADAPT.describe())
-            log(f"observed routing metric: {ADAPT.metric}; fixed profile {self.expert_profile.static}")
+            log(f"observed routing metric: {ADAPT.metric}")
             db = load_prune_db() if ADAPT.use_db else None
             # Rank 0 alone chooses the cold-start seed. Carry it in the existing
             # ranking broadcast so peer-local DB files cannot diverge the map.
@@ -1201,7 +1191,6 @@ class V41Engine:
             else:
                 masks, keep = build_keep_masks(counts, prune_keep, prune_select, device,
                                               layer_counts=self.prune_layer_counts)
-            self.expert_profile.measure_coverage(keep)
             n_keep = max(len(v) for v in keep.values())
             ranked = [(float(counts[L][e]), L, int(e)) for L, ks in keep.items() for e in ks]
             ranked.sort(reverse=True)
@@ -1420,6 +1409,9 @@ class V41Engine:
                 # and the pair diverges silently (engine/expert_topp.py).
                 "expert_topp": _ETP.config(),
                 "expert_topp_version": _ETP.VERSION,
+                # DSV41_HOT_READS changes which experts a decode row uses (engine/hot_reads.py). From
+                # the environment: this guard runs before the FastDecoder that holds the settings.
+                "hot_reads": _hot_boot_fields(self.args),
                 "lookup_draft_enabled": LOOKUP_DRAFT_ENABLED,
                 "lookup_draft_ngram": LOOKUP_DRAFT_NGRAM,
                 "lookup_draft_candidates": LOOKUP_DRAFT_CANDIDATES,
@@ -1523,10 +1515,6 @@ class V41Engine:
                 "prefill_timing": PREFILL_TIMING,
                 "prefill_moe_timing": os.environ.get("DSV41_PREFILL_MOE_TIMING", "0"),
                 "prefill_swap_routes_version": 1,
-                "prefill_ep_overlap": os.environ.get("DSV41_PREFILL_EP_OVERLAP", "0"),
-                "prefill_ep_overlap_join_version": 1,
-                "prefill_replica_slots": self.replica_slots,
-                "prefill_replica_budget_ms": self.replica_budget_ms,
                 # The prefill indexer's score reduction. The tiled path is meant to select the
                 # same positions as the monolithic one, but a per-tile topk can break a tie
                 # differently, so a split pair could read different sparse KV with nothing
@@ -1640,16 +1628,8 @@ class V41Engine:
                     self.model.prefill_routes = routes
             log("fast decode path enabled (CUDA graphs=%s, device slot LUT=%s, ep=%s)"
                 % (self.fast.use_graphs, self.fast.lut is not None, self.ep.world))
-        self.prefill_replicas = None
-        if (self.stream_layers or self.user_prompt_stream or self.dynamic_experts) and (self.fast is None or self.fast.lut is None or self.replica_slots):
-            raise ValueError('streaming/dynamic allocation requires fast resident decode without replicas')
-        if self.replica_slots:
-            if getattr(self.model, "slot_lut", None) is None or not hasattr(self.model, "prefill_routes"):
-                raise ValueError('prefill replicas require pruned all-resident FP4 routing')
-            from engine.prefill_replicas import PrefillReplicas
-            self.prefill_replicas = PrefillReplicas(self, self.replica_budget_ms)
-            log(f"experimental prefill replicas: {self.replica_slots} dedicated slots/rank, "
-                f"{replica_bytes / 1e9:.3f} extra GB/rank; prefix reuse disabled")
+        if (self.stream_layers or self.user_prompt_stream or self.dynamic_experts) and (self.fast is None or self.fast.lut is None):
+            raise ValueError('streaming/dynamic allocation requires fast resident decode')
         # preallocated staging for the lean decode step (see LEAN_STEP): the verify block, the
         # [n_accepted, argmax x 6] readback and its pinned host landing buffer.
         from engine.fastdecode import T_VERIFY as _TV, VERIFY_WIDTHS, DYNAMIC_DEPTHS, CONFIDENCE_DEPTHS
@@ -1691,10 +1671,10 @@ class V41Engine:
                     and self.kernel == 'triton-fp4' and self.ep.tensor_parallel
                     and os.environ.get('DSV41_PREFILL_FIXED_ROUTING', '1') == '1'):
                 raise ValueError('prefill graphs require resident FP4 TP and fixed prefill routing')
-            if (self.replica_slots or PREFILL_TIMING
+            if (PREFILL_TIMING
                     or os.environ.get('DSV41_PREFILL_MOE_TIMING', '0') != '0'
                     or int(os.environ.get('DSV41_MAX_CONCURRENCY', '1')) != 1):
-                raise ValueError('prefill graphs require concurrency 1, replicas/timing instrumentation off')
+                raise ValueError('prefill graphs require concurrency 1, timing instrumentation off')
             self.model.prefill_graphs = PrefillFFNGraphs(self.model, MAX_CHUNK)
             log(f"experimental prefill FFN graphs, rows {self.model.prefill_graphs.rows}")
         torch.cuda.synchronize()
@@ -1759,7 +1739,7 @@ class V41Engine:
         Match tokens AND image inputs before touching state. Placeholder-token equality
         alone says nothing about pixels. Never resume in the middle of an image span.
         """
-        if (pc is None or getattr(self, "replica_slots", 0)
+        if (pc is None
                 or os.environ.get("DSV41_PREFIX_CACHE", "1") != "1" or not self.swa_replay
                 or len(prompt) < len(pc["ids"]) or tuple(prompt[:len(pc["ids"])]) != pc["ids"]):
             return 0
@@ -1814,7 +1794,7 @@ class V41Engine:
 
     def _snapshot_prefix(self, prefix_ids, P: int):
         """Clone the small prefix state at position ``P``, or return None when caching is off."""
-        if (getattr(self, "replica_slots", 0) or os.environ.get("DSV41_PREFIX_CACHE", "1") != "1"
+        if (os.environ.get("DSV41_PREFIX_CACHE", "1") != "1"
                 or not self.swa_replay or P <= 0):
             return None
         media = media_prefix(getattr(self, '_prefix_media', ()), P)
@@ -1857,7 +1837,7 @@ class V41Engine:
             P, end = len(prompt), len(prompt) + len(response)
             eligible = (os.environ.get('DSV41_PREFIX_RESPONSE', '1') == '1'
                         and os.environ.get('DSV41_PREFIX_CACHE', '1') == '1'
-                        and self.swa_replay and not self.replica_slots and bool(response)
+                        and self.swa_replay and bool(response)
                         and end + 8 <= self.max_context and self._images is None
                         and base is not None and base['ids'] == tuple(prompt)
                         and (self.prefix_disk is None or not self.prefix_disk.strict
@@ -1966,7 +1946,7 @@ class V41Engine:
         self._prefix_media = media
         prefix_start = self._restore_prefix(prompt)
         if (self.prefix_disk is not None and self.swa_replay
-                and not self.replica_slots and os.environ.get('DSV41_PREFIX_CACHE', '1') == '1'):
+                and os.environ.get('DSV41_PREFIX_CACHE', '1') == '1'):
             prefix_start = self.prefix_disk.restore(prompt, prefix_start)
         else:
             lengths = self.ep.gather_objects(prefix_start)
@@ -1998,8 +1978,6 @@ class V41Engine:
             self.ep.release_peer()
             raise
         finally:
-            if self.prefill_replicas is not None:
-                self.prefill_replicas.clear()
             n_out = _st.get("n_out", n_out)
             steps = _st.get("steps", steps)
             accepted_hist = _st.get("accepted", accepted_hist)
@@ -2028,6 +2006,9 @@ class V41Engine:
                 "prefill_tok_s": round(P / t_prefill, 2) if t_prefill > 0 else None,
                 "decode_s": round(t_dec, 3), "decode_tok_s": round(max(n_out - 1, 0) / t_dec, 2),
                 "steps": steps,
+                # DSV41_HOT_READS, cumulative since boot (engine/hot_reads.py)
+                "hot_reads": (dict(self.fast.hot.stats) if getattr(getattr(self, 'fast', None), 'hot', None)
+                              is not None else None),
                 "decode_adaptation": {"checks": self._decode_adapt_checks,
                                       "passes": self._decode_adapt_passes},
                 "user_prompt": self.user_prompt.report(),
@@ -2208,9 +2189,6 @@ class V41Engine:
                 self.last_stats["prefill_moe_timing"] = moe_report
                 log("prefill_moe_timing: " + json.dumps(moe_report))
                 self.model.prefill_moe_timing = None
-            if self.prefill_replicas is not None:
-                self.last_stats["prefill_replicas"] = dict(self.prefill_replicas.stats)
-                log("prefill_replicas: " + json.dumps({"rank": self.ep.rank, **self.prefill_replicas.stats}))
             if _st.get("prefill_timing") is not None:
                 report = _st["prefill_timing"].report()
                 self.last_stats["prefill_chunks"] = report
@@ -2481,8 +2459,8 @@ class V41Engine:
         Decode graphs retain the LUT and masks' addresses. Eager prefill compact
         maps are rebuilt for changed layers because their cardinalities can grow
         or shrink. RAM prefix state has no sector pointers and remains historical
-        state, as with within-layer adaptation. Disk/response caches, prefill
-        graphs and replicas are disabled at boot.
+        state, as with within-layer adaptation. Disk/response caches and prefill
+        graphs are disabled at boot.
         Any load failure is fatal: a partially rewritten TP pair cannot continue.
         """
         if not getattr(self.ep, 'tensor_parallel', False):
@@ -2587,51 +2565,36 @@ class V41Engine:
         return self.maintain_demand()
 
     def _decode_adapt_due(self, n_out: int) -> int:
-        """Rank 0 returns 2 for urgent or 1 for periodic adaptation; control broadcasts it.
+        """Rank 0 returns 1 when a periodic decode adaptation pass is due; control broadcasts it.
 
-        Rolling checks read the existing decode-only counter pair once per completed
-        verification burst. No layer kernels or expert reads are added by monitoring.
-        The periodic path retains its interval-only readback when urgent mode is off.
+        The decode-only miss counter pair is read once per ADAPT.decode_tokens output tokens.
+        (DSV41_ADAPT_URGENT's rolling ~30-token check was removed 2026-10-18 for hot reads.)
         """
         mark = getattr(self, '_decode_adapt_mark', None)
         if not ADAPT.decode_tokens or mark is None:
             return 0
-        urgent = getattr(self, '_urgent_adapt', None)
-        periodic = n_out - mark[0] >= ADAPT.decode_tokens
-        if urgent is None and not periodic:
+        if n_out - mark[0] < ADAPT.decode_tokens:
             return 0
         # The eager fallback labels its routes as prefill in existing accounting.
         # Preserve its aggregate-counter delta; the fast path has a decode-only pair.
         snapshot = (getattr(self.model, 'decode_miss_snapshot', self.model.miss_snapshot)
                     if getattr(self, 'fast', None) is not None else self.model.miss_snapshot)
         now = snapshot()
-        graphs = len(getattr(getattr(self, 'fast', None), 'graphs', {}))
-        recaptured = graphs != getattr(self, '_urgent_graph_count', graphs)
-        self._urgent_graph_count = graphs
-        if urgent is not None and recaptured:
-            urgent.restart(n_out, now)  # warm-up forwards are not decoded tokens
-        check = urgent.observe(n_out, now) if urgent is not None and not recaptured else None
-        checks = [check] if check is not None else []
-        if periodic:
-            self._decode_adapt_mark = (n_out, now)
-            valid = now is not None and mark[1] is not None and now[1] > mark[1][1]
-            rate = (now[0] - mark[1][0]) / (now[1] - mark[1][1]) if valid else None
-            checks.append(dict(reason='periodic', output_tokens=n_out, window_tokens=n_out-mark[0],
-                               miss_rate=rate, threshold=ADAPT.swap_prefill_min_miss,
-                               triggered=bool(valid and rate >= ADAPT.swap_prefill_min_miss)))
-        for check in checks:
-            if not hasattr(self, '_decode_adapt_checks'):
-                self._decode_adapt_checks = []
-            self._decode_adapt_checks.append(check)
-            del self._decode_adapt_checks[:-64]  # bounded request diagnostics
-            if check['triggered']:
-                self._decode_adapt_mark = (n_out, now)
-                self._decode_adapt_rate = check['miss_rate']
-                self._decode_adapt_window = check['window_tokens']
-                if urgent is not None:
-                    urgent.attempted(n_out, now)
-                return 2 if check['reason'] == 'urgent' else 1
-        return 0
+        self._decode_adapt_mark = (n_out, now)
+        valid = now is not None and mark[1] is not None and now[1] > mark[1][1]
+        rate = (now[0] - mark[1][0]) / (now[1] - mark[1][1]) if valid else None
+        check = dict(reason='periodic', output_tokens=n_out, window_tokens=n_out-mark[0],
+                     miss_rate=rate, threshold=ADAPT.swap_prefill_min_miss,
+                     triggered=bool(valid and rate >= ADAPT.swap_prefill_min_miss))
+        if not hasattr(self, '_decode_adapt_checks'):
+            self._decode_adapt_checks = []
+        self._decode_adapt_checks.append(check)
+        del self._decode_adapt_checks[:-64]  # bounded request diagnostics
+        if not check['triggered']:
+            return 0
+        self._decode_adapt_rate = check['miss_rate']
+        self._decode_adapt_window = check['window_tokens']
+        return 1
 
     def _engram_rows_async(self, hashes):
         """Start the verify block's hash-id D2H on a side stream; return the `rows` callable
@@ -2667,8 +2630,7 @@ class V41Engine:
         see plan_swaps) and broadcasts; both apply. Past tokens are untouched: their KV is
         already written, only later tokens route to the new experts."""
         t0 = time.perf_counter()
-        reason = 'urgent' if self.ep.control_flag == 2 else 'periodic'
-        cap = ADAPT.urgent_max if reason == 'urgent' else ADAPT.swap_max
+        reason, cap = 'periodic', ADAPT.swap_max
         swaps = None
         if self.ep.rank == 0:
             try:
@@ -2920,9 +2882,6 @@ class V41Engine:
         self.prefill_budget_last["image_span_exceeds_rows"] = self.prefill_budget_last["largest_span"] > chunk_size
         self.prefill_budget_last["new_tokens"] = P - prefix_start
         out_st["prefill_budget"] = dict(self.prefill_budget_last)
-        replicas = self.prefill_replicas
-        if replicas is not None:
-            replicas.begin(len(spans) > 1)
         timing = None
         if PREFILL_TIMING:
             from engine.prefill_timing import PrefillTiming
@@ -2974,10 +2933,6 @@ class V41Engine:
                                 del self._prefix_snapshots[min(self._prefix_snapshots)]
                     with timing.chunk(s, e) if timing is not None else nullcontext():
                         _fwd(s, ids[s:e], need_logits=False, encoder_only=True)
-                    if replicas is not None and (s, e) == spans[0]:
-                        replicas.finish_probe()
-                if replicas is not None:
-                    replicas.clear()  # decoder replay uses original ownership too
                 # Save at the prompt boundary, before decoder replay and generation overwrite the
                 # rings. On a future exact extension, only ids[prefix_start:] are recomputed.
                 self._save_prefix(host_ids if host_ids is not None else ids.tolist(), P)
@@ -2995,10 +2950,6 @@ class V41Engine:
                         logits, mh = _fwd(s, chunk, need_logits=last)
                         if self.spec:
                             m.dspark_seed(mh, s)
-                    if replicas is not None and (s, e) == spans[0]:
-                        replicas.finish_probe()
-        if replicas is not None:
-            replicas.clear()  # before adaptation, graph capture, or token generation
         # The prompt's demand is now complete and no token has been generated yet: the whole
         # prompt's evidence can be applied before it is used, rather than after the answer is
         # written. Outside the read-ahead context so the swap's NVMe loads do not contend with
@@ -3094,14 +3045,8 @@ class V41Engine:
         decode_snapshot = (self.model.decode_miss_snapshot if self.fast is not None
                            else self.model.miss_snapshot)
         self._decode_adapt_mark = ((n_out, decode_snapshot()) if decode_adapt else None)
-        self._urgent_adapt = None
-        self._urgent_graph_count = len(self.fast.graphs) if self.fast is not None else 0
         if self.fast is not None:
             self.fast._ahead = None   # never carry a queued draft across requests
-        if decode_adapt and ADAPT.urgent:
-            from engine.urgent_adapt import UrgentAdaptWindow
-            self._urgent_adapt = UrgentAdaptWindow(n_out, self._decode_adapt_mark[1],
-                ADAPT.urgent_window, ADAPT.urgent_miss, ADAPT.urgent_cooldown)
         while self.ep.control(n_out < max_tokens and tok not in stop_ids,
                               self._decode_step_value(pol, lookup, bypass,
                                   n_out < max_tokens and tok not in stop_ids),
@@ -3268,7 +3213,7 @@ class V41Engine:
                              and conf_pol is None and not getattr(self, "_cooperative_decode", False))
                     if ahead:
                         vhost.copy_(vout, non_blocking=True)
-                        # the urgent-adaptation check reads these at the top of the next step
+                        # the decode-adaptation check reads these at the top of a later step
                         m.stage_decode_miss()
                         _vready = torch.cuda.Event()
                         _vready.record()
@@ -3654,6 +3599,8 @@ class V41Engine:
             "engram_native_threads": int(os.environ.get("DSV41_ENGRAM_NATIVE_THREADS", "64")),
             "moe_fallback": self.kernel == "dequant-fallback",
             "routed_topk": self.args.n_activated_experts,
+            "hot_reads": ({**self.fast.hot.boot_fields(), **self.fast.hot.stats}
+                          if getattr(getattr(self, 'fast', None), 'hot', None) is not None else None),
             "sim_cb2_frac": self.sim_cb2_frac,
             "act_quant": self.act_quant,
             "cycle_break": os.environ.get("DSV41_CYCLE_BREAK", "0") == "1",
@@ -3663,9 +3610,7 @@ class V41Engine:
                                   os.environ.get("DSV41_PREFILL_SKIP_NULL", "1") == "1"),
             "prefill_fixed_routing": (bool(getattr(self.model, "prefill_routes", None)) and
                                       os.environ.get("DSV41_PREFILL_FIXED_ROUTING", "1") == "1"),
-            "prefill_ep_overlap": (self.ep.active and
-                                   os.environ.get("DSV41_PREFILL_EP_OVERLAP", "0") == "1"),
-            "prefix_cache": (not self.replica_slots and self.swa_replay and os.environ.get("DSV41_PREFIX_CACHE", "1") == "1"),
+            "prefix_cache": (self.swa_replay and os.environ.get("DSV41_PREFIX_CACHE", "1") == "1"),
             "prefix_snapshots": PREFIX_SNAPSHOTS,
             "prefix_response": os.environ.get('DSV41_PREFIX_RESPONSE', '1') == '1',
             "prefix_response_last": getattr(self, '_prefix_response_last', None),
@@ -3674,9 +3619,6 @@ class V41Engine:
             "prefix_disk_min_interval_s": PREFIX_DISK_MIN_INTERVAL_S,
             "prefix_disk_dedup": PREFIX_DISK_DEDUP,
             "prefix_disk_last": self.prefix_disk.stats if self.prefix_disk is not None else None,
-            "prefill_replica_slots": self.replica_slots,
-            "prefill_replica_gb": round(self.replica_slots * self.expert_bytes / 1e9, 3),
-            "prefill_replica_budget_ms": self.replica_budget_ms,
             "prefill_fused_attn": M_.PREFILL_FUSED_ATTN,   # not a second os.environ.get: see model.py
             "prefill_engram_prefetch": os.environ.get("DSV41_PREFILL_ENGRAM", "1") == "1",
             "prune_keep": self.prune_keep,
@@ -3688,10 +3630,6 @@ class V41Engine:
             "vision_enabled": self.vision is not None,
             "vision_weights_local": self.vision is not None and (self.vision_mode != 'peer' or self.ep.rank == 1),
             "prune_score_history_version": 2,
-            "urgent_adaptation": {"enabled": ADAPT.urgent, "window_tokens": ADAPT.urgent_window,
-                                  "miss_threshold": ADAPT.urgent_miss,
-                                  "max_swaps": ADAPT.urgent_max,
-                                  "cooldown_tokens": ADAPT.urgent_cooldown},
             "prune_select": getattr(self, "prune_select", None),
             "prune_layer_counts": self.prune_layer_counts,
             "dynamic_experts": self.dynamic_experts,

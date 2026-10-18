@@ -1,5 +1,12 @@
 # Urgent expert loading during decode
 
+> **Removed 2026-10-18.** Its trigger and loading were validated as safe (below) but never shown
+> to improve output, and each pass paused decode ~0.2 s. Asynchronous hot reads
+> (`DSV41_HOT_READS=1 DSV41_HOT_ASYNC=1`, docs/hot-reads.md) read the experts a decode step misses
+> most while the next step runs, at no measured throughput cost, with a measured held-out NLL gain.
+> `DSV41_ADAPT_URGENT=1` now refuses to boot; `0` is accepted. The periodic 600-token decode
+> adaptation is unchanged. This page is kept as the record of what was measured.
+
 `DSV41_ADAPT_URGENT=1` adds a rolling check to the existing decode adaptation path:
 
 - More than 10% missing expert selections over approximately the last 30 output tokens.

@@ -240,7 +240,7 @@ def main():
     root = os.environ['MODEL_DIR']
     e = V.V41Engine(root, max_seq=32768, arena_gb=float(os.environ.get('DSV41_BENCH_ARENA_GB', '90.2')),
                    trace_stats='/app/results/trace-union/stats/coverage.json',
-                   spec=True, prune_keep=.61, transient_slots=8, keep_free_gb=6,
+                   spec=True, prune_keep=.61, transient_slots=int(os.environ.get('DSV41_BENCH_TRANSIENT', '8')), keep_free_gb=6,
                    expert_format=os.environ.get('DSV41_BENCH_EXPERT_FORMAT', 'fp4'))
     e.confidence_depth_policy = None
     e.depth_policy.pinned = 3

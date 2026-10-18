@@ -1,5 +1,10 @@
 # Prefill EP overlap
 
+> **Removed 2026-10-17.** The overlap path, `EPDistributed.combine_async` / `finish_combine`, their
+> tests and `tools/bench_ep_overlap_engine.py` are gone (git history has them); a nonzero
+> `DSV41_PREFILL_EP_OVERLAP` now refuses to boot. Measured below: no reliable gain. This page stays
+> as the record -- including the join race, which matters to anyone who tries it a third time.
+
 Default off: `DSV41_PREFILL_EP_OVERLAP=0`. The opt-in path overlaps the routed expert
 all-reduce with the independent shared expert, then adds the two FP32 outputs and rounds
 as before. Decode is unchanged. The flag and completion-join version are in the EP boot guard.
