@@ -139,7 +139,13 @@ def main():
         for k, sq in enumerate(seqs):
             p, a = sq["prompt"], sq["answer"]
             eng.reset()
-            z = eng.forward(p + a[:-1], all_logits=True)[len(p) - 1:].float()     # predicts a[0..]
+            if len(p) > 4096:
+                # The prompt's own logits are never scored: [18K, 155K] in fp32 and its log-softmax
+                # took a node under the watchdog's 3 GB floor (--set long, 2026-10-18).
+                z0 = eng.forward(p, all_logits=False)[-1:]
+                z = torch.cat([z0, eng.forward(a[:-1], all_logits=True)]).float()
+            else:
+                z = eng.forward(p + a[:-1], all_logits=True)[len(p) - 1:].float()     # predicts a[0..]
             lp = torch.log_softmax(z, -1)
             tgt = torch.tensor(a, device=lp.device)
             top = lp.topk(TOPN, -1)

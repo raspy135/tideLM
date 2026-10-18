@@ -96,11 +96,16 @@ def _q8_rows(w: torch.Tensor, device, kind: str = "int8", rows: int = 8192):
 
 def kv_write(cache, idx, x):
     """Store rows x [n, d] at idx: a BF16 tensor directly, an (fp8, scale) pair quantized per
-    KV_BLOCK values (or per row when the scale has one column)."""
+    KV_BLOCK values (or per row when the scale has one column), a (uint8 nibbles, bf16 scale) pair
+    as E2M1 per 16 values."""
     if isinstance(cache, torch.Tensor):
         cache.index_copy_(0, idx, x)
         return
     q, sc = cache
+    if q.dtype == torch.uint8:                  # GLM_KV=fp4 (engine/glm/kv_fp4.py)
+        from .kv_fp4 import fp4_store
+        fp4_store(q, sc, idx, x)
+        return
     n, d = x.shape
     g = x.float().view(n, sc.shape[1], d // sc.shape[1])
     s = (g.abs().amax(-1, keepdim=True) / 448.0).clamp_min(1e-12)
@@ -114,6 +119,9 @@ def kv_read(cache, idx, dtype=torch.bfloat16):
     if isinstance(cache, torch.Tensor):
         return cache[idx].to(dtype)
     q, sc = cache
+    if q.dtype == torch.uint8:
+        from .kv_fp4 import fp4_dequant
+        return fp4_dequant(q[idx], sc[idx], dtype)
     v, s = q.view(torch.uint8)[idx].view(torch.float8_e4m3fn), sc[idx]
     d, b = v.shape[-1], s.shape[-1]
     # Straight to `dtype`: an fp32 intermediate doubled the gather's traffic (long prefill 1.66x).
@@ -125,6 +133,9 @@ def kv_span(cache, S, dtype=torch.bfloat16):
     if isinstance(cache, torch.Tensor):
         return cache[:S].to(dtype)
     q, sc = cache
+    if q.dtype == torch.uint8:
+        from .kv_fp4 import fp4_dequant
+        return fp4_dequant(q[:S], sc[:S], dtype)
     d, b = q.shape[1], sc.shape[1]
     return (q[:S].to(dtype).view(S, b, d // b) * sc[:S, :, None].to(dtype)).view(S, d)
 
@@ -180,7 +191,15 @@ class GlmTP:
         # GLM_KV=fp8: the MLA latent (512) and the indexer keys (128) are cached as FP8 E4M3 with
         # one fp32 scale per 128 values, the MTP hidden ring as FP8 with one per row; the RoPE keys
         # (64) stay BF16. ~54 KB a position a rank instead of ~97 (+ 6 KB of ring instead of 12).
-        self.kv8 = env("GLM_KV", "bf16") == "fp8"
+        # GLM_KV=fp4: the latent as E2M1 with a BF16 scale per 16 values (engine/glm/kv_fp4.py; 320
+        # bytes a row against FP8's 528) on every layer but the MTP layer and those listed in
+        # GLM_KV_FP8_LAYERS ("0-9,70-77"), which stay FP8; the indexer keys, RoPE keys and the MTP
+        # hidden ring as with fp8.
+        self.kv_fmt = env("GLM_KV", "bf16")
+        if self.kv_fmt not in ("bf16", "fp8", "fp4"):
+            raise ValueError(f"GLM_KV={self.kv_fmt}: bf16, fp8 or fp4")
+        self.kv8 = self.kv_fmt in ("fp8", "fp4")
+        self.kv_fp8_layers = env("GLM_KV_FP8_LAYERS", "") if self.kv_fmt == "fp4" else ""
         # GLM_INDEX_KERNEL=1: the indexer's scores in one Triton kernel (engine/glm/index_kernel.py)
         # instead of fp32 einsums over [T, 32, S]; decode scored all max_seq positions that way.
         self.index_kernel = env("GLM_INDEX_KERNEL", "1") == "1"
@@ -429,13 +448,13 @@ class GlmTP:
                                          ("tp.py", "ref.py", "weights.py", "config.py", "fp8_block.py",
                                           "index_kernel.py", "exl3.py", "sparse_attn.py",
                                           "norm_kernel.py", "direct_io.py", "mxfp4_dense.py", "exl3_attn.py",
-                                          "kv_split.py", "prefix_store.py", "kvb_fp8.py"))).hexdigest()[:16]
+                                          "kv_split.py", "prefix_store.py", "kvb_fp8.py", "kv_fp4.py"))).hexdigest()[:16]
         self.code_digest = digest
         mine = {"version": VERSION, "code": digest, "miss": self.miss, "native": self.native,
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("GLM_HEAD", "bf16"), "depth": env("GLM_MTP_DEPTH", "3"), "db": env("GLM_STATS_DB", ""),
-                "xfmt": self.xfmt, "kv": env("GLM_KV", "bf16"), "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "fused_norm": FUSED_NORM, "h_ring": self.h_ring_n, "fixed_dense": self.fixed_dense, "exl3_attn": self.exl3_attn, "kv_split": self.kv_split, "prefix_disk": env("GLM_PREFIX_DISK", "0"), "kvb_fp8": self.kvb_fp8, "embed_q": self.embed_q, "router_bf16": self.router_bf16, "draft_head": env("GLM_DRAFT_HEAD", "same"), "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
+                "xfmt": self.xfmt, "kv": env("GLM_KV", "bf16"), "kv_fp8_layers": self.kv_fp8_layers, "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "fused_norm": FUSED_NORM, "h_ring": self.h_ring_n, "fixed_dense": self.fixed_dense, "exl3_attn": self.exl3_attn, "kv_split": self.kv_split, "prefix_disk": env("GLM_PREFIX_DISK", "0"), "kvb_fp8": self.kvb_fp8, "embed_q": self.embed_q, "router_bf16": self.router_bf16, "draft_head": env("GLM_DRAFT_HEAD", "same"), "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
                 "pf": [env(k, "") for k in ("GLM_PF", "GLM_PF_SLOTS", "GLM_PF_MIN_ROWS", "GLM_PF_KEEP", "GLM_PF_KEEP_MARGIN", "GLM_HOT", "GLM_HOT_MIN",
                                             "GLM_HOT_TARGET", "GLM_HOT_KEEP", "GLM_HOT_MAX", "GLM_HOT_KEEP_AUDIT", "GLM_HOT_PACE",
                                             "GLM_HOT_PACE_LEAD", "GLM_SUB_WEIGHT", "GLM_MTP_FULL", "GLM_MISS_LOG",
@@ -551,8 +570,16 @@ class GlmTP:
         f32 = dict(dtype=torch.float32, device=self.dev)
         # A split layer holds this rank's s_loc positions and a spare last row (kv_split.owner_rows).
         rows = [self.s_loc + 1 if self.split(L) else self.max_seq for L in range(self.nL)]
+        self.kv4 = []
+        if self.kv_fmt == "fp4":
+            from .kv_fp4 import KV4_BLOCK, parse_layers
+            keep8 = parse_layers(self.kv_fp8_layers, self.nL) | ({self.mtp_L} if self.mtp_on else set())
+            self.kv4 = [L for L in range(self.nL) if L not in keep8]
         if self.kv8:
-            self.c_cache = [(torch.zeros((rows[L], cfg.kv_lora), **f8),
+            u8 = dict(dtype=torch.uint8, device=self.dev)
+            self.c_cache = [(torch.zeros((rows[L], cfg.kv_lora // 2), **u8),
+                             torch.zeros((rows[L], cfg.kv_lora // KV4_BLOCK), **kw)) if L in self.kv4 else
+                            (torch.zeros((rows[L], cfg.kv_lora), **f8),
                              torch.zeros((rows[L], cfg.kv_lora // KV_BLOCK), **f32)) for L in range(self.nL)]
             self.i_cache = {L: (torch.zeros((rows[L], cfg.index_dim), **f8),
                                 torch.zeros((rows[L], cfg.index_dim // KV_BLOCK), **f32))
@@ -564,7 +591,8 @@ class GlmTP:
         nb = lambda c: sum(t.numel() * t.element_size() for t in (c if isinstance(c, tuple) else (c,)))
         kv = sum(nb(c) for c in self.c_cache) + sum(nb(c) for c in self.i_cache.values()) + sum(map(nb, self.r_cache))
         self.log(f"[glm] KV cache {kv / 1e9:.2f} GB a rank for {self.max_seq} positions"
-                 + (" (split across the ranks by position)" if self.kv_split else ""))
+                 + (" (split across the ranks by position)" if self.kv_split else "")
+                 + (f", latent FP4 on {len(self.kv4)} of {self.nL} layers" if self.kv_fmt == "fp4" else ""))
         # Post-norm target hidden of every position: the MTP layer's input when a follow-up
         # turn reuses the cache and its last reused position gets a new next token. It covers
         # max_seq (~12 KB a position, 400 MB at 32K): a ring of one chunk refused reuse whenever
@@ -1898,7 +1926,7 @@ class GlmTP:
     def _prefix_ns(self) -> str:
         """Everything that changes what a cached row means (engine/glm/prefix_store.py)."""
         cfg_bytes = (Path(self.model_dir) / "config.json").read_bytes()
-        key = {"code": self.code_digest, "kv": env("GLM_KV", "bf16"), "split": self.kv_split, "world": self.world,
+        key = {"code": self.code_digest, "kv": env("GLM_KV", "bf16"), "kv_fp8_layers": self.kv_fp8_layers, "split": self.kv_split, "world": self.world,
                "xfmt": self.xfmt, "x3": self.x3pack.reader.header.get("dims") if self.x3pack else None,
                "exl3_attn": self.exl3_attn, "model": hashlib.sha256(cfg_bytes).hexdigest(), "dir": str(self.model_dir),
                "pack": env("GLM_EXL3_PACK", ""),

@@ -35,11 +35,17 @@ def fp32_path(q_lat, q_rope, C, R, sel, positions):
     return torch.einsum("thk,tkc->thc", torch.softmax(sc, -1), cg)
 
 
-def make(T, S, fp8, g, ctx):
+FMTS = ("fp8", "bf16", "fp4")
+
+
+def make(T, S, fmt, g, ctx):
     lat = torch.randn(S, DC, generator=g, device="cuda").to(torch.bfloat16)
-    if fp8:
+    if fmt == "fp8":
         C = (torch.zeros((S, DC), dtype=torch.float8_e4m3fn, device="cuda"),
              torch.zeros((S, DC // 128), dtype=torch.float32, device="cuda"))
+    elif fmt == "fp4":
+        C = (torch.zeros((S, DC // 2), dtype=torch.uint8, device="cuda"),
+             torch.zeros((S, DC // 16), dtype=torch.bfloat16, device="cuda"))
     else:
         C = torch.zeros((S, DC), dtype=torch.bfloat16, device="cuda")
     kv_write(C, torch.arange(S, device="cuda"), lat)
@@ -55,9 +61,9 @@ def make(T, S, fp8, g, ctx):
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
 class SparseAttnTests(unittest.TestCase):
-    def check(self, T, S, ctx, fp8, **kw):
+    def check(self, T, S, ctx, fmt, **kw):
         g = torch.Generator(device="cuda").manual_seed(T * 7 + ctx)
-        q_lat, q_rope, C, R, sel, positions = make(T, S, fp8, g, ctx)
+        q_lat, q_rope, C, R, sel, positions = make(T, S, fmt, g, ctx)
         ref = fp32_path(q_lat, q_rope, C, R, sel, positions)
         old = einsum_path(q_lat, q_rope, C, R, sel, positions).float()
         new = sparse_mla(q_lat, q_rope, C, R, sel, positions, SCALE, **kw).float()
@@ -65,35 +71,36 @@ class SparseAttnTests(unittest.TestCase):
         e_new = float((new - ref).norm() / ref.norm())
         self.assertTrue(torch.isfinite(new).all())
         # Closer to fp32 than the einsum path is (its scores are rounded to BF16 twice).
-        self.assertLess(e_new, max(1.2 * e_old, 2e-3), (T, S, ctx, fp8, e_new, e_old))
+        self.assertLess(e_new, max(1.2 * e_old, 2e-3), (T, S, ctx, fmt, e_new, e_old))
         return e_new, e_old
 
     def test_decode_rows(self):
-        for fp8 in (True, False):
-            self.check(4, 131072, 6000, fp8)
+        for fmt in FMTS:
+            self.check(4, 131072, 6000, fmt)
 
     def test_prefill_rows(self):
-        for fp8 in (True, False):
-            self.check(96, 6144, 6144, fp8)
+        for fmt in FMTS:
+            self.check(96, 6144, 6144, fmt)
 
     def test_default_tiles_fit(self):
         # The engine relies on sparse_mla's own tile choice for both cache types and row counts.
-        for fp8 in (True, False):
+        for fmt in FMTS:
             for T in (4, 64):
-                self.check(T, 8192, 8192, fp8)
+                self.check(T, 8192, 8192, fmt)
 
     def test_block_shapes(self):
         for bh, bn, w in ((32, 32, 8), (16, 64, 4), (8, 32, 4)):
-            self.check(8, 8192, 8192, True, block_h=bh, block_n=bn, num_warps=w)
+            for fmt in ("fp8", "fp4"):
+                self.check(8, 8192, 8192, fmt, block_h=bh, block_n=bn, num_warps=w)
 
     def test_count_and_partials(self):
         # GLM_KV_SPLIT: each half of the picks attended alone (partial=True, cnt limiting the
         # rows' lists) and merged equals attending all of them.
         from engine.glm.kv_split import merge
-        for fp8 in (True, False):
+        for fmt in FMTS:
             T = 4
             g = torch.Generator(device="cuda").manual_seed(11)
-            q_lat, q_rope, C, R, sel, positions = make(T, 8192, fp8, g, 6000)
+            q_lat, q_rope, C, R, sel, positions = make(T, 8192, fmt, g, 6000)
             want = fp32_path(q_lat, q_rope, C, R, sel, positions)
             cut = torch.tensor([700, 1024, 1500, 3], dtype=torch.int32, device="cuda")
             j = torch.arange(K, device="cuda")[None]
@@ -105,7 +112,7 @@ class SparseAttnTests(unittest.TestCase):
                                 cnt=(K - cut).to(torch.int32), partial=True)
             got = merge(o1, l1, o2, l2)
             err = float((got - want).norm() / want.norm())
-            self.assertLess(err, 2e-3, (fp8, err))
+            self.assertLess(err, 2e-3, (fmt, err))
             # Nothing attended: lse -inf, and the merge takes the other side alone.
             none = torch.zeros(T, dtype=torch.int32, device="cuda")
             o0, l0 = sparse_mla(q_lat, q_rope, C, R, sel, positions, SCALE, cnt=none, partial=True)

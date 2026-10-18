@@ -56,8 +56,13 @@ def run_pair(fn):
 
 
 def caches(rows, fp8):
+    """fp8: False (BF16), True (FP8) or "fp4" (FP4 latent, FP8 index keys: GLM_KV=fp4)."""
     f8, dev = torch.float8_e4m3fn, "cuda"
-    if fp8:
+    if fp8 == "fp4":
+        c = (torch.zeros((rows, DC // 2), dtype=torch.uint8, device=dev),
+             torch.zeros((rows, DC // 16), dtype=torch.bfloat16, device=dev))
+        i = (torch.zeros((rows, DI), dtype=f8, device=dev), torch.zeros((rows, 1), device=dev))
+    elif fp8:
         c = (torch.zeros((rows, DC), dtype=f8, device=dev), torch.zeros((rows, DC // 128), device=dev))
         i = (torch.zeros((rows, DI), dtype=f8, device=dev), torch.zeros((rows, 1), device=dev))
     else:
@@ -123,7 +128,7 @@ class KvSplitTests(unittest.TestCase):
             self.assertLess(err, 4e-3, (T, S, n, fp8, err))
 
     def test_decode(self):
-        for fp8 in (True, False):
+        for fp8 in (True, False, "fp4"):
             for T in (1, 4, 8):
                 self.decode_case(T, 16384, 6000, fp8)
             self.decode_case(4, 16384, 900, fp8)            # fewer positions than the top-k
@@ -145,7 +150,7 @@ class KvSplitTests(unittest.TestCase):
             self.assertTrue(torch.equal(got, want[:, :5]))
 
     def test_gather_spans(self):
-        for fp8 in (True, False):
+        for fp8 in (True, False, "fp4"):
             S, n = 8192, 5001
             g = torch.Generator(device="cuda").manual_seed(n)
             full, loc = fill(S, n, fp8, g)

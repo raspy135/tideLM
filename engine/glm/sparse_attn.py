@@ -27,6 +27,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .kv_fp4 import e2m1
+
 _NEG = tl.constexpr(-1e30)
 
 
@@ -36,7 +38,7 @@ def _sparse_mla_kernel(QL, QR, C, CS, R, IDX, POS, CNT, OUT, PM, PL, PACC, H, K,
                        stride_c, stride_cs, stride_r,
                        stride_it, stride_ot, stride_oh, scale,
                        DC: tl.constexpr, DR: tl.constexpr, SB: tl.constexpr, BLOCK_H: tl.constexpr,
-                       BLOCK_N: tl.constexpr, SCALED: tl.constexpr, SPLIT: tl.constexpr,
+                       BLOCK_N: tl.constexpr, FMT: tl.constexpr, SPLIT: tl.constexpr,
                        HAS_CNT: tl.constexpr):
     pid_h = tl.program_id(0)
     t = tl.program_id(1).to(tl.int64)
@@ -71,7 +73,7 @@ def _sparse_mla_kernel(QL, QR, C, CS, R, IDX, POS, CNT, OUT, PM, PL, PACC, H, K,
         keep = nm & (idx >= 0) & (idx <= pos)
         row = tl.maximum(idx, 0).to(tl.int64)
         c = tl.load(C + row[:, None] * stride_c + dc[None, :], mask=nm[:, None], other=0.0).to(tl.bfloat16)
-        if SCALED:
+        if FMT == 1:
             nb: tl.constexpr = DC // SB
             s = tl.load(CS + row[:, None] * stride_cs + tl.arange(0, nb)[None, :], mask=nm[:, None], other=0.0)
             c = tl.reshape(tl.reshape(c, (BLOCK_N, nb, SB)) * s.to(tl.bfloat16)[:, :, None], (BLOCK_N, DC))
@@ -96,14 +98,94 @@ def _sparse_mla_kernel(QL, QR, C, CS, R, IDX, POS, CNT, OUT, PM, PL, PACC, H, K,
         tl.store(PACC + b[:, None] * DC + dc[None, :], acc, mask=hm[:, None])
 
 
-# (block_h, block_n, num_warps, num_stages) by (FP8 cache, prefill rows): the fastest of a sweep on
+@triton.jit
+def _sparse_mla_fp4_kernel(QL, QR, C, CS, R, IDX, POS, CNT, OUT, PM, PL, PACC, H, K, CHUNK, NS, HG,
+                           stride_qlg, stride_qlt, stride_qlh, stride_qrg, stride_qrt, stride_qrh,
+                           stride_c, stride_cs, stride_r,
+                           stride_it, stride_ot, stride_oh, scale,
+                           DC: tl.constexpr, DR: tl.constexpr, SB: tl.constexpr, BLOCK_H: tl.constexpr,
+                           BLOCK_N: tl.constexpr, SPLIT: tl.constexpr, HAS_CNT: tl.constexpr):
+    """_sparse_mla_kernel over an FP4 latent (engine/glm/kv_fp4.py): byte i of a row holds element
+    i (low nibble) and DC / 2 + i, so the row is two halves, each scored and accumulated with its
+    own dot -- nothing to interleave (a join of the nibbles was 1.4x FP8's decode time and 2.3x its
+    prefill time)."""
+    pid_h = tl.program_id(0)
+    t = tl.program_id(1).to(tl.int64)
+    sp = tl.program_id(2)
+    if HAS_CNT:
+        cnt = tl.load(CNT + t)
+        chunk = ((cnt + NS - 1) // NS + BLOCK_N - 1) // BLOCK_N * BLOCK_N
+        k_lo = sp * chunk
+        k_hi = tl.minimum(cnt, k_lo + chunk)
+    else:
+        k_lo = sp * CHUNK
+        k_hi = tl.minimum(K, k_lo + CHUNK)
+    DH: tl.constexpr = DC // 2
+    NBH: tl.constexpr = DH // SB
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    hm = offs_h < H
+    dh = tl.arange(0, DH)
+    dr = tl.arange(0, DR)
+    nbh = tl.arange(0, NBH)
+    grp, hh = offs_h // HG, offs_h % HG
+    qbase = QL + grp[:, None] * stride_qlg + t * stride_qlt + hh[:, None] * stride_qlh
+    ql0 = tl.load(qbase + dh[None, :], mask=hm[:, None], other=0.0)
+    ql1 = tl.load(qbase + DH + dh[None, :], mask=hm[:, None], other=0.0)
+    qr = tl.load(QR + grp[:, None] * stride_qrg + t * stride_qrt + hh[:, None] * stride_qrh + dr[None, :],
+                 mask=hm[:, None], other=0.0)
+    pos = tl.load(POS + t)
+    m_i = tl.full((BLOCK_H,), _NEG, tl.float32)
+    l_i = tl.zeros((BLOCK_H,), tl.float32)
+    acc0 = tl.zeros((BLOCK_H, DH), tl.float32)
+    acc1 = tl.zeros((BLOCK_H, DH), tl.float32)
+    for n0 in range(k_lo, k_hi, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        nm = offs_n < k_hi
+        idx = tl.load(IDX + t * stride_it + offs_n, mask=nm, other=0)
+        keep = nm & (idx >= 0) & (idx <= pos)
+        row = tl.maximum(idx, 0).to(tl.int64)
+        cp = tl.load(C + row[:, None] * stride_c + dh[None, :], mask=nm[:, None], other=0)
+        s0 = tl.load(CS + row[:, None] * stride_cs + nbh[None, :], mask=nm[:, None], other=0.0)
+        s1 = tl.load(CS + row[:, None] * stride_cs + NBH + nbh[None, :], mask=nm[:, None], other=0.0)
+        c0 = tl.reshape(tl.reshape(e2m1(cp & 15), (BLOCK_N, NBH, SB)) * s0[:, :, None], (BLOCK_N, DH))
+        c1 = tl.reshape(tl.reshape(e2m1(cp >> 4), (BLOCK_N, NBH, SB)) * s1[:, :, None], (BLOCK_N, DH))
+        r = tl.load(R + row[:, None] * stride_r + dr[None, :], mask=nm[:, None], other=0.0)
+        sc = (tl.dot(ql0, tl.trans(c0), out_dtype=tl.float32) + tl.dot(ql1, tl.trans(c1), out_dtype=tl.float32)
+              + tl.dot(qr, tl.trans(r), out_dtype=tl.float32))
+        sc = tl.where(keep[None, :], sc * scale, float("-inf"))
+        m_new = tl.maximum(tl.maximum(m_i, tl.max(sc, 1)), _NEG)
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(sc - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+        pb = p.to(tl.bfloat16)
+        acc0 = acc0 * alpha[:, None] + tl.dot(pb, c0, out_dtype=tl.float32)
+        acc1 = acc1 * alpha[:, None] + tl.dot(pb, c1, out_dtype=tl.float32)
+        m_i = m_new
+    if not SPLIT:
+        inv = 1.0 / tl.maximum(l_i, 1e-30)[:, None]
+        obase = OUT + t * stride_ot + offs_h[:, None] * stride_oh
+        tl.store(obase + dh[None, :], (acc0 * inv).to(tl.bfloat16), mask=hm[:, None])
+        tl.store(obase + DH + dh[None, :], (acc1 * inv).to(tl.bfloat16), mask=hm[:, None])
+    else:
+        b = (t * H + offs_h) * NS + sp
+        tl.store(PM + b, m_i, mask=hm)
+        tl.store(PL + b, l_i, mask=hm)
+        tl.store(PACC + b[:, None] * DC + dh[None, :], acc0, mask=hm[:, None])
+        tl.store(PACC + b[:, None] * DC + DH + dh[None, :], acc1, mask=hm[:, None])
+
+
+# (block_h, block_n, num_warps, num_stages) by (cache format, prefill rows): the fastest of a sweep on
 # GB10 that fits its 99 KB of shared memory -- a BF16 latent tile is twice an FP8 one, and 32 heads x
 # 64 keys x 8 warps over a BF16 cache needs 168 KB. FP8: 2,048 rows 8.78 ms, 4 rows 0.17 ms; BF16:
 # 9.29 / 0.14 ms.
 # Decode adds a split of the selected positions (flash-decoding) to ~32 programs: 4 rows over an
 # FP8 cache 170 -> 49 us (32 heads a program, 8 splits), 1 row 170 -> 32 us; BF16 4 rows 157 -> 59.
-TILES = {(True, True): (32, 64, 8, 1), (True, False): (32, 64, 8, 1),
-         (False, True): (32, 32, 4, 2), (False, False): (16, 32, 4, 2)}
+# Format 0 BF16, 1 FP8, 2 FP4 (_sparse_mla_fp4_kernel). FP4, swept 2026-10-18 against FP8's tiles:
+# 4 rows over 2,048 picks 80 us (FP8 73), 2,048 rows 11.3 ms (FP8 8.3) -- the nibbles' decode is
+# integer ALU work where FP8 widens with one conversion.
+TILES = {(1, True): (32, 64, 8, 1), (1, False): (32, 64, 8, 1),
+         (0, True): (32, 32, 4, 2), (0, False): (16, 32, 4, 2),
+         (2, True): (32, 64, 8, 1), (2, False): (32, 32, 8, 1)}
 
 
 def sparse_mla(q_lat: torch.Tensor, q_rope: torch.Tensor, cache, rope: torch.Tensor, sel: torch.Tensor,
@@ -111,7 +193,8 @@ def sparse_mla(q_lat: torch.Tensor, q_rope: torch.Tensor, cache, rope: torch.Ten
                num_warps: int | None = None, num_stages: int | None = None,
                split: int | None = None, cnt: torch.Tensor | None = None, partial: bool = False):
     """q_lat bf16 [T, H, 512] (absorbed), q_rope bf16 [T, H, 64]; cache the latent cache, BF16
-    [S, 512] or an (fp8 [S, 512], fp32 [S, 512 / 128]) pair; rope BF16 [S, 64]; sel int [T, K]
+    [S, 512], an (fp8 [S, 512], fp32 [S, 512 / 128]) pair or an FP4 (uint8 [S, 256], bf16
+    [S, 512 / 16]) pair (engine/glm/kv_fp4.py); rope BF16 [S, 64]; sel int [T, K]
     (cache rows, attended where 0 <= row <= the row's position); positions int [T] -> o_lat bf16
     [T, H, 512]. cnt int32 [T]: only each row's first cnt picks. partial: (o fp32 [T, H, 512]
     normalized over the picks attended, lse fp32 [T, H], -inf where none was) instead.
@@ -128,13 +211,13 @@ def sparse_mla(q_lat: torch.Tensor, q_rope: torch.Tensor, cache, rope: torch.Ten
         qrg, qrt, qrh = 0, q_rope.stride(0), q_rope.stride(1)
     DR = q_rope.shape[-1]
     if isinstance(cache, torch.Tensor):
-        C, CS, scaled, sb = cache, cache, False, DC
+        C, CS, fmt, sb = cache, cache, 0, DC
     else:
         C, CS = cache
-        scaled, sb = True, DC // CS.shape[1]
+        fmt, sb = (2 if C.dtype == torch.uint8 else 1), DC // CS.shape[1]
     assert q_lat.stride(-1) == 1 and q_rope.stride(-1) == 1 and C.stride(-1) == 1 and rope.stride(-1) == 1
     sel = sel.contiguous()
-    th, tn, tw, ts = TILES[(scaled, T > 16)]
+    th, tn, tw, ts = TILES[(fmt, T > 16)]
     block_h, block_n = min(block_h or th, H), block_n or tn
     num_warps, num_stages = num_warps or tw, num_stages or ts
     o = torch.empty((T, H, DC), dtype=torch.bfloat16, device=q_lat.device)
@@ -157,12 +240,16 @@ def sparse_mla(q_lat: torch.Tensor, q_rope: torch.Tensor, cache, rope: torch.Ten
     if cnt is not None:
         cnt = cnt.to(torch.int32).contiguous()
     grid = (hb, T, nsplit)
-    _sparse_mla_kernel[grid](q_lat, q_rope, C, CS, rope, sel, positions.contiguous(),
-                             cnt if cnt is not None else sel, o, pm, pl, pacc, H, K, chunk, nsplit, HG,
-                             qlg, qlt, qlh, qrg, qrt, qrh,
-                             C.stride(0), CS.stride(0), rope.stride(0), sel.stride(0), o.stride(0), o.stride(1),
-                             scale, DC=DC, DR=DR, SB=sb, BLOCK_H=block_h, BLOCK_N=block_n, SCALED=scaled,
-                             SPLIT=use_split, HAS_CNT=cnt is not None, num_warps=num_warps, num_stages=num_stages)
+    args = (q_lat, q_rope, C, CS, rope, sel, positions.contiguous(),
+            cnt if cnt is not None else sel, o, pm, pl, pacc, H, K, chunk, nsplit, HG,
+            qlg, qlt, qlh, qrg, qrt, qrh,
+            C.stride(0), CS.stride(0), rope.stride(0), sel.stride(0), o.stride(0), o.stride(1), scale)
+    kw = dict(DC=DC, DR=DR, SB=sb, BLOCK_H=block_h, BLOCK_N=block_n, SPLIT=use_split, HAS_CNT=cnt is not None,
+              num_warps=num_warps, num_stages=num_stages)
+    if fmt == 2:
+        _sparse_mla_fp4_kernel[grid](*args, **kw)
+    else:
+        _sparse_mla_kernel[grid](*args, FMT=fmt, **kw)
     if partial == "raw":
         return pm, pl, pacc
     if use_split:
