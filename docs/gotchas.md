@@ -3517,3 +3517,23 @@ watchdogs at once), and the sparkDash dashboard runs one ssh per metric every 2-
 minute). Each login is a logind session polkitd keeps something of. The watchdog now multiplexes one
 connection (ControlMaster), which took rank 1 from 265 new sessions a minute to the dashboard's
 ~205; the memory already held only comes back with `systemctl restart polkit` (root).
+
+## Two-pass prefill: a new message's own rows with its own experts (GLM_PREFILL_TWO_PASS, 2026-10-18)
+
+Before this, a prompt was prefilled on whatever was resident and the post-prefill swaps (512) only
+helped decode: the new message's KV rows -- the question itself -- kept the substitutes' error.
+GLM_PREFILL_TWO_PASS=N runs a new suffix of 4..N tokens once, makes the same 512 swaps from its
+routing, rewinds and runs it again (its routing is counted once). Japanese sets, glm_quality eval
+in 3-row steps against every expert exact, serving profiles (two-pass 512 vs off):
+
+| | Tokyo (3 prompts, 900 positions): KL, top-1, miss | New topic on a cached Tokyo turn: KL, top-1, miss |
+| --- | --- | --- |
+| EXL3 | 0.096 -> 0.074, 92.2 -> 94.4%, 10.5 -> 9.0% | 0.110 -> 0.084, 91.8 -> 92.7%, 14.8 -> 11.8% |
+| MXFP4 | 0.144 -> 0.136, 89.9 -> 93.2%, 18.7 -> 16.9% | 0.211 -> 0.154, 88.9 -> 90.3%, 26.2 -> 22.6% |
+
+The step takes 1.6-2.9 s for 10-52 new tokens on EXL3 (0.8 s of it the swaps decode used to wait
+for after prefill anyway), 3.8-4.9 s for ~335. The sampled loop replay (MXFP4, history cached, the
+question new) did not change: loops start in decode. On in both GLM profiles.
+
+The EXL3 serving profile (12,350 slots, 256K) took rank 1 to 2.94 GiB during this batch: its
+polkitd/bluetoothd leak had reached 3.9 GB. The local profile serves 12,000 until polkit is restarted.

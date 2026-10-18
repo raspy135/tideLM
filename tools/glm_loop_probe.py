@@ -64,6 +64,9 @@ def main():
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--rep", type=int, default=6)
+    ap.add_argument("--cut", type=int, default=0,
+                    help="prefill the prompt's first N tokens on their own first, as a chat turn finds its "
+                         "history cached: the rest is new text (GLM_PREFILL_TWO_PASS acts on it)")
     ap.add_argument("--out", default="/app/results/glm-loop")
     args = ap.parse_args()
     tpl = GlmTemplate(args.model)
@@ -90,6 +93,8 @@ def main():
     for k, pre in enumerate(case["prefixes"]):
         ids = head + tpl.encode(pre)
         eng.reset()
+        if args.cut:
+            eng.prefill(list(ids[:args.cut]))
         z = eng.prefill(list(ids))[-1].float()
         p = torch.softmax(z / args.temperature, -1)
         top = p.topk(8)

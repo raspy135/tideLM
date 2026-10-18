@@ -396,6 +396,13 @@ class GlmTP:
         self.route_dump = None         # list: per MoE layer call (L, ids0, w0, missed, {L+d: ids predicted from this x})
         self.record = None
         self.demand = None             # [layers, E] router mass wanted since the last adapt()
+        # GLM_PREFILL_TWO_PASS=N (needs GLM_ADAPT): prefill a new suffix of 4..N tokens twice,
+        # adapting residency to its routing in between (prefill()). Japanese turns, against every
+        # expert exact: EXL3 KL 0.096 -> 0.074 (Tokyo set), 0.110 -> 0.084 (a new topic on a cached
+        # conversation); MXFP4 0.144 -> 0.136, 0.211 -> 0.154. +1-3 s to the first token
+        # (docs/gotchas.md).
+        self.two_pass = int(env("GLM_PREFILL_TWO_PASS", "0"))
+        self.two_passed = False
         self.mtp_fill = True
         self.spec_stats = {"rounds": 0, "accepted": 0}
         self.spec_cal = None            # [(draft index, confidence product, accepted)] when a tool asks
@@ -483,7 +490,7 @@ class GlmTP:
                                             "GLM_LOOP_BREAK")],
                 "adapt": [env(k, "") for k in ("GLM_ADAPT", "GLM_ADAPT_EVERY", "GLM_ADAPT_PREFILL_SWAPS",
                                                "GLM_ADAPT_DECODE_SWAPS", "GLM_ADAPT_DECAY", "GLM_ADAPT_CROSS_LAYER",
-                                               "GLM_ADAPT_MARGIN", "GLM_BG", "GLM_BG_EVERY", "GLM_BG_READS",
+                                               "GLM_ADAPT_MARGIN", "GLM_BG", "GLM_BG_EVERY", "GLM_BG_READS", "GLM_PREFILL_TWO_PASS",
                                                "GLM_BG_DECAY", "GLM_BG_PROTECT", "GLM_BG_COLD", "GLM_WARMUP")],
                 "fast_comm": self.comm.fast,
                 "config": json.dumps({k: v for k, v in self.cfg.extra["raw"].items()
@@ -1949,7 +1956,28 @@ class GlmTP:
         else:
             self.reset()
         self.last_reuse = n
-        out = self.forward(prompt[n:], all_logits=False)
+        m = len(prompt) - n
+        self.two_passed = False
+        if (self.two_pass and 4 <= m <= self.two_pass and self.demand is not None and not self._warming
+                and self.miss == "substitute"):
+            # GLM_PREFILL_TWO_PASS=N: a new suffix of at most N tokens runs once to learn what it
+            # routes to, the post-prefill swaps load that, and it runs again on those residents --
+            # so its own rows are not computed with the substitutes. Both ranks: same prompt, same m.
+            t0 = time.perf_counter()
+            mtp_fill = self.mtp_fill
+            self.forward(prompt[n:], all_logits=False)
+            swaps, sec = self.adapt(self.adapt_prefill_swaps)
+            self.adapt_log.append(("two-pass", swaps, round(sec, 2), self.last_churn))
+            self.pos, self.tokens, self.mtp_fill = n, self.tokens[:n], mtp_fill
+            out = self.forward(prompt[n:], all_logits=False)
+            # The second pass's routing is the first's again: counted once, by the swap above.
+            self.demand.zero_()
+            self.demand_tokens = 0
+            self.two_passed = True
+            self.log(f"[glm] two-pass prefill: {m} new tokens, {swaps} swaps, "
+                     f"{time.perf_counter() - t0:.2f}s (swaps {sec:.2f}s)")
+        else:
+            out = self.forward(prompt[n:], all_logits=False)
         if disk:
             self._disk_save(prompt)
         return out
@@ -2119,7 +2147,7 @@ class GlmTP:
         gen = torch.Generator(device=self.dev).manual_seed(seed)
         self.mtp_fill = True
         logits = self.prefill(list(prompt))
-        if self.demand is not None and not self._warming:
+        if self.demand is not None and not self._warming and not self.two_passed:
             # After prefill: swap toward what this prompt routed to (decode benefits; the prompt's
             # KV is already computed with the substituted experts).
             n, sec = self.adapt(self.adapt_prefill_swaps)
