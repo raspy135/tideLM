@@ -95,6 +95,18 @@ is ~5 chunked preads and a copy, under the GIL) or the extra distinct experts a 
 not profiled. A longer ring also lowers the read rate: at 0.3 / 2, ring 128 read 2,081 times
 against ring 32's 2,875, because the ring already holds what later steps want.
 
+Live serving, same gate over HTTP, each model on its own serving configuration (adaptation,
+probe prefill, prefix cache on; the gate's six requests are the first after boot):
+
+| serving | tok/s | gate |
+| --- | ---: | ---: |
+| old model, image 20261011-topp, `.env` (concurrency 2, urgent adaptation) | 36.55 | 6/6 |
+| 1017, image 20261018-1017-hot, `.env.1017` (concurrency 1, async hot reads, ring 128) | 38.52 | 6/6 |
+
+1017 serves 6% below its frozen-map gate (41.21): its demand history is the old model's, so the
+600-token decode adaptation pass fires in every long answer (0.5-0.8 s; 7-14% decode misses at
+first) until the ranking has learned 1017's traffic.
+
 ## Serving setting
 
 `DSV41_HOT_READS=1 DSV41_HOT_ASYNC=1 DSV41_HOT_MIN=0.3 DSV41_HOT_MAX=2 DSV41_HOT_RING=128
