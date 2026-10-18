@@ -96,9 +96,8 @@ class ScheduledPeer:
         """The decode loop's per-step gate, broadcast from rank 0 exactly as EPDistributed.control.
 
         What it carries that rank 1 cannot compute is rank 0's per-step choice: the speculative
-        depth (DSV41_BLOCK_DYNAMIC, confidence depth) and the decode-adaptation flag (periodic or
-        urgent). Both ranks reach this inside the same scheduler action, in the same lane, so the
-        broadcasts pair up. Termination is still the scheduler's ('close' on both ranks):
+        depth (DSV41_BLOCK_DYNAMIC, confidence depth) and the decode-adaptation flag. Both ranks
+        reach this inside the same scheduler action, in the same lane, so the broadcasts pair up. Termination is still the scheduler's ('close' on both ranks):
         keep_going is identical on both ranks here, because every input to it is.
 
         Keeping each rank's own value instead (the earlier version) left rank 1 at the placeholder

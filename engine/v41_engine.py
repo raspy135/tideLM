@@ -626,7 +626,7 @@ class V41Engine:
         if self.layer_ablation.path:
             if self.stream_layers != frozenset(range(self.args.n_layers)):
                 raise ValueError('layer ablation diagnostics require all backbone layers streamed')
-            if ADAPT.swap or PREFILL_SWAP or ADAPT.decode_tokens or ADAPT.urgent:
+            if ADAPT.swap or PREFILL_SWAP or ADAPT.decode_tokens:
                 raise ValueError('layer ablation diagnostics require every adaptive swap trigger disabled')
         if self.stream_layers:
             if not prune_keep or not 0 < prune_keep < 1:
@@ -2565,51 +2565,36 @@ class V41Engine:
         return self.maintain_demand()
 
     def _decode_adapt_due(self, n_out: int) -> int:
-        """Rank 0 returns 2 for urgent or 1 for periodic adaptation; control broadcasts it.
+        """Rank 0 returns 1 when a periodic decode adaptation pass is due; control broadcasts it.
 
-        Rolling checks read the existing decode-only counter pair once per completed
-        verification burst. No layer kernels or expert reads are added by monitoring.
-        The periodic path retains its interval-only readback when urgent mode is off.
+        The decode-only miss counter pair is read once per ADAPT.decode_tokens output tokens.
+        (DSV41_ADAPT_URGENT's rolling ~30-token check was removed 2026-10-18 for hot reads.)
         """
         mark = getattr(self, '_decode_adapt_mark', None)
         if not ADAPT.decode_tokens or mark is None:
             return 0
-        urgent = getattr(self, '_urgent_adapt', None)
-        periodic = n_out - mark[0] >= ADAPT.decode_tokens
-        if urgent is None and not periodic:
+        if n_out - mark[0] < ADAPT.decode_tokens:
             return 0
         # The eager fallback labels its routes as prefill in existing accounting.
         # Preserve its aggregate-counter delta; the fast path has a decode-only pair.
         snapshot = (getattr(self.model, 'decode_miss_snapshot', self.model.miss_snapshot)
                     if getattr(self, 'fast', None) is not None else self.model.miss_snapshot)
         now = snapshot()
-        graphs = len(getattr(getattr(self, 'fast', None), 'graphs', {}))
-        recaptured = graphs != getattr(self, '_urgent_graph_count', graphs)
-        self._urgent_graph_count = graphs
-        if urgent is not None and recaptured:
-            urgent.restart(n_out, now)  # warm-up forwards are not decoded tokens
-        check = urgent.observe(n_out, now) if urgent is not None and not recaptured else None
-        checks = [check] if check is not None else []
-        if periodic:
-            self._decode_adapt_mark = (n_out, now)
-            valid = now is not None and mark[1] is not None and now[1] > mark[1][1]
-            rate = (now[0] - mark[1][0]) / (now[1] - mark[1][1]) if valid else None
-            checks.append(dict(reason='periodic', output_tokens=n_out, window_tokens=n_out-mark[0],
-                               miss_rate=rate, threshold=ADAPT.swap_prefill_min_miss,
-                               triggered=bool(valid and rate >= ADAPT.swap_prefill_min_miss)))
-        for check in checks:
-            if not hasattr(self, '_decode_adapt_checks'):
-                self._decode_adapt_checks = []
-            self._decode_adapt_checks.append(check)
-            del self._decode_adapt_checks[:-64]  # bounded request diagnostics
-            if check['triggered']:
-                self._decode_adapt_mark = (n_out, now)
-                self._decode_adapt_rate = check['miss_rate']
-                self._decode_adapt_window = check['window_tokens']
-                if urgent is not None:
-                    urgent.attempted(n_out, now)
-                return 2 if check['reason'] == 'urgent' else 1
-        return 0
+        self._decode_adapt_mark = (n_out, now)
+        valid = now is not None and mark[1] is not None and now[1] > mark[1][1]
+        rate = (now[0] - mark[1][0]) / (now[1] - mark[1][1]) if valid else None
+        check = dict(reason='periodic', output_tokens=n_out, window_tokens=n_out-mark[0],
+                     miss_rate=rate, threshold=ADAPT.swap_prefill_min_miss,
+                     triggered=bool(valid and rate >= ADAPT.swap_prefill_min_miss))
+        if not hasattr(self, '_decode_adapt_checks'):
+            self._decode_adapt_checks = []
+        self._decode_adapt_checks.append(check)
+        del self._decode_adapt_checks[:-64]  # bounded request diagnostics
+        if not check['triggered']:
+            return 0
+        self._decode_adapt_rate = check['miss_rate']
+        self._decode_adapt_window = check['window_tokens']
+        return 1
 
     def _engram_rows_async(self, hashes):
         """Start the verify block's hash-id D2H on a side stream; return the `rows` callable
@@ -2645,8 +2630,7 @@ class V41Engine:
         see plan_swaps) and broadcasts; both apply. Past tokens are untouched: their KV is
         already written, only later tokens route to the new experts."""
         t0 = time.perf_counter()
-        reason = 'urgent' if self.ep.control_flag == 2 else 'periodic'
-        cap = ADAPT.urgent_max if reason == 'urgent' else ADAPT.swap_max
+        reason, cap = 'periodic', ADAPT.swap_max
         swaps = None
         if self.ep.rank == 0:
             try:
@@ -3061,14 +3045,8 @@ class V41Engine:
         decode_snapshot = (self.model.decode_miss_snapshot if self.fast is not None
                            else self.model.miss_snapshot)
         self._decode_adapt_mark = ((n_out, decode_snapshot()) if decode_adapt else None)
-        self._urgent_adapt = None
-        self._urgent_graph_count = len(self.fast.graphs) if self.fast is not None else 0
         if self.fast is not None:
             self.fast._ahead = None   # never carry a queued draft across requests
-        if decode_adapt and ADAPT.urgent:
-            from engine.urgent_adapt import UrgentAdaptWindow
-            self._urgent_adapt = UrgentAdaptWindow(n_out, self._decode_adapt_mark[1],
-                ADAPT.urgent_window, ADAPT.urgent_miss, ADAPT.urgent_cooldown)
         while self.ep.control(n_out < max_tokens and tok not in stop_ids,
                               self._decode_step_value(pol, lookup, bypass,
                                   n_out < max_tokens and tok not in stop_ids),
@@ -3235,7 +3213,7 @@ class V41Engine:
                              and conf_pol is None and not getattr(self, "_cooperative_decode", False))
                     if ahead:
                         vhost.copy_(vout, non_blocking=True)
-                        # the urgent-adaptation check reads these at the top of the next step
+                        # the decode-adaptation check reads these at the top of a later step
                         m.stage_decode_miss()
                         _vready = torch.cuda.Event()
                         _vready.record()
@@ -3652,10 +3630,6 @@ class V41Engine:
             "vision_enabled": self.vision is not None,
             "vision_weights_local": self.vision is not None and (self.vision_mode != 'peer' or self.ep.rank == 1),
             "prune_score_history_version": 2,
-            "urgent_adaptation": {"enabled": ADAPT.urgent, "window_tokens": ADAPT.urgent_window,
-                                  "miss_threshold": ADAPT.urgent_miss,
-                                  "max_swaps": ADAPT.urgent_max,
-                                  "cooldown_tokens": ADAPT.urgent_cooldown},
             "prune_select": getattr(self, "prune_select", None),
             "prune_layer_counts": self.prune_layer_counts,
             "dynamic_experts": self.dynamic_experts,

@@ -38,7 +38,6 @@ from dataclasses import dataclass, field
 LEVELS = {"off": None, "low": 40.0, "medium": 20.0, "high": 10.0, "max": 5.0}   # half-life, requests
 DEFAULT_PRIOR = 8.0
 DECODE_TOKENS = 600
-URGENT_WINDOW = 30
 REQUEST_DB = "results/prune_demand_req.npz"
 # Legacy settings the two knobs replace; reported (not read) when a knob is set.
 REPLACED = ("DSV41_PRUNE_UNIT", "DSV41_PRUNE_PRIOR", "DSV41_PRUNE_HALFLIFE", "DSV41_PRUNE_SWAP",
@@ -66,11 +65,6 @@ class AdaptConfig:
     min_growth_req: int          # requests between plans (request unit)
     min_growth_slots: float      # new slots between plans (slot unit)
     decode_tokens: int = 0       # decode-time pass every this many output tokens (0 = never)
-    urgent: bool = False        # rolling decode-only miss trigger
-    urgent_window: int = URGENT_WINDOW
-    urgent_miss: float = 0.10
-    urgent_cooldown: int = 150
-    urgent_max: int = 64
     sensitivity: float | None = None   # newest request's share of observed demand (knobs only)
     level: str | None = None
     ignored: tuple = field(default_factory=tuple)
@@ -92,10 +86,6 @@ class AdaptConfig:
                + (f"every {self.decode_tokens} tokens at the same miss gate" if self.decode_tokens else "off"))
         if self.ignored:
             msg += f"; ignoring {', '.join(self.ignored)} (replaced by DSV41_ADAPT_*)"
-        if self.urgent:
-            msg += (f"; urgent decode when last ~{self.urgent_window} tokens miss > "
-                    f"{self.urgent_miss:.0%}, <= {self.urgent_max} swaps, "
-                    f"{self.urgent_cooldown}-token cooldown")
         return msg
 
     def boot_fields(self) -> dict:
@@ -106,9 +96,6 @@ class AdaptConfig:
                 "prune_record": self.record,
                 "adapt_prior": self.prior, "adapt_halflife": round(self.halflife, 6),
                 "adapt_swap": self.swap, "adapt_decode_tokens": self.decode_tokens,
-                "adapt_urgent_v1": self.urgent, "adapt_urgent_window": self.urgent_window,
-                "adapt_urgent_miss": self.urgent_miss, "adapt_urgent_cooldown": self.urgent_cooldown,
-                "adapt_urgent_max": self.urgent_max,
                 "prune_swap_prefill": "1" if self.swap_prefill else "0",
                 "prune_swap_prefill_min": str(self.swap_prefill_min)}
 
@@ -148,6 +135,12 @@ def _decode_tokens(raw: str | None) -> int:
 def resolve(env=None) -> AdaptConfig:
     env = os.environ if env is None else env
     get = env.get
+    if get("DSV41_ADAPT_URGENT", "0") not in ("", "0"):
+        # Removed 2026-10-18 (docs/urgent-expert-loading.md): a 64-swap pass when ~30 tokens
+        # missed > 10%, never measured as a quality gain and ~0.2 s a pass. DSV41_HOT_ASYNC reads
+        # the experts a step misses most, at no measured cost (docs/hot-reads.md).
+        raise ValueError("DSV41_ADAPT_URGENT was removed; DSV41_HOT_READS=1 DSV41_HOT_ASYNC=1 replaces it "
+                         "(docs/hot-reads.md). Set it to 0 or delete the line.")
     metric = get("DSV41_PRUNE_METRIC", "frequency").strip().lower()
     if metric not in ("frequency", "score"):
         raise ValueError(f"DSV41_PRUNE_METRIC={metric!r}: use frequency or score")
@@ -195,9 +188,6 @@ def resolve(env=None) -> AdaptConfig:
     honored = {k for k, off in (("DSV41_PRUNE_SWAP", freeze),
                                 ("DSV41_PRUNE_SWAP_PREFILL", get("DSV41_PRUNE_SWAP_PREFILL") == "0")) if off}
     decode_tokens = _decode_tokens(get("DSV41_ADAPT_DECODE_TOKENS")) if (on and not freeze) else 0
-    urgent = get('DSV41_ADAPT_URGENT', '1')
-    if urgent not in ('0', '1'):
-        raise ValueError('DSV41_ADAPT_URGENT must be 0 or 1')
     return AdaptConfig(
         source="knobs",
         metric=metric,
@@ -220,7 +210,6 @@ def resolve(env=None) -> AdaptConfig:
         # ~30 s of decode at ~20 tok/s for a ~0.2 s pass (~1% overhead), gated on the decode
         # stretch's own miss rate like the prefill pass (swap_prefill_min_miss).
         decode_tokens=decode_tokens,
-        urgent=urgent == '1' and bool(decode_tokens),
         sensitivity=s if on else 0.0,
         level=level,
         ignored=tuple(k for k in REPLACED if k in env and k not in honored),

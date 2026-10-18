@@ -334,7 +334,8 @@ refer to the example profile, not every engine fallback default.
 | `MAX_SEQ=524288` | Context allocation including generated tokens. Lower it to reduce cache memory needs. |
 | `DSV41_ADAPT_SENSITIVITY=high` | How quickly new traffic changes expert ranking: `low`, `medium`, `high`, `max`; `off` freezes adaptation. Higher follows changes faster but can displace useful experts sooner. |
 | `DSV41_ADAPT_PRIOR=4` | Weight of the shipped routing trace. Lower values let your observed traffic dominate sooner. |
-| `DSV41_ADAPT_DECODE_TOKENS=600` / `DSV41_ADAPT_URGENT=1` | Periodic and urgent adaptation during an answer. Setting the interval to `0` disables both decode triggers; post-prefill adaptation remains. |
+| `DSV41_ADAPT_DECODE_TOKENS=600` | Periodic adaptation during an answer. `0` disables it; post-prefill adaptation remains. (`DSV41_ADAPT_URGENT` was removed for hot reads.) |
+| `DSV41_HOT_READS=1` / `DSV41_HOT_ASYNC=1` | Hot reads: the missing experts a decode step wanted most are read into a ring of their own slots and routable from the next step (docs/hot-reads.md). Concurrency 1; `TRANSIENT_SLOTS` >= 8 + `DSV41_HOT_RING`. |
 | `DSV41_PREFILL_CHUNK=2048` | Tokens processed per prefill chunk. Smaller chunks reduce temporary memory and give finer prefix-cache boundaries; `DSV41_PREFILL_ADAPT=1` shrinks them under memory pressure. |
 | `DSV41_ENGRAM_CACHE_MB=256` / `DSV41_ENGRAM_CACHE_MB_PEER=1024` | Engram row-cache budgets in MiB on the head and worker. Separate from expert residency and prompt caching. |
 | `DSV41_VISION=1` / `DSV41_VISION_MODE=peer` | Enable images and put the vision tower on rank 1. Set vision to `0` for text-only serving. |
