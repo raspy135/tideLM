@@ -2,11 +2,11 @@
 
 The quality yardstick for every lossy choice (resident budget and miss policy, FP8 dense, the
 MXFP4 conversion of layers 0/61): run the same documents under each setting and compare mean
-NLL (nats/token) by category. MUSE_MISS=stream is the exact reference (every expert the router
-picks is used). With MUSE_MISS=substitute the run also reports the share of unmasked picks (and
+NLL (nats/token) by category. GLM_MISS=stream is the exact reference (every expert the router
+picks is used). With GLM_MISS=substitute the run also reports the share of unmasked picks (and
 router mass) that had to be substituted.
 
-    MUSE_MODEL_DIR=... MUSE_ENV="MUSE_MISS=substitute MUSE_DENSE=fp8" \\
+    GLM_MODEL_DIR=... GLM_ENV="GLM_MISS=substitute GLM_DENSE=fp8" \\
         tools/muse_pair_run.sh muse_nll.py --corpus /app/corpus/heldout_eval.jsonl --tokens 1024
 """
 
@@ -45,7 +45,7 @@ def load_tokenizer(model_dir):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=os.environ.get("MUSE_MODEL", "/models"))
+    ap.add_argument("--model", default=os.environ.get("GLM_MODEL", "/models"))
     ap.add_argument("--corpus", default="/app/corpus/heldout_eval.jsonl")
     ap.add_argument("--tokens", type=int, default=1024)
     ap.add_argument("--docs", type=int, default=1000)
@@ -79,7 +79,7 @@ def main():
     if eng.rank != 0:
         return
     report = {
-        "setting": {k: v for k, v in os.environ.items() if k.startswith("MUSE_")},
+        "setting": {k: v for k, v in os.environ.items() if k.startswith("GLM_")},
         "slots": eng.slots_resident, "dense": eng.dense_fmt, "miss": eng.miss,
         "nll": {c: round(sums[c] / counts[c], 4) for c in sums},
         "tokens": dict(counts), "seconds": round(time.perf_counter() - t0, 1),

@@ -1,4 +1,4 @@
-"""Grow the GLM routing-statistics DB (MUSE_STATS_DB) by running documents through generation.
+"""Grow the GLM routing-statistics DB (GLM_STATS_DB) by running documents through generation.
 
 Each document chunk (~1,200 tokens) goes in as a chat prompt -- code: "explain this file and
 suggest one improvement", prose: "summarize this" -- and 64 tokens are generated, so the DB
@@ -6,7 +6,7 @@ records prefill and decode routing. Adaptation stays on (small swap budget), so 
 states stay close to what serving computes. ``--seed`` first loads a routing trace's stats.json
 (exact routing, tools/glm_trace.py) into an empty DB.
 
-    MUSE_MODEL_DIR=... MUSE_ENV="MUSE_STATS_DB=/app/results/glm-stats/db.pt MUSE_ADAPT_PREFILL_SWAPS=256" \\
+    GLM_MODEL_DIR=... GLM_ENV="GLM_STATS_DB=/app/results/glm-stats/db.pt GLM_ADAPT_PREFILL_SWAPS=256" \\
         tools/muse_pair_run.sh glm_train_db.py --seed /app/results/glm-trace-v3/stats.json
 """
 import argparse
@@ -65,7 +65,7 @@ def prompt(kind, text):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=os.environ.get("MUSE_MODEL", "/models"))
+    ap.add_argument("--model", default=os.environ.get("GLM_MODEL", "/models"))
     ap.add_argument("--docs", type=int, default=300)
     ap.add_argument("--chunk-chars", type=int, default=4800)
     ap.add_argument("--tokens", type=int, default=64)
@@ -74,7 +74,7 @@ def main():
     tpl = GlmTemplate(args.model)
     eng = GlmTP(args.model)
     if eng.demand is None:
-        raise SystemExit("needs MUSE_ADAPT=1 and MUSE_MISS=substitute")
+        raise SystemExit("needs GLM_ADAPT=1 and GLM_MISS=substitute")
     if args.seed and eng.rank == 0 and eng.db_tokens == 0 and Path(args.seed).exists():
         st = json.loads(Path(args.seed).read_text())
         mass = torch.tensor(st["mass"], dtype=torch.float64)

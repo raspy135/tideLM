@@ -56,7 +56,7 @@ def route_scores(cfg: GlmConfig, x, weight, bias):
     """The router matmul and group limit: (scores, choice) for route_pick. One call serves the
     masked and the unmasked pick of the same rows."""
     if weight.dtype == torch.bfloat16:
-        # MUSE_ROUTER_BF16: BF16 weights and (BF16) activations, fp32 sums and logits.
+        # GLM_ROUTER_BF16: BF16 weights and (BF16) activations, fp32 sums and logits.
         x2 = x.reshape(-1, weight.shape[1]).to(torch.bfloat16)
         logits = torch.mm(x2, weight.t(), out_dtype=torch.float32).view(*x.shape[:-1], weight.shape[0])
     else:

@@ -90,7 +90,7 @@ class Comm:
             dist.init_process_group(
                 backend="cpu:gloo,cuda:nccl", rank=self.rank, world_size=self.world,
                 timeout=datetime.timedelta(seconds=float(env("DSV41_DIST_TIMEOUT_S", "600"))))
-            if env("MUSE_COMM", "roce") == "roce":
+            if env("GLM_COMM", "roce") == "roce":
                 from engine import comm
                 os.environ.setdefault("DSV41_COMM_BACKEND", "roce")
                 comm.init(self.device)
@@ -245,24 +245,24 @@ class MuseTP:
         self.comm = Comm()
         self.rank, self.world, self.dev = self.comm.rank, self.comm.world, self.comm.device
         self.log = log if self.rank == 0 else (lambda *_: None)
-        need = float(env("MUSE_MIN_FREE_GB", "90"))
+        need = float(env("GLM_MIN_FREE_GB", "90"))
         avail = mem_available()
         if need and avail < need * 1e9:
             raise RuntimeError(f"only {avail / 1e9:.1f} GB MemAvailable, need {need:.0f}: something else "
-                               "holds the unified pool (MUSE_MIN_FREE_GB=0 disables this guard)")
+                               "holds the unified pool (GLM_MIN_FREE_GB=0 disables this guard)")
         self.cfg = cfg = MuseConfig.load(model_dir)
         self.ck = Checkpoint(model_dir)
-        self.max_seq = int(max_seq or env("MUSE_MAX_SEQ", "32768"))
-        self.chunk = int(chunk or env("MUSE_CHUNK", "1024"))
-        self.dense_fmt = dense or env("MUSE_DENSE", "bf16")
-        self.miss = miss or env("MUSE_MISS", "substitute")
-        self.native = env("MUSE_NATIVE_MOE", "1") == "1"
-        self.use_graphs = env("MUSE_GRAPHS", "1") == "1"
-        self.prefill_moe = env("MUSE_PREFILL_MOE", "triton")
+        self.max_seq = int(max_seq or env("GLM_MAX_SEQ", "32768"))
+        self.chunk = int(chunk or env("GLM_CHUNK", "1024"))
+        self.dense_fmt = dense or env("GLM_DENSE", "bf16")
+        self.miss = miss or env("GLM_MISS", "substitute")
+        self.native = env("GLM_NATIVE_MOE", "1") == "1"
+        self.use_graphs = env("GLM_GRAPHS", "1") == "1"
+        self.prefill_moe = env("GLM_PREFILL_MOE", "triton")
         self.decode_rows = 16          # steps of at most this many rows take the device-position path
         self.graph_rows = {1}          # step sizes replayed from captured graphs
         if self.miss not in ("substitute", "stream"):
-            raise ValueError("MUSE_MISS must be substitute or stream")
+            raise ValueError("GLM_MISS must be substitute or stream")
         W, r = self.world, self.rank
         if cfg.heads % W or cfg.kv_heads % W or cfg.moe_inter % W or cfg.moe_hidden % W \
                 or cfg.hidden % W or cfg.vocab % W:
@@ -271,10 +271,10 @@ class MuseTP:
         self.vl = cfg.vocab // W
         total = cfg.layers * cfg.experts
         transient = cfg.experts if self.miss == "stream" else 0
-        want = slots or env("MUSE_SLOTS", "auto")
+        want = slots or env("GLM_SLOTS", "auto")
         t0 = time.perf_counter()
         self._load_dense()
-        if env("MUSE_MEMLOG", "0") == "1":
+        if env("GLM_MEMLOG", "0") == "1":
             print(f"[mem r{self.rank}] after dense: MemAvailable {mem_available() / 1e9:.1f} GB, "
                   f"{rss_anon() / 1e9:.1f} GB anon", flush=True)
         self._alloc_cache()
@@ -287,13 +287,13 @@ class MuseTP:
             free = max(torch.cuda.mem_get_info(self.dev)[0], mem_available())
             # V4.1's rule (docs/gotchas.md): a hard floor under MemAvailable, and only a share of
             # the rest -- page cache and pinned memory come back lazily on this box.
-            reserve = float(env("MUSE_RESERVE_GB", "20")) * 1e9
-            if env("MUSE_DRAFTER", ""):
+            reserve = float(env("GLM_RESERVE_GB", "20")) * 1e9
+            if env("GLM_DRAFTER", ""):
                 # The drafter's weights split over the ranks, its caches, and headroom.
-                files = Path(env("MUSE_DRAFTER", "")).glob("*.safetensors")
+                files = Path(env("GLM_DRAFTER", "")).glob("*.safetensors")
                 reserve += sum(f.stat().st_size for f in files) / W + 1e9
             per = Arena.slot_bytes(cfg, W)
-            share = float(env("MUSE_ARENA_SHARE", "0.88"))
+            share = float(env("GLM_ARENA_SHARE", "0.88"))
             mine = max(0, int(share * (free - reserve) // per) - transient)
             want = min(self.comm.gather_objects(mine))
             self.log(f"[muse] auto slots: {want} ({free / 1e9:.1f} GB available, {reserve / 1e9:.0f} GB floor,"
@@ -316,8 +316,8 @@ class MuseTP:
         self.spec_stats = {"rounds": 0, "accepted": 0}
         self.stats = {"stream_loads": 0, "stream_s": 0.0}
         torch.cuda.synchronize()
-        if env("MUSE_DRAFTER", ""):
-            self.enable_drafter(env("MUSE_DRAFTER", ""))
+        if env("GLM_DRAFTER", ""):
+            self.enable_drafter(env("GLM_DRAFTER", ""))
         self.log(f"[muse] rank {r}/{W} ready in {time.perf_counter() - t0:.1f}s: dense {self.dense_fmt}"
                  f" {self.dense_bytes / 1e9:.2f} GB, {self.slots_resident} resident slots of {total}"
                  f" ({self.arena.bytes_per_slot * self.arena.slots / 1e9:.2f} GB), miss={self.miss},"
@@ -333,8 +333,8 @@ class MuseTP:
         mine = {"version": VERSION, "code": digest, "dense": self.dense_fmt, "miss": self.miss,
                 "native": self.native, "graphs": self.use_graphs, "prefill_moe": self.prefill_moe, "max_seq": self.max_seq, "chunk": self.chunk,
                 "slots": self.slots_resident, "transient": transient, "fast_comm": self.comm.fast,
-                "resident": hashlib.sha256(Path(env("MUSE_RESIDENT", "")).read_bytes()).hexdigest()[:16]
-                if env("MUSE_RESIDENT", "") else "",
+                "resident": hashlib.sha256(Path(env("GLM_RESIDENT", "")).read_bytes()).hexdigest()[:16]
+                if env("GLM_RESIDENT", "") else "",
                 "config": json.dumps(self.cfg.extra["raw"].get("text_config", {}), sort_keys=True)}
         allv = self.comm.gather_objects(mine)
         if any(v != allv[0] for v in allv):
@@ -394,14 +394,14 @@ class MuseTP:
         router under-uses, so a low bias marks a naturally popular expert). A routing trace
         replaces that guess (``resident`` = {layer: [experts]})."""
         cfg = self.cfg
-        if resident is None and env("MUSE_RESIDENT", ""):
-            raw = json.loads(Path(env("MUSE_RESIDENT", "")).read_text())
+        if resident is None and env("GLM_RESIDENT", ""):
+            raw = json.loads(Path(env("GLM_RESIDENT", "")).read_text())
             raw = raw.get("resident", raw)
             resident = {int(k): [int(e) for e in v] for k, v in raw.items()}
             n = sum(len(v) for v in resident.values())
             if n > self.slots_resident:
                 # Keep the file's order within each layer and trim the layers evenly.
-                raise ValueError(f"MUSE_RESIDENT lists {n} experts, {self.slots_resident} slots")
+                raise ValueError(f"GLM_RESIDENT lists {n} experts, {self.slots_resident} slots")
         if resident is None:
             if self.slots_resident >= cfg.layers * cfg.experts:
                 resident = {L: list(range(cfg.experts)) for L in range(cfg.layers)}
@@ -418,11 +418,11 @@ class MuseTP:
         for L in range(cfg.layers):
             for e in resident.get(L, []):
                 if slot >= self.slots_resident:
-                    raise ValueError("resident set larger than MUSE_SLOTS")
+                    raise ValueError("resident set larger than GLM_SLOTS")
                 self.arena.load(self.ck, L, e, slot)
                 slot += 1
             self.ck.drop_cache()
-            if env("MUSE_MEMLOG", "0") == "1" and L % 8 == 0:
+            if env("GLM_MEMLOG", "0") == "1" and L % 8 == 0:
                 print(f"[mem r{self.rank}] layer {L}: {slot} placed, MemAvailable "
                       f"{mem_available() / 1e9:.1f} GB, {rss_anon() / 1e9:.1f} GB anon", flush=True)
         self.log(f"[muse] placed {slot} experts in {time.perf_counter() - t0:.1f}s; "

@@ -1,14 +1,14 @@
 """Chat template rendering and output parsing for server/muse_app.py (CPU).
 
-Needs the checkpoint's tokenizer.json and chat_template.jinja: set MUSE_TOKENIZER_DIR (or
-MUSE_MODEL) to a directory holding them; skipped otherwise.
+Needs the checkpoint's tokenizer.json and chat_template.jinja: set GLM_MUSE_TOKENIZER_DIR (or
+GLM_MODEL) to a directory holding them; skipped otherwise.
 """
 
 import json
 import os
 import unittest
 
-DIR = os.environ.get("MUSE_TOKENIZER_DIR") or os.environ.get("MUSE_MODEL")
+DIR = os.environ.get("GLM_MUSE_TOKENIZER_DIR") or os.environ.get("GLM_MODEL")
 
 
 def have_files():
@@ -16,7 +16,7 @@ def have_files():
                              for f in ("tokenizer.json", "chat_template.jinja"))
 
 
-@unittest.skipUnless(have_files(), "MUSE_TOKENIZER_DIR with tokenizer.json + chat_template.jinja")
+@unittest.skipUnless(have_files(), "GLM_MUSE_TOKENIZER_DIR with tokenizer.json + chat_template.jinja")
 class TemplateParserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

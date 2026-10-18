@@ -1,4 +1,4 @@
-"""GLM attention projections from the EXL3 checkpoint's 5-bit matrices (MUSE_EXL3_ATTN=1).
+"""GLM attention projections from the EXL3 checkpoint's 5-bit matrices (GLM_EXL3_ATTN=1).
 
 The Quark checkpoint's attention is FP8 with 128x128 block scales; bertholomus/GLM-5.3-EXL3-3.0bpw
 stores q_a, q_b, kv_a, o_proj and the indexer's wq_b at 5 bits (EXL3 trellis, mul1 codebook,
@@ -136,7 +136,7 @@ def _members(device: str):
 
 
 class Exl3Source:
-    """The EXL3 checkpoint's attention tensors, sliced for one rank (MUSE_EXL3_SRC, mounted at
+    """The EXL3 checkpoint's attention tensors, sliced for one rank (GLM_EXL3_SRC, mounted at
     /exl3src). Splits are on 128 boundaries, so each rank's matrix is an exact slice."""
 
     def __init__(self, path: str):

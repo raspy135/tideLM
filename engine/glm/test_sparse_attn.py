@@ -87,7 +87,7 @@ class SparseAttnTests(unittest.TestCase):
             self.check(8, 8192, 8192, True, block_h=bh, block_n=bn, num_warps=w)
 
     def test_count_and_partials(self):
-        # MUSE_KV_SPLIT: each half of the picks attended alone (partial=True, cnt limiting the
+        # GLM_KV_SPLIT: each half of the picks attended alone (partial=True, cnt limiting the
         # rows' lists) and merged equals attending all of them.
         from engine.glm.kv_split import merge
         for fp8 in (True, False):

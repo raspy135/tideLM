@@ -1,6 +1,6 @@
 """Exact routing trace of Muse Spark on the pair: which experts a workload uses.
 
-Runs the corpus through the TP2 engine with misses streamed (MUSE_MISS=stream: every pick is
+Runs the corpus through the TP2 engine with misses streamed (GLM_MISS=stream: every pick is
 the router's own), records every layer's top-8 and router weights, and writes (rank 0):
 
   stats.json      per (layer, expert): picks and router-weight mass, overall and per category;
@@ -8,9 +8,9 @@ the router's own), records every layer's top-8 and router weights, and writes (r
                   multiplier a b-row verify step pays in expert reads;
                   miss rate and missed mass against resident fraction, ranked on even documents
                   and measured on odd ones (global ranking by mass across layers).
-  resident-<N>.json  the top-N experts by mass, for MUSE_RESIDENT at an N-slot budget.
+  resident-<N>.json  the top-N experts by mass, for GLM_RESIDENT at an N-slot budget.
 
-    MUSE_MODEL_DIR=~/models/Muse-...-MXFP4 tools/muse_pair_run.sh muse_trace.py \\
+    GLM_MODEL_DIR=~/models/Muse-...-MXFP4 tools/muse_pair_run.sh muse_trace.py \\
         --corpus /app/corpus/trace_corpus_v3.jsonl --tokens 1024 --docs 64
 """
 
@@ -25,7 +25,7 @@ from pathlib import Path
 sys.path.insert(0, "/app")
 import torch  # noqa: E402
 
-os.environ.setdefault("MUSE_MISS", "stream")
+os.environ.setdefault("GLM_MISS", "stream")
 from engine.muse.tp import MuseTP  # noqa: E402
 
 
@@ -57,7 +57,7 @@ def load_tokenizer(model_dir):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=os.environ.get("MUSE_MODEL", "/models"))
+    ap.add_argument("--model", default=os.environ.get("GLM_MODEL", "/models"))
     ap.add_argument("--corpus", default="/app/corpus/trace_corpus_v3.jsonl")
     ap.add_argument("--tokens", type=int, default=1024, help="tokens per document (prefix)")
     ap.add_argument("--docs", type=int, default=64)

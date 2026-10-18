@@ -1,4 +1,4 @@
-"""MUSE_KV_SPLIT on one GPU: GlmTP._split_attn and the prefill gather, run for both ranks in two
+"""GLM_KV_SPLIT on one GPU: GlmTP._split_attn and the prefill gather, run for both ranks in two
 threads over a fake all-gather, against the unsplit indexer + attention (needs a GPU)."""
 
 import threading

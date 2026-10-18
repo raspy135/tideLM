@@ -34,10 +34,10 @@ GROUP = 32
 _OPEN_LOCK = threading.Lock()
 
 
-_READ_CHUNK = int(os.environ.get("MUSE_READ_CHUNK_KB", "256")) * 1024
-# Bulk (background, prefetch, placement) reads: whole tensors unless MUSE_READ_BULK_CHUNK_KB --
+_READ_CHUNK = int(os.environ.get("GLM_READ_CHUNK_KB", "256")) * 1024
+# Bulk (background, prefetch, placement) reads: whole tensors unless GLM_READ_BULK_CHUNK_KB --
 # many small pieces are many Python tasks contending for the GIL with an eager prefill.
-_BULK_CHUNK = int(os.environ.get("MUSE_READ_BULK_CHUNK_KB", "0")) * 1024
+_BULK_CHUNK = int(os.environ.get("GLM_READ_BULK_CHUNK_KB", "0")) * 1024
 _CHUNK_POOLS = {}
 
 
@@ -50,7 +50,7 @@ def _chunk_pool(urgent=False):
         with _OPEN_LOCK:
             pool = _CHUNK_POOLS.get(urgent)
             if pool is None:
-                n = 16 if urgent else int(os.environ.get("MUSE_READ_CHUNK_THREADS", "32"))
+                n = 16 if urgent else int(os.environ.get("GLM_READ_CHUNK_THREADS", "32"))
                 pool = _CHUNK_POOLS[urgent] = ThreadPoolExecutor(max_workers=n)
     return pool
 

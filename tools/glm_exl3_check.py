@@ -2,7 +2,7 @@
 two Comm all-gathers) against a plain reference from the same arena (Exl3Arena.dequant_slot:
 fp32 SiLU(x W1) * (x W3), gather, W2, gather, weighted sum), at decode and prefill shapes.
 
-    MUSE_ENV="MUSE_EXPERT_FORMAT=exl3 MUSE_EXL3_PACK=/packs/glm-exl3-experts-r{rank}of2.bin MUSE_SLOTS=2048" \\
+    GLM_ENV="GLM_EXPERT_FORMAT=exl3 GLM_EXL3_PACK=/packs/glm-exl3-experts-r{rank}of2.bin GLM_SLOTS=2048" \\
         tools/muse_pair_run.sh glm_exl3_check.py
 """
 import sys
@@ -30,7 +30,7 @@ def reference(eng, x, slots, w):
 
 def main():
     eng = GlmTP("/models")
-    assert eng.x3 is not None, "set MUSE_EXPERT_FORMAT=exl3"
+    assert eng.x3 is not None, "set GLM_EXPERT_FORMAT=exl3"
     g = torch.Generator(device="cpu").manual_seed(0)
     L = 40
     res = eng.lut[L][eng.lut[L] >= 0].cpu()

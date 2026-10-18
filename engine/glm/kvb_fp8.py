@@ -1,4 +1,4 @@
-"""MLA's absorbed projections (kv_b_proj: w_uk, w_uv) kept in FP8 (MUSE_KVB_FP8=1).
+"""MLA's absorbed projections (kv_b_proj: w_uk, w_uv) kept in FP8 (GLM_KVB_FP8=1).
 
 The checkpoint stores kv_b_proj as FP8 with 128x128 block scales; the engine dequantized it to
 BF16 at load: 1.16 GB a rank (0.58 in FP8), and decode reads all of it every round -- each layer's

@@ -4,16 +4,16 @@ Three modes, each a separate boot (results under --out):
 
   gen    greedy answers to a fixed set of chat prompts (any residency settings); saves the token ids
          to seqs.json -- the text every configuration is then scored on.
-  exact  MUSE_MISS=stream (every expert exact): teacher-forced prefill of each prompt + answer;
+  exact  GLM_MISS=stream (every expert exact): teacher-forced prefill of each prompt + answer;
          saves, per answer position, the exact log-probability of the answer token, the exact
          top-1 and the exact top-20 (ids, log-probs).
   eval   the configuration under test: prefill the prompt (with whatever prefill settings are on),
          adapt as stream() does, then feed the answer one token at a time as decode steps
-         (background periods every MUSE_BG_EVERY steps, adaptation every MUSE_ADAPT_EVERY), and
+         (background periods every GLM_BG_EVERY steps, adaptation every GLM_ADAPT_EVERY), and
          score each step against exact.json: NLL of the answer token, top-1 agreement with exact,
          and KL(exact || this) over exact's top-20 (both renormalized there).
 
-    MUSE_ENV="MUSE_GRAPHS=0 MUSE_BG=1 MUSE_HOT=1" tools/muse_pair_run.sh glm_quality.py --mode eval --name hot1
+    GLM_ENV="GLM_GRAPHS=0 GLM_BG=1 GLM_HOT=1" tools/muse_pair_run.sh glm_quality.py --mode eval --name hot1
 """
 import argparse
 import json
@@ -84,7 +84,7 @@ def encode_switch(tpl, tokyo):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=os.environ.get("MUSE_MODEL", "/models"))
+    ap.add_argument("--model", default=os.environ.get("GLM_MODEL", "/models"))
     ap.add_argument("--mode", choices=("gen", "exact", "eval"), required=True)
     ap.add_argument("--name", default="")
     ap.add_argument("--tokens", type=int, default=300)
@@ -96,7 +96,7 @@ def main():
                          "its top-20, top-1 agreement, NLL): one numerics change, every expert exact on both sides")
     ap.add_argument("--rows", type=int, default=1,
                     help="eval: feed the answer N tokens a step (3 = an MTP depth-2 verify block, graphed "
-                         "when MUSE_MTP_DEPTH=N-1), so per-step read caps and thresholds act as in serving")
+                         "when GLM_MTP_DEPTH=N-1), so per-step read caps and thresholds act as in serving")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -169,7 +169,7 @@ def main():
     if ex is None:                       # NLL only (--set natural without an exact reference)
         ex = [None] * len(seqs)
     if eng.demand is None:
-        raise SystemExit("eval needs MUSE_ADAPT=1 and MUSE_MISS=substitute")
+        raise SystemExit("eval needs GLM_ADAPT=1 and GLM_MISS=substitute")
     ms = {"picks": 0, "missed": 0, "mass": 0.0, "mass_missed": 0.0}
     eng.miss_stats = ms
     rows, t0 = [], time.perf_counter()

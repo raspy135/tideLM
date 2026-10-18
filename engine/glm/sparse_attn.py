@@ -1,4 +1,4 @@
-"""GLM's sparse MLA attention in one kernel (MUSE_ATTN_KERNEL=1): each query row attends to the
+"""GLM's sparse MLA attention in one kernel (GLM_ATTN_KERNEL=1): each query row attends to the
 cached positions the indexer picked, reading them where they live.
 
 The einsum path (GlmTP.attention with the kernel off) gathers each 32-row block's selected latents
@@ -15,7 +15,7 @@ them to BF16 twice) and the probabilities are rounded per tile against a running
 of after a full softmax -- accumulation-order and rounding-point changes, checked against an fp32
 reference in engine/glm/test_sparse_attn.py.
 
-With the KV cache split across ranks by position (MUSE_KV_SPLIT), a rank attends every head over
+With the KV cache split across ranks by position (GLM_KV_SPLIT), a rank attends every head over
 its own share of the picks -- a per-row count of them, `cnt`, at the front of `sel` -- and returns
 partials (the output normalized over its share, and the share's log-sum-exp) that
 engine/glm/kv_split.merge combines with the other rank's.

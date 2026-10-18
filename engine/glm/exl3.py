@@ -1,4 +1,4 @@
-"""EXL3 routed experts for GlmTP (MUSE_EXPERT_FORMAT=exl3).
+"""EXL3 routed experts for GlmTP (GLM_EXPERT_FORMAT=exl3).
 
 The routed experts of the decoder MoE layers come from a per-rank pack built by
 tools/glm_pack_exl3.py (3-bit EXL3, each record this rank's TP-output slice, 4096-aligned) and
@@ -31,7 +31,7 @@ PIECE = 256 * 1024
 
 class Exl3Pack:
     """One rank's pack: one positional read an expert (pread releases the GIL; the engine's pools
-    issue them in parallel). MUSE_EXL3_DIRECT=1 (default): O_DIRECT into pooled aligned buffers --
+    issue them in parallel). GLM_EXL3_DIRECT=1 (default): O_DIRECT into pooled aligned buffers --
     one 7.1 MB preadv took 0.83 ms (8.5 GB/s) where the buffered read in 16 parallel 256 KB pieces
     took 3.1 ms and a single buffered preadv 7.8 ms; eight at once ran at 9.5 GB/s direct, 3.3
     buffered. Records are 4096-aligned for this (tools/exl3_ref.py)."""
@@ -50,12 +50,12 @@ class Exl3Pack:
         self.layers = sorted({L for L, _ in self.records})
         self._layout = {}
         self.dfd = None
-        if os.environ.get("MUSE_EXL3_DIRECT", "1") == "1":
+        if os.environ.get("GLM_EXL3_DIRECT", "1") == "1":
             if self.data0 % ALIGN or any(m["off"] % ALIGN for m in self.records.values()):
                 raise ValueError(f"{path}: records not {ALIGN}-aligned for O_DIRECT")
             self.dfd = os.open(path, os.O_RDONLY | os.O_DIRECT)
             size = align_up(max(m["nbytes"] for m in self.records.values()))
-            self.pool = BufPool(size, int(os.environ.get("MUSE_EXL3_BUFS", "8")))
+            self.pool = BufPool(size, int(os.environ.get("GLM_EXL3_BUFS", "8")))
 
     def header_sha(self) -> str:
         return self.reader.header_sha256()
@@ -82,7 +82,7 @@ class Exl3Pack:
     def read(self, L: int, e: int, urgent: bool = False) -> tuple[dict, float]:
         """(record of CPU tensors in RECORD_TENSORS order, bits) for routed expert e of layer L.
         Direct: one O_DIRECT preadv into a pooled buffer, the tensors views of it. Buffered
-        (MUSE_EXL3_DIRECT=0): urgent reads (a decode step waits on them) go in 256 KB pieces on
+        (GLM_EXL3_DIRECT=0): urgent reads (a decode step waits on them) go in 256 KB pieces on
         their own pool -- one buffered preadv streams ~1 GB/s from a cold file."""
         meta = self.records[(L, e)]
         bits = float(meta["bits"])

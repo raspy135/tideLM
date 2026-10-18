@@ -2,7 +2,7 @@
 added syncs), the host-side phases (MTP drafts, the verify forward, hot reads, broadcasts,
 adaptation) with wall clocks, and optionally a kernel table from torch.profiler.
 
-    MUSE_ENV="..." tools/muse_pair_run.sh glm_decode_prof.py --prompt long --tokens 400 --kernels 6
+    GLM_ENV="..." tools/muse_pair_run.sh glm_decode_prof.py --prompt long --tokens 400 --kernels 6
 
 GPU spans are per segment kind: embed, attention on an indexer ("full") layer or a shared one,
 the MLP of a dense or MoE layer, the head, the one-row MTP graph. "GPU idle" is the round's wall
@@ -79,15 +79,15 @@ def wrap(obj, name, key, wall, cnt, rec=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=os.environ.get("MUSE_MODEL", "/models"))
+    ap.add_argument("--model", default=os.environ.get("GLM_MODEL", "/models"))
     ap.add_argument("--prompt", choices=("short", "long"), default="long")
     ap.add_argument("--long-tokens", type=int, default=6000)
     ap.add_argument("--tokens", type=int, default=400)
     ap.add_argument("--warm", type=int, default=48, help="decode tokens before measuring (captures)")
-    ap.add_argument("--depth", type=int, default=int(os.environ.get("MUSE_MTP_DEPTH", "2")))
+    ap.add_argument("--depth", type=int, default=int(os.environ.get("GLM_MTP_DEPTH", "2")))
     ap.add_argument("--kernels", type=int, default=0, help="then profile this many rounds' kernels")
     ap.add_argument("--draft-agree", action="store_true",
-                    help="(MUSE_GRAPHS=0, MUSE_DRAFT_HEAD=mxfp4) count drafts whose argmax the main head would change")
+                    help="(GLM_GRAPHS=0, GLM_DRAFT_HEAD=mxfp4) count drafts whose argmax the main head would change")
     a = ap.parse_args()
     tpl = GlmTemplate(a.model)
     eng = GlmTP(a.model)

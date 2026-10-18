@@ -1,4 +1,4 @@
-"""The DSA indexer's scores in one kernel (MUSE_INDEX_KERNEL=1).
+"""The DSA indexer's scores in one kernel (GLM_INDEX_KERNEL=1).
 
 score[t, s] = sum_h w[t, h] * relu(q[t, h] . k[s]) / sqrt(D), and -inf past position[t].
 
@@ -11,7 +11,7 @@ heads with one BF16 tensor-core dot per row, fp32 accumulation -- the same produ
 einsum, summed in another order. Blocks wholly past the last row's position only write -inf, so a
 6K context reads 6K keys whatever max_seq is.
 
-With the KV cache split across ranks by position (MUSE_KV_SPLIT), a rank's cache row s holds
+With the KV cache split across ranks by position (GLM_KV_SPLIT), a rank's cache row s holds
 position s * stride + offset: the mask and the skip compare that position, not s.
 """
 

@@ -64,7 +64,7 @@ class IndexKernelTests(unittest.TestCase):
             self.check(64, 20000, 20000, fp8)
 
     def test_split_rows(self):
-        # MUSE_KV_SPLIT: rank r's row s holds position 2 s + r; its scores are the unsplit ones there.
+        # GLM_KV_SPLIT: rank r's row s holds position 2 s + r; its scores are the unsplit ones there.
         from engine.glm.kv_split import owner_rows
         for fp8 in (True, False):
             for T, n in ((1, 6000), (4, 6001), (300, 4096)):

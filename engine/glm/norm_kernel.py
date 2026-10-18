@@ -1,4 +1,4 @@
-"""RMSNorm in one kernel (MUSE_FUSED_NORM=1) for engine/glm/tp.py's rms().
+"""RMSNorm in one kernel (GLM_FUSED_NORM=1) for engine/glm/tp.py's rms().
 
 rms() is weight * (x.float() * rsqrt(mean(x.float()^2) + eps)).to(bf16): seven eager kernels and,
 at a 1,024-row prefill chunk of the 6,144-wide hidden, ~200 MB of traffic a call, four calls a

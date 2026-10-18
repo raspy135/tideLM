@@ -58,9 +58,9 @@ class Lin:
         return self.q.nbytes if self.q is not None else self.w.numel() * 2
 
 
-# MUSE_FUSED_NORM=1: rms() in one kernel (engine/glm/norm_kernel.py) for 2-D BF16 rows: 12x faster
+# GLM_FUSED_NORM=1: rms() in one kernel (engine/glm/norm_kernel.py) for 2-D BF16 rows: 12x faster
 # at a 1,024-row prefill chunk, a seventh of the kernels in a decode graph; 99.999% identical bits.
-FUSED_NORM = env("MUSE_FUSED_NORM", "1") == "1"
+FUSED_NORM = env("GLM_FUSED_NORM", "1") == "1"
 
 
 def rms(x, weight, eps):
@@ -170,53 +170,53 @@ class GlmTP:
         self.comm = Comm()
         self.rank, self.world, self.dev = self.comm.rank, self.comm.world, self.comm.device
         self.log = log if self.rank == 0 else (lambda *_: None)
-        need = float(env("MUSE_MIN_FREE_GB", "90"))
+        need = float(env("GLM_MIN_FREE_GB", "90"))
         if need and mem_available() < need * 1e9:
             raise RuntimeError(f"only {mem_available() / 1e9:.1f} GB MemAvailable, need {need:.0f}")
         self.cfg = cfg = GlmConfig.load(model_dir)
         self.ck = GlmCheckpoint(model_dir)
         self.model_dir = model_dir
-        self.max_seq = int(max_seq or env("MUSE_MAX_SEQ", "32768"))
-        # MUSE_KV=fp8: the MLA latent (512) and the indexer keys (128) are cached as FP8 E4M3 with
+        self.max_seq = int(max_seq or env("GLM_MAX_SEQ", "32768"))
+        # GLM_KV=fp8: the MLA latent (512) and the indexer keys (128) are cached as FP8 E4M3 with
         # one fp32 scale per 128 values, the MTP hidden ring as FP8 with one per row; the RoPE keys
         # (64) stay BF16. ~54 KB a position a rank instead of ~97 (+ 6 KB of ring instead of 12).
-        self.kv8 = env("MUSE_KV", "bf16") == "fp8"
-        # MUSE_INDEX_KERNEL=1: the indexer's scores in one Triton kernel (engine/glm/index_kernel.py)
+        self.kv8 = env("GLM_KV", "bf16") == "fp8"
+        # GLM_INDEX_KERNEL=1: the indexer's scores in one Triton kernel (engine/glm/index_kernel.py)
         # instead of fp32 einsums over [T, 32, S]; decode scored all max_seq positions that way.
-        self.index_kernel = env("MUSE_INDEX_KERNEL", "1") == "1"
-        # MUSE_ATTN_KERNEL=1: the sparse attention in one Triton kernel (engine/glm/sparse_attn.py)
+        self.index_kernel = env("GLM_INDEX_KERNEL", "1") == "1"
+        # GLM_ATTN_KERNEL=1: the sparse attention in one Triton kernel (engine/glm/sparse_attn.py)
         # instead of gathering each 32-row block's selected latents into BF16 copies.
-        self.attn_kernel = env("MUSE_ATTN_KERNEL", "1") == "1"
-        # MUSE_KV_SPLIT=1: each rank caches every other position (engine/glm/kv_split.py) instead
+        self.attn_kernel = env("GLM_ATTN_KERNEL", "1") == "1"
+        # GLM_KV_SPLIT=1: each rank caches every other position (engine/glm/kv_split.py) instead
         # of both holding all of them; decode exchanges queries and partials, prefill the rows.
-        self.kv_split = env("MUSE_KV_SPLIT", "0") == "1" and self.world == 2
+        self.kv_split = env("GLM_KV_SPLIT", "0") == "1" and self.world == 2
         if self.kv_split and not (self.index_kernel and self.attn_kernel):
-            raise ValueError("MUSE_KV_SPLIT=1 needs MUSE_INDEX_KERNEL=1 and MUSE_ATTN_KERNEL=1")
+            raise ValueError("GLM_KV_SPLIT=1 needs GLM_INDEX_KERNEL=1 and GLM_ATTN_KERNEL=1")
         self.s_loc = -(-self.max_seq // self.world) if self.kv_split else self.max_seq
-        self.exl3_attn = env("MUSE_EXL3_ATTN", "0") == "1"
-        # Dense weights still wider than FP8 (docs/gotchas.md): MUSE_KVB_FP8=1 keeps MLA's absorbed
+        self.exl3_attn = env("GLM_EXL3_ATTN", "0") == "1"
+        # Dense weights still wider than FP8 (docs/gotchas.md): GLM_KVB_FP8=1 keeps MLA's absorbed
         # kv_b (w_uk, w_uv) in the checkpoint's FP8 (engine/glm/kvb_fp8.py; 1.16 -> 0.58 GB a rank),
-        # MUSE_EMBED_8BIT=int8 (or fp8) the embedding rows in 8 bits with a scale per 128 values
+        # GLM_EMBED_8BIT=int8 (or fp8) the embedding rows in 8 bits with a scale per 128 values
         # (0.95 -> 0.49; a lookup, never a matmul, so INT8's uniform grid can be used: fp8 moved the
         # exact-model logits KL 0.015 / 5.2% top-1 flips, docs/gotchas.md),
-        # MUSE_ROUTER_BF16=1 the routers in BF16 with fp32 sums (0.48 -> 0.24).
-        self.kvb_fp8 = env("MUSE_KVB_FP8", "0") == "1"
-        self.embed_q = env("MUSE_EMBED_8BIT", "")
+        # GLM_ROUTER_BF16=1 the routers in BF16 with fp32 sums (0.48 -> 0.24).
+        self.kvb_fp8 = env("GLM_KVB_FP8", "0") == "1"
+        self.embed_q = env("GLM_EMBED_8BIT", "")
         assert self.embed_q in ("", "int8", "fp8"), self.embed_q
         self.embed_fp8 = bool(self.embed_q)            # (any 8-bit embedding: an (8-bit, scales) pair)
-        self.router_bf16 = env("MUSE_ROUTER_BF16", "0") == "1"
-        # MUSE_GATHER_MERGE=1: MoE layers gather the routed and the fixed experts' intermediates
+        self.router_bf16 = env("GLM_ROUTER_BF16", "0") == "1"
+        # GLM_GATHER_MERGE=1: MoE layers gather the routed and the fixed experts' intermediates
         # in one all-gather and their weighted, summed outputs (BF16) in another (mlp()).
-        self.gather_merge = env("MUSE_GATHER_MERGE", "1") == "1"
-        # MUSE_FIXED_DENSE=1: in prefill the fixed experts (shared, dense layers) as BF16 GEMMs on
+        self.gather_merge = env("GLM_GATHER_MERGE", "1") == "1"
+        # GLM_FIXED_DENSE=1: in prefill the fixed experts (shared, dense layers) as BF16 GEMMs on
         # weights dequantized once (engine/glm/mxfp4_dense.py) -- only where they are all of the
         # call's slots (EXL3 config, dense layers); MXFP4's routed picks share the MoE kernel.
-        self.fixed_dense = env("MUSE_FIXED_DENSE", "1") == "1"
-        self.chunk = int(chunk or env("MUSE_CHUNK", "1024"))
-        self.miss = miss or env("MUSE_MISS", "substitute")
-        self.native = env("MUSE_NATIVE_MOE", "1") == "1"
-        self.prefill_moe = env("MUSE_PREFILL_MOE", "triton")
-        self.use_graphs = env("MUSE_GRAPHS", "1") == "1"
+        self.fixed_dense = env("GLM_FIXED_DENSE", "1") == "1"
+        self.chunk = int(chunk or env("GLM_CHUNK", "1024"))
+        self.miss = miss or env("GLM_MISS", "substitute")
+        self.native = env("GLM_NATIVE_MOE", "1") == "1"
+        self.prefill_moe = env("GLM_PREFILL_MOE", "triton")
+        self.use_graphs = env("GLM_GRAPHS", "1") == "1"
         self.decode_rows, self.graph_rows = 16, {1}
         # Held through every graph capture: CUDA refuses another thread's stream work while a
         # capture is open (and invalidates the capture), and the prefix store's background save
@@ -226,76 +226,76 @@ class GlmTP:
         if cfg.heads % W or cfg.vocab % W or cfg.moe_inter % W or cfg.hidden % W:
             raise ValueError("dimensions must split evenly over the ranks")
         self.hl, self.vl = cfg.heads // W, cfg.vocab // W
-        self.mtp_on = (env("MUSE_MTP", "1") == "1" and cfg.mtp_layers > 0
+        self.mtp_on = (env("GLM_MTP", "1") == "1" and cfg.mtp_layers > 0
                        and self.ck_has_mtp(model_dir, cfg))
         self.mtp_L = cfg.layers
         self.nL = cfg.layers + (1 if self.mtp_on else 0)
         self.moe_layers = [L for L in range(self.nL) if not self.dense(L)]
         self.n_pseudo = cfg.inter // cfg.moe_inter
         fixed = len(self.moe_layers) * cfg.shared_experts + sum(cfg.dense_mlp) * self.n_pseudo
-        # MUSE_EXPERT_FORMAT=exl3: the decoder layers' routed experts come from the EXL3 pack at
-        # MUSE_EXL3_PACK ({rank} filled in) into their own arena (engine/glm/exl3.py). The shared
+        # GLM_EXPERT_FORMAT=exl3: the decoder layers' routed experts come from the EXL3 pack at
+        # GLM_EXL3_PACK ({rank} filled in) into their own arena (engine/glm/exl3.py). The shared
         # experts, the dense layers and the MTP layer's experts (4-bit in that checkpoint, a width
         # the routed arena does not hold) stay MXFP4, the MTP layer's all resident. Slot numbers
         # run through both: MXFP4 [0, x3_off), EXL3 from x3_off on.
-        self.xfmt = env("MUSE_EXPERT_FORMAT", "mxfp4")
+        self.xfmt = env("GLM_EXPERT_FORMAT", "mxfp4")
         assert self.xfmt in ("mxfp4", "exl3"), self.xfmt
         self.x3 = self.x3pack = None
         if self.xfmt == "exl3":
             from .exl3 import Exl3Pack
-            self.x3pack = Exl3Pack(env("MUSE_EXL3_PACK", "").format(rank=r), cfg.hidden, cfg.moe_inter)
-        # MUSE_MTP_FULL=1: the MTP layer's routed experts are all resident (MXFP4, 2.5 GB a rank)
+            self.x3pack = Exl3Pack(env("GLM_EXL3_PACK", "").format(rank=r), cfg.hidden, cfg.moe_inter)
+        # GLM_MTP_FULL=1: the MTP layer's routed experts are all resident (MXFP4, 2.5 GB a rank)
         # and out of the swaps: drafts never substitute, and decode-layer residency no longer
         # trades against the drafter. Always so under exl3 (the arena cannot hold their 4 bits).
-        self.mtp_full = self.mtp_on and (self.x3pack is not None or env("MUSE_MTP_FULL", "1") == "1")
+        self.mtp_full = self.mtp_on and (self.x3pack is not None or env("GLM_MTP_FULL", "1") == "1")
         if self.mtp_full:
             fixed += cfg.experts
         self.swap_layers = [L for L in self.moe_layers if not (self.mtp_full and L == self.mtp_L)]
         total = len(self.swap_layers) * cfg.experts
-        # Prefill prefetch (MUSE_PF=1): two buffers of MUSE_PF_SLOTS transient slots, one per
+        # Prefill prefetch (GLM_PF=1): two buffers of GLM_PF_SLOTS transient slots, one per
         # alternate layer, taken from the resident budget. See _pf_predict.
-        self.pf_on = env("MUSE_PF", "0") == "1" and self.miss == "substitute"
-        self.pf_n = int(env("MUSE_PF_SLOTS", "32")) if self.pf_on else 0
-        self.pf_min_rows = int(env("MUSE_PF_MIN_ROWS", "128"))
-        # MUSE_PF_KEEP=1: after its layer, a prefetched expert replaces the coldest resident
+        self.pf_on = env("GLM_PF", "0") == "1" and self.miss == "substitute"
+        self.pf_n = int(env("GLM_PF_SLOTS", "32")) if self.pf_on else 0
+        self.pf_min_rows = int(env("GLM_PF_MIN_ROWS", "128"))
+        # GLM_PF_KEEP=1: after its layer, a prefetched expert replaces the coldest resident
         # (lowest long-term score, any layer, never a layer below 2 x top-k) instead of being
         # dropped, so later chunks, the post-prefill adaptation and decode reuse the read.
-        self.pf_keep = env("MUSE_PF_KEEP", "0") == "1"
-        self.pf_keep_margin = float(env("MUSE_PF_KEEP_MARGIN", "1.5"))
-        # Hot misses (MUSE_HOT=N, eager decode): per layer, read up to N missed experts whose
-        # router weight share is at least MUSE_HOT_MIN synchronously and compute them exactly.
+        self.pf_keep = env("GLM_PF_KEEP", "0") == "1"
+        self.pf_keep_margin = float(env("GLM_PF_KEEP_MARGIN", "1.5"))
+        # Hot misses (GLM_HOT=N, eager decode): per layer, read up to N missed experts whose
+        # router weight share is at least GLM_HOT_MIN synchronously and compute them exactly.
         # They share the transient slots with the prefill prefetch (never both at once).
-        self.hot_n = int(env("MUSE_HOT", "0")) if self.miss == "substitute" else 0
-        self.hot_min = float(env("MUSE_HOT_MIN", "0.2"))
-        # Graphed decode: the threshold rises above hot_min to keep about MUSE_HOT_TARGET reads a
+        self.hot_n = int(env("GLM_HOT", "0")) if self.miss == "substitute" else 0
+        self.hot_min = float(env("GLM_HOT_MIN", "0.2"))
+        # Graphed decode: the threshold rises above hot_min to keep about GLM_HOT_TARGET reads a
         # step (an MTP verify step of 3 rows finds a >= 0.2 miss in about half the layers), and
         # never more than twice that. Both ranks count the same reads, so they keep the same one.
-        self.hot_target = float(env("MUSE_HOT_TARGET", "4"))
-        # MUSE_HOT_MAX: at most this many graphed hot reads a step, whatever the threshold
-        # (0: twice MUSE_HOT_TARGET, or no cap without a target). Earlier layers take it first.
-        self.hot_max = int(env("MUSE_HOT_MAX", "0"))
-        # MUSE_HOT_PACE=g (with a cap): the i-th of n MoE layers may bring the step's reads up to
+        self.hot_target = float(env("GLM_HOT_TARGET", "4"))
+        # GLM_HOT_MAX: at most this many graphed hot reads a step, whatever the threshold
+        # (0: twice GLM_HOT_TARGET, or no cap without a target). Earlier layers take it first.
+        self.hot_max = int(env("GLM_HOT_MAX", "0"))
+        # GLM_HOT_PACE=g (with a cap): the i-th of n MoE layers may bring the step's reads up to
         # ceil(cap * ((i+1)/n)^g) -- unspent budget carries forward, g=1 spreads it evenly, g>1
         # holds more of it for the last layers. 0: first come, first served.
-        self.hot_pace = float(env("MUSE_HOT_PACE", "0"))
-        self.hot_pace_lead = int(env("MUSE_HOT_PACE_LEAD", "0"))   # reads a layer may run ahead of the pace
-        # MUSE_SUB_WEIGHT: weights of a substituted top-k. renorm (the router's own rule over the
+        self.hot_pace = float(env("GLM_HOT_PACE", "0"))
+        self.hot_pace_lead = int(env("GLM_HOT_PACE_LEAD", "0"))   # reads a layer may run ahead of the pace
+        # GLM_SUB_WEIGHT: weights of a substituted top-k. renorm (the router's own rule over the
         # picks it ended with); exact (resident picks keep their exact weights, substitutes get
         # their own score over the exact picks' total); transfer (each substitute takes a missed
         # pick's exact weight, heaviest to the best-scored substitute).
-        self.sub_weight = env("MUSE_SUB_WEIGHT", "renorm")
+        self.sub_weight = env("GLM_SUB_WEIGHT", "renorm")
         assert self.sub_weight in ("renorm", "exact", "transfer"), self.sub_weight
         dec = [L for L in self.moe_layers if L < cfg.layers]
         self._hot_frac = {L: ((i + 1) / len(dec)) ** self.hot_pace for i, L in enumerate(dec)}
         self._hot_quarter = {L: 4 * i // len(dec) for i, L in enumerate(dec)}
         self.hot_thr = {}
-        # MUSE_HOT_KEEP=N: hot reads stay resident instead of being dropped after their layer. Each
-        # background period (MUSE_BG=1) rank 0 queues up to N victims after its own plan's -- cold,
+        # GLM_HOT_KEEP=N: hot reads stay resident instead of being dropped after their layer. Each
+        # background period (GLM_BG=1) rank 0 queues up to N victims after its own plan's -- cold,
         # lowest long-term score first -- and each hot read takes the next one (_hot_keep).
-        self.hot_keep = int(env("MUSE_HOT_KEEP", "0")) if self.hot_n else 0
-        # MUSE_HOT_KEEP_AUDIT=1 (measurement only, rank 0, syncs per keep): how many kept reads a
-        # rank gate -- adapt()'s rule, score beats the victim's by MUSE_ADAPT_MARGIN -- would drop.
-        self.hot_audit = env("MUSE_HOT_KEEP_AUDIT", "0") == "1" and self.rank == 0
+        self.hot_keep = int(env("GLM_HOT_KEEP", "0")) if self.hot_n else 0
+        # GLM_HOT_KEEP_AUDIT=1 (measurement only, rank 0, syncs per keep): how many kept reads a
+        # rank gate -- adapt()'s rule, score beats the victim's by GLM_ADAPT_MARGIN -- would drop.
+        self.hot_audit = env("GLM_HOT_KEEP_AUDIT", "0") == "1" and self.rank == 0
         self.hot_q = []                 # [(VL, ve, slot)] victims for kept hot reads, weakest last
         self.hot_live = None            # [(e, transient slot)] hot reads of the layer being computed
         self._pre_route = {}            # L -> (x, scores, choice) from _hot_candidate, for _route
@@ -309,12 +309,12 @@ class GlmTP:
         if self.x3pack:
             from .exl3 import slot_bytes
             mx_bytes, per = fixed * per, slot_bytes(r, W, cfg.hidden, cfg.moe_inter)
-        want = slots if slots is not None else env("MUSE_SLOTS", "auto")
+        want = slots if slots is not None else env("GLM_SLOTS", "auto")
         if want == "auto":
             self.ck.drop_cache()
             free = max(torch.cuda.mem_get_info(self.dev)[0], mem_available())
-            reserve = float(env("MUSE_RESERVE_GB", "20")) * 1e9
-            share = float(env("MUSE_ARENA_SHARE", "0.88"))
+            reserve = float(env("GLM_RESERVE_GB", "20")) * 1e9
+            share = float(env("GLM_ARENA_SHARE", "0.88"))
             mine = max(0, int(share * (free - reserve - mx_bytes) // per) - transient - (0 if self.x3pack else fixed))
             want = min(self.comm.gather_objects(mine))
             self.log(f"[glm] auto slots: {want} routed + {fixed} fixed ({free / 1e9:.1f} GB available, "
@@ -359,37 +359,37 @@ class GlmTP:
         self.mtp_fill = True
         self.spec_stats = {"rounds": 0, "accepted": 0}
         self.spec_cal = None            # [(draft index, confidence product, accepted)] when a tool asks
-        self.mtp_dyn = float(env("MUSE_MTP_DYN", "0"))
+        self.mtp_dyn = float(env("GLM_MTP_DYN", "0"))
         self.mtp_graph_rows = 1
-        if self.mtp_on and self.x3 is not None and int(env("MUSE_MTP_DEPTH", "3")) > 7:
+        if self.mtp_on and self.x3 is not None and int(env("GLM_MTP_DEPTH", "3")) > 7:
             # exl3.routed's graph-safe decode path takes <= 64 picks (8 rows x top-8); a deeper
             # verify step would take the prefill routing (host syncs) inside a graph capture.
-            raise ValueError("MUSE_MTP_DEPTH > 7 is not supported with MUSE_EXPERT_FORMAT=exl3")
+            raise ValueError("GLM_MTP_DEPTH > 7 is not supported with GLM_EXPERT_FORMAT=exl3")
         if self.mtp_on:
-            self.graph_rows = {1, int(env("MUSE_MTP_DEPTH", "3")) + 1}
-            self.mtp_graph_rows = max(1, int(env("MUSE_MTP_DEPTH", "3")))
-        self.adapt_every = int(env("MUSE_ADAPT_EVERY", "200"))
-        self.adapt_prefill_swaps = int(env("MUSE_ADAPT_PREFILL_SWAPS", "2048"))
-        self.adapt_decode_swaps = int(env("MUSE_ADAPT_DECODE_SWAPS", "256"))
-        self.adapt_margin = float(env("MUSE_ADAPT_MARGIN", "1.5"))
+            self.graph_rows = {1, int(env("GLM_MTP_DEPTH", "3")) + 1}
+            self.mtp_graph_rows = max(1, int(env("GLM_MTP_DEPTH", "3")))
+        self.adapt_every = int(env("GLM_ADAPT_EVERY", "200"))
+        self.adapt_prefill_swaps = int(env("GLM_ADAPT_PREFILL_SWAPS", "2048"))
+        self.adapt_decode_swaps = int(env("GLM_ADAPT_DECODE_SWAPS", "256"))
+        self.adapt_margin = float(env("GLM_ADAPT_MARGIN", "1.5"))
         self.adapt_log = []
-        self.adapt_cross_layer = env("MUSE_ADAPT_CROSS_LAYER", "1") == "1"
+        self.adapt_cross_layer = env("GLM_ADAPT_CROSS_LAYER", "1") == "1"
         # Expert reads that bypass the page cache (O_DIRECT) need no drop_cache() after a swap.
         self.reads_direct = self.ck.direct and (self.x3pack is None or self.x3pack.dfd is not None)
-        # Background expert reads during decode (MUSE_BG=1): every MUSE_BG_EVERY decode rounds,
+        # Background expert reads during decode (GLM_BG=1): every GLM_BG_EVERY decode rounds,
         # rank 0 ranks the non-resident experts by their recent router mass (decayed by
-        # MUSE_BG_DECAY a period), picks up to MUSE_BG_READS of them and a cold resident victim
+        # GLM_BG_DECAY a period), picks up to GLM_BG_READS of them and a cold resident victim
         # for each; both ranks read them on the thread pool while decode goes on and install
         # them at the next period boundary. bg_step() has the rules.
-        self.bg_on = env("MUSE_BG", "0") == "1"
-        self.bg_every = max(1, int(env("MUSE_BG_EVERY", "2")))
-        self.bg_reads = int(env("MUSE_BG_READS", "48"))
-        self.bg_decay = float(env("MUSE_BG_DECAY", "0.7"))
-        self.bg_protect = int(env("MUSE_BG_PROTECT", "8"))
-        self.bg_cold = float(env("MUSE_BG_COLD", "0.01"))   # victims: recent router mass below this
-        if env("MUSE_ADAPT", "1") == "1" and self.miss == "substitute":
-            self.enable_adaptation(float(env("MUSE_ADAPT_DECAY", "0.9")))
-        if env("MUSE_MISS_LOG", "1") == "1" and self.miss == "substitute":
+        self.bg_on = env("GLM_BG", "0") == "1"
+        self.bg_every = max(1, int(env("GLM_BG_EVERY", "2")))
+        self.bg_reads = int(env("GLM_BG_READS", "48"))
+        self.bg_decay = float(env("GLM_BG_DECAY", "0.7"))
+        self.bg_protect = int(env("GLM_BG_PROTECT", "8"))
+        self.bg_cold = float(env("GLM_BG_COLD", "0.01"))   # victims: recent router mass below this
+        if env("GLM_ADAPT", "1") == "1" and self.miss == "substitute":
+            self.enable_adaptation(float(env("GLM_ADAPT_DECAY", "0.9")))
+        if env("GLM_MISS_LOG", "1") == "1" and self.miss == "substitute":
             self.miss_stats = {"picks": 0, "missed": 0, "mass": 0.0, "mass_missed": 0.0}
         torch.cuda.synchronize()
         self.log(f"[glm] rank {r}/{W} ready in {time.perf_counter() - t0:.1f}s: dense {self.dense_bytes / 1e9:.2f} GB, "
@@ -397,17 +397,17 @@ class GlmTP:
                  f"({(self.arena.bytes_per_slot * self.arena.slots + (self.x3.total_bytes if self.x3 else 0)) / 1e9:.2f} GB"
                  f"{', routed EXL3' if self.x3 else ''}), miss={self.miss}, "
                  f"max_seq {self.max_seq}; {mem_available() / 1e9:.1f} GB available")
-        # MUSE_PREFIX_DISK=1: prompt prefixes saved to disk after each prefill and restored when a
+        # GLM_PREFIX_DISK=1: prompt prefixes saved to disk after each prefill and restored when a
         # later prompt starts with one (engine/glm/prefix_store.py). Budget a node, decimal GB;
-        # no save while it would leave less than MUSE_PREFIX_DISK_FREE_GB free.
+        # no save while it would leave less than GLM_PREFIX_DISK_FREE_GB free.
         self.pstore, self.h_from = None, 0
-        self.prefix_min = int(env("MUSE_PREFIX_DISK_MIN", "256"))           # tokens a restore must gain
-        self.prefix_min_save = int(env("MUSE_PREFIX_DISK_MIN_SAVE", "256"))  # tokens a segment must add
-        if env("MUSE_PREFIX_DISK", "0") == "1":
+        self.prefix_min = int(env("GLM_PREFIX_DISK_MIN", "256"))           # tokens a restore must gain
+        self.prefix_min_save = int(env("GLM_PREFIX_DISK_MIN_SAVE", "256"))  # tokens a segment must add
+        if env("GLM_PREFIX_DISK", "0") == "1":
             from .prefix_store import PrefixStore
-            self.pstore = PrefixStore(env("MUSE_PREFIX_DISK_DIR", "/app/results/glm-prefix"), self._prefix_ns(), r, W,
-                                      int(float(env("MUSE_PREFIX_DISK_GB", "20")) * 1e9),
-                                      int(float(env("MUSE_PREFIX_DISK_FREE_GB", "10")) * 1e9),
+            self.pstore = PrefixStore(env("GLM_PREFIX_DISK_DIR", "/app/results/glm-prefix"), self._prefix_ns(), r, W,
+                                      int(float(env("GLM_PREFIX_DISK_GB", "20")) * 1e9),
+                                      int(float(env("GLM_PREFIX_DISK_FREE_GB", "10")) * 1e9),
                                       log=lambda m: print(f"{m} (rank {r})", flush=True), gpu_lock=self.capture_lock)
             self.log(f"[prefix] {len(self.pstore.segs())} saved segment(s) in {self.pstore.dir}")
         self.reset()
@@ -434,16 +434,16 @@ class GlmTP:
         mine = {"version": VERSION, "code": digest, "miss": self.miss, "native": self.native,
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
-                "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"), "db": env("MUSE_STATS_DB", ""),
-                "xfmt": self.xfmt, "kv": env("MUSE_KV", "bf16"), "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "fused_norm": FUSED_NORM, "h_ring": self.h_ring_n, "fixed_dense": self.fixed_dense, "exl3_attn": self.exl3_attn, "kv_split": self.kv_split, "prefix_disk": env("MUSE_PREFIX_DISK", "0"), "kvb_fp8": self.kvb_fp8, "embed_q": self.embed_q, "router_bf16": self.router_bf16, "draft_head": env("MUSE_DRAFT_HEAD", "same"), "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
-                "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_PF_KEEP", "MUSE_PF_KEEP_MARGIN", "MUSE_HOT", "MUSE_HOT_MIN",
-                                            "MUSE_HOT_TARGET", "MUSE_HOT_KEEP", "MUSE_HOT_MAX", "MUSE_HOT_KEEP_AUDIT", "MUSE_HOT_PACE",
-                                            "MUSE_HOT_PACE_LEAD", "MUSE_SUB_WEIGHT", "MUSE_MTP_FULL", "MUSE_MISS_LOG",
-                                            "MUSE_MTP_DYN")],
-                "adapt": [env(k, "") for k in ("MUSE_ADAPT", "MUSE_ADAPT_EVERY", "MUSE_ADAPT_PREFILL_SWAPS",
-                                               "MUSE_ADAPT_DECODE_SWAPS", "MUSE_ADAPT_DECAY", "MUSE_ADAPT_CROSS_LAYER",
-                                               "MUSE_ADAPT_MARGIN", "MUSE_BG", "MUSE_BG_EVERY", "MUSE_BG_READS",
-                                               "MUSE_BG_DECAY", "MUSE_BG_PROTECT", "MUSE_BG_COLD", "MUSE_WARMUP")],
+                "head": env("GLM_HEAD", "bf16"), "depth": env("GLM_MTP_DEPTH", "3"), "db": env("GLM_STATS_DB", ""),
+                "xfmt": self.xfmt, "kv": env("GLM_KV", "bf16"), "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "fused_norm": FUSED_NORM, "h_ring": self.h_ring_n, "fixed_dense": self.fixed_dense, "exl3_attn": self.exl3_attn, "kv_split": self.kv_split, "prefix_disk": env("GLM_PREFIX_DISK", "0"), "kvb_fp8": self.kvb_fp8, "embed_q": self.embed_q, "router_bf16": self.router_bf16, "draft_head": env("GLM_DRAFT_HEAD", "same"), "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
+                "pf": [env(k, "") for k in ("GLM_PF", "GLM_PF_SLOTS", "GLM_PF_MIN_ROWS", "GLM_PF_KEEP", "GLM_PF_KEEP_MARGIN", "GLM_HOT", "GLM_HOT_MIN",
+                                            "GLM_HOT_TARGET", "GLM_HOT_KEEP", "GLM_HOT_MAX", "GLM_HOT_KEEP_AUDIT", "GLM_HOT_PACE",
+                                            "GLM_HOT_PACE_LEAD", "GLM_SUB_WEIGHT", "GLM_MTP_FULL", "GLM_MISS_LOG",
+                                            "GLM_MTP_DYN")],
+                "adapt": [env(k, "") for k in ("GLM_ADAPT", "GLM_ADAPT_EVERY", "GLM_ADAPT_PREFILL_SWAPS",
+                                               "GLM_ADAPT_DECODE_SWAPS", "GLM_ADAPT_DECAY", "GLM_ADAPT_CROSS_LAYER",
+                                               "GLM_ADAPT_MARGIN", "GLM_BG", "GLM_BG_EVERY", "GLM_BG_READS",
+                                               "GLM_BG_DECAY", "GLM_BG_PROTECT", "GLM_BG_COLD", "GLM_WARMUP")],
                 "fast_comm": self.comm.fast,
                 "config": json.dumps({k: v for k, v in self.cfg.extra["raw"].items()
                                       if k != "quantization_config"}, sort_keys=True)}
@@ -457,27 +457,27 @@ class GlmTP:
         self.embed = ck.get_rows(P + "embed_tokens.weight", r * self.vl, (r + 1) * self.vl)
         self.embed = _q8_rows(self.embed, d, self.embed_q) if self.embed_q else self.embed.to(d)
         head = ck.get_rows("lm_head.weight", r * self.vl, (r + 1) * self.vl)
-        # MUSE_DRAFT_HEAD=mxfp4: the MTP drafts score with a 4-bit copy of the head (engine/glm/
+        # GLM_DRAFT_HEAD=mxfp4: the MTP drafts score with a 4-bit copy of the head (engine/glm/
         # mxfp4_dense.gemv, ~0.25 GB a rank): the head is half of a draft's reads. Verification keeps
         # the main head, so this can only move acceptance.
         self.draft_head = None
-        if self.mtp_on and env("MUSE_DRAFT_HEAD", "same") == "mxfp4":
+        if self.mtp_on and env("GLM_DRAFT_HEAD", "same") == "mxfp4":
             from .mxfp4_dense import quantize
             self.draft_head = quantize(head.to(d))
-        if env("MUSE_HEAD", "bf16") == "fp8":
+        if env("GLM_HEAD", "bf16") == "fp8":
             # Halves the largest single read of a decode step (vocab 154880: ~0.95 GB a rank).
             from .weights import _fp8_quant
             head = FP8Block(*_fp8_quant(head.to(d)))    # (not hq, hs: hq is the q head width below)
         self.head = Lin(head, d)
         self.final_norm = ck.get(P + "norm.weight").to(d)
         self.L = []
-        # MUSE_EXL3_ATTN=1: the decoder layers' q_a, q_b, kv_a, o_proj and indexer wq_b from the EXL3
-        # checkpoint's 5-bit matrices (engine/glm/exl3_attn.py), mounted at MUSE_EXL3_ATTN_SRC; the
+        # GLM_EXL3_ATTN=1: the decoder layers' q_a, q_b, kv_a, o_proj and indexer wq_b from the EXL3
+        # checkpoint's 5-bit matrices (engine/glm/exl3_attn.py), mounted at GLM_EXL3_ATTN_SRC; the
         # MTP layer keeps FP8. Splits follow the FP8 ones: q_b by heads (N), o_proj by heads (K).
         x3a = None
         if self.exl3_attn:
             from .exl3_attn import Exl3Source
-            x3a = Exl3Source(env("MUSE_EXL3_ATTN_SRC", "/exl3src"))
+            x3a = Exl3Source(env("GLM_EXL3_ATTN_SRC", "/exl3src"))
         nbytes = sum(t.numel() * t.element_size() for t in (self.embed if self.embed_fp8 else (self.embed,))) \
             + self.head.nbytes + (
             sum(t.numel() for t in self.draft_head) if self.draft_head is not None else 0)
@@ -542,7 +542,7 @@ class GlmTP:
         self.ck.drop_cache()
 
     def split(self, L):
-        """Whether layer L's KV cache is split across the ranks (MUSE_KV_SPLIT; never the MTP layer)."""
+        """Whether layer L's KV cache is split across the ranks (GLM_KV_SPLIT; never the MTP layer)."""
         return self.kv_split and L != self.mtp_L
 
     def _alloc_cache(self):
@@ -570,10 +570,10 @@ class GlmTP:
         # max_seq (~12 KB a position, 400 MB at 32K): a ring of one chunk refused reuse whenever
         # the previous turn ran a chunk past the shared prefix -- every chat turn whose answer
         # (reasoning included) passed 1,024 tokens re-prefilled the whole conversation.
-        # MUSE_H_RING (default 16,384) bounds it: a reuse boundary older than the ring skips the
+        # GLM_H_RING (default 16,384) bounds it: a reuse boundary older than the ring skips the
         # MTP redo -- that one draft position keeps its old entry, which can only cost
         # acceptance (the target verifies every draft). At 128K the full ring was 0.8 GB a rank.
-        self.h_ring_n = min(self.max_seq, int(env("MUSE_H_RING", "16384")))
+        self.h_ring_n = min(self.max_seq, int(env("GLM_H_RING", "16384")))
         if self.kv8:
             self.h_ring = (torch.zeros((self.h_ring_n, cfg.hidden), **f8), torch.zeros((self.h_ring_n, 1), **f32))
         else:
@@ -663,7 +663,7 @@ class GlmTP:
         return self.comm.broadcast_obj(plan)
 
     def _load_db(self):
-        self.db_path = env("MUSE_STATS_DB", "")
+        self.db_path = env("GLM_STATS_DB", "")
         self.db_mass, self.db_tokens = None, 0
         if self.rank == 0 and self.db_path and Path(self.db_path).exists():
             db = torch.load(self.db_path, map_location="cpu", weights_only=True)
@@ -694,12 +694,12 @@ class GlmTP:
     def _place_resident(self, resident=None):
         cfg = self.cfg
         self._load_db()
-        if resident is None and not env("MUSE_RESIDENT", ""):
+        if resident is None and not env("GLM_RESIDENT", ""):
             resident = self._db_resident()
             if resident:
                 self.log(f"[glm] resident set from the stats DB ({self.db_tokens} tokens of routing)")
-        if resident is None and env("MUSE_RESIDENT", ""):
-            raw = json.loads(Path(env("MUSE_RESIDENT", "")).read_text())
+        if resident is None and env("GLM_RESIDENT", ""):
+            raw = json.loads(Path(env("GLM_RESIDENT", "")).read_text())
             raw = raw.get("resident", raw)
             resident = {int(k): [int(e) for e in v] for k, v in raw.items()}
         if resident is not None:
@@ -748,7 +748,7 @@ class GlmTP:
         the NVMe queue full (one at a time ran at ~0.7 GB/s)."""
         if not hasattr(self, "_pool"):
             from concurrent.futures import ThreadPoolExecutor
-            self._pool = ThreadPoolExecutor(max_workers=int(env("MUSE_READ_THREADS", "12")))
+            self._pool = ThreadPoolExecutor(max_workers=int(env("GLM_READ_THREADS", "12")))
         return list(self._pool.map(lambda e: self._expert_parts(L, e), experts))
 
     def _put(self, slot, parts):
@@ -902,8 +902,8 @@ class GlmTP:
            resident -- decided on the shared lut, so both ranks agree.
         2. Rank 0 plans the next reads: candidates are non-resident experts by bg_score (router
            mass of the recent periods, decayed); victims are resident experts whose recent mass is
-           below MUSE_BG_COLD (decay never reaches zero), not filled by a background read in the
-           last MUSE_BG_PROTECT periods, the lowest long-term score first, never taking a layer
+           below GLM_BG_COLD (decay never reaches zero), not filled by a background read in the
+           last GLM_BG_PROTECT periods, the lowest long-term score first, never taking a layer
            below 2 x top-k. Broadcast, then both ranks
            submit the reads and return to decoding."""
         st = self.bg_stats
@@ -1255,7 +1255,7 @@ class GlmTP:
         return torch.cat([slots, fixed], 1).contiguous(), torch.cat([w, ones], 1)
 
     def _sub_weights(self, cfg, lw, x, ids):
-        """MUSE_SUB_WEIGHT=exact|transfer for the substituted picks ``ids`` (graph-safe)."""
+        """GLM_SUB_WEIGHT=exact|transfer for the substituted picks ``ids`` (graph-safe)."""
         from .ref import route
         sc = F.linear(x.float(), lw["router"].float()).sigmoid()            # [T, E]
         w0, ids0 = route(cfg, x, lw["router"], lw["bias"], None)
@@ -1359,7 +1359,7 @@ class GlmTP:
 
     def _pf_predict(self, L, x):
         """Prefill: run the next layer's router on this layer's MLP input, sum the router mass
-        over the chunk's rows, and read the heaviest non-resident experts (up to MUSE_PF_SLOTS)
+        over the chunk's rows, and read the heaviest non-resident experts (up to GLM_PF_SLOTS)
         into the next layer's transient buffer while this layer and the next attention compute.
         Rank 0 decides (the same experts must land on both ranks); a misprediction only costs the
         read -- the next layer's router still decides, over resident + prefetched experts."""
@@ -1378,7 +1378,7 @@ class GlmTP:
             plan = [(e, None) for e in es]
             if self.pf_keep and es and self.demand is not None:
                 # Kept only if it ranks in: its long-term score + this request's demand + the
-                # predicted mass beats the victim's by the adaptation margin (MUSE_PF_KEEP_MARGIN).
+                # predicted mass beats the victim's by the adaptation margin (GLM_PF_KEEP_MARGIN).
                 cs = (self.score[N] + self.demand[N] + mass)[es].tolist()
                 plan = [(e, v) for e, v in zip(es, self._pf_victims(cs))]
         plan = self.comm.broadcast_obj(plan)
@@ -1469,7 +1469,7 @@ class GlmTP:
             self.pf_stats["promoted"] = self.pf_stats.get("promoted", 0) + 1
 
     def _hot_keep(self, L, items):
-        """MUSE_HOT_KEEP: copy each hot read from its transient slot over the next queued victim that
+        """GLM_HOT_KEEP: copy each hot read from its transient slot over the next queued victim that
         still holds its slot (stream-ordered after this layer's MLP), repoint the lut, and protect it
         from background eviction like a background install. The queue, the hot reads and owner are
         the same on both ranks, so both keep the same experts in the same slots."""
@@ -1499,8 +1499,8 @@ class GlmTP:
             st["kept"] += 1
 
     def _hot_stream(self, L, x):
-        """Decode: read this layer's heaviest missed picks (weight share >= MUSE_HOT_MIN, up to
-        MUSE_HOT) now and allow them for this layer only. Both ranks route the same replicated
+        """Decode: read this layer's heaviest missed picks (weight share >= GLM_HOT_MIN, up to
+        GLM_HOT) now and allow them for this layer only. Both ranks route the same replicated
         x with the same weights, so they choose the same experts (as _route already relies on)."""
         from .ref import route
         cfg = self.cfg
@@ -1898,10 +1898,10 @@ class GlmTP:
     def _prefix_ns(self) -> str:
         """Everything that changes what a cached row means (engine/glm/prefix_store.py)."""
         cfg_bytes = (Path(self.model_dir) / "config.json").read_bytes()
-        key = {"code": self.code_digest, "kv": env("MUSE_KV", "bf16"), "split": self.kv_split, "world": self.world,
+        key = {"code": self.code_digest, "kv": env("GLM_KV", "bf16"), "split": self.kv_split, "world": self.world,
                "xfmt": self.xfmt, "x3": self.x3pack.reader.header.get("dims") if self.x3pack else None,
                "exl3_attn": self.exl3_attn, "model": hashlib.sha256(cfg_bytes).hexdigest(), "dir": str(self.model_dir),
-               "pack": env("MUSE_EXL3_PACK", ""),
+               "pack": env("GLM_EXL3_PACK", ""),
                "numerics": [FUSED_NORM, self.attn_kernel, self.index_kernel, self.fixed_dense, self.gather_merge,
                             self.native, self.prefill_moe, self.miss, self.kvb_fp8, self.embed_q, self.router_bf16]}
         return hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:16]
@@ -2003,12 +2003,12 @@ class GlmTP:
         return int(torch.multinomial(self.sample_probs(z, temperature, top_p, top_k), 1, generator=gen))
 
     def _nvme_awake(self, on: bool):
-        """MUSE_NVME_KEEPALIVE_MS (default 50): while a request generates, a 4 KB O_DIRECT read that
+        """GLM_NVME_KEEPALIVE_MS (default 50): while a request generates, a 4 KB O_DIRECT read that
         often keeps the expert drive out of its power-saving states. Hot reads come a few a round
         and rounds are ~190 ms apart; the Samsung drive here sleeps after ~100-200 ms idle and the
         next read then takes 10.3 ms instead of 1.2 (hot reads: p50 1.3, p90 10.3 ms). Reads only,
         on this rank's own drive; nothing numeric."""
-        ms = float(env("MUSE_NVME_KEEPALIVE_MS", "50"))
+        ms = float(env("GLM_NVME_KEEPALIVE_MS", "50"))
         if not on or not ms:
             ev = getattr(self, "_awake", None)
             if ev is not None:
@@ -2049,8 +2049,8 @@ class GlmTP:
         """Generate; with the MTP layer, speculative rounds of ``depth`` drafts. Rank 0 decides
         every token and broadcasts; both ranks run the same calls."""
         stop = self.cfg.eos if stop is None else stop
-        depth = int(env("MUSE_MTP_DEPTH", "3")) if depth is None else depth
-        # MUSE_MTP_DYN=tau: depth is the most drafts a round; a draft is kept only while the
+        depth = int(env("GLM_MTP_DEPTH", "3")) if depth is None else depth
+        # GLM_MTP_DYN=tau: depth is the most drafts a round; a draft is kept only while the
         # product of the drafts' own probabilities (the MTP's softmax at the drafted token) stays
         # at or above tau, so the verify step takes 1 + kept rows. 0: always `depth` drafts.
         dyn = self.mtp_dyn
@@ -2103,7 +2103,7 @@ class GlmTP:
                 anchor = decide(self.sample(logits[-1], temperature, top_p, top_k, gen) if self.rank == 0 else None)
                 continue
             # Drafts: the MTP layer at P-1 (anchor, target hidden at P-1), then on its own output.
-            # Under MUSE_MTP_DYN rank 0 decides whether each draft is kept (and which it is), so
+            # Under GLM_MTP_DYN rank 0 decides whether each draft is kept (and which it is), so
             # both ranks run the same MTP calls and verify the same rows.
             drafts, qs, confs, conf = [], [], [], 1.0
             hm, z = self.mtp_forward(torch.tensor([anchor], device=self.dev), h_last, P - 1)
@@ -2179,7 +2179,7 @@ class GlmTP:
             anchor = nxt
 
     def warmup(self, tokens: int = 48):
-        """MUSE_WARMUP (default 1): capture the decode graphs before the first request. Dynamic MTP
+        """GLM_WARMUP (default 1): capture the decode graphs before the first request. Dynamic MTP
         depth captures a split set per verify row count and MTP graphs per fill size the first time
         each occurs, so the first request after boot ran ~40% slower. Two short greedy generations
         on synthetic tokens -- a repeating pattern (confident drafts, deep verify steps) and an
@@ -2187,7 +2187,7 @@ class GlmTP:
         counters live (a capture bakes in what runs), so those stay on and are zeroed after;
         adaptation and the background step are skipped, so residency and the stats DB are
         untouched. Both ranks run the same calls."""
-        if not tokens or not self.use_graphs or env("MUSE_WARMUP", "1") != "1":
+        if not tokens or not self.use_graphs or env("GLM_WARMUP", "1") != "1":
             return
         t0 = time.perf_counter()
         self._warming = True

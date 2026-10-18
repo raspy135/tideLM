@@ -1,6 +1,6 @@
 """GLM-5.3 on the real weights: greedy generation from three chat prompts, plain and with MTP
 drafts at several depths. Prints text samples, tok/s (prefill excluded) and accepted drafts a round.
-    MUSE_MODEL_DIR=~/models/GLM-5.3-... tools/muse_pair_run.sh glm_probe.py --tokens 128"""
+    GLM_MODEL_DIR=~/models/GLM-5.3-... tools/muse_pair_run.sh glm_probe.py --tokens 128"""
 import argparse
 import json
 import os
@@ -22,7 +22,7 @@ PROMPTS = [
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=os.environ.get("MUSE_MODEL", "/models"))
+    ap.add_argument("--model", default=os.environ.get("GLM_MODEL", "/models"))
     ap.add_argument("--tokens", type=int, default=128)
     ap.add_argument("--depths", default="0,1,2,3")
     ap.add_argument("--effort", default="low")

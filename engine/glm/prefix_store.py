@@ -1,4 +1,4 @@
-"""Prompt prefixes kept on disk across requests, conversations and restarts (MUSE_PREFIX_DISK=1).
+"""Prompt prefixes kept on disk across requests, conversations and restarts (GLM_PREFIX_DISK=1).
 
 GLM's state after a prompt is its KV rows -- the MLA latent, the RoPE keys, the indexer keys, per
 layer -- plus the MTP layer's input hidden at the last position. The in-memory cache (GlmTP.
@@ -55,7 +55,7 @@ def tok_bytes(tokens) -> bytes:
 
 class PrefixStore:
     """One rank's segments. The engine's layout lists the cache tensors as (name, tensor [rows,
-    ...], mode): "split" -- row j holds position j * world + rank (MUSE_KV_SPLIT); "full" -- row p
+    ...], mode): "split" -- row j holds position j * world + rank (GLM_KV_SPLIT); "full" -- row p
     holds position p; "mtp" -- the MTP layer's, whose row p is made with token p + 1, so a segment
     of positions [start, end) holds its rows [start - 1, end - 1): the ones its tokens determine.
     Its last row is redone at a restore that comes with the hidden (GlmTP.prefill)."""

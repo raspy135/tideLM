@@ -34,10 +34,10 @@ class GlmCheckpoint(Checkpoint):
     def __init__(self, model_dir: str | Path):
         super().__init__(model_dir, detect=False)
         self.format = "glm-quark"
-        # MUSE_CK_DIRECT=1: get_rows_many (the MXFP4 expert reads: hot reads, swaps, placement)
+        # GLM_CK_DIRECT=1: get_rows_many (the MXFP4 expert reads: hot reads, swaps, placement)
         # with O_DIRECT into pooled aligned buffers, every range of a call in parallel. A rank-half
         # expert is six ranges (weight + scale of gate, up, down), split by the other rank's rows.
-        self.direct = os.environ.get("MUSE_CK_DIRECT", "1") == "1"
+        self.direct = os.environ.get("GLM_CK_DIRECT", "1") == "1"
         self._dfds, self._dpool, self._spans = {}, None, {}
 
     def get_rows_many(self, specs, urgent: bool = False) -> list[torch.Tensor]:
@@ -76,7 +76,7 @@ class GlmCheckpoint(Checkpoint):
         if self._dpool is None:
             with _OPEN_LOCK:
                 if self._dpool is None:
-                    self._dpool = BufPool(align_up(max(total, 1) + (1 << 20)), int(os.environ.get("MUSE_CK_BUFS", "8")))
+                    self._dpool = BufPool(align_up(max(total, 1) + (1 << 20)), int(os.environ.get("GLM_CK_BUFS", "8")))
         lease = self._dpool.lease(total)
         mv = memoryview(lease.mm)
         jobs = []

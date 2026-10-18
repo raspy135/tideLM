@@ -3,7 +3,7 @@ head, and the post-prefill adaptation, each bracketed with CUDA events (eager pr
 spans are the GPU time of those calls plus any host gaps inside them), and optionally a kernel
 table for one chunk.
 
-    MUSE_ENV="..." tools/muse_pair_run.sh glm_prefill_prof.py --long-tokens 6000 --kernels 1
+    GLM_ENV="..." tools/muse_pair_run.sh glm_prefill_prof.py --long-tokens 6000 --kernels 1
 """
 import argparse
 import collections
@@ -21,7 +21,7 @@ from server.glm_app import GlmTemplate  # noqa: E402
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=os.environ.get("MUSE_MODEL", "/models"))
+    ap.add_argument("--model", default=os.environ.get("GLM_MODEL", "/models"))
     ap.add_argument("--long-tokens", type=int, default=6000)
     ap.add_argument("--kernels", type=int, default=0, help="then profile this many chunks' kernels")
     ap.add_argument("--kernels-after", type=int, default=4, help="... after this many unprofiled chunks")

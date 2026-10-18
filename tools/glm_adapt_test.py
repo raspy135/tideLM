@@ -22,7 +22,7 @@ PROMPT = [{"role": "user", "content": "Write a Python function that parses an IS
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=os.environ.get("MUSE_MODEL", "/models"))
+    ap.add_argument("--model", default=os.environ.get("GLM_MODEL", "/models"))
     ap.add_argument("--tokens", type=int, default=128)
     ap.add_argument("--rounds", type=int, default=6)
     ap.add_argument("--window", type=int, default=32)

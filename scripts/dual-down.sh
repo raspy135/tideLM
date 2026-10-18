@@ -12,7 +12,9 @@ declare -A _CLI=()
 for v in STOP_TIMEOUT MIN_FREE_GIB PEER NAME0 NAME1; do
     [[ -n "${!v:-}" ]] && _CLI[$v]="${!v}"
 done
-[[ -f .env ]] && { set -a; . ./.env; set +a; }
+_env="${TIDE_ENV_FILE:-.env}"   # the profile scripts/tide-up.sh started, else .env
+case "$_env" in */*) ;; *) _env="./$_env" ;; esac   # `.` would search PATH for a bare name
+[[ -f "$_env" ]] && { set -a; . "$_env"; set +a; }
 for v in "${!_CLI[@]}"; do printf -v "$v" '%s' "${_CLI[$v]}"; export "${v?}"; done
 # The GLM pair (scripts/glm-up.sh) takes its peer from .env.glm.
 [[ -z "${PEER:-}" && -f .env.glm ]] && PEER=$(sed -n 's/^PEER=//p' .env.glm | tail -1)

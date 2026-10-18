@@ -35,7 +35,7 @@ RAW = {"text_config": {
     "residual_gate_temperature": 0.3, "routed_scaling_factor": 1.0, "num_shared_experts": 0,
     "bos_token_id": 1, "eos_token_id": 2, "pad_token_id": 0,
 }}
-MODEL = Path(os.environ.get("MUSE_SYNTH_DIR", "/app/results/muse-synth-v2"))
+MODEL = Path(os.environ.get("GLM_MUSE_SYNTH_DIR", "/app/results/muse-synth-v2"))
 FAILED = []
 
 

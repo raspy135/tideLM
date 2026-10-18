@@ -56,7 +56,7 @@ class DraftOptions:
     def from_env(cls) -> "DraftOptions":
         o = cls()
         for k in o.__dataclass_fields__:
-            v = os.environ.get(f"MUSE_DRAFT_{k.upper()}")
+            v = os.environ.get(f"GLM_DRAFT_{k.upper()}")
             if v is not None:
                 t = type(getattr(o, k))
                 setattr(o, k, (v == "1") if t is bool else t(v))
@@ -84,7 +84,7 @@ class DSpark:
         self.softcap = float(cfg.get("output_soft_cap_temp", 20.0))
         metap = cfg.get("metap") or {}
         self.mult = (float(metap.get("base_width", 256)) / self.H) ** 0.5 if metap.get("use_metap") else 1.0
-        fmt = fmt or os.environ.get("MUSE_DRAFT_DENSE", eng.dense_fmt)
+        fmt = fmt or os.environ.get("GLM_DRAFT_DENSE", eng.dense_fmt)
         h = Checkpoint(path, detect=False)        # preadv reads (see Checkpoint._read)
 
         def rows(name, total):

@@ -215,7 +215,7 @@ def engine_loop(engine, jobs: "queue.Queue[Job]", log, tpl: Template, stop: tupl
     # group's timeout bounds (DSV41_DIST_TIMEOUT_S): a GLM pair left idle for 30 min lost rank 1
     # to that timeout and the next request crashed rank 0 on the closed pair. The ping is sent
     # from this thread, so it can never land between a request's broadcast and its generate.
-    ping = float(os.environ.get("MUSE_PING_S", max(30.0, float(os.environ.get("DSV41_DIST_TIMEOUT_S", "600")) / 4)))
+    ping = float(os.environ.get("GLM_PING_S", max(30.0, float(os.environ.get("DSV41_DIST_TIMEOUT_S", "600")) / 4)))
     while True:
         try:
             job = jobs.get(timeout=ping)
@@ -387,9 +387,10 @@ def make_handler(tpl: Template, jobs, model_name: str, defaults: dict, parser_cl
 
             last = [time.monotonic()]
 
-            def send(delta, finish=None):
+            def send(delta, finish=None, **extra):
                 chunk = {"id": rid, "object": "chat.completion.chunk", "created": int(time.time()),
-                         "model": model_name, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+                         "model": model_name, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                         **extra}
                 self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
                 self.wfile.flush()
                 last[0] = time.monotonic()
@@ -413,7 +414,11 @@ def make_handler(tpl: Template, jobs, model_name: str, defaults: dict, parser_cl
                 if calls:
                     send({"tool_calls": [dict(c, index=i) for i, c in enumerate(calls)]})
                 finish = "tool_calls" if calls else ("length" if n >= job.params["max_tokens"] else "stop")
-                send({}, finish)
+                # usage and the engine's stats ride the final chunk, as on the DS server: a streamed
+                # client (bench/bench.py, Open WebUI) otherwise has no token count to divide by
+                send({}, finish, usage={"prompt_tokens": len(job.prompt), "completion_tokens": n,
+                                        "total_tokens": len(job.prompt) + n, "muse": job.stats},
+                     x_engine_stats=job.stats)
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
@@ -428,10 +433,10 @@ def serve(engine, tpl, parser_cls, args):
     """Rank 0's HTTP server and engine loop (rank 1 calls follower_loop)."""
     gen = json.loads((Path(args.model) / "generation_config.json").read_text()) \
         if (Path(args.model) / "generation_config.json").exists() else {}
-    defaults = {"max_tokens": int(os.environ.get("MUSE_DEFAULT_MAX_TOKENS", "4096")),
+    defaults = {"max_tokens": int(os.environ.get("GLM_DEFAULT_MAX_TOKENS", "4096")),
                 "temperature": float(gen.get("temperature", 1.0)), "top_p": float(gen.get("top_p", 1.0)),
                 "top_k": int(gen.get("top_k", 64 if "top_k" in gen else 0)),
-                "reasoning_effort": os.environ.get("MUSE_REASONING_EFFORT", "medium"),
+                "reasoning_effort": os.environ.get("GLM_REASONING_EFFORT", "medium"),
                 "max_seq": engine.max_seq}
     jobs: queue.Queue = queue.Queue(maxsize=64)
     server = ThreadingHTTPServer((args.host, args.port), make_handler(tpl, jobs, args.name, defaults, parser_cls))
@@ -447,7 +452,7 @@ def serve(engine, tpl, parser_cls, args):
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=os.environ.get("MUSE_MODEL", "/models"))
+    ap.add_argument("--model", default=os.environ.get("GLM_MODEL", "/models"))
     ap.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
     ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
     ap.add_argument("--name", default=os.environ.get("SERVED_MODEL_NAME", "muse-spark"))

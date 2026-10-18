@@ -1,11 +1,11 @@
-"""MUSE_PREFIX_DISK on the pair. Hard check: rows restored from disk are the bytes the prefill wrote
+"""GLM_PREFIX_DISK on the pair. Hard check: rows restored from disk are the bytes the prefill wrote
 (every cache tensor, both ranks; the MTP rows its tokens determine; the hidden). Softer check: a
 continuation decodes the same tokens whether its prefix was still in memory or came from disk, at
 the same boundary -- equal unless a row outside the restore (another prompt's computation of a
 shared system prefix) differs in a low bit, so it is reported, not asserted.
 
-  MUSE_ENV="MUSE_PREFIX_DISK=1 MUSE_PREFIX_DISK_DIR=/app/results/glm-prefix-test MUSE_ADAPT=0 \\
-            MUSE_HOT=0 MUSE_BG=0 ..." tools/muse_pair_run.sh glm_prefix_test.py --phase save
+  GLM_ENV="GLM_PREFIX_DISK=1 GLM_PREFIX_DISK_DIR=/app/results/glm-prefix-test GLM_ADAPT=0 \\
+            GLM_HOT=0 GLM_BG=0 ..." tools/muse_pair_run.sh glm_prefix_test.py --phase save
   ... the same with --phase load: a fresh pair restores the saved prefix and checks its bytes.
 
 Residency must stay fixed (no adaptation, hot reads or background swaps) for the decode check.
@@ -53,14 +53,14 @@ def compare(eng, snap, n, mtp_upto, lo=0):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=os.environ.get("MUSE_MODEL", "/models"))
+    ap.add_argument("--model", default=os.environ.get("GLM_MODEL", "/models"))
     ap.add_argument("--phase", choices=("save", "load"), required=True)
     ap.add_argument("--long-tokens", type=int, default=6000)
     ap.add_argument("--dir", default="/app/results/glm-prefix-test")
     a = ap.parse_args()
     tpl = GlmTemplate(a.model)
     eng = GlmTP(a.model)
-    assert eng.pstore is not None, "MUSE_PREFIX_DISK=1"
+    assert eng.pstore is not None, "GLM_PREFIX_DISK=1"
     docs = [json.loads(l)["text"] for l in open("/app/corpus/heldout_eval.jsonl")]
     body = tpl.encode("\n\n".join(docs))
     p1 = tpl.encode(tpl.render([{"role": "user", "content": tpl.tok.decode(body[:a.long_tokens])

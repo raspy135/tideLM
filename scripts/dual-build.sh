@@ -22,8 +22,9 @@ info() { echo "--- $*"; }
 err()  { echo "ERROR: $*" >&2; exit 1; }
 
 # shellcheck disable=SC1091
+_IMAGE_CLI="${IMAGE:-}"          # a caller's IMAGE=... names the build; .env's must not override it
 [[ -f .env ]] && { set -a; . ./.env; set +a; }
-IMAGE="${IMAGE:-deepseek-v41-flash-spark:local}"
+IMAGE="${_IMAGE_CLI:-${IMAGE:-tidelm:local}}"
 PEER="${PEER:-}"
 
 # The engine code this image will run (scripts/code_digest.sh), stamped as a label so dual-up.sh

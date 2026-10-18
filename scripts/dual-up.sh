@@ -53,8 +53,11 @@ done
 while IFS='=' read -r _k _; do
     [[ -n "$_k" ]] && _CLI[$_k]="${!_k}"
 done < <(env | grep -E '^DSV41_[A-Z0-9_]+=' | sort)
-# shellcheck disable=SC1091
-[[ -f .env ]] && { set -a; . ./.env; set +a; }
+# TIDE_ENV_FILE (scripts/tide-up.sh): the profile to serve; .env when unset.
+ENV_FILE="${TIDE_ENV_FILE:-.env}"
+[[ -n "${TIDE_ENV_FILE:-}" && ! -f "$ENV_FILE" ]] && err "no env file $ENV_FILE"
+# shellcheck disable=SC1090
+[[ -f "$ENV_FILE" ]] && { set -a; . "$ENV_FILE"; set +a; }
 for v in "${!_CLI[@]}"; do printf -v "$v" '%s' "${_CLI[$v]}"; export "${v?}"; done
 
 IMAGE="${IMAGE:-deepseek-v41-flash-spark:local}"

@@ -1,4 +1,4 @@
-"""Offline packer: GLM-5.3's EXL3 routed experts -> one aligned file per rank (MUSE_EXPERT_FORMAT=exl3).
+"""Offline packer: GLM-5.3's EXL3 routed experts -> one aligned file per rank (GLM_EXPERT_FORMAT=exl3).
 
 Reads `model.layers.{L}.mlp.experts.{E}.{gate,up,down}_proj.{trellis,suh,svh,mul1}` from an EXL3
 GLM-5.3 checkpoint (bertholomus/GLM-5.3-EXL3-3.0bpw: 3-bit routed experts on layers 3-77, 4-bit

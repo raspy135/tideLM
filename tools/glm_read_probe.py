@@ -1,6 +1,6 @@
 """Expert read latency inside a booted engine: idle, then interleaved with decode rounds.
 
-    MUSE_ENV="..." tools/muse_pair_run.sh glm_read_probe.py
+    GLM_ENV="..." tools/muse_pair_run.sh glm_read_probe.py
 """
 import random
 import sys

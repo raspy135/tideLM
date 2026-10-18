@@ -5,9 +5,9 @@ verification keeps the output the target's. This loads Muse once and, per varian
 drafter and runs greedy generation from a few chat prompts, reporting accepted drafts per round
 (the mean tokens a verify step yields is that + 1). Rank 0 prints a table and the best variant.
 
-    MUSE_MODEL_DIR=... MUSE_ENV="MUSE_DRAFTER=/drafter" tools/muse_pair_run.sh \\
+    GLM_MODEL_DIR=... GLM_ENV="GLM_DRAFTER=/drafter" tools/muse_pair_run.sh \\
         muse_dspark_probe.py --drafter /drafter --tokens 160
-(the runner mounts MUSE_MODEL_DIR at /models; mount the drafter via MUSE_EXTRA_MOUNT)
+(the runner mounts GLM_MODEL_DIR at /models; mount the drafter via GLM_EXTRA_MOUNT)
 """
 
 import argparse
@@ -35,7 +35,7 @@ PROMPTS = [
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=os.environ.get("MUSE_MODEL", "/models"))
+    ap.add_argument("--model", default=os.environ.get("GLM_MODEL", "/models"))
     ap.add_argument("--drafter", required=True)
     ap.add_argument("--tokens", type=int, default=160)
     ap.add_argument("--variants", default="default,tap=output,attn_scale=linear,qk_scale=1.0,"
@@ -44,7 +44,7 @@ def main():
     args = ap.parse_args()
     from muse_app import Template
     tpl = Template(args.model)
-    os.environ.pop("MUSE_DRAFTER", None)
+    os.environ.pop("GLM_DRAFTER", None)
     eng = MuseTP(args.model)
     prompts = [tpl.encode(tpl.render(m, None, args.effort)) for m in PROMPTS]
 

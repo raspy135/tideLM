@@ -1,4 +1,4 @@
-"""The KV cache split across the two ranks by position (MUSE_KV_SPLIT=1).
+"""The KV cache split across the two ranks by position (GLM_KV_SPLIT=1).
 
 GLM's MLA caches one latent row per position that every head reads, so tensor parallelism over
 heads leaves both ranks holding the whole cache: 54.7 KB a position a rank in FP8 (7.2 GB at 128K).

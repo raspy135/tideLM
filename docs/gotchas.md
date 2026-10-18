@@ -2614,7 +2614,7 @@ Workload: tools/glm_adapt_test.py, the one ISO-8601 coding prompt, 600 tokens x 
 7,524 of 19,456 routed experts resident, placement from the trained stats DB (328,554 tokens),
 decay 0.9, margin 1.5. Results in results/glm-freq/every-{64,200,600}/.
 
-| MUSE_ADAPT_EVERY | round 0 decode mass missed | round 2 | round 2 swaps (s) | churn r0/r1/r2 |
+| GLM_ADAPT_EVERY | round 0 decode mass missed | round 2 | round 2 swaps (s) | churn r0/r1/r2 |
 | --- | --- | --- | --- | --- |
 | 64 | 32.7% | 21.0% | 835 (9.7) | 0 / 0 / 0 |
 | 200 | 37.6% | 20.9% | 324 (3.5) | 39 / 13 / 3 |
@@ -2658,29 +2658,29 @@ Background streaming, simulated on a decode routing dump (`--dump`, tools/glm_bg
 
 ## GLM-5.3 background expert reads and prefill prefetch: what they buy (2026-10-16)
 
-Decode (MUSE_BG): every 2 rounds rank 0 ranks non-resident experts by recent router mass (decay
+Decode (GLM_BG): every 2 rounds rank 0 ranks non-resident experts by recent router mass (decay
 0.7 a period), reads up to 48 on the thread pool, installs them over cold residents at the next
 boundary. First version never planned after the first request: victims needed recent mass == 0,
 and a decayed score never reaches zero (4 reads in 1,200 tokens). Victims now need mass below
-MUSE_BG_COLD (0.01). glm_adapt_test, ISO prompt, eager, decode mass missed round 0 / 1 / 2:
+GLM_BG_COLD (0.01). glm_adapt_test, ISO prompt, eager, decode mass missed round 0 / 1 / 2:
 37.6 / 22.7 / 20.9% off, 24.2 / 20.4 / 19.8% on; reads waited 0.02 s in 600 tokens; ~14K
 installs a round (the budget is always spent -- it churns, and the settled gain is ~1 point).
 Speed, graphed, MTP depth 2, glm_probe 3 prompts x 400 tokens: 13.25 off, 12.03 at 24 reads,
 11.97 at 48; the off run's text was visibly broken ("the premise is flawed -- the sky isn't
 blue", "#!/usr/bin bash"), both on runs clean.
 
-Prefill (MUSE_PF): at each MLP the next layer's router runs on this layer's input; the chunk's
+Prefill (GLM_PF): at each MLP the next layer's router runs on this layer's input; the chunk's
 heaviest non-resident experts (by summed mass) are read into one of two transient buffers while
 this layer and the next attention compute, and are allowed for that layer only. 3,321-token
 prompt (engine/glm/ref.py), round 0: prefill mass missed 30.8% off; 18.4% with 32 a layer but
 TTFT 24.5 -> 43.6 s (18 s waiting: a 1,024-row layer is ~57 ms, 32 reads ~120 ms); 23.4% with
-16 a layer, TTFT 30.5 s, 3.4 s waiting. MUSE_READ_THREADS 12 -> 24 did not raise read speed (8
+16 a layer, TTFT 30.5 s, 3.4 s waiting. GLM_READ_THREADS 12 -> 24 did not raise read speed (8
 experts ~31 ms either way, ~2.6 GB/s a rank): the buffered read path is the limit, not threads.
 
 ## GLM-5.3 quality against the exact model: the heaviest miss matters more than its mass (2026-10-16)
 
 tools/glm_quality.py: three Tokyo-sightseeing chat prompts, 300 answer tokens each (generated once
-with background reads on), scored position by position against an exact run (MUSE_MISS=stream,
+with background reads on), scored position by position against an exact run (GLM_MISS=stream,
 teacher-forced prefill). Eval feeds the answer as decode steps, eager, DB snapshot at 372K tokens.
 NLL is not comparable here (the text is the background-reads model's own greedy output); top-1
 agreement and KL(exact || this) over exact's top-20 are.
@@ -2704,11 +2704,11 @@ another, each tensor's 256 KB pieces in parallel; all six tensors' pieces submit
 Hot reads have their own expert and piece pools: on the shared ones they queued behind up to 48
 background reads (9.7 ms a hot read in eager decode with background reads at 48).
 
-Graphs: decode with MUSE_HOT runs as per-layer graphs ([attention + hot candidate], [MLP]) with a
-host sync between; with no hot reads (MUSE_HOT_MIN=9) the samples are identical to the single
-graph at fixed MUSE_SLOTS (auto slots differ boot to boot -- an equality test must pin them),
+Graphs: decode with GLM_HOT runs as per-layer graphs ([attention + hot candidate], [MLP]) with a
+host sync between; with no hot reads (GLM_HOT_MIN=9) the samples are identical to the single
+graph at fixed GLM_SLOTS (auto slots differ boot to boot -- an equality test must pin them),
 3-4% slower. A fixed 0.2 threshold read in about half the layers of an MTP verify step (3 rows):
-4.85 tok/s. The threshold now tracks MUSE_HOT_TARGET reads a step. glm_probe, MTP depth 2,
+4.85 tok/s. The threshold now tracks GLM_HOT_TARGET reads a step. glm_probe, MTP depth 2,
 7,000 slots, background reads 8: 12.50 tok/s without hot reads, 10.63 at target 4 (threshold
 settles at 0.37 for 3 rows, 0.29 for 1), 8.98 at target 8.
 
@@ -2729,7 +2729,7 @@ slots, background reads 8, hot reads 1. Round 0 / round 1:
 | no prefetch, 512 post-prefill swaps | 22.0 / 20.1 | 33.0 / 28.9% | 36.3 / 35.8% |
 | prefetch 16 a layer | 32.8 / 29.0 | 25.0 / 21.9% | 36.6 / 39.5% |
 | prefetch 24 | 36.0 / 32.4 | 22.3 / 19.9% | 36.6 / 34.6% |
-| prefetch 24, keep every read (MUSE_PF_KEEP, no margin) | 51.4 / 50.5 | 25.7 / 26.5% | 39.7 / 37.8% |
+| prefetch 24, keep every read (GLM_PF_KEEP, no margin) | 51.4 / 50.5 | 25.7 / 26.5% | 39.7 / 37.8% |
 | prefetch 24, keep if it ranks in (margin 1.5) | 34.9 / 31.4 | 24.2 / 20.2% | 38.4 / 35.6% |
 
 Prefetch waits on reads for under 2 s; the rest of its ~9 s is the per-layer machinery (rank 0
@@ -2741,7 +2741,7 @@ Prefetch is off by default; post-prefill swaps 512.
 
 Also measured here: 256 KB read pieces for every read (not just urgent ones) made the prefill
 7 s slower (32.8 vs 39.8 s TTFT with prefetch 16) -- hundreds of small Python tasks a layer
-contend for the GIL with an eager prefill. Bulk reads use whole tensors (MUSE_READ_BULK_CHUNK_KB=0).
+contend for the GIL with an eager prefill. Bulk reads use whole tensors (GLM_READ_BULK_CHUNK_KB=0).
 
 Post-prefill swaps on short prompts (glm_quality, the three Tokyo prompts, eager, 7,000 slots,
 hot 1, background 8), all 900 positions / first (fresh-topic) answer: 512 swaps top-1 88.8% /
@@ -2769,13 +2769,13 @@ serving does; `--rows 1` steps one token at a time.
 - One-token steps rarely find 4 heavy misses, so the controller sat at its 0.2 floor there (0.200);
   in 3-row steps it rose (0.25 at the end of this eval, 0.37 in the probe) and the same config
   scored 0.299. Judge per-step policies with `--rows 3`.
-- Keeping a hot read (MUSE_HOT_KEEP: copied over a cold, lowest-ranked resident after its layer)
+- Keeping a hot read (GLM_HOT_KEEP: copied over a cold, lowest-ranked resident after its layer)
   cut reads 29% and KL 0.178 -> 0.152 at one row. A second read a layer bought nothing.
 - 0.2 -> 0.25 halved the reads (2,552 -> 1,064) and gave back most of the gain (KL 0.164 -> 0.257):
   misses at 0.20-0.25 of a token's routed weight matter.
 - A first-come cap lets earlier layers spend it and later layers' misses go unread. Cap 10 hit
   in 39% of 3-row steps and cost KL 0.172 -> 0.235 for 24% fewer reads (10% speed). Pacing it
-  over the layers (MUSE_HOT_PACE=g: by the i-th of n MoE layers, at most ceil(cap*((i+1)/n)^g))
+  over the layers (GLM_HOT_PACE=g: by the i-th of n MoE layers, at most ceil(cap*((i+1)/n)^g))
   recovers most of that -- 3-row eval, reads by quarter of the MoE layers:
 
   | cap 10 unless noted | KL / top-1 | reads | by quarter | tok/s |
@@ -2785,7 +2785,7 @@ serving does; `--rows 1` steps one token at a time.
   | g=0.5 (front-loaded) | 0.220 / 89.0% | 2,024 | 540 / 674 / 410 / 327 | -- |
   | **g=1 (even)** | 0.212 / 89.9% | 1,862 | 425 / 566 / 432 / 367 | 9.29 |
   | g=2 (back-loaded) | 0.231 / 89.1% | 1,500 | 234 / 376 / 412 / 407 | -- |
-  | g=1, may run 2 ahead (MUSE_HOT_PACE_LEAD=2) | 0.210 / 89.2% | 2,013 | 529 / 671 / 451 / 292 | -- |
+  | g=1, may run 2 ahead (GLM_HOT_PACE_LEAD=2) | 0.210 / 89.2% | 2,013 | 529 / 671 / 451 / 292 | -- |
   | g=1, cap 12 | 0.189 / 89.2% | 2,022 | 466 / 617 / 470 / 398 | 9.03 |
   | **g=1, cap 16** (default) | 0.171 / 90.9% | 2,224 | 502 / 737 / 501 / 415 | 8.95 |
 
@@ -2807,7 +2807,7 @@ serving does; `--rows 1` steps one token at a time.
 ## Substitute weights: the router's renormalization beats keeping exact weights (2026-10-16)
 
 A substituted top-k is renormalized over the picks it ended with, so a substitute's lower score
-also inflates the resident picks' weights. Two alternatives (MUSE_SUB_WEIGHT; glm_quality,
+also inflates the resident picks' weights. Two alternatives (GLM_SUB_WEIGHT; glm_quality,
 Tokyo, 3-row steps, hot 0.2 paced cap 12, KL to exact / top-1): renorm 0.189 / 89.2%; `exact`
 (resident picks keep their exact weights, substitutes their own score over the exact total)
 0.217 / 88.8%; `transfer` (each substitute takes a missed pick's exact weight) 0.217 / 89.3%.
@@ -2849,7 +2849,7 @@ two gathers) against a dequantized fp32 reference: rel err 3.5e-4 at T = 1, 3, 2
 
 Teacher-forced NLL on text neither checkpoint wrote (glm_quality --set natural: 12 of
 corpus/heldout_eval.jsonl, 64-token prompt, 300 scored, 3-row steps), every expert exact
-(MUSE_MISS=stream): MXFP4 1.6141, EXL3 1.6107. Serving config on MXFP4 (8,600 slots, hot 0.2
+(GLM_MISS=stream): MXFP4 1.6141, EXL3 1.6107. Serving config on MXFP4 (8,600 slots, hot 0.2
 paced cap 16, kept): 1.6697, +0.056 over its exact, KL 0.126, 23.8% of routed mass missed --
 code and docs miss more than the Tokyo set. The EXL3 serving run (11,756 slots, same memory) was
 stopped for serving before it finished. Caveat from the user, and fair: the corpus is mostly
@@ -2865,7 +2865,7 @@ split by TP): 96.6 KB a position a rank in BF16 -- 3.2 GB at 32K, 12.7 GB at 128
 512K -- plus the MTP hidden ring (12 KB a position). Decode's indexer also scans max_seq every
 step (CUDA graphs need a fixed S).
 
-MUSE_KV=fp8 caches the latent and the indexer keys as E4M3 with an fp32 scale per 128 values and
+GLM_KV=fp8 caches the latent and the indexer keys as E4M3 with an fp32 scale per 128 values and
 the MTP ring with one per row; RoPE keys stay BF16 (~54 KB a position). FP8 has no index_copy_ or
 gather kernels: kv_write/kv_read move the bytes as uint8. EXL3 routed experts, 10,750 slots:
 
@@ -2891,7 +2891,7 @@ the closed pair ("Connection closed by peer"). V4.1's server had already hit thi
 idle ping (`_ep_heartbeat`); the GLM/Muse serve loop never got one. Raising the timeout only moves
 the cliff, since an idle server waits unboundedly by nature.
 
-engine_loop now waits for a job for at most MUSE_PING_S (default a quarter of the timeout, 450 s)
+engine_loop now waits for a job for at most GLM_PING_S (default a quarter of the timeout, 450 s)
 and broadcasts {"op": "ping"} when none came; the follower skips it. The ping goes out from the
 engine thread itself, so unlike V4.1's heartbeat thread it needs no lock to stay out of the gap
 between a request's broadcast and its generate.
@@ -2914,7 +2914,7 @@ prompt (held-out docs + "summarize section by section"), 400 measured decode tok
 | + O_DIRECT expert reads | 14.25 | 190 | 1.71 |
 | same, MTP depth 3 | 15.58 | 213 | 2.32 |
 | + one all-gather each way in the MoE (bit-identical text) | 15.68 | 212 | 2.32 |
-| + dynamic depth: max 5, MUSE_MTP_DYN=0.8 | 16.23 | 202 | 2.27 of 2.66 drafted |
+| + dynamic depth: max 5, GLM_MTP_DYN=0.8 | 16.23 | 202 | 2.27 of 2.66 drafted |
 | dynamic, max 5, tau 0.9 | 16.82 | 206 | 2.44 of 2.70 |
 | **dynamic, max 7, tau 0.9** | **17.59** | 227 | 2.98 of 3.42 |
 | dynamic, max 5, tau 0.95 | 16.26 | 192 | 2.12 of 2.26 |
@@ -2944,7 +2944,7 @@ MTP depth, fixed (same workload, O_DIRECT not yet in): depth 1 10.65 tok/s (0.88
 12.28 (1.71), 3 13.33 (2.32), 4 12.89 (2.72), 5 12.51 (2.89). An extra verify row costs 30-45 ms
 (the MoE reads more experts, one more draft, more hot reads); a draft pays only above ~0.55
 acceptance. The MTP's own probability predicts it: with the product of the drafts' probabilities
->= 0.9, 80-97% are accepted; 0.7-0.9 about half; 0.5-0.7 a third. MUSE_MTP_DYN=tau keeps drafting
+>= 0.9, 80-97% are accepted; 0.7-0.9 about half; 0.5-0.7 a third. GLM_MTP_DYN=tau keeps drafting
 while that product is >= tau (rank 0 decides each step and broadcasts it, so both ranks verify the
 same rows): 0.3 12.84 and 0.5 12.68 (both before O_DIRECT, too permissive), 0.7 15.36, 0.8 16.23.
 Each verify row count captures its own split set; capture inside a measured window cost ~20 ms a
@@ -2980,7 +2980,7 @@ adaptation 0.8 s.
 Past 2,048 cached positions GlmTP.attention gathered each 32-row block's selected latents into
 BF16 copies (kv_read(C, sel): [32, 2048, 512], 64 MB a block, plus the RoPE keys), then ran bf16
 einsums and a softmax over [32, heads, 2048] -- 32 blocks a 1,024-row chunk on every layer, 30 of
-the 6K prompt's 42 s. engine/glm/sparse_attn.py (MUSE_ATTN_KERNEL=1) gives a program BLOCK_H heads
+the 6K prompt's 42 s. engine/glm/sparse_attn.py (GLM_ATTN_KERNEL=1) gives a program BLOCK_H heads
 of one row, loads the selected rows by index (FP8 widened and scaled in BF16 as kv_read does),
 scores latent + RoPE parts with fp32 accumulation and folds them into an online softmax.
 
@@ -3041,12 +3041,12 @@ paired +0.0048 +- 0.0065. MXFP4 (8,344 slots, BF16 KV, dynamic depth 7 / 0.9): g
 - mlp() gathered every pick's fp32 output rows across the ranks and weighted and summed them after
   the gather. The gather only concatenates (each column belongs to one rank), so the sum over
   picks, the routed part and the BF16 cast can run first, per element the same arithmetic: the same
-  text, by hash, on EXL3 (6K-prompt decode) and MXFP4 (glm_probe, MUSE_GATHER_MERGE 0 vs 1). MXFP4
+  text, by hash, on EXL3 (6K-prompt decode) and MXFP4 (glm_probe, GLM_GATHER_MERGE 0 vs 1). MXFP4
   had gathered [9 picks, rows, 3,072] fp32 -- 332 KB at 3 rows, past the RoCE gather's 256 KB, so
   NCCL on every MoE layer: 9.90 -> 10.08 tok/s. EXL3 12K prefill: gathers 2.88 -> 1.55 s of GPU
   time, the total inside the run-to-run spread.
 - GlmCheckpoint.get_rows_many (MXFP4 hot reads, swaps, placement) reads with O_DIRECT
-  (MUSE_CK_DIRECT=1): a rank-half expert is six ranges (weight + scale of gate, up, down) split by
+  (GLM_CK_DIRECT=1): a rank-half expert is six ranges (weight + scale of gate, up, down) split by
   the other rank's rows, read in parallel into one pooled aligned buffer (engine/glm/direct_io.py,
   shared with Exl3Pack). Cold expert 4.78 -> 3.09 ms through the reader (the bare reads 1.7-2.1 ms;
   the rest is per-call Python). glm_probe, MXFP4 8,344 slots, dynamic depth 7 / 0.9: hot-read time
@@ -3055,7 +3055,7 @@ paired +0.0048 +- 0.0065. MXFP4 (8,344 slots, BF16 KV, dynamic depth 7 / 0.9): g
 
 ## FP8 LM head, and deferring adaptation's swaps (2026-10-17)
 
-MUSE_HEAD=fp8 (128-block FP8 of the BF16 head, quantized at load) had never run: `hq, hs =
+GLM_HEAD=fp8 (128-block FP8 of the BF16 head, quantized at load) had never run: `hq, hs =
 _fp8_quant(head)` rebound `hq`, the q head width the next lines use for q_b's rows, and boot
 failed in a CPU multiply on FP8. Fixed, and measured -- 6K prompt, dynamic depth 7 / 0.9: 191 ms a
 round against ~200 (each MTP draft 6.2 -> 4.4 ms; four head reads a round), 17.55 tok/s;
@@ -3098,7 +3098,7 @@ up to 100 ms exit latency) drops into a low-power state after 100-200 ms without
 after 0/20/50/100 ms gaps took 0.85/1.30/1.35/1.31 ms, after 200 ms 10.31. Decode rounds are
 ~190 ms and hot reads come a few a round, so many rounds' first read paid it.
 
-stream() now runs a thread that reads 4 KB with O_DIRECT every MUSE_NVME_KEEPALIVE_MS (50) while
+stream() now runs a thread that reads 4 KB with O_DIRECT every GLM_NVME_KEEPALIVE_MS (50) while
 a request generates (none when idle): 200 ms gaps then read in 1.21 ms. Hot reads p90 10.34 ->
 1.49 ms, 9.4 -> 4.1 ms a round, 6K prompt 18.29 -> 18.98 tok/s (same acceptance); MXFP4, whose
 hot reads were frequent enough to keep the drive mostly awake, 12.87 -> 12.99. The system-level
@@ -3106,7 +3106,7 @@ alternative needs root: a lower latency tolerance on the device
 (/sys/class/nvme/nvme0/power/pm_qos_latency_tolerance_us) or nvme_core.default_ps_max_latency_us.
 
 Also: the MTP layer's eh_proj as FP8 (0.34 -> ~0.2 ms a draft) did not show in the draft time
-(4.18 vs 4.21 ms); not kept. The MTP hidden ring is bounded to the last MUSE_H_RING (16,384)
+(4.18 vs 4.21 ms); not kept. The MTP hidden ring is bounded to the last GLM_H_RING (16,384)
 positions (0.8 GB a rank at 128K): a reuse boundary older than that skips the MTP redo, which can
 only cost that one draft's acceptance.
 
@@ -3114,7 +3114,7 @@ only cost that one draft's acceptance.
 
 The MXFP4 MoE kernel splits rows into 64-row blocks and decodes the weights again for each, so in
 prefill the shared expert (2,048 identical-slot rows) ran at ~20 TFLOPS. engine/glm/mxfp4_dense.py
-(MUSE_FIXED_DENSE=1) dequantizes the fixed slots to BF16 once a call (E2M1 x 2^(e-127) is exact in
+(GLM_FIXED_DENSE=1) dequantizes the fixed slots to BF16 once a call (E2M1 x 2^(e-127) is exact in
 BF16; Triton, identical to dequant_mxfp4) and runs cuBLAS with the kernel's rounding points. Only
 where every slot of the call is fixed (EXL3 layers, the dense layers). Shared expert at 2,048
 rows 5.0 -> 4.1 ms, a dense layer 39 -> 26 ms (world 1 shapes); 12K prefill 28.4 -> 27.8 s; long-set
@@ -3151,7 +3151,7 @@ Same profiler, 6K "summarize" prompt and the short ISO-8601 prompt, 400 tokens, 
 One prompt each, so +-1 tok/s is within the trajectory noise (acceptance moves with any numerics
 change). Max 10 cannot run with EXL3: an 11-row verify step is 88 routed picks, past
 exl3.routed's graph-safe decode path (<= 64 picks), so it took the prefill routing (host syncs)
-inside a graph capture and failed. GlmTP now refuses MUSE_MTP_DEPTH > 7 under EXL3 at boot.
+inside a graph capture and failed. GlmTP now refuses GLM_MTP_DEPTH > 7 under EXL3 at boot.
 
 ## Decode's sparse attention launched 8 programs; split the positions (2026-10-17)
 
@@ -3169,14 +3169,14 @@ indexer, attention, norm and fixed-dense kernels on: NLL 1.6464, KL 0.0870, top-
 1.6457, 0.0888, 87.58%. The long set's drift between runs (0.8815 ... 0.8912 over the night's
 commits, each step within +-0.0065) is the chaotic divergence those notes describe, not a trend.
 
-MXFP4 draft head (MUSE_DRAFT_HEAD=mxfp4, a 4-bit copy of the head for the MTP drafts, Triton GEMV
+MXFP4 draft head (GLM_DRAFT_HEAD=mxfp4, a 4-bit copy of the head for the MTP drafts, Triton GEMV
 at 221 GB/s): drafts 4.20 -> 3.27 ms, but its argmax disagreed with the main head's on 1.3% of
-drafts (6 of 460, eager MUSE_GRAPHS=0 run with --draft-agree): about the saving in lost acceptance,
+drafts (6 of 460, eager GLM_GRAPHS=0 run with --draft-agree): about the saving in lost acceptance,
 and 0.25 GB a rank. Off by default.
 
 ## EXL3 5-bit attention, end to end: faster decode, slower prefill, KL up -- off (2026-10-17)
 
-MUSE_EXL3_ATTN=1 (engine/glm/exl3_attn.Exl3Lin; MUSE_EXL3_SRC mounts the EXL3 checkpoint at
+GLM_EXL3_ATTN=1 (engine/glm/exl3_attn.Exl3Lin; GLM_EXL3_SRC mounts the EXL3 checkpoint at
 /exl3src) serves the decoder layers' q_a, q_b, kv_a, o_proj and indexer wq_b from the 5-bit
 matrices, sliced like the FP8 ones (checked: decode and prefill paths agree to 1e-5, cosine to the
 FP8 projections 0.9986-0.9989 on every matrix). Against FP8 attention, same night's code:
@@ -3197,7 +3197,7 @@ draft-acceptance measurement across many prompts.
 
 With dynamic depth every verify row count (1-8) and MTP fill size (1-7) captures its graphs the
 first time it occurs, inside a request: the first request after boot decoded at 11.3 tok/s.
-GlmTP.warmup() (MUSE_WARMUP=1, called by both ranks in server/glm_app.py before serving) runs two
+GlmTP.warmup() (GLM_WARMUP=1, called by both ranks in server/glm_app.py before serving) runs two
 48-token greedy generations on synthetic tokens -- a repeating 12-token pattern (confident, deep
 drafts) and an irregular run (shallow) -- which captured all 16 graphs in 14.8 s of boot. The
 demand and miss counters must stay live during the capture (a graph bakes in what runs: captured
@@ -3212,7 +3212,7 @@ drafted_per_round).
 
 GLM's MLA latent is read by every head, so tensor parallelism over heads left both ranks holding
 the whole cache: 54.7 KB a position a rank in FP8 (latent 41.7, RoPE keys 10.1 in BF16, indexer keys
-2.9) -- 7.2 GB at 128K. MUSE_KV_SPLIT=1 (engine/glm/kv_split.py): rank r keeps the positions p with
+2.9) -- 7.2 GB at 128K. GLM_KV_SPLIT=1 (engine/glm/kv_split.py): rank r keeps the positions p with
 p % 2 == r, interleaved so both ranks hold and scan the same amount at any length; the MTP layer
 keeps its cache whole (1/79 of it, and its one-row draft steps are the latency-bound calls).
 Decode adds two all-gathers a layer: the queries (with, on the 22 indexer layers, each rank's
@@ -3256,7 +3256,7 @@ times the context for 0.4 GB.
 
 GlmTP keeps one sequence's KV. Another conversation -- or one of Open WebUI's background requests
 (title, tags, follow-ups go to the same model unless a task model is set) -- replaced it, and the
-next turn of a long chat prefilled from scratch. MUSE_PREFIX_DISK=1 (engine/glm/prefix_store.py)
+next turn of a long chat prefilled from scratch. GLM_PREFIX_DISK=1 (engine/glm/prefix_store.py)
 saves each prompt's rows after its prefill and restores the longest saved prefix of a later prompt.
 A segment holds a prompt's rows past its deepest saved ancestor, so a growing conversation writes
 only each turn's new tokens; DS V4.1's bundles rewrite the whole prompt at every save, its
@@ -3288,12 +3288,12 @@ digest, the KV format, the split, the expert format and the numerics switches: a
 starts a new namespace, and old namespaces are evicted first.
 
 Disk: rank 0's drive had 62 GB free when this went in. The default budget is 20 GB a node, and no
-segment is written that would leave less than MUSE_PREFIX_DISK_FREE_GB (10) free.
+segment is written that would leave less than GLM_PREFIX_DISK_FREE_GB (10) free.
 
 ## Serving at 256K with the split and prefixes on disk: a 203K-token prompt end to end (2026-10-17)
 
-EXL3 config, 12,350 slots, MUSE_MAX_SEQ=262144 (KV 7.28 GB a rank split, what 128K took unsplit),
-MUSE_PREFIX_DISK=1; ready at 8.0 GB MemAvailable (128K unsplit: 8.3). Through the HTTP server: a
+EXL3 config, 12,350 slots, GLM_MAX_SEQ=262144 (KV 7.28 GB a rank split, what 128K took unsplit),
+GLM_PREFIX_DISK=1; ready at 8.0 GB MemAvailable (128K unsplit: 8.3). Through the HTTP server: a
 203,373-token prompt (the held-out corpus four times) prefilled in 592 s (344 tok/s) and answered
 correctly; its segment, 5.6 GB a rank, was written in 1.4 s. The follow-up turn reused it from memory
 (TTFT 1.2 s, 12.4 tok/s at 203K). After an unrelated request had replaced the in-memory sequence,
@@ -3310,7 +3310,7 @@ prefix cache, and not ruled out either -- watch for it.
 
 ## Exact-mode quality runs at serving residency took a node to 2.59 GiB (2026-10-17)
 
-glm_quality --mode exact runs with MUSE_MISS=stream (every missing expert read for every layer).
+glm_quality --mode exact runs with GLM_MISS=stream (every missing expert read for every layer).
 Started with MXFP4's serving residency (9,100 slots, 128K KV), streaming's larger transient arena
 (97.3 GB of experts against 94.8) left the pair 5.0 GB at ready, and the first prefill took rank 0
 to 2.59 GiB. Both watchdogs fired: the test watchdog stopped that pair and, by design, exited --
@@ -3328,14 +3328,14 @@ After the head (FP8) and attention (the checkpoint's FP8), a rank still held 2.6
 MLA's absorbed kv_b dequantized to BF16 (1.16 GB), the embedding in BF16 (0.95), the routers in fp32
 (0.48). Three switches:
 
-- MUSE_KVB_FP8=1 keeps the checkpoint's FP8 bytes with each row's scales (a head's 448 rows straddle
+- GLM_KVB_FP8=1 keeps the checkpoint's FP8 bytes with each row's scales (a head's 448 rows straddle
   the 128-row blocks) and multiplies in a Triton kernel that widens them to the BF16 values the
   load-time dequant made (engine/glm/kvb_fp8.py). Decode reads w_uk and w_uv every layer every
   round: L2-cold at 4 rows, q-absorb 66.7 -> 34.9 us and o-absorb 81.3 -> 54.0 us a layer. Prefill
   dequantizes per call, so prefill logits do not change at all (exact-mode KL 0.0).
-- MUSE_EMBED_8BIT=int8 (or fp8): rows with a scale per 128 values. A lookup, never a matmul, so the
+- GLM_EMBED_8BIT=int8 (or fp8): rows with a scale per 128 values. A lookup, never a matmul, so the
   uniform INT8 grid fits: 0.65% relative error against E4M3's 2.6%.
-- MUSE_ROUTER_BF16=1: BF16 weights, fp32 sums and logits.
+- GLM_ROUTER_BF16=1: BF16 weights, fp32 sums and logits.
 
 Quality, glm_quality --mode exact --against (MXFP4, every expert exact, teacher-forced, natural set,
 3,600 positions; KL over the base's top-20):
