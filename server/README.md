@@ -135,3 +135,21 @@ states, expert-to-sector addresses, current loads and a bounded recent load log.
 The page polls once per second and can be paused. Other engine adapters return
 501 for the JSON route. The observer exposes no prompt text and does not take
 the generation lock or perform GPU readbacks/TP collectives.
+
+## The GLM-5.3 server (`server/muse_app.py`)
+
+TideLM's GLM-5.3 profiles (`scripts/tide-up.sh .env.glm53-*`) are served by a second, smaller
+front end with the same API shape. It runs one request at a time and answers:
+
+| Endpoint | |
+| --- | --- |
+| `POST /v1/chat/completions` | chat, streaming or not; tool calls; `reasoning_content` for the model's thinking |
+| `POST /v1/completions` | raw prompt completion |
+| `POST /v1/debug/prompt` | the rendered prompt and its token count (template and tokenizer only; `bench/bench.py` sizes prompts with it) |
+| `GET /v1/models`, `GET /health` | the served model id (`SERVED_MODEL_NAME`, `glm-5.3` in the profiles); liveness and queue length |
+
+Reasoning effort is taken from `reasoning.effort`, then `reasoning_effort`, then
+`chat_template_kwargs.reasoning_effort`, then `GLM_REASONING_EFFORT` (`low` in the profiles). GLM's
+template knows `low` and `high`. Responses carry `usage` with the engine's statistics under
+`usage.muse` (prompt reuse, time to first token, decode tok/s, expert misses, hot reads); a
+streamed response sends them in its final chunk, also as `x_engine_stats`.
