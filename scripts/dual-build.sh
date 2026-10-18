@@ -32,7 +32,10 @@ PEER="${PEER:-}"
 CODE_SHA=$("$ROOT/scripts/code_digest.sh" "$ROOT")
 GIT_DESC=$(git -C "$ROOT" describe --always --dirty 2>/dev/null || echo unknown)
 info "building $IMAGE from $GIT_DESC, code $CODE_SHA (this pulls the CUDA 13 devel base and the cu130 torch wheel)"
-docker build --label "dsv41.code_sha=$CODE_SHA" --label "dsv41.git=$GIT_DESC" -t "$IMAGE" .
+# The Dockerfile writes /app/VERSION (the container's banner, the image label) from this build
+# argument; without it every image claimed its default, 0.1.0-wip.
+docker build --build-arg RECIPE_VERSION="$(cat "$ROOT/VERSION")" \
+    --label "dsv41.code_sha=$CODE_SHA" --label "dsv41.git=$GIT_DESC" -t "$IMAGE" .
 LOCAL_ID=$(docker image inspect -f '{{.Id}}' "$IMAGE")
 info "built $IMAGE  $LOCAL_ID"
 
