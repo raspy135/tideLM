@@ -75,6 +75,25 @@ def rms(x, weight, eps):
 KV_BLOCK = 128          # values per fp32 scale in an FP8 cache row
 
 
+def _q8_rows(w: torch.Tensor, device, kind: str = "int8", rows: int = 8192):
+    """[N, H] -> (int8 or fp8 [N, H], fp32 scales [N, H / 128]) on `device`: a scale per row and 128
+    values (the embedding: a row is read alone, so its scales are its own), in pieces of `rows`.
+    INT8 is symmetric round-to-nearest on amax / 127: a uniform grid, ~4x less error than E4M3's
+    3-bit mantissa for values spread like these."""
+    N, H = w.shape
+    dt = torch.int8 if kind == "int8" else torch.float8_e4m3fn
+    top = 127.0 if kind == "int8" else 448.0
+    q = torch.empty((N, H), dtype=dt, device=device)
+    s = torch.empty((N, H // KV_BLOCK), dtype=torch.float32, device=device)
+    for a in range(0, N, rows):
+        g = w[a:a + rows].to(device).float().view(-1, H // KV_BLOCK, KV_BLOCK)
+        sc = (g.abs().amax(-1, keepdim=True) / top).clamp_min(1e-12)
+        v = (g / sc).round().clamp(-127, 127) if kind == "int8" else g / sc
+        q[a:a + rows] = v.to(dt).view(-1, H)
+        s[a:a + rows] = sc[..., 0]
+    return q, s
+
+
 def kv_write(cache, idx, x):
     """Store rows x [n, d] at idx: a BF16 tensor directly, an (fp8, scale) pair quantized per
     KV_BLOCK values (or per row when the scale has one column)."""
@@ -175,6 +194,17 @@ class GlmTP:
             raise ValueError("MUSE_KV_SPLIT=1 needs MUSE_INDEX_KERNEL=1 and MUSE_ATTN_KERNEL=1")
         self.s_loc = -(-self.max_seq // self.world) if self.kv_split else self.max_seq
         self.exl3_attn = env("MUSE_EXL3_ATTN", "0") == "1"
+        # Dense weights still wider than FP8 (docs/gotchas.md): MUSE_KVB_FP8=1 keeps MLA's absorbed
+        # kv_b (w_uk, w_uv) in the checkpoint's FP8 (engine/glm/kvb_fp8.py; 1.16 -> 0.58 GB a rank),
+        # MUSE_EMBED_8BIT=int8 (or fp8) the embedding rows in 8 bits with a scale per 128 values
+        # (0.95 -> 0.49; a lookup, never a matmul, so INT8's uniform grid can be used: fp8 moved the
+        # exact-model logits KL 0.015 / 5.2% top-1 flips, docs/gotchas.md),
+        # MUSE_ROUTER_BF16=1 the routers in BF16 with fp32 sums (0.48 -> 0.24).
+        self.kvb_fp8 = env("MUSE_KVB_FP8", "0") == "1"
+        self.embed_q = env("MUSE_EMBED_8BIT", "")
+        assert self.embed_q in ("", "int8", "fp8"), self.embed_q
+        self.embed_fp8 = bool(self.embed_q)            # (any 8-bit embedding: an (8-bit, scales) pair)
+        self.router_bf16 = env("MUSE_ROUTER_BF16", "0") == "1"
         # MUSE_GATHER_MERGE=1: MoE layers gather the routed and the fixed experts' intermediates
         # in one all-gather and their weighted, summed outputs (BF16) in another (mlp()).
         self.gather_merge = env("MUSE_GATHER_MERGE", "1") == "1"
@@ -399,13 +429,13 @@ class GlmTP:
                                          ("tp.py", "ref.py", "weights.py", "config.py", "fp8_block.py",
                                           "index_kernel.py", "exl3.py", "sparse_attn.py",
                                           "norm_kernel.py", "direct_io.py", "mxfp4_dense.py", "exl3_attn.py",
-                                          "kv_split.py", "prefix_store.py"))).hexdigest()[:16]
+                                          "kv_split.py", "prefix_store.py", "kvb_fp8.py"))).hexdigest()[:16]
         self.code_digest = digest
         mine = {"version": VERSION, "code": digest, "miss": self.miss, "native": self.native,
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("MUSE_HEAD", "bf16"), "depth": env("MUSE_MTP_DEPTH", "3"), "db": env("MUSE_STATS_DB", ""),
-                "xfmt": self.xfmt, "kv": env("MUSE_KV", "bf16"), "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "fused_norm": FUSED_NORM, "h_ring": self.h_ring_n, "fixed_dense": self.fixed_dense, "exl3_attn": self.exl3_attn, "kv_split": self.kv_split, "prefix_disk": env("MUSE_PREFIX_DISK", "0"), "draft_head": env("MUSE_DRAFT_HEAD", "same"), "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
+                "xfmt": self.xfmt, "kv": env("MUSE_KV", "bf16"), "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "fused_norm": FUSED_NORM, "h_ring": self.h_ring_n, "fixed_dense": self.fixed_dense, "exl3_attn": self.exl3_attn, "kv_split": self.kv_split, "prefix_disk": env("MUSE_PREFIX_DISK", "0"), "kvb_fp8": self.kvb_fp8, "embed_q": self.embed_q, "router_bf16": self.router_bf16, "draft_head": env("MUSE_DRAFT_HEAD", "same"), "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
                 "pf": [env(k, "") for k in ("MUSE_PF", "MUSE_PF_SLOTS", "MUSE_PF_MIN_ROWS", "MUSE_PF_KEEP", "MUSE_PF_KEEP_MARGIN", "MUSE_HOT", "MUSE_HOT_MIN",
                                             "MUSE_HOT_TARGET", "MUSE_HOT_KEEP", "MUSE_HOT_MAX", "MUSE_HOT_KEEP_AUDIT", "MUSE_HOT_PACE",
                                             "MUSE_HOT_PACE_LEAD", "MUSE_SUB_WEIGHT", "MUSE_MTP_FULL", "MUSE_MISS_LOG",
@@ -424,7 +454,8 @@ class GlmTP:
     def _load_dense(self):
         cfg, d, ck, W, r = self.cfg, self.dev, self.ck, self.world, self.rank
         hq, hv = cfg.qk_dim, cfg.nope + cfg.v_dim
-        self.embed = ck.get_rows(P + "embed_tokens.weight", r * self.vl, (r + 1) * self.vl).to(d)
+        self.embed = ck.get_rows(P + "embed_tokens.weight", r * self.vl, (r + 1) * self.vl)
+        self.embed = _q8_rows(self.embed, d, self.embed_q) if self.embed_q else self.embed.to(d)
         head = ck.get_rows("lm_head.weight", r * self.vl, (r + 1) * self.vl)
         # MUSE_DRAFT_HEAD=mxfp4: the MTP drafts score with a 4-bit copy of the head (engine/glm/
         # mxfp4_dense.gemv, ~0.25 GB a rank): the head is half of a draft's reads. Verification keeps
@@ -447,13 +478,20 @@ class GlmTP:
         if self.exl3_attn:
             from .exl3_attn import Exl3Source
             x3a = Exl3Source(env("MUSE_EXL3_ATTN_SRC", "/exl3src"))
-        nbytes = self.embed.numel() * 2 + self.head.nbytes + (
+        nbytes = sum(t.numel() * t.element_size() for t in (self.embed if self.embed_fp8 else (self.embed,))) \
+            + self.head.nbytes + (
             sum(t.numel() for t in self.draft_head) if self.draft_head is not None else 0)
         for L in range(self.nL):
             p = f"{P}layers.{L}."
             a = p + "self_attn."
-            kvb = ck.fp8(a + "kv_b_proj.weight", (r * self.hl * hv, (r + 1) * self.hl * hv)).dequant(torch.bfloat16)
-            kvb = kvb.view(self.hl, hv, cfg.kv_lora)
+            kvb = ck.fp8(a + "kv_b_proj.weight", (r * self.hl * hv, (r + 1) * self.hl * hv))
+            if self.kvb_fp8:
+                from .kvb_fp8 import HeadFP8
+                kvb = HeadFP8.from_rows(kvb.w, kvb.s, self.hl)
+                uk, uv = kvb.split(0, cfg.nope).to(d), kvb.split(cfg.nope, hv).to(d)
+            else:
+                kvb = kvb.dequant(torch.bfloat16).view(self.hl, hv, cfg.kv_lora)
+                uk, uv = kvb[:, :cfg.nope].contiguous().to(d), kvb[:, cfg.nope:].contiguous().to(d)
             x3l = x3a is not None and L < cfg.layers
             xa = f"model.layers.{L}.self_attn."
             o = None if x3l else ck.fp8(a + "o_proj.weight")
@@ -467,9 +505,9 @@ class GlmTP:
                 "kv_a": x3a.lin(xa + "kv_a_proj_with_mqa", d, 8, n_out=cfg.kv_lora + cfg.rope_dim) if x3l else
                 Lin(ck.fp8(a + "kv_a_proj_with_mqa.weight"), d),
                 "kv_norm": ck.get(a + "kv_a_layernorm.weight").to(d),
-                # Absorbed MLA: kv_b's key half [h, nope, c] and value half [h, v, c], BF16.
-                "w_uk": kvb[:, :cfg.nope].contiguous().to(d),
-                "w_uv": kvb[:, cfg.nope:].contiguous().to(d),
+                # Absorbed MLA: kv_b's key half [h, nope, c] and value half [h, v, c], BF16 (or FP8).
+                "w_uk": uk,
+                "w_uv": uv,
                 "o": x3a.lin(xa + "o_proj", d, 2, r, W, "k") if x3l else
                 Lin(o.cols(r * self.hl * cfg.v_dim, (r + 1) * self.hl * cfg.v_dim), d),
             }
@@ -486,10 +524,11 @@ class GlmTP:
                            "i_kn_b": ck.get(i + "k_norm.bias").to(d).float(),
                            "i_w": ck.get(i + "weights_proj.weight").to(d).float()})
             if not self.dense(L):
-                lw["router"] = ck.get(p + "mlp.gate.weight").to(d).float()
+                lw["router"] = ck.get(p + "mlp.gate.weight").to(d).to(torch.bfloat16 if self.router_bf16 else torch.float32)
                 lw["bias"] = ck.get(p + "mlp.gate.e_score_correction_bias").to(d).float()
             nbytes += sum(v.nbytes for v in lw.values() if hasattr(v, "nbytes") and not isinstance(v, torch.Tensor))
-            nbytes += (lw["w_uk"].numel() + lw["w_uv"].numel()) * 2
+            if not self.kvb_fp8:
+                nbytes += (lw["w_uk"].numel() + lw["w_uv"].numel()) * 2
             self.L.append(lw)
             del kvb, o
         self.dense_bytes = nbytes
@@ -1008,12 +1047,12 @@ class GlmTP:
             rows = positions
         kv_write(self.c_cache[L], rows, c)
         self.r_cache[L].index_copy_(0, rows, kr)
-        q_lat = torch.einsum("thn,hnc->thc", q_nope, lw["w_uk"])                  # [T, h, kv_lora]
+        q_lat = self._absorb_q(q_nope, lw["w_uk"])                                 # [T, h, kv_lora]
         scale = cfg.qk_dim ** -0.5
         if split and decode:
             qw = self._index_qw(L, x, q_resid, cos, sin, rows) if self.full(L) else None
             o_lat, topk = self._split_attn(L, qw, q_lat, q_rope, positions, topk_prev, scale)
-            o = torch.einsum("thc,hvc->thv", o_lat, lw["w_uv"]).reshape(T, self.hl * cfg.v_dim)
+            o = self._absorb_o(o_lat, lw["w_uv"]).reshape(T, self.hl * cfg.v_dim)
             return self.comm.all_reduce(lw["o"](o, out_dtype=torch.float32)).to(torch.bfloat16), topk
         C, R, I, qw = self.c_cache[L], self.r_cache[L], None, None
         if split:
@@ -1049,9 +1088,23 @@ class GlmTP:
                 p = torch.softmax(sc, -1).to(torch.bfloat16)
                 outs.append(torch.einsum("thk,tkc->thc", p, cg))
             o_lat = torch.cat(outs)
-        o = torch.einsum("thc,hvc->thv", o_lat, lw["w_uv"]).reshape(T, self.hl * cfg.v_dim)
+        o = self._absorb_o(o_lat, lw["w_uv"]).reshape(T, self.hl * cfg.v_dim)
         partial = lw["o"](o, out_dtype=torch.float32)
         return self.comm.all_reduce(partial).to(torch.bfloat16), topk
+
+    @staticmethod
+    def _absorb_q(q_nope, w_uk):
+        if isinstance(w_uk, torch.Tensor):
+            return torch.einsum("thn,hnc->thc", q_nope, w_uk)
+        from .kvb_fp8 import absorb_q
+        return absorb_q(q_nope, w_uk)
+
+    @staticmethod
+    def _absorb_o(o_lat, w_uv):
+        if isinstance(w_uv, torch.Tensor):
+            return torch.einsum("thc,hvc->thv", o_lat, w_uv)
+        from .kvb_fp8 import absorb_o
+        return absorb_o(o_lat, w_uv)
 
     def _gathered(self, L, S):
         """Prefill on a split layer: its latent, RoPE and index caches for positions [0, S) (and a
@@ -1562,7 +1615,14 @@ class GlmTP:
     def embed_ids(self, ids):
         local = ids - self.rank * self.vl
         inside = (local >= 0) & (local < self.vl)
-        e = self.embed[local.clamp(0, self.vl - 1)] * inside[:, None].to(torch.bfloat16)
+        rows = local.clamp(0, self.vl - 1)
+        if self.embed_fp8:
+            q, sc = self.embed
+            v = q[rows] if q.dtype == torch.int8 else q.view(torch.uint8)[rows].view(q.dtype)  # (no fp8 gather)
+            e = (v.float().view(-1, sc.shape[1], 128) * sc[rows][..., None]).view(v.shape).to(torch.bfloat16)
+        else:
+            e = self.embed[rows]
+        e = e * inside[:, None].to(torch.bfloat16)
         return self.comm.all_reduce(e.float()).to(torch.bfloat16)
 
     def logits(self, h):
@@ -1843,7 +1903,7 @@ class GlmTP:
                "exl3_attn": self.exl3_attn, "model": hashlib.sha256(cfg_bytes).hexdigest(), "dir": str(self.model_dir),
                "pack": env("MUSE_EXL3_PACK", ""),
                "numerics": [FUSED_NORM, self.attn_kernel, self.index_kernel, self.fixed_dense, self.gather_merge,
-                            self.native, self.prefill_moe, self.miss]}
+                            self.native, self.prefill_moe, self.miss, self.kvb_fp8, self.embed_q, self.router_bf16]}
         return hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:16]
 
     def _kv_layout(self):

@@ -91,6 +91,9 @@ def main():
     ap.add_argument("--out", default="/app/results/glm-quality")
     ap.add_argument("--set", choices=("tokyo", "switch", "natural", "long"), default="tokyo")
     ap.add_argument("--ref", default="", help="exact mode: written as exact<-set><-ref>.json; eval: the one to score against")
+    ap.add_argument("--against", default="",
+                    help="exact mode: also score these exact logits against exact<-set>-<against>.json (KL over "
+                         "its top-20, top-1 agreement, NLL): one numerics change, every expert exact on both sides")
     ap.add_argument("--rows", type=int, default=1,
                     help="eval: feed the answer N tokens a step (3 = an MTP depth-2 verify block, graphed "
                          "when MUSE_MTP_DEPTH=N-1), so per-step read caps and thresholds act as in serving")
@@ -128,8 +131,12 @@ def main():
     else:
         seqs = eng.comm.broadcast_obj(json.loads((out / f"seqs{suffix}.json").read_text()) if eng.rank == 0 else None)
     if args.mode == "exact":
-        res = []
-        for sq in seqs:
+        res, cmp = [], []
+        vs = None
+        if args.against:
+            vp = out / f"exact{suffix}-{args.against}.json"
+            vs = eng.comm.broadcast_obj(json.loads(vp.read_text()) if eng.rank == 0 else None)
+        for k, sq in enumerate(seqs):
             p, a = sq["prompt"], sq["answer"]
             eng.reset()
             z = eng.forward(p + a[:-1], all_logits=True)[len(p) - 1:].float()     # predicts a[0..]
@@ -138,9 +145,23 @@ def main():
             top = lp.topk(TOPN, -1)
             res.append({"lp": lp.gather(1, tgt[:, None])[:, 0].tolist(), "top1": top.indices[:, 0].tolist(),
                         "top_ids": top.indices.tolist(), "top_lp": top.values.tolist()})
+            if vs is not None:
+                er = vs[k]
+                ids = torch.tensor(er["top_ids"], device=lp.device)
+                q = torch.log_softmax(lp.gather(1, ids), -1)                      # this, on its top-20
+                pe = torch.log_softmax(torch.tensor(er["top_lp"], device=lp.device), -1)
+                cmp.append((float((pe.exp() * (pe - q)).sum()), int((lp.argmax(-1) == torch.tensor(er["top1"], device=lp.device)).sum()),
+                            float(-lp.gather(1, tgt[:, None]).sum()), -sum(er["lp"]), len(a)))
         if eng.rank == 0:
             (out / f"exact{suffix}{'-' + args.ref if args.ref else ''}.json").write_text(json.dumps(res))
             print("[exact] mean NLL", sum(-x for r in res for x in r["lp"]) / sum(len(r["lp"]) for r in res))
+            if cmp:
+                n = sum(c[4] for c in cmp)
+                print("[against] " + json.dumps({"name": args.name, "against": args.against, "positions": n,
+                                                  "kl": round(sum(c[0] for c in cmp) / n, 5),
+                                                  "top1_agree": round(sum(c[1] for c in cmp) / n, 4),
+                                                  "nll": round(sum(c[2] for c in cmp) / n, 4),
+                                                  "nll_against": round(sum(c[3] for c in cmp) / n, 4)}))
         return
 
     ref = out / f"exact{suffix}{'-' + args.ref if args.ref else ''}.json"

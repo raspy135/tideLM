@@ -3307,3 +3307,54 @@ after the 203K turns answered "Hello! 👋" and then ran on to its max_tokens wi
 the follow-up, the same request) answered and stopped correctly twice, as did the request on a
 fresh pair; the residency adaptation had moved in between. Not attributed to the split or the
 prefix cache, and not ruled out either -- watch for it.
+
+## Exact-mode quality runs at serving residency took a node to 2.59 GiB (2026-10-17)
+
+glm_quality --mode exact runs with MUSE_MISS=stream (every missing expert read for every layer).
+Started with MXFP4's serving residency (9,100 slots, 128K KV), streaming's larger transient arena
+(97.3 GB of experts against 94.8) left the pair 5.0 GB at ready, and the first prefill took rank 0
+to 2.59 GiB. Both watchdogs fired: the test watchdog stopped that pair and, by design, exited --
+and the batch started its next run with no watchdog left; it was stopped by hand at ~3 GB. Exact
+runs do not depend on residency, so they now run at 7,000 slots and a 32K max_seq, and batch
+scripts check that the test watchdog is still alive before each run.
+
+Also, twice: `pkill -f` / `pgrep -f` with a pattern that appears in the calling shell's own command
+line kills that shell (exit 144) before the rest of the line runs. Remove the containers first
+(that stops the GPU work), then kill scripts by explicit PID.
+
+## The last dense weights wider than FP8: kv_b, embedding, routers (2026-10-17)
+
+After the head (FP8) and attention (the checkpoint's FP8), a rank still held 2.6 GB wider than 8 bits:
+MLA's absorbed kv_b dequantized to BF16 (1.16 GB), the embedding in BF16 (0.95), the routers in fp32
+(0.48). Three switches:
+
+- MUSE_KVB_FP8=1 keeps the checkpoint's FP8 bytes with each row's scales (a head's 448 rows straddle
+  the 128-row blocks) and multiplies in a Triton kernel that widens them to the BF16 values the
+  load-time dequant made (engine/glm/kvb_fp8.py). Decode reads w_uk and w_uv every layer every
+  round: L2-cold at 4 rows, q-absorb 66.7 -> 34.9 us and o-absorb 81.3 -> 54.0 us a layer. Prefill
+  dequantizes per call, so prefill logits do not change at all (exact-mode KL 0.0).
+- MUSE_EMBED_8BIT=int8 (or fp8): rows with a scale per 128 values. A lookup, never a matmul, so the
+  uniform INT8 grid fits: 0.65% relative error against E4M3's 2.6%.
+- MUSE_ROUTER_BF16=1: BF16 weights, fp32 sums and logits.
+
+Quality, glm_quality --mode exact --against (MXFP4, every expert exact, teacher-forced, natural set,
+3,600 positions; KL over the base's top-20):
+
+| change | KL | top-1 agree | NLL (base 1.6160) |
+| --- | --- | --- | --- |
+| fused RMSNorm off (control: ~1 bit in 1e5) | 0.0124 | 94.8% | 1.6183 |
+| INT8 embedding | 0.0141 | 94.0% | 1.6184 |
+| BF16 router | 0.0147 | 94.3% | 1.6217 |
+| FP8 embedding | 0.0148 | 94.8% | 1.6131 |
+| FP8 kv_b + FP8 embedding + BF16 router | 0.0148 | 94.5% | 1.6147 |
+| FP8 kv_b + INT8 embedding + BF16 router (adopted) | 0.0144 | 94.4% | 1.6153 |
+
+The floor is chaos, not precision: a perturbation of any size flips some near-tie expert picks and
+the difference spreads, so a 1-bit change, a 0.65% one and a 2.6% one all land at KL 0.012-0.015,
+and stacking three changes adds nothing. This eval cannot resolve these changes below about +-0.003
+KL; NLL moved -0.003 to +0.006 with no sign. (The KV split shows KL 0.0 here only because exact mode
+is prefill, which gathers the cache and runs the unsplit path.)
+
+Memory, MXFP4 serving config: dense 9.44 -> 8.42 GB a rank (the router is not in that figure);
+MemAvailable after a 6K decode 7.28 -> 8.64 GB. Decode speed was not resolved by the profiler pair
+(15.37 / 15.09 tok/s with different acceptance, both capturing graphs mid-measurement).
