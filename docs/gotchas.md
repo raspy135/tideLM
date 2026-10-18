@@ -3347,7 +3347,7 @@ Quality, glm_quality --mode exact --against (MXFP4, every expert exact, teacher-
 | BF16 router | 0.0147 | 94.3% | 1.6217 |
 | FP8 embedding | 0.0148 | 94.8% | 1.6131 |
 | FP8 kv_b + FP8 embedding + BF16 router | 0.0148 | 94.5% | 1.6147 |
-| FP8 kv_b + INT8 embedding + BF16 router (adopted) | 0.0144 | 94.4% | 1.6153 |
+| FP8 kv_b + INT8 embedding + BF16 router | 0.0144 | 94.4% | 1.6153 |
 
 The floor is chaos, not precision: a perturbation of any size flips some near-tie expert picks and
 the difference spreads, so a 1-bit change, a 0.65% one and a 2.6% one all land at KL 0.012-0.015,
@@ -3358,3 +3358,9 @@ is prefill, which gathers the cache and runs the unsplit path.)
 Memory, MXFP4 serving config: dense 9.44 -> 8.42 GB a rank (the router is not in that figure);
 MemAvailable after a 6K decode 7.28 -> 8.64 GB. Decode speed was not resolved by the profiler pair
 (15.37 / 15.09 tok/s with different acceptance, both capturing graphs mid-measurement).
+
+Adopted in both serving configs: FP8 kv_b and INT8 embedding (1.0 GB a rank). The router stays
+fp32: 0.24 GB is ~24 MXFP4 slots, it moves expert choice directly, and it had the largest NLL
+shift of the set (+0.0057, within noise) -- not worth a regression this eval could not see. The
+first served Japanese answer after the switch had broken tokens (decode misses 15.6%, the
+residency still English/code-shaped) and was clean once adaptation ran (misses 11.8 -> 9.9%).
