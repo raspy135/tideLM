@@ -13,6 +13,25 @@ belong to it.
 tagged with it: `ghcr.io/<owner>/deepseek-v41-flash-spark:<version>`. A `-wip` version means
 exactly what it says: the defaults are not settled and the measurements are incomplete.
 
+## 0.2.0-wip — 2026-10-18: TideLM
+
+**Work in progress, not a release.** The DeepSeek V4.1 engine and the GLM-5.3 engine forked from
+it are one repository and one image, named TideLM, with three starting profiles in `configs/`
+and one launcher (`scripts/tide-up.sh <profile>`, `scripts/tide-down.sh`). Measured on
+2026-10-18 with `bench/bench.py`, each profile as shipped ([results](bench/results/2026-10-18/)):
+
+| profile | prose | code | ~8,200-token prompt to first token |
+| --- | ---: | ---: | ---: |
+| `ds41-mxfp4` (DeepSeek-V4.1-Flash-1017) | 25.9 tok/s | 42.8 tok/s | 11.8 s |
+| `glm53-mxfp4` (GLM-5.3, AMD Quark MXFP4) | 12.0 tok/s | 14.9 tok/s | 24.7 s |
+| `glm53-exl3` (GLM-5.3, EXL3 3.0 bpw) | 13.6 tok/s | 18.2 tok/s | 19.5 s |
+
+Changes since 0.1.0-wip that move numbers: async hot reads on DeepSeek (`DSV41_HOT_ASYNC`, ring
+of 128; no measured decode cost, -0.007 / -0.138 nats held-out loss code / prose); urgent decode
+adaptation removed (`DSV41_ADAPT_URGENT=1` refuses to boot). Renamed: the GLM engine's
+`MUSE_*` settings are `GLM_*`. Removed as rejected: static topic profiles, prefill replicas, the
+prefill EP overlap. Not yet repeated on a second day.
+
 ## 0.1.0-wip — 2026-09-10
 
 **Work in progress, not a release.** The recipe serves, and the numbers it served at are

@@ -4,15 +4,16 @@
 #
 # Containers glm-serve-rank0/1 from an existing engine image with this checkout's engine/,
 # tools/ and server/ mounted read-only, so a code change needs a restart, not a rebuild. The
-# checkpoint must exist at the same path on both nodes. Settings come from .env.glm (copy
-# .env.glm.example); GLM_* and the few launch variables below are forwarded to both ranks.
+# checkpoint must exist at the same path on both nodes. Settings come from GLM_ENV_FILE (else
+# .env.glm); scripts/tide-up.sh passes the profile (configs/glm53-*.env.example). GLM_* and the
+# few launch variables below are forwarded to both ranks.
 # The V4.1 deployment (deepseek-v41-ep2-rank*) cannot serve at the same time (each fills the
 # GPUs); dual-down.sh stops whichever pair is running.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 ENV_FILE=${GLM_ENV_FILE:-$ROOT/.env.glm}
-[[ -f "$ENV_FILE" ]] || { echo "missing $ENV_FILE (copy .env.glm.example)" >&2; exit 1; }
+[[ -f "$ENV_FILE" ]] || { echo "missing $ENV_FILE (copy configs/glm53-mxfp4.env.example)" >&2; exit 1; }
 set -a; source "$ENV_FILE"; set +a
 PEER=${PEER:-ryan@10.0.0.2}
 IMAGE=${GLM_IMAGE:-deepseek-v41-flash-dgx-spark-dual-adaptive:20261011-topp}

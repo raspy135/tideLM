@@ -312,6 +312,12 @@ def make_handler(tpl: Template, jobs, model_name: str, defaults: dict, parser_cl
                     chat = True
                 elif path == "/v1/completions":
                     text, chat = req.get("prompt", ""), False
+                elif path == "/v1/debug/prompt":
+                    # The rendered prompt and its length, as the DS server's: bench/bench.py sizes
+                    # its random prompts with it. Template and tokenizer only, never the engine.
+                    text = tpl.render(req.get("messages", []), req.get("tools"),
+                                      request_effort(req, defaults["reasoning_effort"]))
+                    return self._json(200, {"prompt_tokens": len(tpl.encode(text)), "prompt": text})
                 else:
                     return self._json(404, {"error": "not found"})
                 prompt = tpl.encode(text)

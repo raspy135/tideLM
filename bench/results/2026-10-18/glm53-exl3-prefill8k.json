@@ -1,0 +1,84 @@
+{
+  "label": "random8k-fresh",
+  "workload": "random",
+  "seed_salt": null,
+  "isl": 8192,
+  "osl": 256,
+  "runs": 2,
+  "warmup": 1,
+  "thinking": false,
+  "effort": null,
+  "temperature": 0.6,
+  "ignore_eos": false,
+  "base": "http://127.0.0.1:8000",
+  "model": "glm-5.3",
+  "health": {
+    "status": "ok",
+    "queued": 0
+  },
+  "ttft_ms_median": 19528.7908,
+  "tpot_ms_median": 68.014,
+  "decode_tok_s_median": 15.4651,
+  "engine_median": {
+    "accept_len_mean": null,
+    "expert_hit_rate": null,
+    "nvme_gb": null,
+    "engram_rows": null
+  },
+  "raw": [
+    {
+      "ttft_ms": 19652.36231201561,
+      "tpot_ms": 83.11352286665864,
+      "decode_tok_s": 12.031736419166446,
+      "completion_tokens": 256,
+      "reasoning_tokens": null,
+      "finish_reason": "length",
+      "total_s": 40.84631064301357,
+      "x_engine_stats": {
+        "prompt_tokens": 8211,
+        "reused_prefix": 12,
+        "completion_tokens": 256,
+        "ttft_s": 19.646,
+        "decode_tok_s": 12.03,
+        "prefill_miss": 0.1,
+        "decode_miss": 0.071,
+        "decode_miss_picks": 0.089,
+        "hot_reads": 404,
+        "hot_kept": 402,
+        "hot_per_tok": 1.57,
+        "swaps": 768,
+        "drafted_per_round": 0.63,
+        "accepted_per_round": 0.52
+      },
+      "prompt_tokens_actual": 8211,
+      "completion_chars": 0
+    },
+    {
+      "ttft_ms": 19405.219371023122,
+      "tpot_ms": 52.91445092549182,
+      "decode_tok_s": 18.8984291154809,
+      "completion_tokens": 256,
+      "reasoning_tokens": null,
+      "finish_reason": "length",
+      "total_s": 32.89840435702354,
+      "x_engine_stats": {
+        "prompt_tokens": 8201,
+        "reused_prefix": 12,
+        "completion_tokens": 256,
+        "ttft_s": 19.399,
+        "decode_tok_s": 18.9,
+        "prefill_miss": 0.059,
+        "decode_miss": 0.111,
+        "decode_miss_picks": 0.13,
+        "hot_reads": 443,
+        "hot_kept": 442,
+        "hot_per_tok": 1.72,
+        "swaps": 768,
+        "drafted_per_round": 2.9,
+        "accepted_per_round": 2.52
+      },
+      "prompt_tokens_actual": 8201,
+      "completion_chars": 0
+    }
+  ]
+}

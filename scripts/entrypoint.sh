@@ -61,7 +61,7 @@ err()  { echo "ERROR: $*" >&2; exit 1; }
 : "${MASTER_PORT:=29611}"
 : "${EP_LOCAL_IP:=}"
 
-echo "deepseek-v41-flash-spark $(cat /app/VERSION 2>/dev/null || echo dev)"
+echo "TideLM $(cat /app/VERSION 2>/dev/null || echo dev)"
 
 case "$DEFAULT_THINKING" in on|off) ;; *) err "DEFAULT_THINKING must be on|off (got '$DEFAULT_THINKING')" ;; esac
 case "$SPEC" in 0|1) ;; *) err "SPEC must be 0|1 (got '$SPEC')" ;; esac

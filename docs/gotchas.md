@@ -3392,3 +3392,16 @@ code but -0.355 on prose, where substitutes are what the router least wanted. Th
 code-heavy; serving adaptation (sensitivity high) re-ranks from 1017's own traffic, and hot reads
 cover part of the gap in the meantime. Re-measure `exact` after a few days of 1017 traffic before
 blaming the model for prose.
+
+## bench.py's random prompt was 3.7x too long on GLM, then served from cache (2026-10-18)
+
+`bench/bench.py --workload random --isl 8192` sizes its filler prompt with the server's own
+tokenizer through `/v1/debug/prompt`. The GLM server had no such endpoint, so the fit loop fell
+back to its first guess (isl / 2 filler words, about right for DeepSeek's tokenizer) and GLM's
+tokenizer made those 30,261 tokens: a 73 s "8K" time to first token. The GLM server now answers
+`/v1/debug/prompt` (template and tokenizer only), and the same run fits 8,201-8,226 tokens.
+
+The rerun then reported 1.1 s for 8,200 tokens -- a prefix-cache hit, not prefill. The prompt
+seeds come from `--label`; reusing the label of the bad run made every new prompt a prefix of a
+30K prompt the disk prefix cache already held. With a fresh label: 19.5 s. Give every random
+run a label no earlier run on that server used, and check `x_engine_stats.reused_prefix`.

@@ -1,0 +1,111 @@
+{
+  "label": "prose",
+  "workload": "prose",
+  "seed_salt": null,
+  "isl": null,
+  "osl": 1024,
+  "runs": 3,
+  "warmup": 1,
+  "thinking": false,
+  "effort": null,
+  "temperature": 0.6,
+  "ignore_eos": false,
+  "base": "http://127.0.0.1:8000",
+  "model": "glm-5.3",
+  "health": {
+    "status": "ok",
+    "queued": 0
+  },
+  "ttft_ms_median": 606.4414,
+  "tpot_ms_median": 73.3754,
+  "decode_tok_s_median": 13.6285,
+  "engine_median": {
+    "accept_len_mean": null,
+    "expert_hit_rate": null,
+    "nvme_gb": null,
+    "engram_rows": null
+  },
+  "raw": [
+    {
+      "ttft_ms": 1493.832993961405,
+      "tpot_ms": 75.6495931339523,
+      "decode_tok_s": 13.218841748815565,
+      "completion_tokens": 1024,
+      "reasoning_tokens": null,
+      "finish_reason": "length",
+      "total_s": 78.88336676999461,
+      "x_engine_stats": {
+        "prompt_tokens": 54,
+        "reused_prefix": 15,
+        "completion_tokens": 1024,
+        "ttft_s": 1.49,
+        "decode_tok_s": 13.22,
+        "prefill_miss": 0.071,
+        "decode_miss": 0.033,
+        "decode_miss_picks": 0.048,
+        "hot_reads": 509,
+        "hot_kept": 498,
+        "hot_per_tok": 0.5,
+        "swaps": 1327,
+        "drafted_per_round": 1.6,
+        "accepted_per_round": 0.9
+      },
+      "prompt_tokens_actual": null,
+      "completion_chars": 5457
+    },
+    {
+      "ttft_ms": 604.9764499766752,
+      "tpot_ms": 70.912521644195,
+      "decode_tok_s": 14.101881823037122,
+      "completion_tokens": 1024,
+      "reasoning_tokens": null,
+      "finish_reason": "length",
+      "total_s": 73.14848609198816,
+      "x_engine_stats": {
+        "prompt_tokens": 54,
+        "reused_prefix": 15,
+        "completion_tokens": 1024,
+        "ttft_s": 0.602,
+        "decode_tok_s": 14.1,
+        "prefill_miss": 0.106,
+        "decode_miss": 0.029,
+        "decode_miss_picks": 0.043,
+        "hot_reads": 406,
+        "hot_kept": 406,
+        "hot_per_tok": 0.4,
+        "swaps": 261,
+        "drafted_per_round": 1.72,
+        "accepted_per_round": 1.03
+      },
+      "prompt_tokens_actual": null,
+      "completion_chars": 5368
+    },
+    {
+      "ttft_ms": 606.4413540298119,
+      "tpot_ms": 73.37544043690653,
+      "decode_tok_s": 13.628538296269197,
+      "completion_tokens": 1024,
+      "reasoning_tokens": null,
+      "finish_reason": "length",
+      "total_s": 75.66951692098519,
+      "x_engine_stats": {
+        "prompt_tokens": 54,
+        "reused_prefix": 15,
+        "completion_tokens": 1024,
+        "ttft_s": 0.604,
+        "decode_tok_s": 13.63,
+        "prefill_miss": 0.112,
+        "decode_miss": 0.029,
+        "decode_miss_picks": 0.043,
+        "hot_reads": 425,
+        "hot_kept": 425,
+        "hot_per_tok": 0.42,
+        "swaps": 186,
+        "drafted_per_round": 1.53,
+        "accepted_per_round": 0.9
+      },
+      "prompt_tokens_actual": null,
+      "completion_chars": 5583
+    }
+  ]
+}

@@ -21,6 +21,22 @@ chat-template layer, whose `reasoning_effort` string mapping the server's own ma
 follows), **`DeepSelect`** (the indexer top-k kernel — `sm_100a`/`sm_103a` only, which is
 part of why this box needs its own path) and **`DeepJIT`**.
 
+## GLM-5.3
+
+**[Z.ai](https://huggingface.co/zai-org/GLM-5.3)** -- GLM-5.3 (754B total, `glm_moe_dsa`): the
+architecture (MLA attention with the DSA sparse indexer, 256-expert MoE with one shared expert,
+the MTP layer the engine drafts with), the weights, the tokenizer and chat template the server
+renders with. The weights carry Z.ai's GLM-5.3 licence; read it before deploying.
+
+**[AMD](https://huggingface.co/amd/GLM-5.3-Quark-MXFP4-AttnFP8)** -- the MXFP4 checkpoint both GLM
+profiles load (`amd/GLM-5.3-Quark-MXFP4-AttnFP8`, quantized with AMD-Quark): MXFP4 experts, FP8
+attention. **bertholomus** -- the EXL3 3.0 bpw checkpoint
+(`bertholomus/GLM-5.3-EXL3-3.0bpw`) that `tools/glm_pack_exl3.py` repacks per rank for the EXL3
+profile.
+
+The GLM engine (`engine/glm/`) began as the Muse Spark Open experiment (`engine/muse/`), whose
+TP2 runtime, checkpoint readers and server it still builds on.
+
 ## Where the techniques come from
 
 Both of the load-bearing ideas here were built and measured in earlier recipes of mine on
