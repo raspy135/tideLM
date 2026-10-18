@@ -198,8 +198,6 @@ class DecodeRuntime:
                 or engine.fast is None or engine.fast.lut is None or not engine.spec
                 or not getattr(engine.ep, 'tensor_parallel', False)):
             raise ValueError('concurrency > 1 requires TP, speculative decode and a resident expert LUT')
-        if engine.replica_slots:
-            raise ValueError('concurrency > 1 does not support prefill replicas')
         from engine.batch_decode import BatchDecoder, supported
         reason = supported(engine.fast)
         if reason:

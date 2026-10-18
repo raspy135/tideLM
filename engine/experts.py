@@ -122,7 +122,7 @@ def _pread_chunk(fd: int, view: memoryview, off: int, need: int) -> None:
 class ExpertStore:
     def __init__(self, model_dir: str, index: dict, arena, n_layers: int, transient_slots: int = 400,
                  io_threads: int = 12, mtp_prefix: str | None = None, read_threads: int | None = None,
-                 read_chunk_mb: float | None = None, ep=None, replica_slots: int = 0):
+                 read_chunk_mb: float | None = None, ep=None):
         self.model_dir = model_dir
         self.arena = arena  # tools.fp4_moe.ExpertArena or a compatible object with .slots and load_slot_bytes
         # EP2 (engine/dist.py): with expert parallel active, this rank only resolves experts it
@@ -137,11 +137,7 @@ class ExpertStore:
         self.ep = ep
         ep_active = ep is not None and getattr(ep, "active", False)
         self.null_slot = None
-        if replica_slots < 0 or (replica_slots and not ep_active):
-            raise ValueError('replica slots require EP and a nonnegative capacity')
-        self.n_slots = (arena.slots - 1 if ep_active else arena.slots) - replica_slots
-        # Dedicated tail slots, never part of LRU eviction or the transient ring.
-        self.replica_slots = list(range(self.n_slots, self.n_slots + replica_slots))
+        self.n_slots = arena.slots - 1 if ep_active else arena.slots
         if ep_active:
             # Both arena formats can hold a zero expert now. The FP4 arena stores the zeros
             # verbatim; the CB3 arena packs them, which yields an all-zero codebook whose codes

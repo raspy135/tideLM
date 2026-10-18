@@ -1250,10 +1250,6 @@ class Model:
             unmasked = logits
             logits = logits.masked_fill(~effective_keep, float("-inf"))
         indices = logits.topk(k, dim=-1)[1]
-        probe = getattr(self, "prefill_replica_counts", None)
-        if prefill and n_experts != 128 and probe is not None:
-            flat = indices.reshape(-1)
-            probe[L].scatter_add_(0, flat, torch.ones_like(flat, dtype=torch.int32))
         weights = scores.gather(1, indices)
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
         policy = getattr(self, "miss_policy", "substitute")
@@ -1284,9 +1280,6 @@ class Model:
         # backstop, because the failure mode is silent wrong slots, not an error.
         lut = getattr(self, "slot_lut", None)
         sector_stream = streaming and focus is not None and getattr(focus, 'dynamic', False)
-        replica_lut = getattr(self, "prefill_replica_lut", None) if prefill else None
-        if replica_lut is not None and n_experts != 128:
-            lut = replica_lut
         if sector_stream:
             try:
                 from engine.global_residency import streaming_moe
@@ -1331,9 +1324,6 @@ class Model:
             route = getattr(self, "prefill_routes", {}).get(L) if prefill else None
             if streaming:
                 route = None  # static compact IDs do not include nonresident experts
-            replica_routes = getattr(self, "prefill_replica_routes", None) if prefill else None
-            if replica_routes is not None:
-                route = replica_routes.get(L)
             route_args = {}
             if rescued:
                 # Static compact IDs omit pruned experts. Rebuild only this call's routing;
