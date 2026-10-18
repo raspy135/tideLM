@@ -817,18 +817,18 @@ class V41Engine:
                 or os.environ.get('DSV41_TP_EXPERT_LAYOUT', 'output') != 'output'):
             raise ValueError('draft TP requires native FP4 TP2 with output layout')
         if self.ep.tensor_parallel:
-            if exl3_cls is not None:
-                if os.environ.get('DSV41_PREFILL_EP_OVERLAP', '0') == '1':
-                    raise ValueError('EXL3 expert TP forbids EP overlap')
-            elif (self.kernel != 'triton-fp4' or cb3_cls is not None or sim_bits
-                    or os.environ.get('DSV41_PREFILL_EP_OVERLAP', '0') == '1'):
-                raise ValueError('expert TP requires native FP4, no EP overlap')
+            if exl3_cls is None and (self.kernel != 'triton-fp4' or cb3_cls is not None or sim_bits):
+                raise ValueError('expert TP requires native FP4')
             if exl3_cls is None:
                 self.expert_bytes //= self.ep.world
-        # Experimental EP2 prefill replicas (DSV41_PREFILL_REPLICA_GB) were removed 2026-10-17:
-        # never enabled in a profile; docs/prefill-replicas.md keeps what was measured.
+        # Experimental EP2 prefill replicas (DSV41_PREFILL_REPLICA_GB) and the prefill EP combine
+        # overlap (DSV41_PREFILL_EP_OVERLAP) were removed 2026-10-17: never enabled in a profile,
+        # and the overlap measured no reliable gain. docs/prefill-replicas.md and
+        # docs/prefill-ep-overlap.md keep what was measured.
         if float(os.environ.get("DSV41_PREFILL_REPLICA_GB", "0") or 0):
             raise ValueError('DSV41_PREFILL_REPLICA_GB: prefill replicas were removed (docs/prefill-replicas.md)')
+        if os.environ.get("DSV41_PREFILL_EP_OVERLAP", "0") not in ("", "0"):
+            raise ValueError('DSV41_PREFILL_EP_OVERLAP: the overlap was removed (docs/prefill-ep-overlap.md)')
         if self.ep.active:
             assert expert_format in ("", "fp4", "cb3", "exl3"), expert_format
             self.ep.init(device)
@@ -1504,8 +1504,6 @@ class V41Engine:
                 "prefill_timing": PREFILL_TIMING,
                 "prefill_moe_timing": os.environ.get("DSV41_PREFILL_MOE_TIMING", "0"),
                 "prefill_swap_routes_version": 1,
-                "prefill_ep_overlap": os.environ.get("DSV41_PREFILL_EP_OVERLAP", "0"),
-                "prefill_ep_overlap_join_version": 1,
                 # The prefill indexer's score reduction. The tiled path is meant to select the
                 # same positions as the monolithic one, but a per-tile topk can break a tie
                 # differently, so a split pair could read different sparse KV with nothing
@@ -3618,8 +3616,6 @@ class V41Engine:
                                   os.environ.get("DSV41_PREFILL_SKIP_NULL", "1") == "1"),
             "prefill_fixed_routing": (bool(getattr(self.model, "prefill_routes", None)) and
                                       os.environ.get("DSV41_PREFILL_FIXED_ROUTING", "1") == "1"),
-            "prefill_ep_overlap": (self.ep.active and
-                                   os.environ.get("DSV41_PREFILL_EP_OVERLAP", "0") == "1"),
             "prefix_cache": (self.swa_replay and os.environ.get("DSV41_PREFIX_CACHE", "1") == "1"),
             "prefix_snapshots": PREFIX_SNAPSHOTS,
             "prefix_response": os.environ.get('DSV41_PREFIX_RESPONSE', '1') == '1',

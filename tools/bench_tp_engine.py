@@ -42,7 +42,7 @@ os.environ['DSV41_TP_EXPERT_REDUCE'] = args.reduce
 for flag in ('DSV41_TP_ATTN', 'DSV41_TP_DENSE', 'DSV41_TP_HEAD'):
     os.environ[flag] = str(int(args.mode == 'tp'))
 for flag in ('DSV41_PREFIX_DISK', 'DSV41_PREFIX_CACHE', 'DSV41_PRUNE_SWAP',
-             'DSV41_PRUNE_SWAP_PREFILL', 'DSV41_PREFILL_EP_OVERLAP',
+             'DSV41_PRUNE_SWAP_PREFILL',
              'DSV41_PREFILL_TIMING', 'DSV41_PREFILL_MOE_TIMING', 'DSV41_ATTN_TIMING',
              'DSV41_STEP_TIMING', 'DSV41_GPU_TIMING'):
     os.environ[flag] = '0'

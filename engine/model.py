@@ -507,15 +507,6 @@ class Model:
         # single value handed to the model.
         self._positions = torch.arange(caches.max_seq + 8, device=self.dev)
         self._window_offsets = torch.arange(a.window_size - 1, -1, -1, device=self.dev)
-        # DSV41_PREFILL_EP_OVERLAP runs the per-layer EP2 all-reduce on this side stream so it
-        # overlaps compute. Default off. The original path waited on this user stream rather
-        # than the Work's internal NCCL stream, racing the routed-output read. finish_combine
-        # now establishes the actual completion dependency; see docs/prefill-ep-overlap.md.
-        ep = getattr(store, "ep", None)
-        self._ep_comm_stream = (torch.cuda.Stream(device=self.dev)
-                                if (torch.cuda.is_available() and getattr(ep, "active", False)
-                                    and os.environ.get("DSV41_PREFILL_EP_OVERLAP", "0") == "1")
-                                else None)
         self.tap = None  # optional diagnostic hook: callable(name, L, tensor)
         # Persistent because fastdecode captures compressed-KV QDQ in a CUDA graph.  Copying the
         # tiny lookup table from CPU inside capture is illegal even though the arithmetic itself
@@ -1318,8 +1309,6 @@ class Model:
         # separately, and leave their fp32 total carrying both errors. So EP2 takes the half in
         # fp32, all-reduces, and rounds once, exactly where the single-box path rounds: what
         # remains is purely the REGROUPED fp32 addition engine/dist.py documents.
-        ep_work = None
-        ep_overlap = False
         if getattr(store, "null_slot", None) is not None and not sector_stream:
             route = getattr(self, "prefill_routes", {}).get(L) if prefill else None
             if streaming:
@@ -1355,12 +1344,7 @@ class Model:
             # during prefill.
             _mark("moe_kernel")
             tc = time.perf_counter()
-            tp_experts = getattr(store.ep, 'tensor_parallel', False)
-            ep_overlap = (not tp_experts and prefill and y.size(0) > 16 and self._ep_comm_stream is not None
-                          and os.environ.get("DSV41_PREFILL_EP_OVERLAP", "0") == "1")
-            if ep_overlap:
-                ep_work = store.ep.combine_async(routed, self._ep_comm_stream)
-            elif not tp_experts:
+            if not getattr(store.ep, 'tensor_parallel', False):
                 store.ep.combine(routed)
                 _mark("ep_combine")
             self.stats["ep_s"] += time.perf_counter() - tc   # pure network time; moe_s includes it
@@ -1379,12 +1363,6 @@ class Model:
         # A TP shared expert's RowParallelWeight reduces before BF16 rounding inside
         # expert_ffn. Unsharded DSpark shared experts must not be reduced a second time.
         _mark("shared_expert")   # the dense FFN every token passes through
-        if getattr(store, "null_slot", None) is not None:
-            if ep_overlap:
-                # Queue, rather than host-synchronise, the dependency.  The shared expert already
-                # sits ahead of this wait on the compute stream; conversion/add wait for both.
-                store.ep.finish_combine(ep_work)
-                _mark("ep_combine")
         self._tap("moe_routed", L, routed); self._tap("moe_shared", L, shared)
         out = routed + shared
         self.stats["moe_s"] += time.perf_counter() - t0
