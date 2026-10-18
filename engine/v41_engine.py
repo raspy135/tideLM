@@ -565,7 +565,6 @@ class V41Engine:
             self.args.n_routed_experts, self.args.n_activated_experts, prune_keep, prune_select)
         from engine.expert_profiles import ExpertProfile
         self.expert_profile = ExpertProfile(os.environ, self.args.n_layers, self.args.n_routed_experts)
-        self.expert_profile.validate(prune_keep, prune_select, self.prune_layer_counts, ADAPT)
         from engine.layer_stream import parse_layers
         self.stream_layers = parse_layers(os.environ.get('DSV41_STREAM_LAYERS', ''), self.args.n_layers)
         self.user_prompt_stream = os.environ.get('DSV41_USER_PROMPT_STREAM', '0') == '1'
@@ -583,7 +582,7 @@ class V41Engine:
         if self.dynamic_experts and (self.prune_layer_counts is not None or any(w != 1. for w in self.prune_layer_weights)):
             raise ValueError('fully dynamic allocation requires no fixed layer counts or layer discounts')
         if self.dynamic_experts:
-            if self.stream_layers or self.expert_profile.static or not prune_keep or not 0 < prune_keep < 1:
+            if self.stream_layers or not prune_keep or not 0 < prune_keep < 1:
                 raise ValueError('dynamic allocation requires adaptive pruned residency without layer streaming')
             # Concurrent lanes (DSV41_MAX_CONCURRENCY > 1) are fine: a cross-layer transfer edits the
             # shared slot table and masks in place, at a scheduler boundary where no lane is
@@ -605,7 +604,7 @@ class V41Engine:
                 raise ValueError('latest-user streaming requires bounded replay to refresh the first answer after admission')
             if os.environ.get('DSV41_PRUNE_MISS', '0') != '1':
                 raise ValueError('latest-user streaming requires DSV41_PRUNE_MISS=1')
-            if self.stream_layers or self.expert_profile.static or not prune_keep or not 0 < prune_keep < 1:
+            if self.stream_layers or not prune_keep or not 0 < prune_keep < 1:
                 raise ValueError('latest-user streaming requires adaptive pruned residency without layer streaming')
             if os.environ.get('DSV41_MAX_CONCURRENCY', '1') != '1':
                 raise ValueError('latest-user streaming requires concurrency 1')
@@ -1116,13 +1115,8 @@ class V41Engine:
         if prune_keep and prune_keep < 1.0:
             # pruned, all-resident mode: per layer only the top-N experts (by trace frequency) stay
             # routable, and exactly those are warm-started, so decode never touches NVMe
-            if self.expert_profile.static:
-                counts = self.expert_profile.scores(trace_stats, prune_keep)
-                log(f"fixed expert profile: {self.expert_profile.rank} on {self.expert_profile.source}; "
-                    f"topics: {', '.join(self.expert_profile.topics)}")
-            else:
-                cc, cg = EX.category_counts(trace_stats, "coding"), EX.category_counts(trace_stats, "general")
-                assert len(cc) == 40 and len(cg) == 40, "pruned mode needs the per-layer trace npz files next to trace_stats"
+            cc, cg = EX.category_counts(trace_stats, "coding"), EX.category_counts(trace_stats, "general")
+            assert len(cc) == 40 and len(cg) == 40, "pruned mode needs the per-layer trace npz files next to trace_stats"
             # How the two workloads are combined into one ranking. "sum" (the 0.2.0-wip default)
             # adds the per-layer-normalized frequencies, which favours experts moderately used by
             # both and drops each workload's specialists -- the coding and prose top sets overlap by
@@ -1131,9 +1125,7 @@ class V41Engine:
             # ranked on prose alone wrote clean text (NOTES 2026-09-12). "max" keeps an expert that
             # matters to EITHER workload, which is what a general-purpose server needs.
             rank = self.expert_profile.rank
-            if self.expert_profile.static:
-                pass  # admission priorities / saliency retain their own units
-            elif rank == "sum":
+            if rank == "sum":
                 counts = {L: cc[L] / cc[L].sum() + cg[L] / cg[L].sum() for L in range(40)}
             elif rank == "max":
                 counts = {L: np.maximum(cc[L] / cc[L].sum(), cg[L] / cg[L].sum()) for L in range(40)}
@@ -1143,10 +1135,9 @@ class V41Engine:
             # with the model; the demand DB is this box's own history and accumulates across
             # restarts, so a server used mostly for one kind of work drifts towards the experts
             # that work needs. DSV41_PRUNE_ADAPT=0 pins the shipped ranking.
-            self._prune_trace = (None if self.expert_profile.static else
-                                 {L: v.copy() for L, v in counts.items()})
+            self._prune_trace = {L: v.copy() for L, v in counts.items()}
             log(ADAPT.describe())
-            log(f"observed routing metric: {ADAPT.metric}; fixed profile {self.expert_profile.static}")
+            log(f"observed routing metric: {ADAPT.metric}")
             db = load_prune_db() if ADAPT.use_db else None
             # Rank 0 alone chooses the cold-start seed. Carry it in the existing
             # ranking broadcast so peer-local DB files cannot diverge the map.
@@ -1201,7 +1192,6 @@ class V41Engine:
             else:
                 masks, keep = build_keep_masks(counts, prune_keep, prune_select, device,
                                               layer_counts=self.prune_layer_counts)
-            self.expert_profile.measure_coverage(keep)
             n_keep = max(len(v) for v in keep.values())
             ranked = [(float(counts[L][e]), L, int(e)) for L, ks in keep.items() for e in ks]
             ranked.sort(reverse=True)

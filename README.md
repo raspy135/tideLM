@@ -408,9 +408,9 @@ What this fork changed, compared with upstream at
 | Routed expert weights | CB3 requantization in the headline configuration | EXL3 2.9 bpw (default) or the checkpoint's native MXFP4 |
 | Launch | `start.sh` on one box | Containerised pair launcher; boot-time guard that both ranks agree on configuration |
 
-Both the static topic profiles and maxmin ranker remain available here, ported with exact
-parity, as [an optional fixed profile](docs/expert-profiles.md); in a small comparison they did not
-beat adaptive residency ([gotchas](docs/gotchas.md#the-authors-broad-topic-profiles-are-not-a-demonstrated-quality-default)).
+The static topic profiles and maxmin ranker were ported here with exact parity, measured, and
+removed on 2026-10-17: in a small comparison they did not beat adaptive residency
+([record](docs/expert-profiles.md), [gotchas](docs/gotchas.md#the-authors-broad-topic-profiles-are-not-a-demonstrated-quality-default)).
 
 The RoCE all-gather is ported from [TensorFold](https://github.com/ashhart/TensorFold), which
 adapted b12x's; the EXL3 expert kernels port TensorFold's ExLlamaV3-derived device code; the
