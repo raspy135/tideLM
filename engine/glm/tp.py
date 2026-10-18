@@ -315,11 +315,32 @@ class GlmTP:
         # GLM_HOT_KEEP_AUDIT=1 (measurement only, rank 0, syncs per keep): how many kept reads a
         # rank gate -- adapt()'s rule, score beats the victim's by GLM_ADAPT_MARGIN -- would drop.
         self.hot_audit = env("GLM_HOT_KEEP_AUDIT", "0") == "1" and self.rank == 0
+        # Repetition loops (docs/gotchas.md, 2026-10-18). A served Japanese answer that switched to
+        # English ("sports drinks") and then repeated " sports" until stopped, replayed 8 times
+        # from each point: just before the loop, 2 of 8 continuations looped with substituted
+        # experts and 0 of 8 with every expert exact; from inside it, 5 of 8 and 3 of 8 (the exact
+        # model gives the repeated word 0.69 there). Misses open the loop; once in it, the model
+        # holds it on its own. Two settings, one for each:
+        # GLM_LOOP_GUARD=R (needs GLM_HOT): when the tokens emitted so far end in a cycle of 1-8
+        # tokens repeated R times, the next GLM_LOOP_EXACT tokens decode with every missed pick
+        # read -- hot reads with no threshold or step cap, up to GLM_LOOP_READS a layer. Once a
+        # cycle has had its window it does not trigger again in that request (a table rule or a
+        # run of zeros the exact model chose to continue).
+        self.loop_rep = int(env("GLM_LOOP_GUARD", "0")) if self.hot_n else 0
+        # GLM_LOOP_BREAK=N: when the next token would make a cycle's N-th repetition, it is drawn
+        # again from the same logits without that token.
+        self.loop_break = int(env("GLM_LOOP_BREAK", "0"))
+        self.loop_window = int(env("GLM_LOOP_EXACT", "32"))
+        self.loop_reads = int(env("GLM_LOOP_READS", "32"))
+        self.loop_left = 0
+        self._loop_seen: set = set()
+        # Candidates the decode graphs keep per layer: the hot reads' own, or the guard's.
+        self.hot_c = max(self.hot_n, self.loop_reads if self.loop_rep else 0)
         self.hot_q = []                 # [(VL, ve, slot)] victims for kept hot reads, weakest last
         self.hot_live = None            # [(e, transient slot)] hot reads of the layer being computed
         self._pre_route = {}            # L -> (x, scores, choice) from _hot_candidate, for _route
         self._warming = False           # warmup(): no adaptation or background step
-        transient = cfg.experts if self.miss == "stream" else max(2 * self.pf_n, self.hot_n)
+        transient = cfg.experts if self.miss == "stream" else max(2 * self.pf_n, self.hot_c)
         t0 = time.perf_counter()
         self._load_dense()
         self._alloc_cache()
@@ -458,7 +479,8 @@ class GlmTP:
                 "pf": [env(k, "") for k in ("GLM_PF", "GLM_PF_SLOTS", "GLM_PF_MIN_ROWS", "GLM_PF_KEEP", "GLM_PF_KEEP_MARGIN", "GLM_HOT", "GLM_HOT_MIN",
                                             "GLM_HOT_TARGET", "GLM_HOT_KEEP", "GLM_HOT_MAX", "GLM_HOT_KEEP_AUDIT", "GLM_HOT_PACE",
                                             "GLM_HOT_PACE_LEAD", "GLM_SUB_WEIGHT", "GLM_MTP_FULL", "GLM_MISS_LOG",
-                                            "GLM_MTP_DYN")],
+                                            "GLM_MTP_DYN", "GLM_LOOP_GUARD", "GLM_LOOP_EXACT", "GLM_LOOP_READS",
+                                            "GLM_LOOP_BREAK")],
                 "adapt": [env(k, "") for k in ("GLM_ADAPT", "GLM_ADAPT_EVERY", "GLM_ADAPT_PREFILL_SWAPS",
                                                "GLM_ADAPT_DECODE_SWAPS", "GLM_ADAPT_DECAY", "GLM_ADAPT_CROSS_LAYER",
                                                "GLM_ADAPT_MARGIN", "GLM_BG", "GLM_BG_EVERY", "GLM_BG_READS",
@@ -1186,6 +1208,7 @@ class GlmTP:
         h = self.hot_stats
         return {"picks": ms.get("picks", 0), "missed": ms.get("missed", 0), "mass": ms.get("mass", 0.0),
                 "mass_missed": ms.get("mass_missed", 0.0), "hot": h["reads"], "kept": h.get("kept", 0),
+                "loops": h.get("loop_guards", 0), "breaks": h.get("loop_breaks", 0),
                 "swaps": self.adapt_totals["swaps"] if self.demand is not None else 0, "tokens": len(self.tokens),
                 "rounds": self.spec_stats.get("rounds", 0), "accepted": self.spec_stats.get("accepted", 0),
                 "drafted": self.spec_stats.get("drafted", 0)}
@@ -1201,6 +1224,7 @@ class GlmTP:
         return {"prefill_miss": miss(s0, s1), "decode_miss": miss(s1, s2),
                 "decode_miss_picks": round((s2["missed"] - s1["missed"]) / p, 3) if p > 0 else None,
                 "hot_reads": s2["hot"] - s1["hot"], "hot_kept": s2["kept"] - s1["kept"],
+                **{k: s2[k] - s1[k] for k in ("loops", "breaks") if s2.get(k, 0) - s1.get(k, 0)},
                 "hot_per_tok": round((s2["hot"] - s1["hot"]) / max(1, s2.get("tokens", 0) - s1.get("tokens", 0)), 2),
                 "swaps": s2["swaps"] - s0["swaps"],
                 "drafted_per_round": round((s2["drafted"] - s1["drafted"]) / max(1, s2["rounds"] - s1["rounds"]), 2),
@@ -1534,11 +1558,13 @@ class GlmTP:
         cfg = self.cfg
         w0, ids0 = route(cfg, x, self.L[L]["router"], self.L[L]["bias"], None)
         share = (w0 / cfg.routed_scaling) * (~self.allowed[L][ids0])
-        vals, idx = torch.topk(share.reshape(-1), min(share.numel(), 4 * self.hot_n))
+        exact = self.loop_left > 0                 # GLM_LOOP_GUARD's window: every miss
+        lim, thr = (self.loop_reads, 1e-9) if exact else (self.hot_n, self.hot_min)
+        vals, idx = torch.topk(share.reshape(-1), min(share.numel(), 4 * lim))
         picks = ids0.reshape(-1)[idx].tolist()
         es = []
         for v, e in zip(vals.tolist(), picks):
-            if v < self.hot_min or len(es) >= self.hot_n:
+            if v < thr or len(es) >= lim:
                 break
             if e not in es:
                 es.append(e)
@@ -1687,7 +1713,7 @@ class GlmTP:
         """Graph-safe: this layer's heaviest missed picks (weight share, expert) into the pinned
         host buffer, read by _replay_split between this layer's two graphs."""
         from .ref import route_pick, route_scores
-        cfg, n = self.cfg, self.hot_n
+        cfg, n = self.cfg, self.hot_c
         sc = route_scores(cfg, x, self.L[L]["router"], self.L[L]["bias"])
         self._pre_route[L] = (x, *sc)          # the MLP segment's _route reuses the matmul
         w0, ids0 = route_pick(cfg, *sc, None)
@@ -1723,8 +1749,8 @@ class GlmTP:
         boundary tensor kept alive by the entry, so later graphs read earlier graphs' outputs."""
         cfg = self.cfg
         if not hasattr(self, "_hot_dev"):
-            self._hot_dev = torch.zeros((self.nL, 4 * self.hot_n), dtype=torch.float32, device=self.dev)
-            self._hot_host = torch.zeros((self.nL, 4 * self.hot_n), dtype=torch.float32).pin_memory()
+            self._hot_dev = torch.zeros((self.nL, 4 * self.hot_c), dtype=torch.float32, device=self.dev)
+            self._hot_host = torch.zeros((self.nL, 4 * self.hot_c), dtype=torch.float32).pin_memory()
         st_ids = ids.clone()
         side = self._side_stream()
         side.wait_stream(torch.cuda.current_stream())
@@ -1769,9 +1795,13 @@ class GlmTP:
             entry = self.graphs[("split", T)] = self._capture_split(ids)
         segs, st_ids, st_out, st_h, _ = entry
         st_ids.copy_(ids)
-        n, st = self.hot_n, self.hot_stats
-        thr = self.hot_thr.get(T, self.hot_min)
-        cap = self.hot_max or (max(1, int(2 * self.hot_target)) if self.hot_target > 0 else 1 << 30)
+        n, st = self.hot_c, self.hot_stats
+        # The candidates are sorted, so with lim = hot_n these are the reads a hot_c of hot_n made.
+        exact = self.loop_left > 0                 # GLM_LOOP_GUARD's window: every miss, no cap
+        lim = self.loop_reads if exact else self.hot_n
+        thr = 1e-9 if exact else self.hot_thr.get(T, self.hot_min)
+        cap = 1 << 30 if exact else \
+            self.hot_max or (max(1, int(2 * self.hot_target)) if self.hot_target > 0 else 1 << 30)
         reads = 0
         for kind, L, g in segs:
             g.replay()
@@ -1788,7 +1818,7 @@ class GlmTP:
                 room = min(room, -int(-cap * self._hot_frac[L] // 1) + self.hot_pace_lead - reads)
             es = []
             for v, e in zip(row[:2 * n], row[2 * n:]):
-                if v < thr or len(es) >= min(n, room):
+                if v < thr or len(es) >= min(lim, room):
                     break
                 if int(e) not in es:
                     es.append(int(e))
@@ -1811,7 +1841,9 @@ class GlmTP:
                 self.ck.drop_cache()
         if reads >= cap:
             st["capped"] = st.get("capped", 0) + 1      # later layers' misses went unread
-        if self.hot_target > 0:
+        if exact:
+            st["loop_reads"] = st.get("loop_reads", 0) + reads
+        elif self.hot_target > 0:
             # Multiplicative step toward the target; float math on identical counts on both ranks.
             thr *= 1.1 ** ((reads - self.hot_target) / self.hot_target)
             self.hot_thr[T] = min(1.0, max(self.hot_min, thr))
@@ -2078,6 +2110,8 @@ class GlmTP:
         every token and broadcasts; both ranks run the same calls."""
         stop = self.cfg.eos if stop is None else stop
         depth = int(env("GLM_MTP_DEPTH", "3")) if depth is None else depth
+        out = []                                   # emitted tokens, for GLM_LOOP_GUARD (both ranks)
+        self.loop_left, self._loop_seen = 0, set()
         # GLM_MTP_DYN=tau: depth is the most drafts a round; a draft is kept only while the
         # product of the drafts' own probabilities (the MTP's softmax at the drafted token) stays
         # at or above tau, so the verify step takes 1 + kept rows. 0: always `depth` drafts.
@@ -2104,6 +2138,7 @@ class GlmTP:
             return out[0] if n == 1 else out
 
         anchor = decide(self.sample(logits[-1], temperature, top_p, top_k, gen) if self.rank == 0 else None)
+        z_anchor = logits[-1]                     # what the pending anchor was drawn from (GLM_LOOP_BREAK)
         h_last = self.last_hidden[-1:]
         next_adapt = self.adapt_every
         rounds = 0
@@ -2111,6 +2146,17 @@ class GlmTP:
             halt = bool(decide(bool(should_stop and self.rank == 0 and should_stop())))
             if halt:
                 return
+            if self.loop_rep:
+                self._loop_check(out)
+            if self.loop_break and not self._warming and self._tail_cycle(out + [anchor], self.loop_break):
+                # Both ranks take this branch (same tokens) and receive the same new anchor.
+                z = None
+                if self.rank == 0:
+                    z = z_anchor.float().clone()
+                    z[anchor] = float("-inf")
+                anchor = decide(self.sample(z, temperature, top_p, top_k, gen) if self.rank == 0 else None)
+                self.hot_stats["loop_breaks"] = self.hot_stats.get("loop_breaks", 0) + 1
+                self.log(f"[glm] loop break at token {len(out)}: a cycle's {self.loop_break}th repetition")
             if self.demand is not None and self.adapt_every and emitted >= next_adapt and not self._warming:
                 # Both ranks reach this at the same token count (emitted is decided on rank 0).
                 n, sec = self.adapt(self.adapt_decode_swaps)
@@ -2121,6 +2167,8 @@ class GlmTP:
                 self.bg_step()                    # same round on both ranks
             yield anchor
             emitted += 1
+            out.append(anchor)
+            self.loop_left = max(0, self.loop_left - 1)
             if anchor in stop or emitted >= max_new:
                 self.mtp_fill = True
                 self.forward([anchor], all_logits=False)
@@ -2129,6 +2177,7 @@ class GlmTP:
             if not spec:
                 logits = self.forward([anchor], all_logits=False)
                 anchor = decide(self.sample(logits[-1], temperature, top_p, top_k, gen) if self.rank == 0 else None)
+                z_anchor = logits[-1]
                 continue
             # Drafts: the MTP layer at P-1 (anchor, target hidden at P-1), then on its own output.
             # Under GLM_MTP_DYN rank 0 decides whether each draft is kept (and which it is), so
@@ -2187,6 +2236,7 @@ class GlmTP:
                     nxt = self.sample(tl[nd], temperature, top_p, top_k, gen)
                 decision = (n_acc, nxt)
             n_acc, nxt = decide(decision, 2)
+            z_anchor = tl[n_acc]                  # nxt came from the first rejected row, or after the last
             self.spec_stats["rounds"] += 1
             self.spec_stats["accepted"] += n_acc
             self.spec_stats["drafted"] = self.spec_stats.get("drafted", 0) + nd
@@ -2202,9 +2252,37 @@ class GlmTP:
             for d in drafts[:n_acc]:
                 yield d
                 emitted += 1
+                out.append(d)
+                self.loop_left = max(0, self.loop_left - 1)
                 if d in stop or emitted >= max_new:
                     return
             anchor = nxt
+
+    @staticmethod
+    def _tail_cycle(seq, rep):
+        """The cycle of 1-8 tokens seq ends in, repeated rep times (in a canonical phase), or None."""
+        for p in range(1, 9):
+            n = p * rep
+            tail = seq[-n:]
+            if len(tail) == n and all(tail[i] == tail[i + p] for i in range(n - p)):
+                cyc = tail[-p:]
+                return min(tuple(cyc[i:] + cyc[:i]) for i in range(p))
+        return None
+
+    def _loop_check(self, out):
+        """GLM_LOOP_GUARD: an exact window when the emitted tokens end in a cycle repeated loop_rep
+        times that has not had one in this request. Both ranks run it on the same tokens at the
+        same point of the same round, so they agree without a message."""
+        if self.loop_left > 0 or self._warming:
+            return
+        key = self._tail_cycle(out, self.loop_rep)
+        if key is None or key in self._loop_seen:
+            return
+        self._loop_seen.add(key)
+        self.loop_left = self.loop_window
+        self.hot_stats["loop_guards"] = self.hot_stats.get("loop_guards", 0) + 1
+        self.log(f"[glm] loop guard: a {len(key)}-token cycle repeated {self.loop_rep} times at token "
+                 f"{len(out)}; the next {self.loop_window} decode with every expert exact")
 
     def warmup(self, tokens: int = 48):
         """GLM_WARMUP (default 1): capture the decode graphs before the first request. Dynamic MTP
