@@ -3289,3 +3289,21 @@ starts a new namespace, and old namespaces are evicted first.
 
 Disk: rank 0's drive had 62 GB free when this went in. The default budget is 20 GB a node, and no
 segment is written that would leave less than MUSE_PREFIX_DISK_FREE_GB (10) free.
+
+## Serving at 256K with the split and prefixes on disk: a 203K-token prompt end to end (2026-10-17)
+
+EXL3 config, 12,350 slots, MUSE_MAX_SEQ=262144 (KV 7.28 GB a rank split, what 128K took unsplit),
+MUSE_PREFIX_DISK=1; ready at 8.0 GB MemAvailable (128K unsplit: 8.3). Through the HTTP server: a
+203,373-token prompt (the held-out corpus four times) prefilled in 592 s (344 tok/s) and answered
+correctly; its segment, 5.6 GB a rank, was written in 1.4 s. The follow-up turn reused it from memory
+(TTFT 1.2 s, 12.4 tok/s at 203K). After an unrelated request had replaced the in-memory sequence,
+the next turn restored 203,363 positions from disk in 0.64 s (TTFT 2.15 s). A replay from a fresh
+request later restored the whole prompt with TTFT 0.87 s. MemAvailable bottomed at 5.35 GiB on both
+ranks at the start of the long prefill and held 5.7-5.9 through it (the watchdog's floor is 3).
+
+Unexplained, once: the unrelated short request ("Say hello in one short sentence.", greedy) right
+after the 203K turns answered "Hello! 👋" and then ran on to its max_tokens with
+"</div>Assistant okay.Hello! 👋..." repeated. Replaying the same sequence (long prompt from disk,
+the follow-up, the same request) answered and stopped correctly twice, as did the request on a
+fresh pair; the residency adaptation had moved in between. Not attributed to the split or the
+prefix cache, and not ruled out either -- watch for it.
