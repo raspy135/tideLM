@@ -197,7 +197,8 @@ if VERIFY_ODD:
     VERIFY_WIDTHS = tuple(sorted({1, *VERIFY_WIDTHS}))
 # FastDecoder attributes that are sized by the verify width; _bind(T) points them at T's set.
 _WIDTH_ATTRS = ("ids", "pos", "eg_rows", "slots", "h", "pre_mix", "attn_pre", "ffn_post", "ffn_comb",
-                "ffn_pre", "y", "route_idx", "route_w", "topk", "candidates", "main_hidden", "logits",
+                "ffn_pre", "y", "route_idx", "route_w", "hot_scores", "hot_logits", "topk", "candidates",
+                "main_hidden", "logits",
                 "_ar_t", "_premix0", "kvl_buf", "sc_buf")
 
 # The graphed indexer needs a fixed key-axis shape, but that shape does not need to be the
@@ -240,6 +241,41 @@ class FastDecoder:
         self.decode_probe = None
         self._probe_draft_key = None
         self.stream_layers = getattr(model, 'stream_layers', frozenset())
+        # DSV41_HOT_READS (engine/hot_reads.py): every pruned MoE layer splits at its router, and
+        # the heaviest missing pick is read into the transient ring before the layer's MoE runs.
+        # DSV41_HOT_ASYNC: no split; the reads start after the step and are routable from the next.
+        from engine.hot_reads import HotReads, HotRing
+        self.hot, self.hot_layers, self._hot_live = None, frozenset(), None
+        self.hot_async, self.hot_ring = False, None
+        if HotReads.enabled():
+            pm = getattr(model, "prune_mask", None) or {}
+            self.hot = HotReads(self.a.n_layers, self.a.n_routed_experts, self.a.n_activated_experts)
+            self.hot_layers = frozenset(L for L in pm if L not in self.stream_layers)
+            if not self.hot_layers:
+                raise ValueError("DSV41_HOT_READS needs pruned (resident-only) routing")
+            self.hot.layers = sorted(self.hot_layers)
+            n = 2 * self.hot.width
+            self._hot_dev = torch.zeros(self.a.n_layers, n, dtype=torch.float32, device=self.dev)
+            self._hot_host = torch.zeros(self.a.n_layers, n, dtype=torch.float32).pin_memory()
+            self.hot_async = self.hot.asynchronous
+            if self.hot_async:
+                if os.environ.get("DSV41_MAX_CONCURRENCY", "1") != "1":
+                    raise ValueError("DSV41_HOT_ASYNC runs with one decode lane (DSV41_MAX_CONCURRENCY=1)")
+                self.hot_ring = HotRing(model.store.reserve_transient(self.hot.ring))
+                self._hot_pin = torch.zeros(self.hot.ring, 3, dtype=torch.int64).pin_memory()
+                self._hot_pin_np = self._hot_pin.numpy()
+                self._hot_idx = torch.zeros(self.hot.ring, 3, dtype=torch.int64, device=self.dev)
+                # The ring's live experts, every layer in one mask: a hot layer's router ORs its
+                # row into the resident mask (graph-captured), so a step sets them with one fill
+                # instead of a write a layer, and the resident masks are never touched.
+                E = self.a.n_routed_experts
+                self._hot_mask = torch.zeros(self.a.n_layers, E, dtype=torch.bool, device=self.dev)
+                self._hot_keep = {L: torch.zeros(E, dtype=torch.bool, device=self.dev) for L in self.hot_layers}
+                self._hot_side = torch.cuda.Stream(device=self.dev)
+                self._hot_ev = torch.cuda.Event()
+                self._hot_futs, self._hot_saved = [], None
+        # Layers whose decode graph splits at the router, for a host step between the halves.
+        self.split_layers = self.stream_layers | (frozenset() if self.hot_async else self.hot_layers)
         self.shared_stream = torch.cuda.Stream(device=self.dev) if SHARED_OVERLAP else None
         # DSV41_L2PF_MB: prefetch the next layer's weights during the MoE all-gather (engine/l2pf.py)
         self.l2pf_side = torch.cuda.Stream(device=self.dev) if l2pf.enabled() else None
@@ -410,6 +446,9 @@ class FastDecoder:
             y=torch.zeros(T, a.dim, dtype=bf16, device=dev),
             route_idx=torch.zeros(T, a.n_activated_experts, dtype=torch.long, device=dev),
             route_w=torch.zeros(T, a.n_activated_experts, dtype=f32, device=dev),
+            # DSV41_HOT_READS: a hot layer's pre-mask router outputs, for graph B to route again
+            hot_scores=torch.zeros(T, a.n_routed_experts, dtype=f32, device=dev),
+            hot_logits=torch.zeros(T, a.n_routed_experts, dtype=f32, device=dev),
             topk=torch.full((T, a.index_topk), -1, dtype=torch.long, device=dev),
             candidates=torch.zeros(T, self._n_cache(1), dtype=torch.bool, device=dev),
             main_hidden=torch.zeros(T, a.dim * len(a.dspark_target_layer_ids), dtype=f32, device=dev),
@@ -937,19 +976,29 @@ class FastDecoder:
         keep = pm[L] if pm is not None and L in pm else None
         if L in self.stream_layers:
             keep = self.m.stream_keep[L]
+        if self.hot_async and L in self.hot_layers:
+            keep = torch.logical_or(keep, self._hot_mask[L], out=self._hot_keep[L])
         if self.lean is not None and self.lean.usable_router(y, w.gate_w):
             # the same router with its elementwise work fused (engine/decode_lean.py); the gate
             # GEMM, topk and the k-way sum stay torch ops on the same shapes
             record = None
-            if keep is not None and M.PRUNE_MISS:
-                def record(lg, sc, _keep=keep, _L=L):
-                    self.m._record_prune_miss(lg, sc, _keep, _L, a.n_activated_experts, decode=True)
+            hot = L in self.hot_layers
+            if (keep is not None and M.PRUNE_MISS) or hot:
+                # The router's unmasked logits/scores: prune-miss accounting, and a hot layer's
+                # capture for graph B and the host (DSV41_HOT_READS)
+                def record(lg, sc, _keep=keep, _L=L, _hot=hot):
+                    if _keep is not None and M.PRUNE_MISS:
+                        self.m._record_prune_miss(lg, sc, _keep, _L, a.n_activated_experts, decode=True)
+                    if _hot:
+                        self._hot_capture(_L, sc, lg, _keep)
             self.lean.router(y, w.gate_w, w.gate_bias, keep, a.n_activated_experts, a.route_scale,
                              self.route_idx, self.route_w, record=record)
             idx = self.route_idx
         else:
             scores = F.softplus(R.mm(y.float(), self.W.layers[L].gate_w)).sqrt()
             logits = scores + w.gate_bias
+            if L in self.hot_layers:
+                self._hot_capture(L, scores, logits, keep)
             if keep is not None:
                 # same accounting as Model.moe: what the router wanted before pruning masked it.
                 # Fixed-shape throughout, and the accumulators are allocated before capture, so this
@@ -1217,6 +1266,18 @@ class FastDecoder:
     def _layer_b(self, L):
         a = self.a
         w = self.W.layers[L]
+        if L in self.hot_layers and not self.hot_async:
+            # Route again under the keep mask the host may have widened (DSV41_HOT_READS); with no
+            # read it equals graph A's routing.
+            lg = self.hot_logits.masked_fill(~self.m.prune_mask[L], float("-inf"))
+            idx = lg.topk(a.n_activated_experts, dim=-1)[1]
+            wts = self.hot_scores.gather(1, idx)
+            wts = wts / (wts.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
+            self.route_idx.copy_(idx); self.route_w.copy_(wts)
+            if self.expert_topp is not None:
+                _ETP.apply_(self.route_idx, self.route_w, *self.expert_topp, self.topp_sentinel)
+            if self.lut is not None:
+                torch.index_select(self.lut[L], 0, self.route_idx.view(-1), out=self.slots.view(-1))
         if L not in self.stream_layers and self._moe_merged_ok(w):
             if getattr(self.eng, "kernel", None) == "exl3-cuda":
                 self._moe_merged_exl3(L, w)
@@ -1623,11 +1684,11 @@ class FastDecoder:
             # a segment is queued asynchronously, so the host blocks on the next boundary's NVMe
             # reads while the GPU is still running the segment before it.
             from engine.layer_stream import graph_bounds
-            bounds = graph_bounds(self.a.n_layers, self.a.engram_layer_ids, self.stream_layers)
+            bounds = graph_bounds(self.a.n_layers, self.a.engram_layer_ids, self.split_layers)
             segs = []
             for i in range(len(bounds) - 1):
                 lo, hi = bounds[i], bounds[i + 1]
-                if lo in self.stream_layers:
+                if lo in self.split_layers:
                     # Router/attention first, then host loads current picks, then MoE.
                     # Both ranks split at these guarded static boundaries unconditionally.
                     gA = torch.cuda.CUDAGraph()
@@ -1653,7 +1714,7 @@ class FastDecoder:
             return
         gA, gB = [], []
         for L in range(self.a.n_layers):
-            if self.lut is not None and L not in self.stream_layers:
+            if self.lut is not None and L not in self.split_layers:
                 g = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(g, pool=self.pool):
                     self._layer_ab(L, st)
@@ -1696,6 +1757,118 @@ class FastDecoder:
             raise
         self.slots.copy_(slots)
 
+    def _hot_capture(self, L, scores, logits, keep):
+        """Graph A of a hot layer: keep the unmasked router outputs for graph B, and put the
+        layer's candidates in its pinned host row. DSV41_HOT_ASYNC: the candidates only, on the
+        device; the step copies every layer's row to the host once, at its end."""
+        if self.hot_async:
+            self.hot.candidates(scores, logits, keep, self._hot_dev[L])
+            return
+        self.hot_scores.copy_(scores); self.hot_logits.copy_(logits)
+        self.hot.candidates(scores, logits, keep, self._hot_dev[L])
+        self._hot_host[L].copy_(self._hot_dev[L], non_blocking=True)
+
+    def _split_resolve(self, L):
+        """Between a split layer's graphs: a stream layer resolves its picks; a hot layer reads
+        the planned misses into the transient ring and makes them routable for graph B."""
+        if L not in self.hot_layers or self.hot_async:
+            self._resolve(L)
+            return
+        if self.hot.room(L) <= 0:
+            self.hot.unread.append(L)        # budget spent: no sync (its row is counted next step)
+            return
+        torch.cuda.current_stream(self.dev).synchronize()       # graph A wrote the host row
+        es = self.hot.plan(L, self._hot_host[L].tolist())
+        if not es:
+            return
+        t0, st = time.perf_counter(), self.m.store.stats
+        n0 = st["prefill_misses"]
+        slots = self.m.store.resolve(L, torch.tensor([es], dtype=torch.int64), True)[0]
+        self.hot.stats["loaded"] += st["prefill_misses"] - n0     # the rest were ring hits
+        ids = torch.tensor(es, dtype=torch.long, device=self.dev)
+        keep, lut = self.m.prune_mask[L], self.lut[L]
+        self._hot_live = (L, ids, lut[ids].clone())
+        keep[ids] = True
+        lut[ids] = slots.to(device=self.dev, dtype=lut.dtype)
+        self.hot.stats["s"] += time.perf_counter() - t0
+
+    def _hot_restore(self):
+        """After graph B (stream-ordered): the read experts are not residents."""
+        if self._hot_live is None:
+            return
+        L, ids, old = self._hot_live
+        self.m.prune_mask[L][ids] = False
+        self.lut[L][ids] = old
+        self._hot_live = None
+
+    def _hot_async_begin(self):
+        """DSV41_HOT_ASYNC, before the step's graphs: plan from the last step's candidates (its
+        logits were read, so its host rows are final), start the reads into the ring, and make the
+        ring's live experts routable for this step: their slot-table entries, and `_hot_mask`,
+        which the hot layers' routers OR into the resident mask. A handful of launches however
+        many are live; a write a layer to the resident masks cost ~3 ms of host time a step.
+
+        A read's slot was last routable in an earlier step, all of whose work is queued ahead of
+        `_hot_ev`; the copy waits for that event only, so it overlaps this step's graphs, which no
+        longer route to the slot (`take` removed its previous key before the marks below)."""
+        t0 = time.perf_counter()
+        ring, st = self.hot_ring, self.m.store
+        plan = self.hot.plan_async(self._hot_host.tolist(), ring.taken())
+        null = getattr(st, "null_slot", None)
+        if plan:
+            self._hot_ev.record()
+            self._hot_side.wait_event(self._hot_ev)
+            for key in plan:
+                slot = ring.take(key)
+                if null is None or st.ep.owns(*key):     # EP2: only the owner holds the expert
+                    self._hot_futs.append(st.pool.submit(self._hot_load, key, slot))
+        if ring.live:
+            items = sorted(ring.live.items())
+            n = len(items)
+            pin = self._hot_pin_np
+            for i, ((L, e), slot) in enumerate(items):
+                pin[i, 0], pin[i, 1] = L, e
+                pin[i, 2] = slot if null is None or st.ep.owns(L, e) else null
+            idx = self._hot_idx[:n]
+            idx.copy_(self._hot_pin[:n], non_blocking=True)
+            flat = idx[:, 0] * self.lut.shape[1] + idx[:, 1]
+            lut = self.lut.view(-1)
+            self._hot_saved = (flat, lut.index_select(0, flat))
+            lut.index_copy_(0, flat, idx[:, 2].to(lut.dtype))
+            self._hot_mask.view(-1).index_fill_(0, idx[:, 0] * self._hot_mask.shape[1] + idx[:, 1], True)
+        self.hot.stats["s"] += time.perf_counter() - t0
+
+    def _hot_load(self, key, slot):
+        """An io thread's read into a ring slot. With `_hot_side` current, the store's copy waits
+        for that stream (the event before this step's graphs), not for the graphs themselves."""
+        with torch.cuda.stream(self._hot_side):
+            self.m.store._load_into_slot(key, slot)
+
+    def _hot_async_end(self):
+        """After the step's graphs are queued: undo the marks (stream-ordered after the graphs),
+        queue the candidate rows' copy to the host, and wait for the step's reads, which ran while
+        the GPU worked; they are routable from the next step. Nothing is in flight between steps,
+        so prefill and adaptation never see a mark or a ring slot being written."""
+        t0 = time.perf_counter()
+        if self._hot_saved is not None:
+            flat, saved = self._hot_saved
+            self.lut.view(-1).index_copy_(0, flat, saved)
+            self._hot_mask.zero_()     # capture warm-ups between steps must route as residents only
+            self._hot_saved = None
+        self._hot_host.copy_(self._hot_dev, non_blocking=True)
+        futs, self._hot_futs = self._hot_futs, []
+        try:
+            for f in futs:
+                f.result()
+        except Exception:
+            # One rank without the expert would route the same rows to garbage: stop the pair.
+            import traceback
+            traceback.print_exc()
+            os._exit(1)
+        self.hot.stats["loaded"] += len(futs)
+        self.hot_ring.promote()
+        self.hot.stats["wait_s"] += time.perf_counter() - t0
+
     def step(self, block_ids: torch.Tensor, S: int, engram_rows: dict):
         """Run the T-token verify block at positions S..S+T-1, T = len(block_ids), one of
         VERIFY_WIDTHS. engram_rows: {L: [T,24,256] fp32}. Returns (logits [T,V] fp32,
@@ -1703,6 +1876,9 @@ class FastDecoder:
         a = self.a
         T = block_ids.numel()
         assert T in self._width_bufs, (T, VERIFY_WIDTHS)
+        if self.hot is not None and not self.hot_async:
+            # the previous step's skipped rows are final by now (its logits were read)
+            self.hot.begin_step([self._hot_host[L].tolist() for L in self.hot.unread])
         assert self.c.len == S, (self.c.len, S)
         self._bind(T)
         if LEAN_STEP:
@@ -1740,6 +1916,8 @@ class FastDecoder:
                 # warm-up overwrites. Keep committed history across a cold graph.
                 self.c.pending.update(pending)
             self.prepare_pending_buffers()  # capture's warm-up/capture runs overwrite the buffers
+        if self.hot_async:
+            self._hot_async_begin()
         t0 = time.perf_counter()
         gA, gB, gF, gD, segs = self.graphs[graph_key] if self.use_graphs else (None,) * 5
         # {layer: Future} -- reads already in flight. With segments, the call waits until the first
@@ -1764,8 +1942,9 @@ class FastDecoder:
                     _ev_segment = self._ev_begin("segments")
                     g.replay()
                     if gB is not None:
-                        self._resolve(lo)
+                        self._split_resolve(lo)
                         gB.replay()
+                        self._hot_restore()
                     if _ev_segment is not None:
                         _ev_segment.record()
             else:
@@ -1779,8 +1958,9 @@ class FastDecoder:
                     _ev_segment = self._ev_begin("segments")
                     gA[L].replay()
                     if gB[L] is not None:
-                        self._resolve(L)
+                        self._split_resolve(L)
                         gB[L].replay()
+                        self._hot_restore()
                     if _ev_segment is not None:
                         _ev_segment.record()
                 gF.replay()
@@ -1796,8 +1976,10 @@ class FastDecoder:
             st = {"parity": parity, "index_bucket": index_bucket,
                   "ckv": None, "ik": None, "ratio": 0}
             for L in range(a.n_layers):
-                self._layer_a(L, st); self._resolve(L); self._layer_b(L)
+                self._layer_a(L, st); self._split_resolve(L); self._layer_b(L); self._hot_restore()
             self._final()
+        if self.hot_async:
+            self._hot_async_end()
         # host-side bookkeeping for Caches.rollback (same tuple layout as model.py)
         for L in self.kvl_buf:
             before = self.c.pending.get(L)

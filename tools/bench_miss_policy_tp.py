@@ -10,6 +10,12 @@ runtime in one process on a frozen expert map (Model._apply_miss_policy):
   skip_raw    no contribution; the resident picks keep their unpruned weights
   random      a random other resident expert in the substitute's slot, same weight
 
+  hot:M:C:B   DSV41_HOT_READS emulated (engine/hot_reads.PrefillEmulation): blocks of B rows (a
+              verify step), each with decode's paced budget of C reads, reading a block's heaviest
+              missing pick at weight share >= M; the read expert is routable for the whole block
+  hot:M:C:B:G:H  the same read not waited for: routable G blocks later, for H blocks
+  exact       every missing pick read: the unpruned routing, the reference for the others
+
 and TensorFold's lossy routed-expert pruning on top of `substitute` (Model._apply_expert_topp):
 `topp85` / `topp90` keep each row's shortest weight-share prefix reaching 0.85 / 0.90 (at least 3)
 with the router's own weights, `topp85k` renormalizes the kept ones (TensorFold's production rule).
@@ -44,6 +50,24 @@ ARM_SPECS = {
 ARMS = ('substitute', 'skip', 'skip_raw', 'random')
 
 
+def hot_arm(arm, model, k):
+    """'hot:M:C:B' / 'exact' -> a PrefillEmulation over the pruned layers, else None."""
+    from engine.hot_reads import HotReads, PrefillEmulation
+    lag, hold = 0, 1
+    if arm == 'exact':
+        env, block = {'DSV41_HOT_MIN': '1e-9', 'DSV41_HOT_MAX': '1000000', 'DSV41_HOT_PER_LAYER': str(k)}, 1
+    elif arm.startswith('hot:'):
+        m, c, b, *lh = arm[4:].split(':')
+        env, block = {'DSV41_HOT_MIN': m, 'DSV41_HOT_MAX': c}, int(b)
+        lag, hold = (int(lh[0]), int(lh[1])) if lh else (0, 1)
+    else:
+        return None
+    a = model.args
+    stream = getattr(model, 'stream_layers', frozenset())
+    return PrefillEmulation(HotReads(a.n_layers, a.n_routed_experts, k, env),
+                            [L for L in model.prune_mask if L not in stream], block, lag, hold)
+
+
 def clustered(diffs, ns):
     """Token-weighted mean of per-sequence mean differences and its cluster-robust SE."""
     tot = sum(ns)
@@ -62,12 +86,13 @@ def main():
     ap.add_argument('--arms', default=','.join(ARMS))
     args = ap.parse_args()
     arms = args.arms.split(',')
-    assert arms[0] == 'substitute' and set(arms) <= set(ARM_SPECS)
+    assert arms[0] == 'substitute' and all(a in ARM_SPECS or a == 'exact' or a.startswith('hot:') for a in arms)
     V.save_prune_db = lambda *a, **kw: None
     root = os.environ['MODEL_DIR']
     e = V.V41Engine(root, max_seq=32768, arena_gb=float(os.environ.get('DSV41_BENCH_ARENA_GB', '98.4')),
                     trace_stats='/app/results/trace-union/stats/coverage.json',
-                    spec=True, prune_keep=.61, transient_slots=8, keep_free_gb=6,
+                    spec=True, prune_keep=.61, transient_slots=int(os.environ.get('DSV41_BENCH_TRANSIENT', '8')),
+                    keep_free_gb=6,
                     expert_format=os.environ.get('DSV41_BENCH_EXPERT_FORMAT', 'fp4'))
     m = e.model
     assert m.prune_mask, 'no resident mask: nothing can miss'
@@ -88,8 +113,9 @@ def main():
               'config': {k: cfg.get(k) for k in ('expert_format', 'arena_slots', 'prune_keep', 'tp_experts')}}
 
     def score(arm, which):
-        policy, rule = ARM_SPECS[arm]
+        policy, rule = ARM_SPECS.get(arm, ('substitute', None))
         m.miss_policy, m.expert_topp = policy, rule
+        m.hot_eval = hot_arm(arm, m, m.args.n_activated_experts)
         m.miss_gen.manual_seed(20261011)
         m.miss_stats.zero_()
         m.topp_stats.zero_()
@@ -101,7 +127,9 @@ def main():
             logits, _ = m.forward(t, 0, prefill=True, need_logits=True)
             lp = torch.log_softmax(logits[:-1].float(), dim=-1)
             out.append(-lp.gather(1, t[1:, None]).squeeze(1).cpu())
+        hot, m.hot_eval = m.hot_eval, None
         m.miss_policy, m.expert_topp = 'substitute', None
+        score.hot = dict(hot.stats) if hot is not None else None
         miss, slots = m.miss_stats.tolist()
         kept, total = m.topp_stats.tolist()
         return out, miss, slots, (kept / total if total else None)
@@ -117,7 +145,8 @@ def main():
         if base is None:
             base = nll
         row = {'seconds': round(time.time() - t0, 1), 'miss_slots': miss, 'slots': slots,
-               'miss_rate': miss / max(1, slots), 'topp_kept_fraction': kept_frac, 'categories': {}}
+               'miss_rate': miss / max(1, slots), 'topp_kept_fraction': kept_frac, 'hot': score.hot,
+               'categories': {}}
         for cat in sorted({d['category'] for d in seqs}):
             idx = [i for i, d in enumerate(seqs) if d['category'] == cat]
             ns = [nll[i].numel() for i in idx]

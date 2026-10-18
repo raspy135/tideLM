@@ -394,6 +394,23 @@ class ExpertStore:
         self.slot_key[slot] = key
         return slot
 
+    def reserve_transient(self, n: int) -> list[int]:
+        """Take `n` slots out of the transient ring for a caller that manages them itself
+        (DSV41_HOT_ASYNC's ring): the store never allocates, promotes or reads into them again.
+        The ring keeps at least the 8 it asserts at construction."""
+        if len(self.transient_ring) - n < 8:
+            raise ValueError(f"TRANSIENT_SLOTS={self.transient_slots} cannot give {n} slots away and keep 8 "
+                             f"(raise TRANSIENT_SLOTS to at least {8 + n})")
+        taken = self.transient_ring[len(self.transient_ring) - n:]
+        del self.transient_ring[len(self.transient_ring) - n:]
+        self.transient_index = {s: i for i, s in enumerate(self.transient_ring)}
+        self.transient_pos %= len(self.transient_ring)
+        for s in taken:
+            old = self.slot_key.pop(s, None)
+            if old is not None:
+                self.transient_map.pop(old, None)
+        return taken
+
     def _promote_transient(self, key: tuple, slot: int, used: set) -> bool:
         """Give a transient-ring slot to the LRU without re-reading its 18.8 MB.
 

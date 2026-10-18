@@ -1240,6 +1240,11 @@ class Model:
             # expert pruning experiment: the router may only pick surviving experts (REAP-style drop)
             unmasked = logits
             logits = logits.masked_fill(~effective_keep, float("-inf"))
+            hot = getattr(self, "hot_eval", None)  # eval-only (bench_miss_policy_tp `hot:`/`exact`)
+            if hot is not None and prefill and not streaming and not rescued:
+                row_keep, rescued = hot.widen(L, unmasked, scores, effective_keep, k)
+                if rescued:  # the transient-ring path below loads them; residents stay put
+                    logits = unmasked.masked_fill(~row_keep, float("-inf"))
         indices = logits.topk(k, dim=-1)[1]
         weights = scores.gather(1, indices)
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale

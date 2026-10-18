@@ -502,6 +502,14 @@ def blend_demand(trace_counts: dict, db, prior_slots: float):
     return out, (sum(ws) / len(ws) if ws else 0.0)
 
 
+def _hot_boot_fields(args):
+    """The boot-guard entry for DSV41_HOT_READS: every setting that changes routing, or "0"."""
+    from engine.hot_reads import HotReads
+    if not HotReads.enabled():
+        return "0"
+    return HotReads(args.n_layers, args.n_routed_experts, args.n_activated_experts).boot_fields()
+
+
 class V41Engine:
     #: this engine can constrain sampling with a decoding gate (``generate(grammar=...)``)
     supports_grammar = True
@@ -1401,6 +1409,9 @@ class V41Engine:
                 # and the pair diverges silently (engine/expert_topp.py).
                 "expert_topp": _ETP.config(),
                 "expert_topp_version": _ETP.VERSION,
+                # DSV41_HOT_READS changes which experts a decode row uses (engine/hot_reads.py). From
+                # the environment: this guard runs before the FastDecoder that holds the settings.
+                "hot_reads": _hot_boot_fields(self.args),
                 "lookup_draft_enabled": LOOKUP_DRAFT_ENABLED,
                 "lookup_draft_ngram": LOOKUP_DRAFT_NGRAM,
                 "lookup_draft_candidates": LOOKUP_DRAFT_CANDIDATES,
@@ -1995,6 +2006,9 @@ class V41Engine:
                 "prefill_tok_s": round(P / t_prefill, 2) if t_prefill > 0 else None,
                 "decode_s": round(t_dec, 3), "decode_tok_s": round(max(n_out - 1, 0) / t_dec, 2),
                 "steps": steps,
+                # DSV41_HOT_READS, cumulative since boot (engine/hot_reads.py)
+                "hot_reads": (dict(self.fast.hot.stats) if getattr(getattr(self, 'fast', None), 'hot', None)
+                              is not None else None),
                 "decode_adaptation": {"checks": self._decode_adapt_checks,
                                       "passes": self._decode_adapt_passes},
                 "user_prompt": self.user_prompt.report(),
@@ -3607,6 +3621,8 @@ class V41Engine:
             "engram_native_threads": int(os.environ.get("DSV41_ENGRAM_NATIVE_THREADS", "64")),
             "moe_fallback": self.kernel == "dequant-fallback",
             "routed_topk": self.args.n_activated_experts,
+            "hot_reads": ({**self.fast.hot.boot_fields(), **self.fast.hot.stats}
+                          if getattr(getattr(self, 'fast', None), 'hot', None) is not None else None),
             "sim_cb2_frac": self.sim_cb2_frac,
             "act_quant": self.act_quant,
             "cycle_break": os.environ.get("DSV41_CYCLE_BREAK", "0") == "1",
