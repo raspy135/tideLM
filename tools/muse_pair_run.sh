@@ -17,7 +17,7 @@ PEER=${PEER:-ryan@10.0.0.2}
 image=${GLM_IMAGE:-deepseek-v41-flash-dgx-spark-dual-adaptive:20261011-topp}
 log_dir=${GLM_LOG_DIR:-$ROOT/results/muse-run-$(date +%Y%m%d-%H%M%S)}
 timeout=${GLM_TIMEOUT:-1800s}
-for name in deepseek-v41-ep2-rank0 muse-rank0; do
+for name in deepseek-v41-ep2-rank0 glm-serve-rank0 muse-rank0; do
     if docker container inspect "$name" >/dev/null 2>&1; then
         echo "Container $name is running: stop serving first" >&2; exit 1
     fi
@@ -50,7 +50,7 @@ if [[ -n "${GLM_EXL3_SRC:-}" ]]; then         # the EXL3 checkpoint (GLM_EXL3_AT
     flags+=(-v "$GLM_EXL3_SRC:/exl3src:ro")
 fi
 for kv in ${GLM_ENV:-}; do
-    [[ "$kv" =~ ^(MUSE|DSV41)_[A-Z0-9_]+=[^[:space:]]*$ ]] || { echo "GLM_ENV: bad entry '$kv'" >&2; exit 1; }
+    [[ "$kv" =~ ^(GLM|DSV41)_[A-Z0-9_]+=[^[:space:]]*$ ]] || { echo "GLM_ENV: bad entry '$kv'" >&2; exit 1; }
     flags+=(-e "$kv")
 done
 printf -v peer_cmd '%q ' docker run --name muse-rank1 "${flags[@]}" -e RANK=1 \
