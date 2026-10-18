@@ -3405,3 +3405,105 @@ The rerun then reported 1.1 s for 8,200 tokens -- a prefix-cache hit, not prefil
 seeds come from `--label`; reusing the label of the bad run made every new prompt a prefix of a
 30K prompt the disk prefix cache already held. With a fresh label: 19.5 s. Give every random
 run a label no earlier run on that server used, and check `x_engine_stats.reused_prefix`.
+
+## A served loop replayed with every expert exact: misses open it, the model holds it (2026-10-18)
+
+The case: on the MXFP4 profile, a Japanese answer about hangover remedies switched to English at
+"sports drinks" and then repeated " sports" until the user stopped it (191 tokens; the request's
+decode_miss was 0.293, against 0.08-0.09 for English prose and 0.16-0.21 for code in
+bench/results/2026-10-18 -- the learned resident set holds few of the experts Japanese routes to).
+
+tools/glm_loop_probe.py replays it: the served prompt's token ids (a prefix-store segment's .tok
+file holds them), the answer cut at three points, 8 continuations of 64 tokens each sampled as the
+server samples (temperature 1.0, top-p 0.95, MTP rounds), once on the serving configuration and
+once with GLM_MISS=stream (every routed expert exact):
+
+| Cut | Loops, served | Loops, exact | p(" sports") next, served / exact |
+| --- | ---: | ---: | --- |
+| before "sports drinks" | 0 / 8 | 0 / 8 | 0.0006 / 0.0001 |
+| after "sports drinks" | 2 / 8 | 0 / 8 | 0.0012 / 0.002 |
+| inside "sports sports sports" | 5 / 8 | 3 / 8 | 0.51 / 0.69 |
+
+Whole answers from the prompt alone: served 0 / 6, exact 0 / 2 (stopped there: exact decode runs
+at ~0.7 tok/s). So substituted experts open the loop -- from the same point the exact model never
+entered it -- but once the text repeats, the model itself holds it: the exact model gives the
+repeated word 0.69, more than the served one. An exact window alone cannot be relied on to end a
+loop that has started.
+
+The same replay shows the cost of misses on Japanese beyond loops: served continuations drop and
+garble characters (スポドリンク for スポーツドリンク, ブド糖, ポカリエス, "A100の摂取", "スンNW-givescobbava");
+the exact ones from the same points write ポカリスエット, アクエリアス, 経口補水液(OS-1) correctly.
+
+Two settings came out of it (engine/glm/tp.py), measured on the same replay:
+
+- GLM_LOOP_BREAK=12: a token that would make a cycle of 1-8 tokens repeat a 12th time is excluded
+  and the next token drawn again from the same logits. From inside the loop the longest repetition
+  in 8 continuations was 13 (without it 5 of 8 looped, some for all 64 tokens); some drift back into a near cycle
+  ("isotonic sports isotonic ..."), so it caps a loop rather than curing it. No cost when it does
+  not fire. On in the GLM profiles.
+- GLM_LOOP_GUARD=R: after R repetitions, GLM_LOOP_EXACT tokens decode with every miss read. Its
+  GLM_LOOP_READS transient slots are memory (32: +0.31 GB a rank), and its burst of reads took
+  rank 1 -- already 3.6 GB down to a polkitd/bluetoothd leak -- to 2.99 GiB, where the test watchdog
+  stopped it before the in-loop arm finished. With the exact model itself holding a loop 3 times
+  in 8, it is off by default and unmeasured.
+
+## The latent cache in 4 bits (GLM_KV=fp4): 2.1 GB a rank at 256K for KL +0.004-0.010 (2026-10-18)
+
+GLM_KV=fp4 stores MLA's latent as E2M1 with a BF16 scale per 16 values (engine/glm/kv_fp4.py: 320
+bytes a row, FP8's 528); the indexer keys stay FP8, the RoPE keys BF16, the MTP layer FP8, and
+GLM_KV_FP8_LAYERS keeps listed layers FP8 (the "three quarters FP4, one quarter FP8" mix below is
+0-9,68-77). Split across the ranks, a position costs 19.6 KB a rank all-FP4, 21.7 KB mixed, 27.8 KB
+FP8: at 256K 5.1 / 5.7 / 7.3 GB, so all-FP4 holds 384K in what FP8 takes for 256K.
+
+Quality, every expert exact (glm_quality --mode exact --against the FP8 run, MXFP4 experts):
+
+| Change against FP8 | Long set (6K/12K/18K contexts, 900 positions): KL, top-1 | Natural set (3,600): KL, top-1 |
+| --- | --- | --- |
+| fused RMSNorm off (a ~1-bit control: the floor) | 0.0124, 97.2% | 0.0124, 94.8% (2026-10-17) |
+| mix, 58 layers FP4 | 0.0166, 96.6% | 0.0205, 93.4% |
+| all 78 decoder layers FP4 | 0.0193, 96.0% | 0.0227, 93.3% |
+
+NLL does not separate them: long set FP8 0.8387, control 0.8358, mix 0.8229, FP4 0.8376; natural
+FP8 1.6184, mix 1.6140, FP4 1.6166. FP4 is a real, small move above the chaos floor (+0.004 to
++0.010 KL) -- for scale, substituting the experts that are not resident costs KL 0.11-0.17 at
+serving residency, and on that eval's slope (0.132 at 8,500 slots, 0.113 at 9,394) the ~215 slots FP4
+frees at 256K are worth about 0.005 of it.
+
+Speed. Decode (glm_decode_prof, 6K prompt, 128K, MXFP4 serving config): 208.6 ms a round against
+200.8 (+4%). The kernel (sparse_attn._sparse_mla_fp4_kernel), 4 rows over 2,048 picks: 80 us
+against FP8's 73; 2,048 prefill rows: 11.3 ms against 8.3 -- about +4% on a whole prefill.
+
+Rejected on the way, kept here: nibbles interleaved (element 2i low, 2i + 1 high) and joined back
+with tl.join cost 101 us / 19.1 ms -- the join is a register shuffle per tile; storing element i
+with element 256 + i lets the kernel score and accumulate the two halves with their own dots and
+nothing to undo. INT4 instead of E2M1 lost on heavy-tailed rows (relative error 0.106-0.108 against
+0.090 on Student-t and gain-weighted Gaussian rows; won only on a plain Gaussian, 0.084 / 0.095);
+32-value blocks cost 0.10-0.104 against 16's 0.090-0.095.
+
+Served (substituted experts, graphs) FP4 at 384K / 8,700 slots booted at 10.5 GB MemAvailable and
+an English echo came back exact, but of two Japanese prompts one sampled answer read the prompt as
+garbled ("文章が崩れているように見えます") and a greedy echo trailed into 「散歩」は「散歩」ではなく...;
+the FP8 256K profile echoed cleanly, and one of its three sampled answers was garbled too. One
+sample each cannot separate FP4 from substitution, so FP4 stays opt-in until it can.
+
+Also: the exact quality tool computed logits for every prompt position; at the long set's 18K
+prompt that is [18K, 155K] in fp32 plus its log-softmax, and it took rank 1 to 2.66 GiB under the
+test watchdog. Prompts past 4K now prefill first and take logits for the answer only.
+
+## MXFP4 at 256K: 8,740 slots, a 203K-token prompt end to end (2026-10-18)
+
+The MXFP4 profile moved from 128K / 9,100 slots to 256K / 8,740 (KV split, FP8: 7.28 GB a rank, 3.64
+more; 363 slots of 10.03 MB). Ready at 9.3 GB MemAvailable on rank 0. Through the server
+(the held-out corpus four times, greedy): the 203,373-token prompt prefilled in 667 s and was
+answered correctly; the follow-up from memory 1.8 s TTFT, the next one after an unrelated request
+restored 203,363 positions from disk (0.60 s; TTFT 2.9 s). MemAvailable bottomed at 6.87 GiB on
+rank 0 and 4.86 on rank 1, whose polkitd and bluetoothd had grown back to 3.6 GB.
+
+The oddity of the EXL3 256K run (2026-10-17, above) came back: the unrelated short request right
+after the long turns answered "Hello!Hello! How can I help you today?Hello! How can I help you
+today?..." to its max_tokens, and the same request twice more a minute later stopped cleanly after
+15 tokens. Its decode_miss was 0.38-0.46 -- adaptation had just followed a 203K-token document --
+and stale rows past the sequence are masked on both paths (the indexer scores them -inf, the
+attention kernel drops rows past each rank's bound). With the loop replay above, substitution at
+that miss rate is the likelier cause -- not shown. GLM_LOOP_BREAK does not catch it (a 10-token
+cycle, 3 times).
