@@ -406,6 +406,7 @@ class GlmTP:
         self.mtp_fill = True
         self.spec_stats = {"rounds": 0, "accepted": 0}
         self.spec_cal = None            # [(draft index, confidence product, accepted)] when a tool asks
+        self.spec_cal_overlap = False   # sampled rounds: also each draft's overlap with the target
         self.mtp_dyn = float(env("GLM_MTP_DYN", "0"))
         self.mtp_graph_rows = 1
         if self.mtp_on and self.x3 is not None and int(env("GLM_MTP_DEPTH", "3")) > 7:
@@ -2210,7 +2211,7 @@ class GlmTP:
             # Drafts: the MTP layer at P-1 (anchor, target hidden at P-1), then on its own output.
             # Under GLM_MTP_DYN rank 0 decides whether each draft is kept (and which it is), so
             # both ranks run the same MTP calls and verify the same rows.
-            drafts, qs, confs, conf = [], [], [], 1.0
+            drafts, qs, confs, conf, sig, zs = [], [], [], 1.0, [], []
             hm, z = self.mtp_forward(torch.tensor([anchor], device=self.dev), h_last, P - 1)
             for k in range(depth):
                 q, p = None, 1.0
@@ -2224,7 +2225,14 @@ class GlmTP:
                 else:
                     q = self.sample_probs(z[-1], temperature, top_p, top_k)
                     d = int(torch.multinomial(q, 1, generator=gen)) if self.rank == 0 else 0
-                    if dyn and self.rank == 0:
+                    if self.spec_cal is not None and self.rank == 0:
+                        # Tools: the drawn token's probability and the MTP's largest (the gate's
+                        # signal and the greedy one -- the latter did no better, docs/gotchas.md).
+                        p, pm = torch.stack([q[d], q.max()]).tolist()
+                        sig.append((p, pm))
+                        if self.spec_cal_overlap:
+                            zs.append(z[-1].float().clone())
+                    elif dyn and self.rank == 0:
                         p = float(q[d])
                     if not dyn:
                         d = decide(d)
@@ -2263,13 +2271,32 @@ class GlmTP:
                 if nxt is None:
                     nxt = self.sample(tl[nd], temperature, top_p, top_k, gen)
                 decision = (n_acc, nxt)
+                if self.spec_cal is not None and temperature > 0:
+                    # Tools only (spec_cal_overlap, which costs a sort a draft): each draft's
+                    # overlap sum(min(p, q)) -- its acceptance chance before the draw.
+                    ov = [float("nan")] * nd
+                    if self.spec_cal_overlap:
+                        # ... and what drawing the draft at another temperature would overlap
+                        # (0: the MTP's argmax, accepted with p[argmax]); still exact sampling.
+                        for k in range(nd):
+                            pk = self.sample_probs(tl[k], temperature, top_p, top_k)
+                            alt = {}
+                            for T in (0.0, 0.5, 0.7, 0.85, 1.0):
+                                qT = (torch.zeros_like(pk).scatter_(0, zs[k].argmax().view(1), 1.0) if T == 0
+                                      else self.sample_probs(zs[k], T, top_p, top_k))
+                                alt[T] = float(torch.minimum(pk, qT).sum())
+                            ov[k] = (float(torch.minimum(pk, qs[k]).sum()), alt)
             n_acc, nxt = decide(decision, 2)
             z_anchor = tl[n_acc]                  # nxt came from the first rejected row, or after the last
             self.spec_stats["rounds"] += 1
             self.spec_stats["accepted"] += n_acc
             self.spec_stats["drafted"] = self.spec_stats.get("drafted", 0) + nd
-            if self.spec_cal is not None and dyn:
-                self.spec_cal.extend((k, c, k < n_acc) for k, c in enumerate(confs))
+            if self.spec_cal is not None and dyn and self.rank == 0:
+                if temperature > 0:
+                    self.spec_cal.extend((k, c, k < n_acc, sig[k][0], sig[k][1], *(ov[k] if isinstance(ov[k], tuple) else (ov[k],)))
+                                         for k, c in enumerate(confs))
+                else:
+                    self.spec_cal.extend((k, c, k < n_acc) for k, c in enumerate(confs))
             self.pos = P + 1 + n_acc
             self.tokens = self.tokens[:self.pos]
             # The MTP cache for positions P..P+n_acc-1 gets the accepted tokens as next tokens

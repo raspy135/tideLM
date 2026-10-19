@@ -3537,3 +3537,78 @@ question new) did not change: loops start in decode. On in both GLM profiles.
 
 The EXL3 serving profile (12,350 slots, 256K) took rank 1 to 2.94 GiB during this batch: its
 polkitd/bluetoothd leak had reached 3.9 GB. The local profile serves 12,000 until polkit is restarted.
+
+## Sampled decode is slower than greedy because sampled text is harder to draft, not the gate (2026-10-18)
+
+Served GLM decode (temperature 1.0, top-p 0.95, the generation config) ran 13-16 tok/s at ~1.4
+accepted drafts a round against the profiler's greedy 18-20 at ~3.0. The suspicion was GLM_MTP_DYN's
+gate: at temperature > 0 it multiplies the MTP's probability of the token it *drew*, and rejection
+sampling accepts a draft with min(1, p/q), so a well-drawn 30% token could score 0.3 and be accepted
+anyway. tools/glm_decode_prof.py --temperature 1.0 --top-p 0.95 --sweep 1e-9 (always 7 drafts) on
+five prompts (6K summary, short code, Japanese, a story, an HTML page; 545 rounds, rank-0 records of
+each draft's drawn probability, the MTP's largest, and its overlap sum(min(p, q)) with the target):
+
+| draft's signal | <0.1 | 0.2-0.3 | 0.5-0.6 | 0.8-0.9 | >=0.95 |
+| --- | --- | --- | --- | --- | --- |
+| drawn probability: accepted | 0.18 | 0.33 | 0.43 | 0.57 | 0.88 |
+| MTP's largest probability | 0.00 | 0.14 | 0.40 | 0.55 | 0.88 |
+| overlap (unknown at draft time) | 0.05 | 0.21 | 0.58 | 0.81 | 1.00 |
+
+A low drawn probability does mean a likely rejection; the greedy signal is no better. Replaying the
+gate offline over those rounds (rows cost ~95 ms + 22 a row + 4.5 a draft): drawn probability at
+tau 0.9 (served) 13.2 modelled tok/s, best tau 0.6-0.7 13.7 (+3.5%), MTP's largest at 0.8 13.7; a
+perfect predictor (the overlap) 15.4 -- the ceiling of any gate. Drawing drafts at another
+temperature (still exact rejection sampling) does not raise the overlap either: draft 1 0.701 at
+the MTP's argmax, 0.726 at T 0.5, 0.735 at 0.7, 0.739 at 0.85, 0.738 at 1.0. Acceptance at
+temperature 1 is what the text allows: always drafting 7, the summary accepted 2.44 a round, code
+2.83, HTML 1.67, Japanese 1.41, the story 1.11. GLM_MTP_DYN_SIGNAL=max and a separate tau for sampled
+rounds were tried and removed; the profiler keeps --temperature, --sweep (tau values in one boot)
+and --overlap / --cal-out for the records.
+
+## Where a sampled GLM decode round goes; the FP8 projections are near cold bandwidth (2026-10-18)
+
+glm_decode_prof, EXL3 serving config (12,000 slots, 256K FP8 KV split), temperature 1.0 /
+top-p 0.95, 400 tokens: 6K summary 14.10 tok/s at 169 ms a round (1.41 of 1.63 accepted), story
+11.04 at 137 ms (0.52 of 0.70), Japanese 12.05 at 134 ms (0.61 of 0.74). Graph segments cover 88-91%
+of the short prompts' wall and 73% of the 6K one's (hot reads 4-7 ms, adaptation up to 5). Kernels
+over 8 Japanese rounds, 151.5 ms a round:
+
+| kernel | ms a round | calls |
+| --- | --- | --- |
+| _fp8_block_kernel (q_a, kv_a, q_b, o_proj, indexer; MTP) | 46.3 | 377 |
+| exl3 grouped_kernel (routed experts) | 41.8 | 150 |
+| dsv41_roce gather_kernel | 14.2 | 412 (34 us each) |
+| moe_up / moe_down bm16 (shared expert, dense layers) | 9.0 | 81 + 81 |
+| head, sparse MLA, everything else | ~40 | |
+
+The FP8 projections read ~6.7 GB a rank a forward. Cold (L2 flushed before each call), 2 rows:
+q_a 91 us (138 GB/s), kv_a 37 (96), q_b 124 (136), o_proj 284 (177), indexer wk 24 (32). A plain
+streaming read of the same sizes cold: 4 MB 30 us (137 GB/s), 16 MB 92 (180), 50 MB 249 (210) --
+small reads are slow whatever reads them. A sweep of the decode tile (BN 16-128, 1-8 warps, 2-6
+stages; every candidate bit-identical to the current kernel) found 87 / 32 / 117 / 281 / 18 us: ~1 ms
+a round. Not changed. What is left in this direction is fewer bytes (EXL3 5-bit attention, measured
+and parked above) or fewer launches (q_a and kv_a share their input: one read of 16 MB instead of
+12.6 + 3.5 would save ~35 us a layer, ~2.7 ms a round, if the fused kernel matches the split one).
+
+## FP8 projections in a graph already stream at ~200 GB/s; PDL and q_a + kv_a fusion measured (2026-10-18)
+
+The "~145 GB/s" read off the kernel table above was wrong: torch.profiler's per-kernel times sum
+to 151.5 ms a round against ~122 ms of graph time in an unprofiled run of the same prompt, so the
+table runs ~25% long. Measured directly instead: one layer's four projections (2 rows, q_a, kv_a,
+q_b, o_proj, 83.3 MB) x 24 layers with distinct weights (2 GB, cold) in one CUDA graph, small torch
+kernels between them for the norms and attention:
+
+| variant | us a layer | GB/s |
+| --- | --- | --- |
+| current kernel | 416.2 | 200 |
+| PDL (gdc_wait / launch_dependents, launch_pdl) | 406.4 | 205 |
+| PDL + prefetch.global.L2 of 8 K-blocks before the wait | 402.2 | 207 |
+| same, 16 K-blocks | 406.6 | 205 |
+| q_a + kv_a as one [2624, 6144] weight | 392.3 | 212 |
+| fused + PDL + prefetch 8 / 16 | 395.7 / 403.3 | 210 / 206 |
+
+All bit-identical. The ceiling at 220 GB/s is 378 us: back to back, the kernel is at 91% of it. The
+fusion is the only real gain, 24 us a layer, ~1.9 ms a round (~1.3%); PDL adds nothing on top. What
+fills the rest of an attention segment (0.70 ms a shared layer, event-timed, against ~0.42 of
+projections) is the next place to look: ~5 RoCE gathers a layer at ~34 us each, the sparse
+attention, and small kernels.
