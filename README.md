@@ -121,13 +121,10 @@ your traffic. One profile serves at a time: each fills both boxes.
 
 ## Abliterated overlay (DeepSeek V4.1 only)
 
-This optional feature applies only to DeepSeek V4.1 Flash, including the 1017 update, through
-`DSV41_ABLIT_WOB` in the `ds41-mxfp4` profile. GLM-5.3 profiles do not support this overlay.
-Choose the overlay that matches your base checkpoint:
+Abliterated overlay is supported for DeepSeek v4.1 flash.
 
 | Base checkpoint | Overlay repository | Native FP8 sidecar |
 | --- | --- | --- |
-| `DeepSeek-V4.1-Flash-1017` | [1017 Keys overlay](https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated) | `wo_b_l10_35_1017.safetensors` |
 | Original `DeepSeek-V4.1-Flash` | [September overlay](https://huggingface.co/drowzeys/DeepSeek-V4.1-Flash-Abliterated-Cybersecurity-Unleashed) | `wo_b_l10_35.safetensors` |
 
 For **1017**, accept the repository's access terms on Hugging Face and authenticate `hf` first.
@@ -146,14 +143,6 @@ Set this **container path** in `.env.ds41-mxfp4`, then start that profile normal
 ```bash
 DSV41_ABLIT_WOB=/models/dsv41-1017-wo-b-ablit/wo_b_l10_35_1017.safetensors
 ```
-
-This replaces only layers 10–35 `attn.wo_b`, before dense conversion and tensor-parallel
-sharding; the base checkpoint stays untouched. Both ranks must load the same file, enforced
-by the existing boot-time digest guard. Leave the variable empty for stock weights.
-The September `wo_b_l10_35.safetensors` belongs to the original `DeepSeek-V4.1-Flash` only;
-do not reuse it with 1017. The `exl3_wo_b_*` sidecars are for other runtimes' quantized attention
-and cannot be loaded here. Existing EXL3 dense packs also need rebuilding against the matching
-base checkpoint and overlay; the MXFP4 profile uses native attention.
 
 ## Use
 
