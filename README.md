@@ -123,13 +123,13 @@ your traffic. One profile serves at a time: each fills both boxes.
 
 Abliterated overlay is supported for DeepSeek v4.1 flash.
 
-| Base checkpoint | Overlay repository | Native FP8 sidecar |
-| --- | --- | --- |
-| Original `DeepSeek-V4.1-Flash` | [September overlay](https://huggingface.co/drowzeys/DeepSeek-V4.1-Flash-Abliterated-Cybersecurity-Unleashed) | `wo_b_l10_35.safetensors` |
+https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated
 
 For **1017**, accept the repository's access terms on Hugging Face and authenticate `hf` first.
 Download only the native FP8 sidecar on **both nodes**, under the parent of `MODEL_DIR`
 (mounted at `/models`):
+
+The model is gated model, you need to submit a form on HF.
 
 ```bash
 hf download drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated \
