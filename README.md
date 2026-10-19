@@ -1,7 +1,9 @@
 # TideLM
 
-**Mixture-of-experts models too big for your memory, served from two DGX Sparks.** TideLM keeps
-the experts your traffic actually uses resident in the two boxes' unified memory, learns which
+**Mixture-of-experts models too big for your memory, served from two DGX Sparks.** 
+
+Normally it requires heavy quantization, however TideLM took different approach.
+TideLM keeps the experts your traffic actually uses resident in the two boxes' unified memory, learns which
 ones those are from the router's own demand while it serves, and reads the misses that matter
 most from NVMe as decoding goes on. The resident set rises and falls with what you ask it — the
 tide — so the engine gets better the more you use it.
