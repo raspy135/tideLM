@@ -3612,3 +3612,43 @@ fusion is the only real gain, 24 us a layer, ~1.9 ms a round (~1.3%); PDL adds n
 fills the rest of an attention segment (0.70 ms a shared layer, event-timed, against ~0.42 of
 projections) is the next place to look: ~5 RoCE gathers a layer at ~34 us each, the sparse
 attention, and small kernels.
+
+## Consolidating decode kernels: the routing kernel pays, the profiler overstates small kernels ~10x (2026-10-19)
+
+A torch.profiler timeline of four decode rounds (EXL3, 384K FP4/FP8 latent mix, 11,800 slots) showed
+13,032 kernels a round, ~10,800 of them under 5 us: 17.6 ms a round by the profiler's clock. A MoE
+block (o_proj to the next q_a) was 96 kernels, 80 of them routing (sigmoid, bias, two top-8s, gathers,
+normalization, demand and miss counters, slot lookup, slotless-pick patching): 129 us a layer. A
+shared attention block was 37 kernels, ~30 of them RoPE arithmetic, position and owner-row math and
+cache-write indexing.
+
+- GLM_ROUTE_KERNEL=1 (engine/glm/route_kernel.py, default on): the exact top-8 and the hot
+  candidates in one program at the end of the attention graph, the resident top-8, slots, demand
+  and miss counters in one program in the MLP graph (after the hot reads). MoE block 96 -> 40
+  kernels. Same pick sets; weights can differ in the last fp32 bit (sum order), so greedy text is
+  not identical. Event-timed segments (glm_decode_prof, greedy, 6K summary / short code /
+  Japanese): MoE layer at 1 row 484-500 -> 430-447 us, shared attention 694-703 -> 664-668 us
+  (the exact pick moved there); Japanese round 132.0 -> 126.6 ms at 1.72 rows against 1.65.
+  Tokyo 3-row eval against every expert exact: KL 0.0820 -> 0.0783, top-1 93.1 -> 94.3%, NLL
+  0.591 -> 0.601, miss mass 10.28 -> 10.27% -- unchanged within the eval's spread.
+- Positions, RoPE rows, split-cache owner rows and local bounds once a forward (layer 0's attention;
+  the MTP layer and prefill compute their own), RoPE in one kernel (engine/glm/rope_kernel.py):
+  attention block 37 -> 18 kernels, a round 8,214 -> 6,124. Bit-identical: the same greedy text by
+  hash and the same acceptance. Shared attention 664-668 -> 636-638 us, indexer layers 931-945 ->
+  877-897 us -- but the round did not move (165.9 / 188.0 / 126.6 -> 165.1 / 188.2 / 127.3 ms):
+  the MoE segments of that boot ran 18-45 us slower, within the ~+-30 us MoE segments vary
+  between boots. Kept (it is free and exact); worth ~1 ms a round at most.
+- The profiler's per-kernel durations: the 2,090 kernels removed by the second change were ~9 ms
+  of its timeline (153.8 -> 144.9 ms a round) and ~1 ms of an unprofiled round. Small kernels
+  replayed in a CUDA graph on GB10 cost a fraction of what CUPTI reports; judge a fusion by
+  glm_decode_prof's event-timed segments and the round, not by a kernel table.
+- Triton folded `.to(tl.bfloat16).to(tl.float32)` away: the first RoPE kernel rounded its products
+  that way and matched PyTorch's multiplies but not the sums (one BF16 step in ~20% of values).
+  rope_kernel rounds with integer arithmetic on the bits; any kernel that relies on an
+  intermediate BF16 rounding should check this.
+- What is left outside the GPU: ~12 ms a round (9%) in which the GPU waits on the host -- the
+  attention graph's synchronize for the hot candidates in each of the 75 MoE layers, and the
+  sampling decisions.
+
+The local EXL3 profile then moved from 384K to 320K (same mix): 7.12 GB of KV a rank, 12,000 slots
+again (384K had taken 200).

@@ -33,6 +33,7 @@ from engine.muse.weights import GROUP, quantize_mxfp4, dequant_mxfp4
 from .config import GlmConfig
 from .fp8_block import FP8Block, fp8_block_linear
 from .ref import LATENT_EPS, rope_interleave
+from .rope_kernel import rope
 from .weights import GlmCheckpoint, P
 
 VERSION = 1
@@ -309,6 +310,10 @@ class GlmTP:
         self.route_kernel = (env("GLM_ROUTE_KERNEL", "1") == "1" and cfg.n_group == 1
                              and self.sub_weight == "renorm")
         self._x3_pick = None
+        # Decode: positions, their RoPE rows, the split cache's write rows and attention bounds are
+        # the same in every layer of a forward -- computed in layer 0's attention, reused by the
+        # rest (11 small kernels a layer). The MTP layer and prefill compute their own.
+        self._dctx = None
         dec = [L for L in self.moe_layers if L < cfg.layers]
         self._hot_frac = {L: ((i + 1) / len(dec)) ** self.hot_pace for i, L in enumerate(dec)}
         self._hot_quarter = {L: 4 * i // len(dec) for i, L in enumerate(dec)}
@@ -1055,8 +1060,8 @@ class GlmTP:
         k = F.layer_norm(lw["i_k"](x, out_dtype=torch.float32), (cfg.index_dim,), lw["i_kn_w"], lw["i_kn_b"], 1e-6)
         k = k.to(torch.bfloat16)[:, None]
         rd = cfg.rope_dim
-        q = torch.cat([rope_interleave(q[..., :rd], cos, sin), q[..., rd:]], -1)
-        k = torch.cat([rope_interleave(k[..., :rd], cos, sin), k[..., rd:]], -1)[:, 0]
+        q = torch.cat([rope(q[..., :rd], cos, sin), q[..., rd:]], -1)
+        k = torch.cat([rope(k[..., :rd], cos, sin), k[..., rd:]], -1)[:, 0]
         kv_write(self.i_cache[L], rows, k)
         return q, F.linear(x.float(), lw["i_w"]) * cfg.index_heads ** -0.5
 
@@ -1088,33 +1093,45 @@ class GlmTP:
             out.append(score.topk(min(cfg.index_topk, S), -1).indices)
         return torch.cat(out)
 
+    def _attn_ctx(self, L, T, decode, device):
+        """(positions, cos, sin, owner rows or None, local bound or None) for this forward."""
+        shared = decode and L != self.mtp_L
+        if shared and L > 0 and self._dctx is not None and self._dctx[0].shape[0] == T:
+            return self._dctx
+        positions = (self.pos_t + torch.arange(T, device=device)) if decode else \
+            torch.arange(self.pos, self.pos + T, device=device)
+        cos, sin = self.cos.index_select(0, positions), self.sin.index_select(0, positions)
+        rows = lb = None
+        if self.kv_split:
+            from .kv_split import local_bound, owner_rows
+            rows = owner_rows(positions, self.rank, self.world, self.s_loc)
+            lb = local_bound(positions, self.rank, self.world)
+        ctx = (positions, cos, sin, rows, lb)
+        if shared:
+            self._dctx = ctx
+        return ctx
+
     def attention(self, L, x, topk_prev):
         cfg, lw = self.cfg, self.L[L]
         T = x.shape[0]
         decode = T <= self.decode_rows
-        positions = (self.pos_t + torch.arange(T, device=x.device)) if decode else \
-            torch.arange(self.pos, self.pos + T, device=x.device)
+        positions, cos, sin, own_rows, lb = self._attn_ctx(L, T, decode, x.device)
         S = self.max_seq if decode else self.pos + T
-        cos, sin = self.cos.index_select(0, positions), self.sin.index_select(0, positions)
         q_resid = rms(lw["q_a"](x), lw["q_norm"], LATENT_EPS)
         q = lw["q_b"](q_resid).view(T, self.hl, cfg.qk_dim)
-        q_nope, q_rope = q[..., :cfg.nope], rope_interleave(q[..., cfg.nope:], cos, sin)
+        q_nope, q_rope = q[..., :cfg.nope], rope(q[..., cfg.nope:], cos, sin)
         ckv = lw["kv_a"](x)
         c = rms(ckv[:, :cfg.kv_lora], lw["kv_norm"], LATENT_EPS)
-        kr = rope_interleave(ckv[:, None, cfg.kv_lora:], cos, sin)[:, 0]
+        kr = rope(ckv[:, None, cfg.kv_lora:], cos, sin)[:, 0]
         split = self.split(L)
-        if split:
-            from .kv_split import owner_rows
-            rows = owner_rows(positions, self.rank, self.world, self.s_loc)
-        else:
-            rows = positions
+        rows = own_rows if split else positions
         kv_write(self.c_cache[L], rows, c)
         self.r_cache[L].index_copy_(0, rows, kr)
         q_lat = self._absorb_q(q_nope, lw["w_uk"])                                 # [T, h, kv_lora]
         scale = cfg.qk_dim ** -0.5
         if split and decode:
             qw = self._index_qw(L, x, q_resid, cos, sin, rows) if self.full(L) else None
-            o_lat, topk = self._split_attn(L, qw, q_lat, q_rope, positions, topk_prev, scale)
+            o_lat, topk = self._split_attn(L, qw, q_lat, q_rope, positions, topk_prev, scale, lb)
             o = self._absorb_o(o_lat, lw["w_uv"]).reshape(T, self.hl * cfg.v_dim)
             return self.comm.all_reduce(lw["o"](o, out_dtype=torch.float32)).to(torch.bfloat16), topk
         C, R, I, qw = self.c_cache[L], self.r_cache[L], None, None
@@ -1182,7 +1199,7 @@ class GlmTP:
         I2 = None if I is None else (tuple(full[nc + 1:]) if isinstance(I, tuple) else full[nc + 1])
         return C2, full[nc], I2
 
-    def _split_attn(self, L, qw, q_lat, q_rope, positions, topk_prev, scale):
+    def _split_attn(self, L, qw, q_lat, q_rope, positions, topk_prev, scale, lb=None):
         """Decode attention on a split layer (engine/glm/kv_split.py) -> (o_lat bf16 [T, hl,
         kv_lora] for this rank's heads, the picks (rows, count) the layers sharing this indexer
         reuse). Two all-gathers: this rank's queries (and on an indexer layer its top-k scores),
@@ -1210,7 +1227,7 @@ class GlmTP:
         else:
             topk = topk_prev
         own_o, own_l, out = split_partials(q_all[..., :cfg.kv_lora], q_all[..., cfg.kv_lora:], self.c_cache[L],
-                                           self.r_cache[L], topk[0], local_bound(positions, r, W), topk[1],
+                                           self.r_cache[L], topk[0], local_bound(positions, r, W) if lb is None else lb, topk[1],
                                            scale, r, hl)
         return merge_received(own_o, own_l, gather_rows(self.comm, out)[1 - r]), topk
 
