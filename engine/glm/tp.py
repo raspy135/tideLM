@@ -304,6 +304,11 @@ class GlmTP:
         # pick's exact weight, heaviest to the best-scored substitute).
         self.sub_weight = env("GLM_SUB_WEIGHT", "renorm")
         assert self.sub_weight in ("renorm", "exact", "transfer"), self.sub_weight
+        # GLM_ROUTE_KERNEL=1: decode routing (<= 8 rows) in two kernels (engine/glm/route_kernel.py)
+        # instead of ~80 small PyTorch kernels a MoE layer. Same picks; weights to the last fp32 bit.
+        self.route_kernel = (env("GLM_ROUTE_KERNEL", "1") == "1" and cfg.n_group == 1
+                             and self.sub_weight == "renorm")
+        self._x3_pick = None
         dec = [L for L in self.moe_layers if L < cfg.layers]
         self._hot_frac = {L: ((i + 1) / len(dec)) ** self.hot_pace for i, L in enumerate(dec)}
         self._hot_quarter = {L: 4 * i // len(dec) for i, L in enumerate(dec)}
@@ -487,7 +492,7 @@ class GlmTP:
                 "pf": [env(k, "") for k in ("GLM_PF", "GLM_PF_SLOTS", "GLM_PF_MIN_ROWS", "GLM_PF_KEEP", "GLM_PF_KEEP_MARGIN", "GLM_HOT", "GLM_HOT_MIN",
                                             "GLM_HOT_TARGET", "GLM_HOT_KEEP", "GLM_HOT_MAX", "GLM_HOT_KEEP_AUDIT", "GLM_HOT_PACE",
                                             "GLM_HOT_PACE_LEAD", "GLM_SUB_WEIGHT", "GLM_MTP_FULL", "GLM_MISS_LOG",
-                                            "GLM_MTP_DYN", "GLM_LOOP_GUARD", "GLM_LOOP_EXACT", "GLM_LOOP_READS",
+                                            "GLM_MTP_DYN", "GLM_ROUTE_KERNEL", "GLM_LOOP_GUARD", "GLM_LOOP_EXACT", "GLM_LOOP_READS",
                                             "GLM_LOOP_BREAK")],
                 "adapt": [env(k, "") for k in ("GLM_ADAPT", "GLM_ADAPT_EVERY", "GLM_ADAPT_PREFILL_SWAPS",
                                                "GLM_ADAPT_DECODE_SWAPS", "GLM_ADAPT_DECAY", "GLM_ADAPT_CROSS_LAYER",
@@ -1262,6 +1267,8 @@ class GlmTP:
             return fixed.contiguous(), ones
         from .ref import route, route_pick, route_scores
         allowed = self.allowed[L] if self.allowed is not None else None
+        if self._route_fused(T):
+            return self._route_kernel(L, x)
         # One router matmul serves every pick below; under split graphs the attention segment's
         # hot candidate already ran it on this same x (_hot_candidate).
         pre = self._pre_route.pop(L, None)
@@ -1313,6 +1320,38 @@ class GlmTP:
         w = torch.where(missing, torch.zeros_like(w), w)
         slots = torch.where(missing, fixed[:, :1].expand_as(slots), slots)
         return torch.cat([slots, fixed], 1).contiguous(), torch.cat([w, ones], 1)
+
+    def _route_fused(self, T):
+        return (self.route_kernel and T <= 8 and self.allowed is not None and self.miss != "stream"
+                and self.record is None and self.route_dump is None and self.miss_hist is None)
+
+    def _route_kernel(self, L, x):
+        """_route for decode rows in route_kernel's two programs (the exact pick normally ran in
+        the attention graph's _hot_candidate). Under EXL3 the routed part goes to mlp through
+        _x3_pick and the return value is the fixed slots only."""
+        from .ref import route_logits
+        from .route_kernel import exact_pick, routed_pick
+        cfg, lw = self.cfg, self.L[L]
+        al = self.allowed[L].view(torch.uint8)
+        pre = self._pre_route.pop(L, None)
+        if pre is not None and pre[0] is x and pre[1] == "kernel":
+            logits, ids0, w0 = pre[2:]
+        else:
+            logits = route_logits(x, lw["router"])
+            ids0, w0 = exact_pick(logits, lw["bias"], al, cfg.topk, cfg.routed_scaling)
+        acc = None
+        if self.miss_stats is not None:
+            if "dev" not in self.miss_stats:
+                self.miss_stats["dev"] = torch.zeros(4, dtype=torch.float64, device=x.device)
+            acc = self.miss_stats["dev"]
+        x3 = self.x3 is not None and L != self.mtp_L
+        out = routed_pick(logits, lw["bias"], al, self.lut[L], self.fixed[L], ids0, w0, cfg.routed_scaling,
+                          x3_off=self.x3_off if x3 else None,
+                          demand=self.demand[L] if self.demand is not None else None, acc=acc)
+        if x3:
+            self._x3_pick = out[:2]
+            return out[2], out[3]
+        return out
 
     def _sub_weights(self, cfg, lw, x, ids):
         """GLM_SUB_WEIGHT=exact|transfer for the substituted picks ``ids`` (graph-safe)."""
@@ -1609,11 +1648,15 @@ class GlmTP:
         x3 = self.x3 is not None and not self.dense(L) and L != self.mtp_L
         if x3:
             from .exl3 import routed, routed_down, routed_up
-            k = self.cfg.topk
-            rs = slots[:, :k] - self.x3_off
-            bad = rs < 0                      # a slotless pick: zero weight on any loaded slot
-            wr = torch.where(bad, torch.zeros_like(w[:, :k]), w[:, :k])
-            slots, w = slots[:, k:].contiguous(), w[:, k:]
+            if self._x3_pick is not None:     # route_kernel: (slots - x3_off clamped, weights)
+                (rs, wr), self._x3_pick = self._x3_pick, None
+            else:
+                k = self.cfg.topk
+                rs = slots[:, :k] - self.x3_off
+                bad = rs < 0                  # a slotless pick: zero weight on any loaded slot
+                wr = torch.where(bad, torch.zeros_like(w[:, :k]), w[:, :k])
+                rs = rs.clamp_min(0)
+                slots, w = slots[:, k:].contiguous(), w[:, k:]
         if self.gather_merge:
             # One all-gather each way. The routed EXL3 and the fixed experts' intermediates go
             # together; every pick's output rows are weighted and summed on the rank that owns
@@ -1635,7 +1678,7 @@ class GlmTP:
                 h, rt = (self._native_up if native else self._triton_up)(x, slots)
             local = None
             if x3:
-                xd, ctx = routed_up(x, rs.clamp_min(0), wr, self.x3)
+                xd, ctx = routed_up(x, rs, wr, self.x3)
                 xd_full, h_full = self._gather_pair(xd, h)
                 local = routed_down(xd_full.contiguous(), ctx, self.x3)
             else:
@@ -1647,7 +1690,7 @@ class GlmTP:
             z = (parts * w.t()[:, :, None]).sum(0)
             out = self.comm.cat_last((z if local is None else z + local).to(torch.bfloat16))
         elif x3:
-            y = routed(x, rs.clamp_min(0), wr, self.x3, self.comm)
+            y = routed(x, rs, wr, self.x3, self.comm)
         if out is None:
             T, k = slots.shape
             if self.native and T * k <= 512:
@@ -1722,6 +1765,16 @@ class GlmTP:
         host buffer, read by _replay_split between this layer's two graphs."""
         from .ref import route_pick, route_scores
         cfg, n = self.cfg, self.hot_c
+        if self._route_fused(x.shape[0]):
+            from .ref import route_logits
+            from .route_kernel import exact_pick
+            lw = self.L[L]
+            logits = route_logits(x, lw["router"])
+            ids0, w0 = exact_pick(logits, lw["bias"], self.allowed[L].view(torch.uint8), cfg.topk,
+                                  cfg.routed_scaling, self._hot_dev[L], 2 * n)
+            self._hot_host[L].copy_(self._hot_dev[L], non_blocking=True)
+            self._pre_route[L] = (x, "kernel", logits, ids0, w0)
+            return logits, ids0, w0
         sc = route_scores(cfg, x, self.L[L]["router"], self.L[L]["bias"])
         self._pre_route[L] = (x, *sc)          # the MLP segment's _route reuses the matmul
         w0, ids0 = route_pick(cfg, *sc, None)

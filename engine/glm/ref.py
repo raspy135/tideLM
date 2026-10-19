@@ -52,15 +52,19 @@ def route(cfg: GlmConfig, x, weight, bias, allowed=None):
     return route_pick(cfg, *route_scores(cfg, x, weight, bias), allowed)
 
 
-def route_scores(cfg: GlmConfig, x, weight, bias):
-    """The router matmul and group limit: (scores, choice) for route_pick. One call serves the
-    masked and the unmasked pick of the same rows."""
+def route_logits(x, weight):
+    """The router matmul, fp32 logits."""
     if weight.dtype == torch.bfloat16:
         # GLM_ROUTER_BF16: BF16 weights and (BF16) activations, fp32 sums and logits.
         x2 = x.reshape(-1, weight.shape[1]).to(torch.bfloat16)
-        logits = torch.mm(x2, weight.t(), out_dtype=torch.float32).view(*x.shape[:-1], weight.shape[0])
-    else:
-        logits = F.linear(x.float(), weight.float())
+        return torch.mm(x2, weight.t(), out_dtype=torch.float32).view(*x.shape[:-1], weight.shape[0])
+    return F.linear(x.float(), weight.float())
+
+
+def route_scores(cfg: GlmConfig, x, weight, bias):
+    """The router matmul and group limit: (scores, choice) for route_pick. One call serves the
+    masked and the unmasked pick of the same rows."""
+    logits = route_logits(x, weight)
     scores = logits.sigmoid()
     choice = scores + bias.float()
     if cfg.n_group > 1:
