@@ -30,6 +30,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from server.progress import DecodeProgress  # noqa: E402
+
 START, MESSAGE, EOM, EOT, EOS = "<|start|>", "<|message|>", "<|eom|>", "<|eot|>", "<|end_of_text|>"
 
 
@@ -208,6 +210,16 @@ class Job:
         self.stats: dict = {}
 
 
+class _LineLog:
+    """server.progress.DecodeProgress logs through logger.info(fmt, *args); this server prints."""
+
+    def __init__(self, log):
+        self.log = log
+
+    def info(self, fmt, *args):
+        self.log("[progress] " + fmt % args)
+
+
 def engine_loop(engine, jobs: "queue.Queue[Job]", log, tpl: Template, stop: tuple[int, ...]):
     """Rank 0: run jobs one at a time; every engine call is mirrored on rank 1."""
     start_id = tpl.special.get(START)          # Muse's header guard; None for other formats
@@ -236,6 +248,12 @@ def engine_loop(engine, jobs: "queue.Queue[Job]", log, tpl: Template, stop: tupl
         first = None
         snap = getattr(engine, "request_snapshot", None)     # engines that count misses (GLM)
         s0 = s1 = snap() if snap else None
+        # A line every 10 s while decoding (tokens, recent tok/s, thinking or answer): a long
+        # thinking turn printed nothing until its end -- an hour and a half for one 86K-token
+        # answer. Rank 0 only and CPU only; the engine's calls are unchanged.
+        think, think_end = getattr(tpl, "think", None), getattr(tpl, "think_end", None)
+        progress = DecodeProgress(_LineLog(log), len(job.prompt), cmd["max_new"],
+                                  think is not None and job.prompt[-1:] == [think], think_end)
         try:
             for tok in engine.stream(job.prompt, cmd["max_new"], temperature=cmd["temperature"],
                                      top_p=cmd["top_p"], top_k=cmd["top_k"], seed=cmd["seed"],
@@ -245,6 +263,7 @@ def engine_loop(engine, jobs: "queue.Queue[Job]", log, tpl: Template, stop: tupl
                     s1 = snap() if snap else None
                 n += 1
                 job.out.put(tok)
+                progress.update((tok,))
                 # A new message header that is not the assistant's (a made-up tool result or
                 # user turn) ends the turn.
                 if start_id is not None and after_start and not tpl.decode([tok]).strip().startswith("assistant"):

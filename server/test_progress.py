@@ -39,5 +39,30 @@ class DecodeProgressTests(unittest.TestCase):
         self.assertNotEqual(a.request_id, b.request_id)
 
 
+
+class EngineLoopProgressTests(unittest.TestCase):
+    """The GLM server (server/muse_app.engine_loop) logs a request's start and first output,
+    and knows a prompt that ends in <think> starts in the thinking phase."""
+
+    def test_glm_prompt_inside_think(self):
+        import queue
+        from types import SimpleNamespace
+        from server.muse_app import Job, engine_loop
+
+        engine = SimpleNamespace(comm=SimpleNamespace(broadcast_obj=lambda cmd: None), last_reuse=0,
+                                 stream=lambda *a, **k: iter([5, 6, 7]))
+        tpl = SimpleNamespace(special={}, think=1, think_end=2, decode=lambda ids: "")
+        jobs = queue.Queue()
+        job = Job([9, 1], {"max_tokens": 8, "temperature": 1.0, "top_p": 1.0, "top_k": 0, "seed": None})
+        jobs.put(job)
+        jobs.put(None)
+        lines = []
+        engine_loop(engine, jobs, lines.append, tpl, ())
+        self.assertIn("thinking=True", lines[0])
+        self.assertTrue(lines[0].startswith("[progress] generation start"))
+        self.assertIn("phase=thinking", lines[1])
+        self.assertTrue(lines[-1].startswith("[muse] request:"))
+
+
 if __name__ == '__main__':
     unittest.main()
