@@ -29,11 +29,11 @@ import fp4_moe as F4  # noqa: E402
 PACK = os.environ.get("DSV41_EXL3_PACK", os.path.expanduser("~/models/exl3-packs/exl3-experts-r0of2.bin"))
 
 
-def routing(T, E, zipf, gen):
-    """[T, 6] distinct experts per row, P(e) ~ (rank+1)^-zipf over a fixed random permutation."""
+def routing(T, E, zipf, gen, K=6):
+    """[T, K] distinct experts per row, P(e) ~ (rank+1)^-zipf over a fixed random permutation."""
     p = (torch.arange(E, dtype=torch.float64) + 1).pow(-zipf)
     p = p[torch.randperm(E, generator=gen)]
-    return torch.multinomial(p.expand(T, E).float(), 6, replacement=False, generator=gen).to(torch.int32)
+    return torch.multinomial(p.expand(T, E).float(), K, replacement=False, generator=gen).to(torch.int32)
 
 
 def group(slots, block_m):
@@ -116,9 +116,18 @@ def main():
     ap.add_argument("--block-m", type=int, default=64)
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--tiles", default="grouped,4x4x2,2x4x2,4x2x2,2x8x2,4x4x3,bm32:4x4x2,bm32:8x4x2",
-                    help="kernels to time: 'grouped' (decode kernel, BM 64) or [bm32:]NTxWARPSxPF (exl3m_prefill)")
+                    help="kernels to time: 'grouped' (decode kernel, BM 64), [bm32:]NTxWARPSxPF (exl3m_prefill) "
+                         "or smem:WxMTWxNTBxPF (exl3m_prefill_smem; BM = W*MTW*16)")
+    ap.add_argument("--topk", type=int, default=6, help="picks a row (DeepSeek 6, GLM-5.3 8)")
     a = ap.parse_args()
     pack = R.PackReader(PACK)
+    if "dims" in pack.header:                        # a GLM pack: its own hidden / intermediate
+        X3.DIM, X3.INTER = pack.header["dims"]
+        XC.DIM, XC.INTER = pack.header["dims"]
+    n_layer = sum(1 for (L, _) in pack.records if L == a.layer)
+    if a.experts > n_layer:
+        print(f"layer {a.layer} has {n_layer} experts in the pack; loading those")
+        a.experts = n_layer
     bits = pack.bits_map[a.layer]
     arena = X3.Exl3Arena(a.experts, device="cuda", tp_rank=pack.rank, tp_world=pack.world, bits=3.0)
     t0 = time.perf_counter()
@@ -129,16 +138,21 @@ def main():
           f"{a.experts} experts loaded in {time.perf_counter() - t0:.1f} s, {arena.bytes_per_slot / 1e6:.2f} MB/slot")
     gen = torch.Generator().manual_seed(0)
     for T in a.rows:
-        slots = routing(T, a.experts, a.zipf, gen).cuda()
-        weights = torch.rand(T, 6, generator=gen).cuda()
+        slots = routing(T, a.experts, a.zipf, gen, a.topk).cuda()
+        weights = torch.rand(T, a.topk, generator=gen).cuda()
         x = (torch.randn(T, X3.DIM, generator=gen) * 0.1).to(torch.bfloat16).cuda()
         counts = torch.bincount(slots.reshape(-1).long(), minlength=a.experts)
-        print(f"\nT={T}  pairs {T * 6}  experts touched {int((counts > 0).sum())}  max/expert {int(counts.max())}")
+        print(f"\nT={T}  pairs {T * a.topk}  experts touched {int((counts > 0).sum())}  max/expert {int(counts.max())}  "
+              f"mean rows/expert {float(counts[counts > 0].float().mean()):.1f}")
         ref = None
         for spec in a.tiles.split(","):
-            bm = int(spec.split(":")[0][2:]) if spec.startswith("bm") else a.block_m
             name = spec.split(":")[-1]
-            tile = None if name == "grouped" else tuple(int(v) for v in name.split("x"))
+            if spec.startswith("smem:"):
+                tile = tuple(int(v) for v in name.split("x"))
+                bm = tile[0] * tile[1] * 16
+            else:
+                bm = int(spec.split(":")[0][2:]) if spec.startswith("bm") else a.block_m
+                tile = None if name == "grouped" else tuple(int(v) for v in name.split("x"))
             tg = []
             for _ in range(a.iters):
                 torch.cuda.synchronize()
@@ -159,9 +173,10 @@ def main():
             if ref is None:
                 ref = out
             rel = float((out - ref).norm() / ref.norm())
-            print(f"  {spec:12s} blocks {NB:4d}  group {sorted(tg)[len(tg) // 2]:6.2f}  "
+            same = "bitwise" if torch.equal(out, ref) else f"{rel:.1e}"
+            print(f"  {spec:14s} blocks {NB:4d}  group {sorted(tg)[len(tg) // 2]:6.2f}  "
                   + "  ".join(f"{k} {v:7.2f}" for k, v in med.items() if k != "gather_standin")
-                  + f"  | total {total:7.2f} ms  vs first {rel:.1e}")
+                  + f"  | total {total:7.2f} ms  vs first {same}")
     return 0
 
 

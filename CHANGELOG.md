@@ -26,6 +26,15 @@ and one launcher (`scripts/tide-up.sh <profile>`, `scripts/tide-down.sh`). Measu
 | `glm53-mxfp4` (GLM-5.3, AMD Quark MXFP4) | 12.0 tok/s | 14.9 tok/s | 24.7 s |
 | `glm53-exl3` (GLM-5.3, EXL3 3.0 bpw) | 13.6 tok/s | 18.2 tok/s | 19.5 s |
 
+2026-10-20, GLM-5.3 EXL3 profile: the FP8 latent cache at 256K again (the FP4/FP8 mix hurt the
+model's recall of its context in use); prefill 8K 18.9 -> ~17 s from a BF16 o_proj reduce
+(`GLM_PREFILL_REDUCE=bf16`), the first chunk's attention walking only the causal prefix
+(`GLM_DENSE_CAUSAL=1`), 4,096-row chunks with an EXL3 prefill kernel that decodes each expert once
+a 64-row block (`GLM_CHUNK=4096`, `GLM_EXL3_PREFILL=smem:4x1x8x2`); q_a and kv_a as one FP8
+projection (bit-identical, ~1 ms a decode round); the two-pass prefill skipped when the first pass
+missed under 8% (`GLM_PREFILL_TWO_PASS_MISS`). Measured and rejected: a listed draft vocabulary for
+the MTP head (docs/gotchas.md).
+
 Changes since 0.1.0-wip that move numbers: async hot reads on DeepSeek (`DSV41_HOT_ASYNC`, ring
 of 128; no measured decode cost, -0.007 / -0.138 nats held-out loss code / prose); urgent decode
 adaptation removed (`DSV41_ADAPT_URGENT=1` refuses to boot). Renamed: the GLM engine's

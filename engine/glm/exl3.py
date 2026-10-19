@@ -116,6 +116,19 @@ class Exl3Pack:
                 for name, dt, n, shape, off in self._offsets(bits)}
 
 
+def prefill_setting():
+    """The prefill MoE kernel for GLM: GLM_EXL3_PREFILL=KERNEL[:TILE] ("tile:4x2x2", "smem:4x1x8x2",
+    "grouped"), else exl3_moe_cuda's DSV41_EXL3_PREFILL_* defaults. (kernel, tile, routing rows).
+    In the boot guard: the kernels differ in how K is summed (grouped) or are bit-identical (tile,
+    smem), but both ranks must run the same one."""
+    import exl3_moe_cuda as C
+    spec = os.environ.get("GLM_EXL3_PREFILL", "")
+    if not spec:
+        return C.prefill_setting()
+    kernel, _, tile = spec.partition(":")
+    return C.prefill_setting(kernel, tile or None)
+
+
 def make_arena(slots: int, rank: int, world: int, device, hidden: int, inter: int):
     R.set_dims(hidden, inter)
     import exl3_moe as M
@@ -167,7 +180,7 @@ def routed_up(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, arena
         maxm, nexp, nt, warps, pf, tile = 16, P, 8, 4, 1, None
     else:
         import fp4_moe as F4
-        block_m = C.PREFILL_BM
+        _, tile, block_m = prefill_setting()
         uniq, inv = torch.unique(pick.view(T, K), return_inverse=True)
         block_slot, block_pair, NB = F4.build_routing(inv.to(torch.int32), int(uniq.numel()), block_m)
         block_slot = torch.where(block_slot >= 0, uniq.to(torch.int32)[block_slot.clamp_min(0)], block_slot)
@@ -176,7 +189,6 @@ def routed_up(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, arena
         uids = block_slot.to(torch.int32).contiguous()
         ucount = torch.full((1,), NB, dtype=torch.int32, device=x.device)
         maxm, nexp, nt, warps, pf = block_m, NB, 8, 4, 2
-        tile = tuple(int(v) for v in C.PREFILL_TILE.split("x"))
     xd = torch.empty((P, arena.inter), dtype=torch.float16, device=x.device)
     C._up(x.contiguous(), pick, uids, ucount, members, arena, T, K, maxm, nexp, INF, xd, nt, warps, pf, tile)
     return xd, (pick, uids, ucount, members, wts, T, K, maxm, nexp, nt, warps, pf, tile)

@@ -480,6 +480,242 @@ void prefill_launch(const void* x0, const void* x1, const int64_t* tp0, const in
 #undef EXL3_PLAUNCH
 }
 
+// ---------------------------------------------------------------- prefill: tiles decoded once a block, shared through smem
+
+// prefill_kernel decodes an expert's trellis once for the MT m-tiles of a warp -- and MT is 2: the
+// 32-row routing block of the 2026-10-08 sweep, where 4 m-tiles' accumulators cut occupancy. An
+// expert with ~100 rows in a 2,048-row chunk is therefore decoded three or four times, and the
+// decode (integer ALU: the codebook hash, the bit windows), not the mma and not the DRAM bytes, is
+// where a GLM prefill MoE layer's ~29 ms went (2026-10-20, docs/gotchas.md). Here a block owns
+// BM = W * MTW * 16 rows of one routing block and NTB n-tiles. Each k-step the warps decode the
+// step's KS x NTB tiles between them -- TPW tiles a warp -- into shared memory, and every warp
+// multiplies all of them into its own MTW m-tiles: the trellis is decoded once for BM rows. A is
+// read from global memory (L2) per warp as before. Two stages, one __syncthreads a step. The
+// same k order and the same mma chain per accumulator as prefill_kernel, so the outputs are
+// bit-identical to it (tools/bench_exl3_prefill.py checks).
+template <int CB, int K2, int W, int MTW, int NTB, int PF>
+__device__ __forceinline__ void smem_tiles(const uint32_t* __restrict__ T, int NTILES, int KT, int ntb0,
+                                           const half* __restrict__ X, int K, const int* rows_sh, int nmt,
+                                           int warp, int lane, uint32_t* Bs, float (&acc)[MTW][NTB][2][4]) {
+    constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW;
+    constexpr int KS = (W >= NTB) ? W / NTB : 1;          // k-tiles a step
+    constexpr int TPW = (NTB > W) ? NTB / W : 1;          // tiles a warp decodes a step
+    constexpr int TILES = KS * NTB;                       // tiles a step
+    constexpr int STAGE = TILES * 32 * 4;                 // uint32 words a stage
+    static_assert(W * TPW == TILES, "the warps must cover a step's tiles exactly");
+    const LaneMap<K2> map(lane);
+    const size_t kstride = (size_t)NTILES * TW;
+    const int g = lane >> 2, t = lane & 3;
+    const int NS = KT / KS;                               // steps (the launcher checks KT % KS == 0)
+    // This warp's tiles of a step: ti = warp * TPW + j is k-tile ti / NTB of the step, n-tile ti % NTB.
+    const uint32_t* tp[TPW];
+#pragma unroll
+    for (int j = 0; j < TPW; ++j) {
+        const int ti = warp * TPW + j;
+        tp[j] = T + ((size_t)(ti / NTB) * NTILES + ntb0 + (ti % NTB)) * TW + lane;
+    }
+    const int m0 = warp * MTW;
+    const half* xr0[MTW];
+    const half* xr1[MTW];
+    bool ok0[MTW], ok1[MTW];
+#pragma unroll
+    for (int m = 0; m < MTW; ++m) {
+        const int r0 = rows_sh[(m0 + m) * 16 + g], r1 = rows_sh[(m0 + m) * 16 + g + 8];
+        ok0[m] = r0 >= 0;
+        ok1[m] = r1 >= 0;
+        xr0[m] = X + (size_t)(ok0[m] ? r0 : 0) * K + 2 * t;
+        xr1[m] = X + (size_t)(ok1[m] ? r1 : 0) * K + 2 * t;
+    }
+    const int nmw = min(max(nmt - m0, 0), MTW);           // this warp's live m-tiles
+
+    auto consume = [&](int stage, int s) {
+        const uint32_t* st = Bs + stage * STAGE;
+#pragma unroll
+        for (int kk = 0; kk < KS; ++kk) {
+            const int k = (s * KS + kk) * 16;
+#pragma unroll
+            for (int m = 0; m < MTW; ++m) {
+                if (m < nmw) {
+                    uint32_t a[4] = {load_pair(xr0[m] + k, ok0[m]), load_pair(xr1[m] + k, ok1[m]),
+                                     load_pair(xr0[m] + k + 8, ok0[m]), load_pair(xr1[m] + k + 8, ok1[m])};
+#pragma unroll
+                    for (int n = 0; n < NTB; ++n) {
+                        const uint4 v = *reinterpret_cast<const uint4*>(st + ((kk * NTB + n) * 32 + lane) * 4);
+                        const uint32_t b0[2] = {v.x, v.y}, b1[2] = {v.z, v.w};
+                        mma16816(acc[m][n][0], a, b0);
+                        mma16816(acc[m][n][1], a, b1);
+                    }
+                }
+            }
+        }
+    };
+    auto store = [&](int stage, const uint32_t (&b)[TPW][4]) {
+        uint32_t* st = Bs + stage * STAGE;
+#pragma unroll
+        for (int j = 0; j < TPW; ++j)
+            *reinterpret_cast<uint4*>(st + ((warp * TPW + j) * 32 + lane) * 4) = make_uint4(b[j][0], b[j][1], b[j][2], b[j][3]);
+    };
+
+    // Trellis words PF steps ahead: step q's words sit in slot q % PF.
+    uint32_t pf[PF][TPW][LW];
+#pragma unroll
+    for (int d = 0; d < PF; ++d)
+        if (d < NS)
+#pragma unroll
+            for (int j = 0; j < TPW; ++j) load_words<K2>(pf[d][j], tp[j] + (size_t)d * KS * kstride, lane);
+    {
+        uint32_t b[TPW][4];
+#pragma unroll
+        for (int j = 0; j < TPW; ++j) {
+            uint32_t b0[2], b1[2];
+            decode_tile<CB, K2>(pf[0][j], map, lane, b0, b1);
+            b[j][0] = b0[0]; b[j][1] = b0[1]; b[j][2] = b1[0]; b[j][3] = b1[1];
+        }
+        if (PF < NS)
+#pragma unroll
+            for (int j = 0; j < TPW; ++j) load_words<K2>(pf[0][j], tp[j] + (size_t)PF * KS * kstride, lane);
+        store(0, b);
+    }
+    __syncthreads();
+    // Step q is decoded while step q - 1 is multiplied; q runs 1 .. NS - 1 in groups of PF so the
+    // slot (q % PF == (d + 1) % PF) is a compile-time index.
+    for (int qb = 1; qb < NS; qb += PF) {
+#pragma unroll
+        for (int d = 0; d < PF; ++d) {
+            const int q = qb + d;
+            if (q < NS) {
+                uint32_t b[TPW][4];
+#pragma unroll
+                for (int j = 0; j < TPW; ++j) {
+                    uint32_t b0[2], b1[2];
+                    decode_tile<CB, K2>(pf[(d + 1) % PF][j], map, lane, b0, b1);
+                    b[j][0] = b0[0]; b[j][1] = b0[1]; b[j][2] = b1[0]; b[j][3] = b1[1];
+                }
+                if (q + PF < NS)
+#pragma unroll
+                    for (int j = 0; j < TPW; ++j)
+                        load_words<K2>(pf[(d + 1) % PF][j], tp[j] + (size_t)(q + PF) * KS * kstride, lane);
+                consume((q - 1) & 1, q - 1);
+                store(q & 1, b);
+                __syncthreads();
+            }
+        }
+    }
+    consume((NS - 1) & 1, NS - 1);
+}
+
+// Program (n block of NTB tiles, routing block u, matrix): BM = W * MTW * 16 member rows of one arena
+// slot times NTB * 16 columns. Members as prefill_kernel's (build_routing's block, -1 padded).
+template <int CB, int W, int MTW, int NTB, int PF, int LO, int HI>
+__global__ void __launch_bounds__(W * 32) prefill_smem_kernel(
+    const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
+    const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
+    const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
+    float* __restrict__ Z, int K, int N, int P, int slots) {
+    constexpr int BM = W * MTW * 16;
+    constexpr int KS = (W >= NTB) ? W / NTB : 1;
+    constexpr int STAGE = KS * NTB * 32 * 4;
+    __shared__ __align__(16) uint32_t Bs[2 * STAGE];
+    __shared__ int rows_sh[BM];
+    const int u = blockIdx.y;
+    if (u >= ucount[0]) return;
+    const int e = uids[u];
+    if (e < 0) return;
+    const int mat = blockIdx.z;
+    for (int i = threadIdx.x; i < BM; i += W * 32) {
+        const int code = members[(size_t)u * BM + i];
+        rows_sh[i] = code >= 0 ? (code >> 5) * slots + (code & 31) : -1;
+    }
+    __syncthreads();
+    int nmt = 0;
+#pragma unroll
+    for (int m = 0; m < W * MTW; ++m)
+        if (rows_sh[m * 16] >= 0) nmt = m + 1;
+    if (nmt == 0) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int NTILES = N >> 4, KT = K >> 4;
+    const int ntb0 = blockIdx.x * NTB;
+    if (ntb0 >= NTILES) return;
+    const half* X = mat ? X1 : X0;
+    const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
+    const int k2 = mat ? K2_1[e] : K2_0[e];
+
+    float acc[MTW][NTB][2][4];
+#pragma unroll
+    for (int m = 0; m < MTW; ++m)
+#pragma unroll
+        for (int i = 0; i < NTB; ++i)
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+#pragma unroll
+                for (int c = 0; c < 4; ++c) acc[m][i][h][c] = 0.f;
+
+    switch (k2) {
+#define EXL3_SCASE(K2_)                                                                                         \
+    case K2_:                                                                                                   \
+        if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
+            smem_tiles<CB, K2_, W, MTW, NTB, PF>(T, NTILES, KT, ntb0, X, K, rows_sh, nmt, warp, lane, Bs, acc); \
+        else                                                                                                    \
+            __trap();                                                                                           \
+        break;
+        EXL3_SCASE(2) EXL3_SCASE(3) EXL3_SCASE(4) EXL3_SCASE(5) EXL3_SCASE(6) EXL3_SCASE(7) EXL3_SCASE(8)
+        EXL3_SCASE(9) EXL3_SCASE(10)
+#undef EXL3_SCASE
+        default:
+            __trap();
+    }
+
+    float* Zm = Z + (size_t)mat * P * N;
+#pragma unroll
+    for (int m = 0; m < MTW; ++m) {
+        const int mt = warp * MTW + m;
+        if (mt >= nmt) break;
+        const int r0 = rows_sh[mt * 16 + g], r1 = rows_sh[mt * 16 + g + 8];
+#pragma unroll
+        for (int i = 0; i < NTB; ++i)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int col = (ntb0 + i) * 16 + h * 8 + 2 * t;
+                if (r0 >= 0)
+                    *reinterpret_cast<float2*>(Zm + (size_t)r0 * N + col) = make_float2(acc[m][i][h][0], acc[m][i][h][1]);
+                if (r1 >= 0)
+                    *reinterpret_cast<float2*>(Zm + (size_t)r1 * N + col) = make_float2(acc[m][i][h][2], acc[m][i][h][3]);
+            }
+    }
+}
+
+template <int CB>
+void prefill_smem_launch(const void* x0, const void* x1, const int64_t* tp0, const int64_t* tp1, const int* k2_0,
+                         const int* k2_1, const int* uids, const int* ucount, const int* members, float* z, int K,
+                         int N, int P, int slots, int nblocks, int mats, int warps, int mtw, int ntb, int pf, int lo,
+                         int hi, cudaStream_t stream) {
+    EXL3_CHECK(lo >= 4 && hi <= 6, "prefill kernel is built for 2- and 3-bit trellis (K2 4..6)");
+    const int ntiles = N / 16;
+    EXL3_CHECK(ntiles % ntb == 0, "N must be a multiple of 16 * NTB");
+#define EXL3_SLAUNCH(W_, MTW_, NTB_, PF_)                                                                       \
+    {                                                                                                           \
+        constexpr int KS_ = (W_ >= NTB_) ? W_ / NTB_ : 1;                                                       \
+        EXL3_CHECK((K / 16) % KS_ == 0, "K must be a multiple of 16 * KS");                                     \
+        dim3 grid((unsigned)(ntiles / NTB_), (unsigned)nblocks, (unsigned)mats);                                \
+        prefill_smem_kernel<CB, W_, MTW_, NTB_, PF_, 4, 6><<<grid, W_ * 32, 0, stream>>>(                       \
+            (const half*)x0, (const half*)x1, tp0, tp1, k2_0, k2_1, uids, ucount, members, z, K, N, P, slots);  \
+    }
+    if (warps == 8 && mtw == 1 && ntb == 8 && pf == 2) EXL3_SLAUNCH(8, 1, 8, 2)
+    else if (warps == 8 && mtw == 1 && ntb == 8 && pf == 3) EXL3_SLAUNCH(8, 1, 8, 3)
+    else if (warps == 8 && mtw == 2 && ntb == 8 && pf == 2) EXL3_SLAUNCH(8, 2, 8, 2)
+    else if (warps == 4 && mtw == 2 && ntb == 8 && pf == 2) EXL3_SLAUNCH(4, 2, 8, 2)
+    else if (warps == 4 && mtw == 1 && ntb == 8 && pf == 2) EXL3_SLAUNCH(4, 1, 8, 2)
+    else if (warps == 8 && mtw == 1 && ntb == 4 && pf == 2) EXL3_SLAUNCH(8, 1, 4, 2)
+    else if (warps == 8 && mtw == 2 && ntb == 4 && pf == 2) EXL3_SLAUNCH(8, 2, 4, 2)
+    else if (warps == 16 && mtw == 1 && ntb == 8 && pf == 2) EXL3_SLAUNCH(16, 1, 8, 2)
+    else if (warps == 16 && mtw == 1 && ntb == 4 && pf == 2) EXL3_SLAUNCH(16, 1, 4, 2)
+    else if (warps == 4 && mtw == 1 && ntb == 16 && pf == 2) EXL3_SLAUNCH(4, 1, 16, 2)
+    else if (warps == 8 && mtw == 1 && ntb == 16 && pf == 2) EXL3_SLAUNCH(8, 1, 16, 2)
+    else EXL3_CHECK(false, "unsupported smem prefill tile setting");
+#undef EXL3_SLAUNCH
+}
+
 // ---------------------------------------------------------------- rotations / epilogues (TensorFold experts.cu)
 
 constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
@@ -804,6 +1040,14 @@ void exl3m_prefill(const void* X0, const void* X1, const int64_t* tp0, const int
                    cudaStream_t s) {
     exl3::prefill_launch<2>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots, nblocks, mats,
                             bm, nt, warps, pf, lo, hi, s);
+}
+
+void exl3m_prefill_smem(const void* X0, const void* X1, const int64_t* tp0, const int64_t* tp1, const int* k2_0,
+                        const int* k2_1, const int* uids, const int* ucount, const int* members, float* Z, int K,
+                        int N, int P, int slots, int nblocks, int mats, int warps, int mtw, int ntb, int pf, int lo,
+                        int hi, cudaStream_t s) {
+    exl3::prefill_smem_launch<2>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots, nblocks,
+                                 mats, warps, mtw, ntb, pf, lo, hi, s);
 }
 
 void exl3m_gateup(const float* Z, const int* pick, const void* svh_g, const void* svh_u, const void* suh_d,

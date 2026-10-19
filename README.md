@@ -12,7 +12,7 @@ tide — so the engine gets better the more you use it.
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,208 / 15,360 (66%) | 512K | **25.9 tok/s** | **42.8 tok/s** | 11.8 s |
 | `glm53-mxfp4`(Experimental) | GLM-5.3 | MXFP4 (AMD Quark) | 8,740 / 19,200 (46%) | 256K | **12.2 tok/s** | **15.3 tok/s** | 23.6 s |
-| `glm53-exl3` | GLM-5.3 | EXL3 3.0 bpw | 12,000 / 19,200 (62.5%) | 320K | **14.0 tok/s** | **18.4 tok/s** | 19.7 s |
+| `glm53-exl3` | GLM-5.3 | EXL3 3.0 bpw | 12,000 / 19,200 (62.5%) | 256K | **14.1 tok/s** | **19.1 tok/s** | 17.9 s |
 
 *Decode speed is `bench/bench.py`'s median over three measured runs after one warmup: 1,024
 output tokens at temperature 0.6, prose = an essay request, code = an LRU-cache request. The last
@@ -20,11 +20,11 @@ column is the median time to first token of a fresh ~8,200-token prompt (no pref
 profile ran exactly as shipped in `configs/` (adaptation, hot reads and speculative decoding on)
 on two DGX Sparks, 2026-10-18, with the expert history it had learned from earlier use. Raw runs:
 [bench/results/2026-10-18/](bench/results/2026-10-18/). The `glm53-exl3` row was measured again on
-2026-10-19 after the decode routing kernel and the move to 320K with the FP4/FP8 latent cache
-([bench/results/2026-10-19/](bench/results/2026-10-19/)), at 12,000 residents rather than the
-example's 12,350 while one node had ~3 GB held by a leaking system service; its first-token time
-is from later that day, after the 4-bit cache's prefill fix, with two warm-up requests before the
-three measured. The first requests after a boot run 1-3 s slower, so a time from one or two of
+2026-10-20 ([bench/results/2026-10-20/](bench/results/2026-10-20/)) after the prefill changes of
+that day (BF16 attention reduce, 4,096-row chunks with the shared-memory EXL3 prefill kernel, the
+first chunk's causal attention) and the fused q_a/kv_a projection, FP8 cache at 256K, at 12,000
+residents rather than the example's 12,350 while one node had ~3 GB held by a leaking system
+service; the first-token time had two warm-up requests before the three measured. The first requests after a boot run 1-3 s slower, so a time from one or two of
 them is that much off ([gotchas](docs/gotchas.md)).*
 
 ## How adaptive expert loading works
@@ -171,7 +171,7 @@ with what each setting measured.
 | `DSV41_MAX_CONCURRENCY=1` | — | Concurrent requests; async hot reads need 1. |
 | `SPEC=1` | `GLM_MTP=1`, `GLM_MTP_DEPTH=7` | Speculative decoding. |
 | `DSV41_PREFIX_CACHE=1`, `DSV41_PREFIX_DISK=1` | `GLM_PREFIX_DISK=1`, `GLM_KV_SPLIT=1` | Prompt caching; GLM's KV cache split across the ranks. |
-| — | `GLM_KV=fp4`, `GLM_KV_FP8_LAYERS=0-9,68-77` (or `fp8`) | GLM's KV cache format. The EXL3 profile keeps the first and last ten layers in FP8 and the rest in 4 bits: 320K in less memory than 256K in FP8, for KL +0.004 against FP8; prefill widens the 4-bit rows to BF16 once a chunk, so it is no slower than FP8 ([gotchas](docs/gotchas.md)). The MXFP4 profile stays FP8 at 256K. |
+| — | `GLM_KV=fp8` (or `fp4` with `GLM_KV_FP8_LAYERS=0-9,68-77`) | GLM's KV cache format. Both profiles serve FP8 at 256K. The 4-bit latent with the first and last ten layers in FP8 fits 320K in less memory and measured KL +0.004 against FP8 on the long eval, but in use the model's recall of its context was visibly worse, so it is off by default ([gotchas](docs/gotchas.md)). |
 | — | `GLM_LOOP_BREAK=12` | Stops a short cycle of tokens from repeating a 12th time (repetition loops start where experts are substituted). |
 
 ## Documentation

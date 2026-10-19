@@ -37,6 +37,32 @@ PREFILL_KERNEL = os.environ.get("DSV41_EXL3_PREFILL_KERNEL", "tile")
 # accumulators a thread) were slower, 30-39 ms: occupancy, not decode count, sets the pace.
 PREFILL_TILE = os.environ.get("DSV41_EXL3_PREFILL_TILE", "4x2x2")
 PREFILL_BM = int(os.environ.get("DSV41_EXL3_PREFILL_BM", "32"))
+# "smem" = exl3m_prefill_smem: a block of W warps x MTW m-tiles each (BM = W * MTW * 16 rows) decodes
+# every trellis tile of its NTB n-tiles once into shared memory and all the warps multiply it
+# (exl3_moe_cuda.cu, smem_tiles). WxMTWxNTBxPF. Bit-identical to "tile"; the routing block follows
+# from the setting, DSV41_EXL3_PREFILL_BM is not read. Measured on GLM-5.3's shapes (2026-10-20,
+# docs/gotchas.md): no faster than "tile" at 2,048 rows, 10% faster at 4,096 with 4x1x8x2; wider
+# blocks (8x1x8, 16x1x8) and MTW = 2 are slower. The GLM profile selects it (GLM_EXL3_PREFILL).
+PREFILL_SMEM_TILE = os.environ.get("DSV41_EXL3_PREFILL_SMEM_TILE", "4x1x8x2")
+
+
+def prefill_setting(kernel: str | None = None, tile: str | None = None, block_m: int | None = None):
+    """(kernel, tile tuple or None, routing block rows) for the prefill MoE path: the defaults
+    above unless overridden. tile: (nt, warps, pf) for "tile", (warps, mtw, ntb, pf) for "smem"."""
+    kernel = kernel or PREFILL_KERNEL
+    if kernel == "smem":
+        t = tuple(int(v) for v in (tile or PREFILL_SMEM_TILE).split("x"))
+        if len(t) != 4:
+            raise ValueError(f"smem prefill tile {tile or PREFILL_SMEM_TILE}: want WxMTWxNTBxPF")
+        return kernel, t, t[0] * t[1] * 16
+    if kernel == "tile":
+        t = tuple(int(v) for v in (tile or PREFILL_TILE).split("x"))
+        if len(t) != 3:
+            raise ValueError(f"prefill tile {tile or PREFILL_TILE}: want NTxWARPSxPF")
+        return kernel, t, block_m or PREFILL_BM
+    if kernel == "grouped":
+        return kernel, None, block_m or 64
+    raise ValueError(f"DSV41_EXL3_PREFILL_KERNEL={kernel}: tile, smem or grouped")
 
 
 def source_digest() -> str:
@@ -73,6 +99,8 @@ def _library():
     lib.exl3m_down_combine.argtypes = [ptr, ptr, ptr, ptr, ptr, ptr, i32, i32, i32, i32, i32, i32, ptr]
     lib.exl3m_prefill.argtypes = [ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr,
                                   i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, ptr]
+    lib.exl3m_prefill_smem.argtypes = [ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr,
+                                       i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, ptr]
     lib.exl3m_dense_rot.argtypes = [ptr, i32, ptr, ptr, i32, i32, i32, i32, ptr]
     lib.exl3m_dense_out.argtypes = [ptr, ptr, ptr, i32, i32, i32, i32, i32, ptr]
     return lib
@@ -123,6 +151,12 @@ def _grouped_or_tile(lib, tile, x0, x1, t0, t1, k2a, k2b, uids, ucount, members,
     if tile is None:
         lib.exl3m_grouped(x0, x1, t0, t1, k2a, k2b, uids, ucount, members, z, int(Kd), int(N), int(P), 1,
                           int(maxm), int(K), int(nexp_max), mats, nt, warps, pf, 2, 10, CB_MUL1, st)
+    elif len(tile) == 4:
+        tw, tmtw, tntb, tpf = tile
+        if tw * tmtw * 16 != maxm:
+            raise ValueError(f"smem prefill tile {tile} wants {tw * tmtw * 16}-row routing blocks, got {maxm}")
+        lib.exl3m_prefill_smem(x0, x1, t0, t1, k2a, k2b, uids, ucount, members, z, int(Kd), int(N), int(P), int(K),
+                               int(nexp_max), mats, tw, tmtw, tntb, tpf, 4, 6, st)
     else:
         tnt, tw, tpf = tile
         lib.exl3m_prefill(x0, x1, t0, t1, k2a, k2b, uids, ucount, members, z, int(Kd), int(N), int(P), int(K),
@@ -265,8 +299,7 @@ def moe_forward_prefill(x: torch.Tensor, slots: torch.Tensor, weights: torch.Ten
     """
     import fp4_moe as F4
     T, K = slots.shape
-    kernel = kernel or PREFILL_KERNEL
-    block_m = block_m or (PREFILL_BM if kernel == "tile" else 64)
+    kernel, ptile, block_m = prefill_setting(kernel, tile, block_m)
     # Compact the slot ids BEFORE routing, exactly as fp4_moe does: build_routing's cost tracks
     # n_slots, not the experts a chunk touches, and at a 13.5k-slot arena that is the dominant
     # prefill cost (~1.5 s a layer here against <1 ms compacted).  Pair ids stay original.
@@ -287,10 +320,9 @@ def moe_forward_prefill(x: torch.Tensor, slots: torch.Tensor, weights: torch.Ten
     members = torch.where(pair >= 0, (pair // K) * 32 + (pair % K), pair).to(torch.int32).contiguous()
     uids = block_slot.to(torch.int32).contiguous()
     ucount = torch.full((1,), NB, dtype=torch.int32, device=slots.device)
-    if kernel == "tile":
-        t = tuple(int(v) for v in (tile or PREFILL_TILE).split("x"))
+    if ptile is not None:
         return _run_pipeline(x, slots, weights, arena, uids, ucount, members, block_m, NB, swiglu_limit,
-                             nt=8, warps=4, pf=2, tile=t)
+                             nt=8, warps=4, pf=2, tile=ptile)
     # pf=2 is the grouped kernel's prefill winner (58 vs 86 ms at T=2048); decode keeps pf=1.
     return _run_pipeline(x, slots, weights, arena, uids, ucount, members, block_m, NB, swiglu_limit,
                          nt=8, warps=4, pf=2)

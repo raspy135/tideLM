@@ -32,6 +32,8 @@ from engine.muse.tp import Comm, env, mem_available, rss_anon  # noqa: F401  (to
 from engine.muse.weights import GROUP, quantize_mxfp4, dequant_mxfp4
 from .config import GlmConfig
 from .fp8_block import FP8Block, fp8_block_linear
+import torch.distributed as dist
+
 from .ref import LATENT_EPS, rope_interleave
 from .rope_kernel import rope
 from .weights import GlmCheckpoint, P
@@ -344,6 +346,29 @@ class GlmTP:
         # the scores' fp32 sums run in another order. fp4: the FP4 kernel in prefill too.
         self.kv4_prefill = env("GLM_KV4_PREFILL", "bf16")
         assert self.kv4_prefill in ("bf16", "fp4"), self.kv4_prefill
+        # GLM_FUSE_QKV_A=1 (default): q_a and kv_a read the same input, so the FP8 pair is one
+        # [2,624, 6,144] weight (q_a's 2,048 rows, then kv_a's 576; 2,048 is a multiple of the
+        # 128-row scale block, so every block scale stays where it was) and a layer launches one
+        # projection kernel instead of two over x. Bit-identical (docs/gotchas.md 2026-10-18:
+        # 24 us a layer in the graph microbenchmark). Not under GLM_EXL3_ATTN (other matrices).
+        self.fuse_qkv_a = env("GLM_FUSE_QKV_A", "1") == "1" and not self.exl3_attn
+        # GLM_PREFILL_REDUCE: how a prefill chunk's o_proj partials (fp32 [rows, hidden]: 50 MB a
+        # layer-chunk at 2,048 rows, 312 of them in an 8K prefill) are summed over the ranks.
+        # fp32: NCCL all-reduce, then BF16. rs: reduce-scatter in fp32 and all-gather the BF16
+        # halves -- the same fp32 sum and the same rounding as fp32, three quarters of the bytes.
+        # bf16: all-reduce in BF16 (the partials rounded before the sum: not the same bits).
+        self.prefill_reduce = env("GLM_PREFILL_REDUCE", "fp32")
+        assert self.prefill_reduce in ("fp32", "rs", "bf16"), self.prefill_reduce
+        # GLM_DENSE_CAUSAL=1 (default): while the context is within the indexer's top-k every
+        # cached position is selected, so a prefill row attends to [0, its position] -- the kernel
+        # walks those in position order and stops there, instead of 2,048 picks half of which are
+        # masked. Same keys, summed in another order (the picks came in score order).
+        self.dense_causal = env("GLM_DENSE_CAUSAL", "1") == "1"
+        self._causal_cache = None
+        # GLM_PREFILL_TWO_PASS_MISS=f (with GLM_PREFILL_TWO_PASS): the second pass runs only when
+        # the first computed at least this share of the new tokens' routed weight on substitutes
+        # (rank 0 reads the miss counters and decides; both ranks take the decision). 0: always.
+        self.two_pass_min = float(env("GLM_PREFILL_TWO_PASS_MISS", "0"))
         # GLM_HOT_KEEP_AUDIT=1 (measurement only, rank 0, syncs per keep): how many kept reads a
         # rank gate -- adapt()'s rule, score beats the victim's by GLM_ADAPT_MARGIN -- would drop.
         self.hot_audit = env("GLM_HOT_KEEP_AUDIT", "0") == "1" and self.rank == 0
@@ -517,6 +542,10 @@ class GlmTP:
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("GLM_HEAD", "bf16"), "depth": env("GLM_MTP_DEPTH", "3"), "db": env("GLM_STATS_DB", ""),
                 "xfmt": self.xfmt, "kv": env("GLM_KV", "bf16"), "kv_fp8_layers": self.kv_fp8_layers, "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "fused_norm": FUSED_NORM, "h_ring": self.h_ring_n, "fixed_dense": self.fixed_dense, "exl3_attn": self.exl3_attn, "kv_split": self.kv_split, "prefix_disk": env("GLM_PREFIX_DISK", "0"), "kvb_fp8": self.kvb_fp8, "embed_q": self.embed_q, "router_bf16": self.router_bf16, "draft_head": env("GLM_DRAFT_HEAD", "same"), "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
+                "fuse_qkv_a": self.fuse_qkv_a, "prefill_reduce": self.prefill_reduce, "dense_causal": self.dense_causal,
+                "two_pass_min": self.two_pass_min,
+                "x3_prefill": [env(k, "") for k in ("GLM_EXL3_PREFILL", "DSV41_EXL3_PREFILL_KERNEL", "DSV41_EXL3_PREFILL_TILE",
+                                                     "DSV41_EXL3_PREFILL_BM", "DSV41_EXL3_PREFILL_SMEM_TILE")],
                 "pf": [env(k, "") for k in ("GLM_PF", "GLM_PF_SLOTS", "GLM_PF_MIN_ROWS", "GLM_PF_KEEP", "GLM_PF_KEEP_MARGIN", "GLM_HOT", "GLM_HOT_MIN",
                                             "GLM_HOT_TARGET", "GLM_HOT_KEEP", "GLM_HOT_MAX", "GLM_HOT_KEEP_AUDIT", "GLM_HOT_PACE",
                                             "GLM_HOT_PACE_LEAD", "GLM_SUB_WEIGHT", "GLM_MTP_FULL", "GLM_MISS_LOG",
@@ -593,6 +622,10 @@ class GlmTP:
                 "o": x3a.lin(xa + "o_proj", d, 2, r, W, "k") if x3l else
                 Lin(o.cols(r * self.hl * cfg.v_dim, (r + 1) * self.hl * cfg.v_dim), d),
             }
+            if self.fuse_qkv_a and not x3l:
+                qa, ka = lw.pop("q_a").q, lw.pop("kv_a").q
+                lw["qkv_a"] = Lin(FP8Block(torch.cat([qa.w, ka.w]), torch.cat([qa.s, ka.s])), d)
+                del qa, ka
             if L == self.mtp_L:
                 lw.update({"enorm": ck.get(p + "enorm.weight").to(d), "hnorm": ck.get(p + "hnorm.weight").to(d),
                            "sh_norm": ck.get(p + "shared_head.norm.weight").to(d),
@@ -1140,10 +1173,15 @@ class GlmTP:
         decode = T <= self.decode_rows
         positions, cos, sin, own_rows, lb = self._attn_ctx(L, T, decode, x.device)
         S = self.max_seq if decode else self.pos + T
-        q_resid = rms(lw["q_a"](x), lw["q_norm"], LATENT_EPS)
+        if "qkv_a" in lw:
+            y = lw["qkv_a"](x)
+            q_resid = rms(y[:, :cfg.q_lora], lw["q_norm"], LATENT_EPS)
+            ckv = y[:, cfg.q_lora:]
+        else:
+            q_resid = rms(lw["q_a"](x), lw["q_norm"], LATENT_EPS)
+            ckv = lw["kv_a"](x)
         q = lw["q_b"](q_resid).view(T, self.hl, cfg.qk_dim)
         q_nope, q_rope = q[..., :cfg.nope], rope(q[..., cfg.nope:], cos, sin)
-        ckv = lw["kv_a"](x)
         c = rms(ckv[:, :cfg.kv_lora], lw["kv_norm"], LATENT_EPS)
         kr = rope(ckv[:, None, cfg.kv_lora:], cos, sin)[:, 0]
         split = self.split(L)
@@ -1181,7 +1219,10 @@ class GlmTP:
             # Within the first index_topk positions the indexer's picks are every position, so the
             # dense case goes here too (its [T, heads, S] fp32 scores made 2,048-row chunks slower).
             from .sparse_attn import sparse_mla
-            o_lat = sparse_mla(q_lat, q_rope, C, R, topk, positions, scale)
+            if self.dense_causal and not decode and S <= cfg.index_topk:
+                o_lat = sparse_mla(q_lat, q_rope, C, R, self._causal_sel(T, S), positions, scale, cnt=positions + 1)
+            else:
+                o_lat = sparse_mla(q_lat, q_rope, C, R, topk, positions, scale)
         else:
             outs = []
             for t0 in range(0, T, 32):
@@ -1196,7 +1237,32 @@ class GlmTP:
             o_lat = torch.cat(outs)
         o = self._absorb_o(o_lat, lw["w_uv"]).reshape(T, self.hl * cfg.v_dim)
         partial = lw["o"](o, out_dtype=torch.float32)
+        if not decode:
+            return self._reduce_prefill(partial), topk
         return self.comm.all_reduce(partial).to(torch.bfloat16), topk
+
+    def _causal_sel(self, T, S):
+        """[T, S] int32: every cached position in order (GLM_DENSE_CAUSAL; a row's count is its
+        position + 1). Kept for the chunk: the layers share it."""
+        c = self._causal_cache
+        if c is None or c.shape != (T, S):
+            c = self._causal_cache = torch.arange(S, dtype=torch.int32, device=self.dev)[None].expand(T, S).contiguous()
+        return c
+
+    def _reduce_prefill(self, partial):
+        """A prefill chunk's o_proj partial sums over the ranks -> BF16 (GLM_PREFILL_REDUCE)."""
+        mode = self.prefill_reduce
+        T = partial.shape[0]
+        if self.world == 1 or mode == "fp32" or (mode == "rs" and T % self.world):
+            return self.comm.all_reduce(partial).to(torch.bfloat16)
+        if mode == "bf16":
+            return self.comm.all_reduce(partial.to(torch.bfloat16))
+        rows = T // self.world
+        mine = torch.empty((rows, partial.shape[1]), dtype=torch.float32, device=partial.device)
+        dist.reduce_scatter_tensor(mine, partial.contiguous())
+        out = torch.empty((T, partial.shape[1]), dtype=torch.bfloat16, device=partial.device)
+        dist.all_gather_into_tensor(out, mine.to(torch.bfloat16))
+        return out
 
     @staticmethod
     def _absorb_q(q_nope, w_uk):
@@ -2190,17 +2256,34 @@ class GlmTP:
             # so its own rows are not computed with the substitutes. Both ranks: same prompt, same m.
             t0 = time.perf_counter()
             mtp_fill = self.mtp_fill
-            self.forward(prompt[n:], all_logits=False)
-            swaps, sec = self.adapt(self.adapt_prefill_swaps)
-            self.adapt_log.append(("two-pass", swaps, round(sec, 2), self.last_churn))
-            self.pos, self.tokens, self.mtp_fill = n, self.tokens[:n], mtp_fill
+            acc = self.miss_stats.get("dev") if self.miss_stats is not None else None
+            before = acc.clone() if acc is not None else None
             out = self.forward(prompt[n:], all_logits=False)
-            # The second pass's routing is the first's again: counted once, by the swap above.
-            self.demand.zero_()
-            self.demand_tokens = 0
-            self.two_passed = True
-            self.log(f"[glm] two-pass prefill: {m} new tokens, {swaps} swaps, "
-                     f"{time.perf_counter() - t0:.2f}s (swaps {sec:.2f}s)")
+            miss, run2 = None, True
+            acc = self.miss_stats.get("dev") if self.miss_stats is not None else None
+            if self.two_pass_min > 0 and acc is not None:
+                # GLM_PREFILL_TWO_PASS_MISS: what the first pass computed on substitutes, as a
+                # share of the new tokens' routed weight. Rank 0 decides from its own counters
+                # (the ranks' routing is the same, but one decision keeps them in step).
+                d = (acc - before if before is not None else acc).tolist()
+                miss = d[3] / d[2] if d[2] > 0 else 0.0
+                run2 = bool(self._decide(miss >= self.two_pass_min))
+            if run2:
+                swaps, sec = self.adapt(self.adapt_prefill_swaps)
+                self.adapt_log.append(("two-pass", swaps, round(sec, 2), self.last_churn))
+                self.pos, self.tokens, self.mtp_fill = n, self.tokens[:n], mtp_fill
+                out = self.forward(prompt[n:], all_logits=False)
+                # The second pass's routing is the first's again: counted once, by the swap above.
+                self.demand.zero_()
+                self.demand_tokens = 0
+                self.two_passed = True
+                self.log(f"[glm] two-pass prefill: {m} new tokens, {swaps} swaps, "
+                         f"{time.perf_counter() - t0:.2f}s (swaps {sec:.2f}s)"
+                         + (f", first pass missed {miss:.1%}" if miss is not None else ""))
+            else:
+                # Below the threshold: the first pass stands, and stream() adapts after it as usual.
+                self.log(f"[glm] two-pass prefill: {m} new tokens, first pass missed {miss:.1%} "
+                         f"< {self.two_pass_min:.0%}: second pass skipped")
         else:
             out = self.forward(prompt[n:], all_logits=False)
         if disk:
@@ -2383,14 +2466,7 @@ class GlmTP:
         if spec:
             self.graph_rows |= set(range(1, depth + 2)) if dyn else {depth + 1}
         emitted = 0
-
-        def decide(v, n=1):
-            """Rank 0's int(s) to both ranks as a small tensor over the fast gather: broadcast_obj
-            pickles through gloo's TCP pair, ~1.9 ms a call at 2-3 calls a round."""
-            vals = ([int(v)] if n == 1 else [int(a) for a in v]) if self.rank == 0 else [0] * n
-            out = self.comm.all_gather(torch.tensor(vals, dtype=torch.long, device=self.dev))[0].tolist()
-            return out[0] if n == 1 else out
-
+        decide = self._decide
         anchor = decide(self.sample(logits[-1], temperature, top_p, top_k, gen) if self.rank == 0 else None)
         z_anchor = logits[-1]                     # what the pending anchor was drawn from (GLM_LOOP_BREAK)
         h_last = self.last_hidden[-1:]
@@ -2537,6 +2613,13 @@ class GlmTP:
                 if d in stop or emitted >= max_new:
                     return
             anchor = nxt
+
+    def _decide(self, v, n=1):
+        """Rank 0's int(s) to both ranks as a small tensor over the fast gather: broadcast_obj
+        pickles through gloo's TCP pair, ~1.9 ms a call at 2-3 calls a round."""
+        vals = ([int(v)] if n == 1 else [int(a) for a in v]) if self.rank == 0 else [0] * n
+        out = self.comm.all_gather(torch.tensor(vals, dtype=torch.long, device=self.dev))[0].tolist()
+        return out[0] if n == 1 else out
 
     @staticmethod
     def _tail_cycle(seq, rep):

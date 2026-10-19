@@ -66,6 +66,8 @@ def main():
     wrap(eng, "logits", "head")
     wrap(eng, "adapt", "adapt (post-prefill)")
     wrap(eng.comm, "all_gather", "  all_gather (any)")
+    wrap(eng.comm, "all_reduce", "  all_reduce (any)")
+    wrap(eng, "_reduce_prefill", "  o_proj reduce")
 
     if a.warmup:
         eng.warmup()

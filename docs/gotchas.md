@@ -3770,3 +3770,93 @@ resolve it either way: long set KL 0.0792 FP4 kernel, 0.0861 BF16 pass, its spre
 
 Served (EXL3 320K mix, 12,000 slots, bench.py random 8K, a fresh label, two warm-up requests, then
 three): 19.68 / 19.74 / 20.19 s to the first token, median 19.7 s, where the README had 23.6.
+
+## GLM-5.3 EXL3 prefill and decode tuning: what moved and what did not (2026-10-20)
+
+The FP8 latent at 256K is the EXL3 profile again: in use, the FP4/FP8 mix made the model's recall of
+its own context visibly worse, which the long-set KL (+0.004) had not shown. Measured on that
+profile (12,000 slots, 256K FP8 KV split), tools/glm_prefill_prof.py --warmup --reps 4 on the 8,020-token
+prompt, median of the three measured reps (one boot each; the MoE segments vary ~0.4 s between
+boots, so read the component columns, not only the total):
+
+| prefill, 8K prompt | total | MoE | attention | o_proj reduce |
+| --- | ---: | ---: | ---: | ---: |
+| as served: tile kernel, 2,048-row chunks, fp32 all-reduce | 18.93 s | 10.66 | 6.80 | 0.95 |
+| + GLM_DENSE_CAUSAL=1, GLM_PREFILL_REDUCE=rs | 19.15 | 11.04 | 6.75 | 0.72 |
+| + GLM_DENSE_CAUSAL=1, GLM_PREFILL_REDUCE=bf16 | 18.15 | 10.54 | 6.05 | 0.53 |
+| dense causal, rs, 4,096-row chunks, tile kernel | 18.82 | 10.67 | 6.67 | 0.71 |
+| dense causal, rs, 4,096-row chunks, smem kernel 4x1x8x2 | 17.77 | 9.78 | 6.50 | -- |
+
+- **o_proj's reduce.** A prefill chunk's attention output partials are fp32 [rows, 6,144], 50 MB a
+  layer-chunk over NCCL, 0.95 s of an 8K prefill. GLM_PREFILL_REDUCE=rs (reduce-scatter in fp32,
+  all-gather the BF16 halves) is the same sum and the same rounding for three quarters of the
+  bytes: 0.72 s. bf16 (the partials rounded before the sum) is 0.53 s and takes 0.75 s off the
+  attention span in all -- a one-BF16-step perturbation of every layer's attention output, so it is a
+  numerics choice, in the boot guard. Quality, glm_quality --mode exact --set long (every expert
+  exact, 900 positions, 32K), each arm against the fp32-reduce arm of the same code: bf16 KL 0.0138,
+  top-1 97.3%, NLL 0.8462 vs 0.8565; the one-bit control (fused RMSNorm off) KL 0.0138, top-1 97.8%,
+  NLL 0.8549. The same distance as the control: taken for both GLM profiles.
+- **Dense causal.** Within the first 2,048 positions the indexer selects every position, so the
+  sparse kernel walked 2,048 picks a row with half of them masked. GLM_DENSE_CAUSAL=1 passes the
+  positions in order with a per-row count: the same keys, summed in position order instead of score
+  order. 8K prompt: attention 6.80 -> 6.75 s (one chunk of four); a 1,519-token prompt 4.27 -> 4.05 s
+  (attention 1.17 -> 0.97). On by default.
+- **q_a + kv_a as one projection** (GLM_FUSE_QKV_A=1, one [2,624, 6,144] FP8 weight; the 128-row
+  scale blocks stay aligned because q_a has 2,048 rows): bit-identical -- the same greedy text and
+  acceptance on three prompts -- and a decode round 168.0 -> 166.2 ms (6K summary), 169.4 -> 168.6
+  (short code), 116.2 -> 115.9 (Japanese); a shared attention layer 0.628 -> 0.621 ms. Less than the
+  24 us a layer the graph microbenchmark promised; kept because it is free.
+- **The two-pass prefill gate** (GLM_PREFILL_TWO_PASS_MISS=0.15 in the profiles): the second pass
+  runs only when the first computed at least that share of the new tokens' routed weight on
+  substitutes; rank 0 decides from the miss counters and broadcasts. First-pass misses seen at
+  12,000 slots: the profiler's fresh-topic prompts 27.3% and 41.1%, a served Japanese first turn
+  30.4%, its two follow-up turns 14.3% and 11.9% -- each of which paid 1.9-2.9 s for the second pass
+  under the 8% threshold tried first. 15% skips the follow-ups and keeps the fresh topics; the
+  second pass's quality gain was measured at the fresh-topic rates, not at 12-14%, so the
+  threshold is a judgment, logged per prefill ("first pass missed x%").
+
+**The EXL3 prefill MoE kernel is not decode-bound.** The hypothesis was that prefill_kernel, which
+decodes an expert's trellis once per 32-row routing block (an expert with ~100 rows in a 2,048-row
+chunk: three or four times), spends its time in the integer decode. exl3m_prefill_smem decodes each
+tile once per block of W x MTW x 16 rows into shared memory and lets every warp multiply it; the
+mma chain per accumulator is prefill_kernel's, so the outputs are bitwise equal (the bench checks).
+tools/bench_exl3_prefill.py, GLM pack layer 20, 160 experts, top-8, Zipf 0.8, ms for one rank's
+up/gate + down:
+
+| rows | tile 4x2x2 (32-row blocks) | grouped (decode kernel) | best smem | smem 4x1x8x2 (64-row blocks) |
+| --- | ---: | ---: | ---: | ---: |
+| 2,048 | 25.8 | 67.2 | 27.7 (4x1x16x2) | 27.8 |
+| 4,096 | 51.5 | 129.6 | 46.1 (4x1x8x2) | 46.1 |
+
+Halving the decodes (64-row blocks) buys nothing at 2,048 rows and 10% at 4,096; 128- and 256-row
+blocks (8x1x8, 16x1x8) are slower, and MTW = 2 much slower (accumulator registers). The tile kernel
+runs the up/gate GEMM at ~30 TFLOPS, about 3.5x its DRAM floor and well under what the FP8
+projection kernel reaches (60-77): the limit is the mma issue and the latency of the tile and A
+loads, not the ALU. The per-row cost of the tile kernel is flat from 2,048 to 4,096 rows (12.6 us a
+row), which is why 4,096-row chunks alone gave 0.1 s; with the smem kernel they give ~1 s, for
+~1 GB more transient memory (reserved peak 106.6 -> 107.6 GB). The EXL3 profile takes that
+(GLM_CHUNK=4096, GLM_EXL3_PREFILL=smem:4x1x8x2); the MXFP4 profile is unmeasured and unchanged.
+One of the smem reps ran 3 s slow with every component slow (20.9 s against 17.3-17.8): a
+boot-to-boot event, not the kernel, but note the spread.
+
+**A listed draft vocabulary does not pay on GLM.** DS V4.1 drafts over 40,960 listed ids a rank
+(0.28% of held-out tokens unlisted). The GLM head's FP8 scale blocks are 128 rows, so an exact
+subset is 128-row blocks, and GLM's frequent ids are spread over them: ranking blocks by the summed
+frequency of their ids over 20.8M tokens of UltraChat, 60M of wikitext-103, 86M of Japanese
+Wikipedia and the repo's corpus (Japanese weighted 3x), the blocks covering 65,536 of 154,880 ids
+still leave 11.5% of Japanese answer tokens and 5.3% of held-out docs unlisted; at 98,304 ids
+4.8% / 1.7%. Every unlisted token is a draft that cannot be right, and the head is ~1.8 ms of a
+4.4 ms draft, so the most the full idea could save is ~2% of a round against a larger acceptance
+loss. Per-id lists need a requantized or per-row-scaled head and 0.25 GB a rank for a gain of
+about the same size. Not built; tools/build_draft_vocab.py and engine/draft_vocab.py remain DS's.
+
+Served with all of the above (bench/bench.py as the README's method, bench/results/2026-10-20/):
+prose 14.1 tok/s, code 19.1, a fresh 8.2K-token prompt to the first token 17.9 s (19.7 the day
+before, measured with the 320K FP4/FP8 profile). Memory: rank 1's MemAvailable bottomed at 4.7 GiB
+during the benches with polkitd holding 4.7 GB there; the 4,096-row chunk's extra GB comes out of
+that margin.
+
+**Bookkeeping that cost runs:** the prefill profiler restores reps 2+ from the disk prefix store
+unless GLM_PREFIX_DISK=0 is set (1 s "prefills"); a CPU-only tokenizer container beside a pair run
+took rank 0 under the 3 GiB floor and the watchdog killed the run; editing engine files while a run
+launches leaves the peer's rsync behind, and the boot guard refuses (`code` digest).
