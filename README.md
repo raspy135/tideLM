@@ -125,11 +125,9 @@ Abliterated overlay is supported for DeepSeek v4.1 flash.
 
 https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated
 
-For **1017**, accept the repository's access terms on Hugging Face and authenticate `hf` first.
+Accept the repository's access terms on Hugging Face and authenticate `hf` first.
 Download only the native FP8 sidecar on **both nodes**, under the parent of `MODEL_DIR`
 (mounted at `/models`):
-
-The model is gated model, you need to submit a form on HF.
 
 ```bash
 hf download drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated \
