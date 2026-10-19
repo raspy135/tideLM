@@ -3590,6 +3590,17 @@ a round. Not changed. What is left in this direction is fewer bytes (EXL3 5-bit 
 and parked above) or fewer launches (q_a and kv_a share their input: one read of 16 MB instead of
 12.6 + 3.5 would save ~35 us a layer, ~2.7 ms a round, if the fused kernel matches the split one).
 
+## EXL3 at 384K: the FP4/FP8 latent mix, 11,800 slots (2026-10-18)
+
+The local EXL3 profile moved from 256K FP8 to 384K with the latent in FP4 on layers 10-67 and FP8
+on 0-9 and 68-77 (GLM_KV=fp4, GLM_KV_FP8_LAYERS=0-9,68-77: the mix measured above, KL +0.004 on the
+long set): KV 8.54 GB a rank against 7.28, so 11,800 slots instead of 12,000 (rank 1's polkitd leak
+still holds ~3 GB). Ready at 11.5 / 12.1 GB MemAvailable on rank 0; after three short requests
+rank 0 10.0 GiB, rank 1 8.0. Two Japanese answers (hangover drinks, garbage sorting in Tokyo) and an
+English one read cleanly. A 355,884-token prompt was started and stopped during prefill (rank 1 at
+6.7 GiB a minute in); a prompt past 256K has not been answered end to end on this profile. Note that
+a prefill cannot be cancelled: a client that disconnects leaves the server busy until it ends.
+
 ## FP8 projections in a graph already stream at ~200 GB/s; PDL and q_a + kv_a fusion measured (2026-10-18)
 
 The "~145 GB/s" read off the kernel table above was wrong: torch.profiler's per-kernel times sum
