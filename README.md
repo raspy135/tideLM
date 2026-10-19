@@ -9,15 +9,20 @@ tide — so the engine gets better the more you use it.
 | Profile | Model | Routed experts | Resident | Context | Prose | Code | 8K-token prompt, first token |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,208 / 15,360 (66%) | 512K | **25.9 tok/s** | **42.8 tok/s** | 11.8 s |
-| `glm53-mxfp4` | GLM-5.3 | MXFP4 (AMD Quark) | 8,740 / 19,200 (46%) | 256K | **12.2 tok/s** | **15.3 tok/s** | 23.6 s |
-| `glm53-exl3` | GLM-5.3 | EXL3 3.0 bpw | 12,350 / 19,200 (64%) | 256K | **13.6 tok/s** | **18.2 tok/s** | 19.5 s |
+| `glm53-mxfp4`(Experimental) | GLM-5.3 | MXFP4 (AMD Quark) | 8,740 / 19,200 (46%) | 256K | **12.2 tok/s** | **15.3 tok/s** | 23.6 s |
+| `glm53-exl3` | GLM-5.3 | EXL3 3.0 bpw | 12,000 / 19,200 (62.5%) | 320K | **14.0 tok/s** | **18.4 tok/s** | 23.6 s |
 
 *Decode speed is `bench/bench.py`'s median over three measured runs after one warmup: 1,024
 output tokens at temperature 0.6, prose = an essay request, code = an LRU-cache request. The last
 column is the median time to first token of a fresh ~8,200-token prompt (no prefix reused). Each
 profile ran exactly as shipped in `configs/` (adaptation, hot reads and speculative decoding on)
 on two DGX Sparks, 2026-10-18, with the expert history it had learned from earlier use. Raw runs:
-[bench/results/2026-10-18/](bench/results/2026-10-18/).*
+[bench/results/2026-10-18/](bench/results/2026-10-18/). The `glm53-exl3` row was measured again on
+2026-10-19 after the decode routing kernel and the move to 320K with the FP4/FP8 latent cache
+([bench/results/2026-10-19/](bench/results/2026-10-19/)), at 12,000 residents rather than the
+example's 12,350 while one node had ~3 GB held by a leaking system service. The 4-bit cache costs
+the fresh 8K prompt ~2.6 s: the same day and code with the 256K FP8 cache took 21.0 s (it was
+19.5 s on 2026-10-18).*
 
 ## How adaptive expert loading works
 
@@ -125,13 +130,13 @@ with what each setting measured.
 | DeepSeek (`DSV41_*`) | GLM-5.3 (`GLM_*`) | What it controls |
 | --- | --- | --- |
 | `ARENA_GB=97.4` | `GLM_SLOTS=8740` | Expert memory per node, and so how many experts stay resident. |
-| `MAX_SEQ=524288` | `GLM_MAX_SEQ=262144` | Context allocation, generated tokens included. Less context, more experts. |
+| `MAX_SEQ=524288` | `GLM_MAX_SEQ=327680` | Context allocation, generated tokens included. Less context, more experts. |
 | `DSV41_ADAPT_SENSITIVITY=high` | `GLM_ADAPT=1`, `GLM_ADAPT_EVERY=200` | How fast the resident set follows new traffic. |
 | `DSV41_HOT_READS=1`, `DSV41_HOT_ASYNC=1`, `DSV41_HOT_RING=128` | `GLM_HOT=1`, `GLM_HOT_MIN=0.2`, `GLM_HOT_MAX=16` | Hot reads (above). |
 | `DSV41_MAX_CONCURRENCY=1` | — | Concurrent requests; async hot reads need 1. |
 | `SPEC=1` | `GLM_MTP=1`, `GLM_MTP_DEPTH=7` | Speculative decoding. |
 | `DSV41_PREFIX_CACHE=1`, `DSV41_PREFIX_DISK=1` | `GLM_PREFIX_DISK=1`, `GLM_KV_SPLIT=1` | Prompt caching; GLM's KV cache split across the ranks. |
-| — | `GLM_KV=fp8` (or `fp4`, `GLM_KV_FP8_LAYERS`) | GLM's KV cache format. FP4 fits 384K in FP8's 256K memory, for a small measured quality cost ([gotchas](docs/gotchas.md)); off by default. |
+| — | `GLM_KV=fp4`, `GLM_KV_FP8_LAYERS=0-9,68-77` (or `fp8`) | GLM's KV cache format. The EXL3 profile keeps the first and last ten layers in FP8 and the rest in 4 bits: 320K in less memory than 256K in FP8, for KL +0.004 against FP8 and ~12% on a fresh prompt's prefill ([gotchas](docs/gotchas.md)). The MXFP4 profile stays FP8 at 256K. |
 | — | `GLM_LOOP_BREAK=12` | Stops a short cycle of tokens from repeating a 12th time (repetition loops start where experts are substituted). |
 
 ## Documentation
