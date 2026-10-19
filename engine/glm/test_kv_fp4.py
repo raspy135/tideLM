@@ -5,7 +5,7 @@ import unittest
 
 import torch
 
-from engine.glm.kv_fp4 import fp4_dequant, fp4_quant_ref, fp4_store, parse_layers
+from engine.glm.kv_fp4 import fp4_dequant, fp4_quant_ref, fp4_store, fp4_to_bf16, parse_layers
 from engine.glm.tp import kv_read, kv_span, kv_write
 
 D = 512
@@ -61,6 +61,37 @@ class Fp4Tests(unittest.TestCase):
         self.assertTrue(torch.equal(kv_span(C, 32), want))
         sel = torch.tensor([[3, 1], [0, 31]], device="cuda")
         self.assertTrue(torch.equal(kv_read(C, sel), want[sel]))
+
+    def test_bf16_pass_is_dequant(self):
+        """fp4_to_bf16 (prefill's one pass over the latent) is fp4_dequant bit for bit, rows
+        limited or not."""
+        x = self.rows(77)
+        packed = torch.zeros(80, D // 2, dtype=torch.uint8, device="cuda")
+        scale = torch.zeros(80, D // 16, dtype=torch.bfloat16, device="cuda")
+        fp4_store(packed, scale, torch.arange(77, device="cuda"), x)
+        self.assertTrue(torch.equal(fp4_to_bf16(packed, scale), fp4_dequant(packed, scale)))
+        self.assertTrue(torch.equal(fp4_to_bf16(packed, scale, rows=50), fp4_dequant(packed[:50], scale[:50])))
+
+    def test_prefill_attention_over_bf16_pass(self):
+        """The prefill path's BF16 latent gives the FP4 kernel's attention up to fp32 summation
+        order: both form the same BF16 keys (the FP4 kernel scores each row as two halves)."""
+        from engine.glm.sparse_attn import sparse_mla
+        g = torch.Generator(device="cuda").manual_seed(1)
+        S, T, H, K = 3000, 48, 32, 2048
+        x = self.rows(S, seed=2)
+        packed = torch.zeros(S, D // 2, dtype=torch.uint8, device="cuda")
+        scale = torch.zeros(S, D // 16, dtype=torch.bfloat16, device="cuda")
+        fp4_store(packed, scale, torch.arange(S, device="cuda"), x)
+        rope = (torch.randn(S, 64, generator=g, device="cuda")).to(torch.bfloat16)
+        q_lat = (torch.randn(T, H, D, generator=g, device="cuda") * 0.05).to(torch.bfloat16)
+        q_rope = (torch.randn(T, H, 64, generator=g, device="cuda") * 0.05).to(torch.bfloat16)
+        positions = torch.arange(S - T, S, device="cuda")
+        sel = torch.stack([torch.randperm(S - T, generator=g, device="cuda")[:K] for _ in range(T)]).to(torch.int32)
+        a = sparse_mla(q_lat, q_rope, (packed, scale), rope, sel, positions, 0.07).float()
+        b = sparse_mla(q_lat, q_rope, fp4_to_bf16(packed, scale), rope, sel, positions, 0.07).float()
+        err = ((a - b).abs().max() / a.abs().max()).item()
+        self.assertLess(err, 1e-2, err)                     # one BF16 step at the outputs' scale
+        self.assertGreater(torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), 0).item(), 0.99999)
 
 
 if __name__ == "__main__":

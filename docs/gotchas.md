@@ -3663,3 +3663,53 @@ cache-write indexing.
 
 The local EXL3 profile then moved from 384K to 320K (same mix): 7.12 GB of KV a rank, 12,000 slots
 again (384K had taken 200).
+
+## GLM prefill: no regression since 2026-10-18; the 4-bit latent's prefill cost, removed (2026-10-19)
+
+The README's 8K time to first token read 19.5 s on 2026-10-18 and 21.0 s on 2026-10-19 (FP8, 256K),
+23.6 s with the FP4/FP8 latent mix -- each from two requests on one boot. tools/glm_prefill_prof.py
+(8,020-token prompt), first without the server's boot: 21.18 s at the 10-18 code, 22.75 at today's,
+22.04 with the mix, the MLP's GPU time alone moving 1.2 s between two runs of the same code. With
+`--warmup` (the decode graphs captured first, as the server does) and `--reps 4`:
+
+| | median of 3 measured | range |
+| --- | --- | --- |
+| 10-18 code (d079df7), FP8, 256K | 19.49 s | 18.98-20.24 |
+| today's code, FP8, 256K | 19.45 s | 19.04-19.57 |
+| today's code, FP4/FP8 mix, 320K | 20.19 s | 19.71-20.76 |
+| same, GLM_KV4_PREFILL=bf16 | 19.16 s | 18.67-19.16 |
+
+No code regression: the day-to-day 1.5 s and most of the mix's 2.6 s were the first requests after
+a boot, which run 1-3 s slow. The allocator made no retries and no cudaFree in any rep, so memory
+pressure from the graph pools (the first suspect) was not it either. Serving numbers from two
+requests per boot carry that much noise.
+
+The mix's real cost was ~0.8 s of attention, in _sparse_mla_fp4_kernel: every prefill row decodes
+the nibbles of each of its 2,048 selected keys again (integer ALU work), 12.68 ms a 2,048-row chunk
+over 8K positions against 8.3 for FP8. GLM_KV4_PREFILL=bf16 (default) turns a chunk's [0, S) rows of
+the gathered FP4 latent into BF16 once (kv_fp4.fp4_to_bf16, 0.02 ms at 8K; at 320K 0.3 GB of
+transient) and runs the BF16 kernel on them: 8.34 ms. The keys are the FP4 kernel's own BF16
+products, bit for bit (test_kv_fp4); the scores' fp32 sums run in another order, so 86% of
+attention outputs are bit-equal and the rest move by one BF16 step. Decode keeps the FP4 kernel
+(a few rows: nothing to share).
+
+Quality, glm_quality --mode exact --set long (every expert exact, MXFP4, 7,000 slots, 32K, the mix;
+900 positions), each arm against the FP8-latent run of the 2026-10-18 entry and against each other
+(KL over the reference's top-20; an id outside a run's own top-20 counted at its 20th log-prob --
+this reproduces that entry's numbers to +-0.0005):
+
+| | against FP8: KL, top-1 | NLL |
+| --- | --- | --- |
+| fused RMSNorm off (the ~1-bit control) | 0.0122, 97.2% | 0.8358 |
+| mix, FP4 kernel in prefill (before) | 0.0161, 96.6% | 0.8229 |
+| mix, GLM_KV4_PREFILL=bf16 | 0.0157, 96.7% | 0.8318 |
+| all 78 layers FP4 | 0.0188, 96.0% | 0.8376 |
+
+Equally close to FP8. The two arms differ from each other by KL 0.0196 (top-1 95.9%), about what
+all-FP4 differs from the mix (0.0210): 14% of attention outputs a BF16 step apart in every layer of
+an 18K-token prompt is a wider perturbation than the control's ~1 bit in 1e5, and teacher-forced
+long contexts amplify any of them. The eval mode (substituted experts, one boot an arm) cannot
+resolve it either way: long set KL 0.0792 FP4 kernel, 0.0861 BF16 pass, its spread being about that.
+
+Served (EXL3 320K mix, 12,000 slots, bench.py random 8K, a fresh label, two warm-up requests, then
+three): 19.68 / 19.74 / 20.19 s to the first token, median 19.7 s, where the README had 23.6.

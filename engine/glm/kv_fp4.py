@@ -78,6 +78,40 @@ def fp4_store(packed: torch.Tensor, scale: torch.Tensor, idx: torch.Tensor, x: t
                         D=D, B=D // scale.shape[-1], num_warps=4)
 
 
+@triton.jit
+def _bf16_kernel(P, S, Y, n, stride_p, stride_s, stride_y, D: tl.constexpr, B: tl.constexpr, R: tl.constexpr):
+    """R rows a program: nibbles to E2M1 in BF16, times the row's BF16 block scale in BF16 -- the
+    product _sparse_mla_fp4_kernel forms for each key it reads."""
+    DH: tl.constexpr = D // 2
+    NBH: tl.constexpr = DH // B
+    rows = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R)
+    rm = rows < n
+    dh = tl.arange(0, DH)
+    nbh = tl.arange(0, NBH)
+    cp = tl.load(P + rows[:, None] * stride_p + dh[None, :], mask=rm[:, None], other=0)
+    s0 = tl.load(S + rows[:, None] * stride_s + nbh[None, :], mask=rm[:, None], other=0.0)
+    s1 = tl.load(S + rows[:, None] * stride_s + NBH + nbh[None, :], mask=rm[:, None], other=0.0)
+    c0 = tl.reshape(tl.reshape(e2m1(cp & 15), (R, NBH, B)) * s0[:, :, None], (R, DH))
+    c1 = tl.reshape(tl.reshape(e2m1(cp >> 4), (R, NBH, B)) * s1[:, :, None], (R, DH))
+    tl.store(Y + rows[:, None] * stride_y + dh[None, :], c0, mask=rm[:, None])
+    tl.store(Y + rows[:, None] * stride_y + DH + dh[None, :], c1, mask=rm[:, None])
+
+
+def fp4_to_bf16(packed: torch.Tensor, scale: torch.Tensor, rows: int | None = None) -> torch.Tensor:
+    """Rows [0, rows) of an FP4 latent (packed uint8 [n, D / 2], scale bf16 [n, D / 16]) as BF16
+    [rows, D] in one pass -- what fp4_dequant computes, bit for bit, without its int32 and fp32
+    temporaries (a 320K-row latent is 0.3 GB in BF16, ~0.7 GB per temporary there)."""
+    n = packed.shape[0] if rows is None else rows
+    D = packed.shape[1] * 2
+    y = torch.empty((n, D), dtype=torch.bfloat16, device=packed.device)
+    if n:
+        assert packed.stride(-1) == 1 and scale.stride(-1) == 1
+        R = 16
+        _bf16_kernel[(triton.cdiv(n, R),)](packed, scale, y, n, packed.stride(0), scale.stride(0), y.stride(0),
+                                           D=D, B=D // scale.shape[-1], R=R, num_warps=4)
+    return y
+
+
 def fp4_dequant(packed: torch.Tensor, scale: torch.Tensor, dtype=torch.bfloat16) -> torch.Tensor:
     """packed uint8 [..., D / 2], scale bf16 [..., D / 16] -> [..., D] in `dtype` (values times
     scale in BF16, as the kernels compute them)."""

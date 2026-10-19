@@ -322,6 +322,14 @@ class GlmTP:
         # background period (GLM_BG=1) rank 0 queues up to N victims after its own plan's -- cold,
         # lowest long-term score first -- and each hot read takes the next one (_hot_keep).
         self.hot_keep = int(env("GLM_HOT_KEEP", "0")) if self.hot_n else 0
+        # GLM_KV4_PREFILL=bf16 (default): a prefill chunk over an FP4 latent layer first turns the
+        # rows it can attend, [0, S), into BF16 in one pass, and runs the BF16 attention kernel on
+        # them. The FP4 kernel decodes each selected key's nibbles again for every row -- 2,048 rows
+        # x 2,048 picks a chunk: 11.3 ms against FP8's 8.3, integer ALU work -- where the pass costs
+        # S rows once. Same BF16 keys either way (kv_fp4.fp4_to_bf16 is the kernel's own product);
+        # the scores' fp32 sums run in another order. fp4: the FP4 kernel in prefill too.
+        self.kv4_prefill = env("GLM_KV4_PREFILL", "bf16")
+        assert self.kv4_prefill in ("bf16", "fp4"), self.kv4_prefill
         # GLM_HOT_KEEP_AUDIT=1 (measurement only, rank 0, syncs per keep): how many kept reads a
         # rank gate -- adapt()'s rule, score beats the victim's by GLM_ADAPT_MARGIN -- would drop.
         self.hot_audit = env("GLM_HOT_KEEP_AUDIT", "0") == "1" and self.rank == 0
@@ -487,7 +495,8 @@ class GlmTP:
                                          ("tp.py", "ref.py", "weights.py", "config.py", "fp8_block.py",
                                           "index_kernel.py", "exl3.py", "sparse_attn.py",
                                           "norm_kernel.py", "direct_io.py", "mxfp4_dense.py", "exl3_attn.py",
-                                          "kv_split.py", "prefix_store.py", "kvb_fp8.py", "kv_fp4.py"))).hexdigest()[:16]
+                                          "kv_split.py", "prefix_store.py", "kvb_fp8.py", "kv_fp4.py",
+                                          "route_kernel.py", "rope_kernel.py"))).hexdigest()[:16]
         self.code_digest = digest
         mine = {"version": VERSION, "code": digest, "miss": self.miss, "native": self.native,
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
@@ -498,7 +507,7 @@ class GlmTP:
                                             "GLM_HOT_TARGET", "GLM_HOT_KEEP", "GLM_HOT_MAX", "GLM_HOT_KEEP_AUDIT", "GLM_HOT_PACE",
                                             "GLM_HOT_PACE_LEAD", "GLM_SUB_WEIGHT", "GLM_MTP_FULL", "GLM_MISS_LOG",
                                             "GLM_MTP_DYN", "GLM_ROUTE_KERNEL", "GLM_LOOP_GUARD", "GLM_LOOP_EXACT", "GLM_LOOP_READS",
-                                            "GLM_LOOP_BREAK")],
+                                            "GLM_LOOP_BREAK", "GLM_KV4_PREFILL")],
                 "adapt": [env(k, "") for k in ("GLM_ADAPT", "GLM_ADAPT_EVERY", "GLM_ADAPT_PREFILL_SWAPS",
                                                "GLM_ADAPT_DECODE_SWAPS", "GLM_ADAPT_DECAY", "GLM_ADAPT_CROSS_LAYER",
                                                "GLM_ADAPT_MARGIN", "GLM_BG", "GLM_BG_EVERY", "GLM_BG_READS", "GLM_PREFILL_TWO_PASS",
@@ -1140,6 +1149,9 @@ class GlmTP:
             # [0, S) and run the unsplit path on it -- the bytes an unsplit cache would hold.
             qw = self._index_qw(L, x, q_resid, cos, sin, rows) if self.full(L) else None
             C, R, I = self._gathered(L, S)
+        if not decode and self.kv4_prefill == "bf16" and isinstance(C, tuple) and C[0].dtype == torch.uint8:
+            from .kv_fp4 import fp4_to_bf16
+            C = fp4_to_bf16(C[0], C[1], rows=min(S, C[0].shape[0]))
         topk = self._indexer(L, x, q_resid, positions, cos, sin, S, cache=I, qw=qw) if self.full(L) else topk_prev
         if not decode and S <= cfg.index_topk and not self.attn_kernel:
             C = kv_span(C, S)
@@ -2062,7 +2074,8 @@ class GlmTP:
                "exl3_attn": self.exl3_attn, "model": hashlib.sha256(cfg_bytes).hexdigest(), "dir": str(self.model_dir),
                "pack": env("GLM_EXL3_PACK", ""),
                "numerics": [FUSED_NORM, self.attn_kernel, self.index_kernel, self.fixed_dense, self.gather_merge,
-                            self.native, self.prefill_moe, self.miss, self.kvb_fp8, self.embed_q, self.router_bf16]}
+                            self.native, self.prefill_moe, self.miss, self.kvb_fp8, self.embed_q, self.router_bf16,
+                            *([self.kv4_prefill] if env("GLM_KV", "bf16") == "fp4" else [])]}
         return hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:16]
 
     def _kv_layout(self):

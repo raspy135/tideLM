@@ -15,7 +15,7 @@ import time
 sys.path.insert(0, "/app")
 import torch  # noqa: E402
 
-from engine.glm.tp import GlmTP  # noqa: E402
+from engine.glm.tp import GlmTP, mem_available  # noqa: E402
 from server.glm_app import GlmTemplate  # noqa: E402
 
 
@@ -25,6 +25,10 @@ def main():
     ap.add_argument("--long-tokens", type=int, default=6000)
     ap.add_argument("--kernels", type=int, default=0, help="then profile this many chunks' kernels")
     ap.add_argument("--kernels-after", type=int, default=4, help="... after this many unprofiled chunks")
+    ap.add_argument("--reps", type=int, default=2, help="prefills of the prompt; the first warms kernels/JIT")
+    ap.add_argument("--warmup", action="store_true",
+                    help="capture the decode graphs first (eng.warmup(), as the server does at boot): their "
+                         "pools hold memory a prefill's transients then cannot use")
     a = ap.parse_args()
     tpl = GlmTemplate(a.model)
     eng = GlmTP(a.model)
@@ -63,10 +67,14 @@ def main():
     wrap(eng, "adapt", "adapt (post-prefill)")
     wrap(eng.comm, "all_gather", "  all_gather (any)")
 
-    for rep in range(2):                              # rep 0 warms kernels/JIT; rep 1 is measured
+    if a.warmup:
+        eng.warmup()
+    totals = []
+    for rep in range(a.reps):                         # rep 0 warms kernels/JIT; the rest are measured
         pending.clear(), spans.clear(), calls.clear(), wall.clear()
         eng.reset()
         torch.cuda.synchronize()
+        m0 = torch.cuda.memory_stats()
         t0 = time.perf_counter()
         it = eng.stream(prompt, 1, depth=0)
         next(it)
@@ -75,9 +83,19 @@ def main():
         it.close()
         for key, e0, e1 in pending:
             spans[key] += e0.elapsed_time(e1) / 1e3
+        m1 = torch.cuda.memory_stats()
+        d = {k: m1.get(k, 0) - m0.get(k, 0) for k in ("num_alloc_retries", "num_device_alloc", "num_device_free")}
+        if rep:
+            totals.append(total)
         if eng.rank == 0:
             print(f"[pf] rep {rep}: {len(prompt)} tokens in {total:.2f}s = {len(prompt) / total:.1f} tok/s "
-                  f"(chunk {eng.chunk})", flush=True)
+                  f"(chunk {eng.chunk}); mlp {spans['mlp']:.2f}s, attention {spans['attention (incl. indexer)']:.2f}s; "
+                  f"allocator retries {d['num_alloc_retries']}, cudaMalloc {d['num_device_alloc']}, "
+                  f"cudaFree {d['num_device_free']}; reserved {m1.get('reserved_bytes.all.peak', 0) / 1e9:.1f} GB peak, "
+                  f"MemAvailable {mem_available() / 1e9:.1f} GB", flush=True)
+    if eng.rank == 0 and totals:
+        ts = sorted(totals)
+        print(f"[pf] measured reps: median {ts[len(ts) // 2]:.2f}s, min {ts[0]:.2f}s, max {ts[-1]:.2f}s", flush=True)
     if eng.rank == 0:
         for k in sorted(spans, key=lambda k: -spans[k]):
             print(f"[pf]   {k:28s} GPU span {spans[k]:7.2f}s  host {wall[k]:7.2f}s  calls {calls[k]}", flush=True)
