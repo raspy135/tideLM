@@ -12,7 +12,7 @@ tide — so the engine gets better the more you use it.
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,208 / 15,360 (66%) | 512K | **25.9 tok/s** | **42.8 tok/s** | 11.8 s |
 | `glm53-mxfp4`(Experimental) | GLM-5.3 | MXFP4 (AMD Quark) | 8,740 / 19,200 (46%) | 256K | **12.2 tok/s** | **15.3 tok/s** | 23.6 s |
-| `glm53-exl3` | GLM-5.3 | EXL3 3.0 bpw | 12,000 / 19,200 (62.5%) | 256K | **14.1 tok/s** | **19.1 tok/s** | 17.9 s |
+| `glm53-exl3` | GLM-5.3 | EXL3 3.0 bpw | 12,400 / 19,200 (64.6%) | 256K | **14.1 tok/s** | **19.1 tok/s** | 17.9 s |
 
 *Decode speed is `bench/bench.py`'s median over three measured runs after one warmup: 1,024
 output tokens at temperature 0.6, prose = an essay request, code = an LRU-cache request. The last
@@ -22,9 +22,10 @@ on two DGX Sparks, 2026-10-18, with the expert history it had learned from earli
 [bench/results/2026-10-18/](bench/results/2026-10-18/). The `glm53-exl3` row was measured again on
 2026-10-20 ([bench/results/2026-10-20/](bench/results/2026-10-20/)) after the prefill changes of
 that day (BF16 attention reduce, 4,096-row chunks with the shared-memory EXL3 prefill kernel, the
-first chunk's causal attention) and the fused q_a/kv_a projection, FP8 cache at 256K, at 12,000
-residents rather than the example's 12,350 while one node had ~3 GB held by a leaking system
-service; the first-token time had two warm-up requests before the three measured. The first requests after a boot run 1-3 s slower, so a time from one or two of
+first chunk's causal attention) and the fused q_a/kv_a projection, FP8 cache at 256K. Those runs
+were at 12,000 residents; the profile moved to 12,400 later that day, once the memory a leaking
+service held on one node was freed, and was not re-measured. The first-token time had two
+warm-up requests before the three measured. The first requests after a boot run 1-3 s slower, so a time from one or two of
 them is that much off ([gotchas](docs/gotchas.md)).*
 
 ## How adaptive expert loading works
