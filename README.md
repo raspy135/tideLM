@@ -97,8 +97,13 @@ docker run --rm --gpus all -v <exl3 dir>:/models-exl3:ro -v <packs dir>:/packs -
 **3. Build the image** on the head; it is copied to the worker, and every profile runs from it:
 
 ```bash
-IMAGE=tidelm:local bash scripts/dual-build.sh    # set the same IMAGE / GLM_IMAGE in your profile
+IMAGE=tidelm:local PEER=<user>@<worker address> bash scripts/dual-build.sh
 ```
+
+The example profiles already name `tidelm:local` (`IMAGE` for DeepSeek, `GLM_IMAGE` for GLM-5.3).
+Without `PEER` the image is only built on the head, and the worker cannot start. DeepSeek runs
+the code baked into the image and refuses to boot from an image older than the checkout, so
+rebuild after pulling new code; GLM-5.3 mounts the checkout itself.
 
 **4. Start and stop:**
 
