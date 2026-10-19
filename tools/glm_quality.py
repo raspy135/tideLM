@@ -97,11 +97,16 @@ def main():
     ap.add_argument("--rows", type=int, default=1,
                     help="eval: feed the answer N tokens a step (3 = an MTP depth-2 verify block, graphed "
                          "when GLM_MTP_DEPTH=N-1), so per-step read caps and thresholds act as in serving")
+    ap.add_argument("--graphs", action="store_true",
+                    help="eval: run the N-row steps as decode graphs at any GLM_MTP_DEPTH (serving's path: "
+                         "split graphs with sync hot reads, or GLM_HOT_ASYNC's one graph a forward)")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     tpl = GlmTemplate(args.model)
     eng = GlmTP(args.model)
+    if args.graphs:
+        eng.graph_rows.add(args.rows)
     suffix = "" if args.set == "tokyo" else f"-{args.set}"
     if args.set in ("natural", "long"):
         prompts = None

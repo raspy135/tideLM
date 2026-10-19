@@ -322,6 +322,20 @@ class GlmTP:
         # background period (GLM_BG=1) rank 0 queues up to N victims after its own plan's -- cold,
         # lowest long-term score first -- and each hot read takes the next one (_hot_keep).
         self.hot_keep = int(env("GLM_HOT_KEEP", "0")) if self.hot_n else 0
+        # GLM_HOT_ASYNC=1 (graphed decode, needs GLM_HOT_KEEP and GLM_BG): the hot reads leave the
+        # step. A forward is one graph that leaves every MoE layer's candidates on the device and
+        # copies them to the host once at its end; the heaviest (the same threshold and step cap)
+        # are read on the io threads while the next round drafts, and go into kept-victim slots
+        # before the next forward. A read serves the steps after the one that wanted it, where the
+        # sync path computes that step's own pick exactly. Measured 2026-10-19 (docs/gotchas.md):
+        # ~5 ms off a decode round (the reads leave it; the 75 host waits cost almost nothing by
+        # themselves) for KL 0.086 -> 0.137 against the exact model -- GLM's heavy misses rarely
+        # recur, so a read a step late seldom finds its expert wanted again. Off by default.
+        self.hot_async = env("GLM_HOT_ASYNC", "0") == "1" and self.hot_n > 0
+        if self.hot_async and not (self.hot_keep and env("GLM_BG", "0") == "1"):
+            raise ValueError("GLM_HOT_ASYNC needs GLM_HOT_KEEP and GLM_BG=1 (the victims its reads replace)")
+        self.hot_pending = []           # GLM_HOT_ASYNC: [(L, e, read future)] for the next forward
+        self._hot_eager = True          # False while a GLM_HOT_ASYNC capture warms up (no sync reads)
         # GLM_KV4_PREFILL=bf16 (default): a prefill chunk over an FP4 latent layer first turns the
         # rows it can attend, [0, S), into BF16 in one pass, and runs the BF16 attention kernel on
         # them. The FP4 kernel decodes each selected key's nibbles again for every row -- 2,048 rows
@@ -507,7 +521,7 @@ class GlmTP:
                                             "GLM_HOT_TARGET", "GLM_HOT_KEEP", "GLM_HOT_MAX", "GLM_HOT_KEEP_AUDIT", "GLM_HOT_PACE",
                                             "GLM_HOT_PACE_LEAD", "GLM_SUB_WEIGHT", "GLM_MTP_FULL", "GLM_MISS_LOG",
                                             "GLM_MTP_DYN", "GLM_ROUTE_KERNEL", "GLM_LOOP_GUARD", "GLM_LOOP_EXACT", "GLM_LOOP_READS",
-                                            "GLM_LOOP_BREAK", "GLM_KV4_PREFILL")],
+                                            "GLM_LOOP_BREAK", "GLM_HOT_ASYNC", "GLM_KV4_PREFILL")],
                 "adapt": [env(k, "") for k in ("GLM_ADAPT", "GLM_ADAPT_EVERY", "GLM_ADAPT_PREFILL_SWAPS",
                                                "GLM_ADAPT_DECODE_SWAPS", "GLM_ADAPT_DECAY", "GLM_ADAPT_CROSS_LAYER",
                                                "GLM_ADAPT_MARGIN", "GLM_BG", "GLM_BG_EVERY", "GLM_BG_READS", "GLM_PREFILL_TWO_PASS",
@@ -1668,7 +1682,7 @@ class GlmTP:
         if pf:
             self._pf_install(L)
             self._pf_predict(L, x)
-        elif (self.hot_n and x.shape[0] <= self.decode_rows and not self.dense(L)
+        elif (self.hot_n and x.shape[0] <= self.decode_rows and not self.dense(L) and self._hot_eager
               and not torch.cuda.is_current_stream_capturing()):
             pf = self._hot_stream(L, x)
         slots, w = self._route(L, x)
@@ -1789,9 +1803,10 @@ class GlmTP:
         graph.replay()
         return static_out.clone(), static_h.clone()
 
-    def _hot_candidate(self, L, x):
+    def _hot_candidate(self, L, x, copy=True):
         """Graph-safe: this layer's heaviest missed picks (weight share, expert) into the pinned
-        host buffer, read by _replay_split between this layer's two graphs."""
+        host buffer, read by _replay_split between this layer's two graphs. copy=False: into
+        _hot_dev only (GLM_HOT_ASYNC copies every layer's at once after the head)."""
         from .ref import route_pick, route_scores
         cfg, n = self.cfg, self.hot_c
         if self._route_fused(x.shape[0]):
@@ -1801,7 +1816,8 @@ class GlmTP:
             logits = route_logits(x, lw["router"])
             ids0, w0 = exact_pick(logits, lw["bias"], self.allowed[L].view(torch.uint8), cfg.topk,
                                   cfg.routed_scaling, self._hot_dev[L], 2 * n)
-            self._hot_host[L].copy_(self._hot_dev[L], non_blocking=True)
+            if copy:
+                self._hot_host[L].copy_(self._hot_dev[L], non_blocking=True)
             self._pre_route[L] = (x, "kernel", logits, ids0, w0)
             return logits, ids0, w0
         sc = route_scores(cfg, x, self.L[L]["router"], self.L[L]["bias"])
@@ -1812,7 +1828,8 @@ class GlmTP:
         v, i = share.reshape(-1).topk(k)
         self._hot_dev[L, :k] = v
         self._hot_dev[L, 2 * n:2 * n + k] = ids0.reshape(-1)[i].float()
-        self._hot_host[L].copy_(self._hot_dev[L], non_blocking=True)
+        if copy:
+            self._hot_host[L].copy_(self._hot_dev[L], non_blocking=True)
         return sc
 
     def _side_stream(self):
@@ -1940,6 +1957,131 @@ class GlmTP:
         st["steps"] = st.get("steps", 0) + 1
         st[f"thr_{T}"] = round(self.hot_thr.get(T, self.hot_min), 3)
         return st_out.clone(), st_h.clone()
+
+    def _step_hot(self, ids):
+        """_step for GLM_HOT_ASYNC: each MoE layer's hot candidates into _hot_dev, then one copy of
+        all of them to the pinned host buffer behind the head."""
+        cfg = self.cfg
+        h, topk = self.embed_ids(ids), None
+        for L in range(cfg.layers):
+            a, topk = self.attention(L, rms(h, self.L[L]["ln_in"], cfg.rms_eps), topk)
+            h = h + a
+            x = rms(h, self.L[L]["ln_post"], cfg.rms_eps)
+            if not self.dense(L):
+                self._hot_candidate(L, x, copy=False)
+            h = h + self.mlp(L, x)
+        out = self.logits(h)
+        self._hot_host.copy_(self._hot_dev, non_blocking=True)
+        return out
+
+    def _replay_async(self, ids):
+        """GLM_HOT_ASYNC decode: install the reads the last forward asked for, replay this one's
+        graph, then plan its reads (the caller reads the logits next, so waiting here is free)."""
+        T = ids.numel()
+        entry = self.graphs.get(("hot", T))
+        if entry is None:
+            if not hasattr(self, "_hot_dev"):
+                self._hot_dev = torch.zeros((self.nL, 4 * self.hot_c), dtype=torch.float32, device=self.dev)
+                self._hot_host = torch.zeros((self.nL, 4 * self.hot_c), dtype=torch.float32).pin_memory()
+            st_ids = ids.clone()
+            side = self._side_stream()
+            side.wait_stream(torch.cuda.current_stream())
+            self._hot_eager = False
+            try:
+                with torch.cuda.stream(side):
+                    for _ in range(2):
+                        self._step_hot(st_ids)
+            finally:
+                self._hot_eager = True
+            torch.cuda.current_stream().wait_stream(side)
+            graph = torch.cuda.CUDAGraph()
+            with self.capture_lock, torch.cuda.graph(graph, pool=self._graph_pool()):
+                st_out, st_h = self._step_hot(st_ids)
+            torch.cuda.empty_cache()
+            entry = self.graphs[("hot", T)] = (graph, st_ids, st_out, st_h)
+            self.log(f"[glm] captured decode graph with async hot reads for {T} rows")
+        graph, st_ids, st_out, st_h = entry
+        self._hot_install()
+        st_ids.copy_(ids)
+        graph.replay()
+        torch.cuda.current_stream().synchronize()
+        self._hot_plan(T)
+        return st_out.clone(), st_h.clone()
+
+    def _hot_plan(self, T):
+        """GLM_HOT_ASYNC, after a forward: per MoE layer its best GLM_HOT candidates at or above
+        the threshold, then the heaviest of those up to the step cap and the victims queued (each
+        read takes one), submitted to the io threads. Both ranks see the same candidates
+        (replicated x) and the same queue, so they read the same experts."""
+        if self._warming:
+            return
+        n, st = self.hot_c, self.hot_stats
+        thr = self.hot_thr.get(T, self.hot_min)
+        cap = self.hot_max or (max(1, int(2 * self.hot_target)) if self.hot_target > 0 else 1 << 30)
+        cap = min(cap, len(self.hot_q))
+        rows = self._hot_host.tolist()
+        cand = []
+        for L in self._hot_quarter:
+            row, es = rows[L], []
+            for v, e in zip(row[:2 * n], row[2 * n:]):
+                if v < thr or len(es) >= self.hot_n:
+                    break
+                if int(e) not in es:
+                    es.append(int(e))
+                    cand.append((v, L, int(e)))
+        cand.sort(key=lambda c: -c[0])                      # stable: equal shares keep layer order
+        cand = cand[:cap]
+        if self.hot_target > 0:
+            thr *= 1.1 ** ((len(cand) - self.hot_target) / self.hot_target)
+            self.hot_thr[T] = min(1.0, max(self.hot_min, thr))
+        st["steps"] = st.get("steps", 0) + 1
+        if not cand:
+            return
+        if not hasattr(self, "_hot_pool"):
+            from concurrent.futures import ThreadPoolExecutor
+            self._hot_pool = ThreadPoolExecutor(max_workers=4)
+        self.hot_pending = [(L, e, self._hot_pool.submit(self._expert_parts, L, e, True)) for _, L, e in cand]
+        st["reads"] += len(cand)
+        st["layers"] += len({L for _, L, _ in cand})
+        for _, L, _ in cand:
+            st["quarters"][self._hot_quarter[L]] += 1
+
+    def _hot_install(self):
+        """GLM_HOT_ASYNC, before a forward: the last forward's reads into the next queued victims
+        that still hold their slots (_hot_keep's rule), unless the expert became resident on its
+        own meanwhile (an adaptation). Decided on the shared lut and queue: both ranks agree."""
+        items, self.hot_pending = self.hot_pending, []
+        if not items:
+            return
+        st, q = self.hot_stats, self.hot_q
+        t0 = time.perf_counter()
+        parts = [f.result() for *_, f in items]
+        t1 = time.perf_counter()
+        st["wait_s"] = st.get("wait_s", 0.0) + t1 - t0
+        lut = self.lut.cpu()
+        done = 0
+        for (L, e, _), pr in zip(items, parts):
+            if int(lut[L, e]) >= 0:
+                st["stale"] = st.get("stale", 0) + 1
+                continue
+            while q:
+                VL, ve, vs = q.pop()
+                if self.owner[vs] == (VL, ve):
+                    break
+            else:
+                st["unkept"] += 1
+                continue
+            self._put(vs, pr)
+            lut[VL, ve] = -1
+            lut[L, e] = vs
+            self.owner[vs] = (L, e)
+            self.bg_until[L, e] = self.bg_period + self.bg_protect
+            done += 1
+        if done:
+            self.lut.copy_(lut)
+            self.allowed.copy_(self.lut >= 0)
+        st["kept"] += done
+        st["s"] += time.perf_counter() - t0
 
     def _mtp_core(self, next_ids, h_prev, logits=True):
         """The MTP layer at positions pos_t.. (device) -- graph-capturable. logits=False: the
@@ -2466,7 +2608,12 @@ class GlmTP:
         if T <= self.decode_rows:
             self.pos_t.fill_(self.pos)
             if self.use_graphs and T in self.graph_rows and self.miss == "substitute":
-                out, hn = self._replay_split(ids) if self.hot_n else self._replay(ids)
+                if not self.hot_n:
+                    out, hn = self._replay(ids)
+                elif self.hot_async and self.loop_left <= 0:      # (GLM_LOOP_GUARD's window: sync)
+                    out, hn = self._replay_async(ids)
+                else:
+                    out, hn = self._replay_split(ids)
             else:
                 out, hn = self._step(ids)
             self._after_rows(ids, hn, self.pos)

@@ -3659,10 +3659,67 @@ cache-write indexing.
   intermediate BF16 rounding should check this.
 - What is left outside the GPU: ~12 ms a round (9%) in which the GPU waits on the host -- the
   attention graph's synchronize for the hot candidates in each of the 75 MoE layers, and the
-  sampling decisions.
+  sampling decisions. (Measured later the same day, "Async hot reads on GLM" below: that time is
+  the hot reads and their copies; the synchronizations themselves cost almost nothing.)
 
 The local EXL3 profile then moved from 384K to 320K (same mix): 7.12 GB of KV a rank, 12,000 slots
 again (384K had taken 200).
+
+## Async hot reads on GLM: 4-5% off a decode round, KL 0.086 -> 0.137 -- off (2026-10-19)
+
+GLM_HOT_ASYNC=1 (engine/glm/tp.py `_replay_async`, after DS V4.1's DSV41_HOT_ASYNC): a forward is
+one graph that leaves every MoE layer's hot candidates on the device and copies them to the host
+once at its end; the heaviest (same threshold, step cap and kept-victim queue as the sync path)
+are read on the io threads while the next round drafts and are installed over the queued victims
+before the next forward. The sync path splits each MoE layer's graph at the router, waits for the
+host, reads the layer's heaviest miss and computes it exactly for the token that wanted it.
+
+Speed, glm_decode_prof, EXL3 320K mix, 12,000 slots, greedy, 400 tokens, one boot an arm:
+
+| prompt | sync: ms a round (rows) | async | tok/s sync / async |
+| --- | --- | --- | --- |
+| 6K summary | 164.8 (1.89 drafted) | 157.3 (2.01) | 16.03 / 17.25 |
+| short code | 178.6 (2.65) | 176.4 (2.98) | 19.42 / 21.34 |
+| Japanese | 121.9 (0.65) | 116.7 (0.64) | 12.89 / 13.62 |
+
+About 5 ms a round at the same rows (the tok/s moves more because the greedy text, and with it the
+accepted drafts, changed). What it saves is the reads, not the waits: on the Japanese prompt the
+sync path's graph segments sum to 103.2 ms a round against 109.1 of forward wall, and the 5.9 ms
+between them is the hot reads (4.5) and their arena copies (1.5); the one-graph forward takes
+104.8 ms plus the copies (1.4) it still makes before replaying. So the "~12 ms a round in which
+the GPU waits on the host" of the entry above is almost all reads -- 75 synchronizations a forward
+cost nearly nothing by themselves -- and the per-layer split graphs are as fast as one graph.
+
+Quality, glm_quality --mode eval --set tokyo --ref x3tk26 --rows 3 --graphs (900 positions,
+against every expert exact):
+
+| | KL | top-1 | routing weight missed | hot reads |
+| --- | --- | --- | --- | --- |
+| sync (serving) | 0.0862 | 94.0% | 10.0% | 1,057 |
+| async | 0.1365 | 92.4% | 10.4% | 1,029 |
+
++0.050 KL is, on the residency curve (0.132 at 8,500 slots, 0.113 at 9,394), what ~2,400 fewer
+resident experts cost. GLM's heavy misses are per token: a read that serves the next steps instead
+of this one rarely finds its expert wanted again (14% of missed mass was picked by the same layer
+the token before, 2026-10-16 above). DS V4.1's async reads gained on prose because its misses
+recur. Kept as an opt-in, default off.
+
+The eval needed `--graphs`: with the serving profile's MTP depth of 7 only 1- and 8-row decode
+graphs exist, so 3-row steps ran eagerly -- the per-layer sync read in both arms -- and the first
+A/B came out identical to the last digit.
+
+## GLM decode collectives: five a layer, one dependency chain; their time is not host skew (2026-10-19)
+
+A decode layer runs five RoCE gathers, each needing the one before: the queries (with the indexer
+layers' local top-k scores) and the other rank's partials for the split KV cache, the o_proj sum
+(Comm.all_reduce is a gather plus a local add), and the MoE's intermediates and outputs
+(gather_merge). Payloads at 3 rows: 111, ~99, 72, 54 and 18 KB, under the 256 KB slot; the
+microbenchmark floor is 12.7 / 15.5 / 19.9 us at 16 / 48 / 96 KB (docs/decode-launches.md), and
+the profiler put them at ~34 us in a round. The gap is not the ranks drifting apart at the 75 host
+synchronizations: the one-graph forward above, with none, is no faster than the split segments.
+Fewer of them needs the MoE's down projection split by rows (one sum instead of two gathers),
+which means re-slicing every EXL3 pack's down trellis between the nodes, for one ~20 us gather in
+75 layers -- ~1.5 ms a round, ~1%. Not done.
 
 ## GLM prefill: no regression since 2026-10-18; the 4-bit latent's prefill cost, removed (2026-10-19)
 
