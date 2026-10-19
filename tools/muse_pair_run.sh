@@ -31,7 +31,7 @@ mkdir -p "$ROOT/results" "$ROOT/.triton-cache" "$log_dir"
 flags=(--rm --network host --gpus all --device /dev/infiniband --cap-add IPC_LOCK --ipc host
        --ulimit memlock=-1 --ulimit stack=67108864
        -v "$ROOT/engine:/app/engine:ro" -v "$ROOT/tools:/app/tools:ro" -v "$ROOT/server:/app/server:ro"
-       -v "$ROOT/corpus:/app/corpus:ro"
+       -v "$ROOT/corpus:/app/corpus:ro" -v "$ROOT/profiles:/app/profiles:ro"
        -v "$ROOT/results:/app/results" -v "$ROOT/.triton-cache:/app/.triton"
        -e TRITON_CACHE_DIR=/app/.triton
        -e WORLD_SIZE=2 -e MASTER_ADDR=10.0.0.1 -e MASTER_PORT=29641

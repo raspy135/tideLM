@@ -733,12 +733,12 @@ class GlmTP:
     def _load_db(self):
         self.db_path = env("GLM_STATS_DB", "")
         self.db_mass, self.db_tokens = None, 0
-        if self.rank == 0 and self.db_path and Path(self.db_path).exists():
-            db = torch.load(self.db_path, map_location="cpu", weights_only=True)
-            if tuple(db["mass"].shape) == (self.nL, self.cfg.experts):
-                self.db_mass, self.db_tokens = db["mass"].double(), int(db["tokens"])
-        if self.rank == 0 and self.db_path and self.db_mass is None:
-            self.db_mass = torch.zeros((self.nL, self.cfg.experts), dtype=torch.float64)
+        if self.rank == 0 and self.db_path:
+            from .stats_seed import load_stats
+            self.db_mass, self.db_tokens, note = load_stats(self.db_path, (self.nL, self.cfg.experts),
+                                                            env("GLM_STATS_SEED", "1"))
+            if note:
+                self.log(f"[glm] {note}")
 
     def flush_db(self):
         """Fold the demand since the last adapt() into the DB and save it (rank 0; the server calls

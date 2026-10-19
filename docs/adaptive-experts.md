@@ -144,5 +144,38 @@ original 9,400 budget the exact resident map is restored; other budgets use the
 seed history with the normal global selector. Subsequent traffic updates the
 new user's own history through the usual persistence path. Rank 0 broadcasts
 the seed and ranking; the boot guard includes its checksum and protocol version.
-Set `DSV41_EXPERT_SEED=0` to start from the original trace. This is a useful
-starting point, not a claim that one person's distribution suits every workload.
+Set `DSV41_EXPERT_SEED=0` to start from the original trace, or to a seed file's
+path to start from another one. This is a useful starting point, not a claim
+that one person's distribution suits every workload.
+
+The v1 seed was learned on the original V4.1-Flash. `tools/export_expert_seed.py`
+packages a running pair's map and demand DB in the same format (run it in the
+rank-0 container while the server is idle); a 1017 seed made that way goes in
+`profiles/` and the 1017 profile names it with `DSV41_EXPERT_SEED=<path>`.
+
+### GLM-5.3
+
+GLM's history is `GLM_STATS_DB`: router mass per (layer, expert) and a token
+count, added to after every adaptation and read only at boot, to place the
+resident set. Without it, a fresh install placed the same number of experts in
+every layer by the router's load-balancing bias. Now a missing DB starts from
+`profiles/glm53-experts-v1.pt` (2,339,364 tokens: a trace of the routing corpora,
+`tools/glm_train_db.py` over them, and live serving through 2026-10-19; the
+`.json` records where it came from and its checksum). The first save writes it to
+`GLM_STATS_DB`, and the user's own traffic accumulates on top. An existing DB
+always wins; `GLM_STATS_SEED=0` starts empty, and a path starts from another
+seed. The history does not decay, so for a long time a new install's boot
+placement leans on the seed. Within a session, adaptation follows its own
+decayed demand regardless.
+
+What it is worth on the first request after a fresh boot (2026-10-19, EXL3
+profile at 320K, 12,000 residents, adaptation on; `tools/glm_quality.py --mode
+eval --set tokyo --ref x3tk26 --rows 3`, 900 positions, scored against exact
+routing; GLM_STATS_DB missing at boot in both arms):
+
+| boot placement | KL to exact | routing weight missed | hot reads | top-1 agree |
+| --- | ---: | ---: | ---: | ---: |
+| router bias (`GLM_STATS_SEED=0`) | 0.104 | 12.6% | 1,247 | 93.6% |
+| bundled seed | 0.093 | 9.9% | 1,058 | 93.3% |
+
+One prompt set; top-1 differs by 2 of 900 positions, within noise.

@@ -1144,11 +1144,13 @@ class V41Engine:
             if self.ep.rank == 0:
                 try:
                     from engine.expert_seed import load_seed
+                    # DSV41_EXPERT_SEED: 1 the bundled seed, 0 none, else a seed file's path.
+                    seed_opt = os.environ.get('DSV41_EXPERT_SEED', '1')
                     self._expert_seed = load_seed(
-                        PRUNE_DB, enabled=(self.dynamic_experts and ADAPT.use_db and
-                            os.environ.get('DSV41_EXPERT_SEED', '1') == '1'),
+                        PRUNE_DB, enabled=(self.dynamic_experts and ADAPT.use_db and seed_opt != '0'),
                         request_unit=ADAPT.request_unit, metric=ADAPT.metric,
-                        layers=self.args.n_layers, experts=self.args.n_routed_experts)
+                        layers=self.args.n_layers, experts=self.args.n_routed_experts,
+                        path=None if seed_opt == '1' else seed_opt)
                     if self._expert_seed is not None:
                         db = (self._expert_seed['counts'], self._expert_seed['mass'])
                 except Exception as exc:

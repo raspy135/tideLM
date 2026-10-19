@@ -37,6 +37,9 @@ experts. TideLM decides which share, keeps deciding, and cheaply covers the rest
    persists across restarts. The arena is filled from it at boot, and re-planned after each
    prompt's prefill, every few hundred generated tokens during long answers, and between
    requests. One arena is shared by all layers: a busy layer takes slots from a quiet one.
+   A fresh install has no history yet. It starts from one learned on the development pair
+   (`profiles/`, aggregate routing counts only), and your own traffic builds on top of it
+   ([details](docs/adaptive-experts.md#learned-fresh-start-distribution)).
 2. **Misses never stall a token.** The router only picks resident experts; a missing pick is
    replaced by the next-best resident one for that token, and the demand still counts toward the
    next re-plan.
@@ -139,6 +142,7 @@ with what each setting measured.
 | `ARENA_GB=97.4` | `GLM_SLOTS=8740` | Expert memory per node, and so how many experts stay resident. |
 | `MAX_SEQ=524288` | `GLM_MAX_SEQ=327680` | Context allocation, generated tokens included. Less context, more experts. |
 | `DSV41_ADAPT_SENSITIVITY=high` | `GLM_ADAPT=1`, `GLM_ADAPT_EVERY=200` | How fast the resident set follows new traffic. |
+| `DSV41_EXPERT_SEED=1` | `GLM_STATS_SEED=1` | With no local history yet, start from the bundled one in `profiles/` (`0`: from scratch; or a seed file's path). |
 | `DSV41_HOT_READS=1`, `DSV41_HOT_ASYNC=1`, `DSV41_HOT_RING=128` | `GLM_HOT=1`, `GLM_HOT_MIN=0.2`, `GLM_HOT_MAX=16` | Hot reads (above). |
 | `DSV41_MAX_CONCURRENCY=1` | — | Concurrent requests; async hot reads need 1. |
 | `SPEC=1` | `GLM_MTP=1`, `GLM_MTP_DEPTH=7` | Speculative decoding. |

@@ -3,10 +3,11 @@
 # stops it.
 #
 # Containers glm-serve-rank0/1 from an existing engine image with this checkout's engine/,
-# tools/ and server/ mounted read-only, so a code change needs a restart, not a rebuild. The
-# checkpoint must exist at the same path on both nodes. Settings come from GLM_ENV_FILE (else
-# .env.glm); scripts/tide-up.sh passes the profile (configs/glm53-*.env.example). GLM_* and the
-# few launch variables below are forwarded to both ranks.
+# tools/, server/ and profiles/ mounted read-only, so a code change needs a restart, not a
+# rebuild. The checkpoint must exist at the same path on both nodes. Settings come from
+# GLM_ENV_FILE (else .env.glm); scripts/tide-up.sh passes the profile
+# (configs/glm53-*.env.example). GLM_* and the few launch variables below are forwarded to both
+# ranks.
 # The V4.1 deployment (deepseek-v41-ep2-rank*) cannot serve at the same time (each fills the
 # GPUs); dual-down.sh stops whichever pair is running.
 set -euo pipefail
@@ -39,7 +40,7 @@ mkdir -p "$ROOT/results" "$ROOT/.triton-cache"
 flags=(-d --network host --gpus all --device /dev/infiniband --cap-add IPC_LOCK --ipc host
        --ulimit memlock=-1 --ulimit stack=67108864 --restart no
        -v "$ROOT/engine:/app/engine:ro" -v "$ROOT/tools:/app/tools:ro" -v "$ROOT/server:/app/server:ro"
-       -v "$ROOT/results:/app/results" -v "$ROOT/.triton-cache:/app/.triton"
+       -v "$ROOT/profiles:/app/profiles:ro" -v "$ROOT/results:/app/results" -v "$ROOT/.triton-cache:/app/.triton"
        -v "$MODEL_DIR:/models:ro"
        ${GLM_DRAFTER_DIR:+-v "$GLM_DRAFTER_DIR:/drafter:ro" -e GLM_DRAFTER=/drafter}
        ${GLM_EXL3_DIR:+-v "$GLM_EXL3_DIR:/packs:ro"}

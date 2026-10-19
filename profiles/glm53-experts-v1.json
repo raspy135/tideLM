@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "captured_at": "2026-10-19T08:47:05Z",
+  "model": "GLM-5.3",
+  "layers": 79,
+  "experts_per_layer": 256,
+  "tokens": 2339364,
+  "source": "GLM_STATS_DB of the development pair: a routing trace of corpus/trace_corpus_v2+v3 (tools/glm_trace.py), tools/glm_train_db.py runs over the same corpora, then live serving (EXL3 and MXFP4) through 2026-10-19",
+  "contents": "Aggregate router mass per (layer, expert) and a token count only; no prompts, responses, KV, or model weights.",
+  "sha256": "027489084afd2bad22adfe6dd632b1a6be63bf7e947bd77d76b2940b360cab31"
+}
