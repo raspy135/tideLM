@@ -3856,6 +3856,16 @@ before, measured with the 320K FP4/FP8 profile). Memory: rank 1's MemAvailable b
 during the benches with polkitd holding 4.7 GB there; the 4,096-row chunk's extra GB comes out of
 that margin.
 
+**Residency after the leak (12,000 -> 12,400 slots).** Rank 1's polkitd had 4.7 GB: the sparkDash
+dashboard on rank 0 spawned a fresh `ssh ryan@192.168.11.207 <cmd>` for every poll, 3-4 logins a
+second (384K in a day), each a logind session with a polkit check, and polkit 124 grows under
+that. The dashboard stopped and polkit restarted, MemAvailable minima by scripts/mem-watchdog.sh,
+4,096-row chunks, rank 0 / rank 1: 12,250 slots 5.9 / 5.6 GiB through an 8K prompt and 6.06 / 6.32
+through a 61K one (143 s to the first token, 428 tok/s) -- the long prompt goes no lower than the
+short one; 12,400 slots 4.97 / 6.32 through the 8K prompt. Rank 0 binds (the HTTP server); each
+1 GB is ~140 slots. 12,400 is where the EXL3 profile sits, ~2 GiB over the watchdog's floor; a
+dashboard that comes back must share one ssh connection (ControlMaster/ControlPersist).
+
 **Bookkeeping that cost runs:** the prefill profiler restores reps 2+ from the disk prefix store
 unless GLM_PREFIX_DISK=0 is set (1 s "prefills"); a CPU-only tokenizer container beside a pair run
 took rank 0 under the 3 GiB floor and the watchdog killed the run; editing engine files while a run
