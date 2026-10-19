@@ -53,7 +53,7 @@ OUT="$HOST_MODELS/exl3-packs"
 PACK_GB=99   # 98.24 GB a rank, plus slack
 
 [[ -n "$PEER" ]] || err "PEER is required (set it in .env)"
-docker image inspect "$IMAGE" >/dev/null 2>&1 || err "image $IMAGE missing: run scripts/dual-build.sh first"
+docker image inspect "$IMAGE" >/dev/null 2>&1 || err "image $IMAGE missing: run scripts/dual-build.sh <your profile> first"
 [[ -f "$SRC/config.json" ]] || err "no EXL3 checkpoint at $SRC (download Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw there, or pass its path)"
 case "$SRC" in "$HOST_MODELS"/*) ;; *) err "the checkpoint must sit under $HOST_MODELS (it is mounted into the image as /models)";; esac
 grep -q '"quant_method": *"exl3"' "$SRC/config.json" || err "$SRC/config.json is not an EXL3 checkpoint"

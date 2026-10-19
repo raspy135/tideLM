@@ -59,6 +59,10 @@ ENV_FILE="${TIDE_ENV_FILE:-.env}"
 # shellcheck disable=SC1090
 [[ -f "$ENV_FILE" ]] && { set -a; . "$ENV_FILE"; set +a; }
 for v in "${!_CLI[@]}"; do printf -v "$v" '%s' "${_CLI[$v]}"; export "${v?}"; done
+# What to tell a user to build with: the profile, because a bare dual-build.sh reads neither its
+# IMAGE nor its PEER (it falls back to .env and tidelm:local) and so can rebuild the wrong tag or
+# leave the worker on the old image.
+BUILD="scripts/dual-build.sh"; [[ -f "$ENV_FILE" ]] && BUILD+=" ${ENV_FILE#"$ROOT"/}"
 
 IMAGE="${IMAGE:-deepseek-v41-flash-spark:local}"
 PEER="${PEER:-}"
@@ -95,7 +99,7 @@ case "${1:-}" in
     *)         err "unknown argument '${1}' (expected --no-wait or --check)" ;;
 esac
 
-[[ -n "$PEER" ]] || err "PEER is required (e.g. PEER=user@10.0.0.2), set it in .env"
+[[ -n "$PEER" ]] || err "PEER is required (e.g. PEER=user@10.0.0.2), set it in $ENV_FILE"
 PEER_IP="${PEER#*@}"
 MASTER_ADDR="${MASTER_ADDR:-$(ip route get "$PEER_IP" 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}' | head -1)}"
 [[ -n "$MASTER_ADDR" ]] || err "cannot derive MASTER_ADDR toward $PEER_IP; set it in .env"
@@ -114,7 +118,7 @@ check_box() {   # $1 = label, $2 = "" for local or the ssh target
     local label="$1" tgt="${2:-}" run avail
     run() { if [[ -z "$tgt" ]]; then bash -c "$1"; else ssh_peer "$1"; fi; }
     run "docker image inspect '$IMAGE' >/dev/null 2>&1" \
-        || err "$label: image '$IMAGE' is missing. Build it there first: scripts/dual-build.sh"
+        || err "$label: image '$IMAGE' is missing. Build it and ship it to both nodes: $BUILD"
     run "test -f '$HOST_MODELS/$MODEL_NAME/model.safetensors.index.json'" \
         || err "$label: no checkpoint at $HOST_MODELS/$MODEL_NAME (each box needs its OWN local copy -- O_DIRECT does not cross a network filesystem)"
     run "test -e /dev/infiniband/rdma_cm" || err "$label: /dev/infiniband missing -- is the RoCE driver loaded?"
@@ -138,7 +142,7 @@ check_box "rank 1 ($PEER)" "$PEER"
 # running different engine code wedges on a mismatched collective instead of failing.
 id0=$(docker image inspect -f '{{.Id}}' "$IMAGE")
 id1=$(ssh_peer "docker image inspect -f '{{.Id}}' '$IMAGE'")
-[[ "$id0" == "$id1" ]] || err "image '$IMAGE' differs between the boxes ($id0 vs $id1): run scripts/dual-build.sh"
+[[ "$id0" == "$id1" ]] || err "image '$IMAGE' differs between the boxes ($id0 vs $id1). Build it once and ship it to both: $BUILD"
 
 # The image must run the checkout's engine code, unless the checkout is mounted over it
 # (dual-dev.sh sets DSV41_DEV_SOURCE=1). A stale image boots "healthy" and can be minutes per
@@ -153,8 +157,16 @@ elif [[ "$IMAGE_SHA" == "$CODE_SHA" ]]; then
 elif [[ "${ALLOW_STALE_IMAGE:-0}" == "1" ]]; then
     info "WARNING: image $IMAGE runs engine code ${IMAGE_SHA:-unlabelled}, the checkout is $CODE_SHA (ALLOW_STALE_IMAGE=1)"
 else
-    err "image $IMAGE was built from other engine code (image ${IMAGE_SHA:-unlabelled}${IMAGE_GIT:+ from $IMAGE_GIT}, checkout $CODE_SHA). \
-Rebuild it (scripts/dual-build.sh), boot the checkout (scripts/dual-dev.sh), or ALLOW_STALE_IMAGE=1 to run it anyway."
+    # Profiles copied before 2026-10-19 name tidelm:20261018, while dual-build.sh's default
+    # (and the README's) is tidelm:local: a rebuild that lands under the other tag fixes nothing.
+    hint=""
+    if [[ "$IMAGE" != "tidelm:local" ]] && [[ "$(docker image inspect -f '{{index .Config.Labels "dsv41.code_sha"}}' \
+            tidelm:local 2>/dev/null)" == "$CODE_SHA" ]]; then
+        hint=" tidelm:local is already built from this code: set IMAGE=tidelm:local in ${ENV_FILE#"$ROOT"/}."
+    fi
+    err "image $IMAGE was built from other engine code (image ${IMAGE_SHA:-unlabelled}${IMAGE_GIT:+ from $IMAGE_GIT}, checkout $CODE_SHA).$hint
+Rebuild it for both nodes: $BUILD
+Or boot the checkout over it (${BUILD/dual-build/dual-dev}), or ALLOW_STALE_IMAGE=1 to run it anyway."
 fi
 
 # Each box's own GID index, resolved here purely so a mismatch is a message rather than a
@@ -299,7 +311,7 @@ for _ in $(seq 1 "$HEALTH_TIMEOUT_S"); do
             'import json,sys; print(json.load(sys.stdin).get("engine_config", {}).get("kernel", ""))' 2>/dev/null || true)
         if [[ "${EXPERT_FORMAT:-fp4}" == "exl3" && "$_kernel" != "exl3-cuda" ]]; then
             err "EXPERT_FORMAT=exl3 came up on kernel '${_kernel:-?}', not exl3-cuda: the routed experts run the \
-torch reference. Check the image's code (scripts/dual-build.sh) and rank 0's log for the nvcc build."
+torch reference. Check the image's code ($BUILD) and rank 0's log for the nvcc build."
         fi
         info "EP2 pair serving on http://$BIND_HOST:$PORT/v1 (kernel ${_kernel:-?})"
         exit 0

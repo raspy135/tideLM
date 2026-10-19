@@ -8,17 +8,26 @@
 # start and weight load).  Requires the repo at the same path on both boxes.  The image still
 # provides the interpreter, CUDA, torch and Triton; only /app/{engine,tools,server} differ.
 #
-# Usage: scripts/dual-dev.sh          (same flags as dual-up.sh, e.g. --check)
+# Usage: scripts/dual-dev.sh [ENV_FILE] [dual-up.sh flags, e.g. --check]
+#   ENV_FILE: the DeepSeek profile to serve (e.g. .env.ds41-mxfp4); .env when omitted.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT"
 
 info() { echo "--- $*"; }
 
-# shellcheck disable=SC1091
-[[ -f .env ]] && { set -a; . ./.env; set +a; }
-PEER="${PEER:?set PEER in .env (user@host)}"
+if [[ -n "${1:-}" && "$1" != -* ]]; then
+    f=$1; shift
+    [[ -f "$f" ]] || { [[ -f "$ROOT/$f" ]] && f="$ROOT/$f"; } || { echo "ERROR: no env file $f" >&2; exit 1; }
+    export TIDE_ENV_FILE="$(cd "$(dirname "$f")" && pwd)/$(basename "$f")"
+fi
+cd "$ROOT"
+
+# shellcheck disable=SC1090,SC1091
+_PEER_CLI="${PEER:-}"
+f="${TIDE_ENV_FILE:-.env}"
+[[ -f "$f" ]] && { set -a; . "$f"; set +a; }
+PEER="${_PEER_CLI:-${PEER:?set PEER in $f (user@host)}}"
 
 info "syncing engine/ tools/ server/ to $PEER"
 for d in engine tools server; do

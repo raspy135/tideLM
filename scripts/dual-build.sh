@@ -12,20 +12,46 @@
 # The transfer is ~10 GB. Over the direct-attach link that is seconds; over WiFi it is not,
 # so this uses the same PEER address the engine does.
 #
-# Usage: scripts/dual-build.sh [--local-only]
+# Usage: scripts/dual-build.sh [ENV_FILE] [--local-only]
+#
+#   scripts/dual-build.sh .env.ds41-mxfp4   build the image that profile runs (IMAGE, or GLM_IMAGE
+#                                           in a GLM-5.3 profile) and ship it to its PEER
+#   scripts/dual-build.sh                   the same from .env, else tidelm:local and $PEER
+#
+# IMAGE=... or PEER=... on the command line beat the file. Without a PEER it stops before
+# building: a head-only build leaves the worker on its old image, and dual-up.sh then refuses
+# the pair as two different images. --local-only builds on this node only, on purpose.
 # ---------------------------------------------------------------------------------------
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT"
 
 info() { echo "--- $*"; }
 err()  { echo "ERROR: $*" >&2; exit 1; }
 
-# shellcheck disable=SC1091
-_IMAGE_CLI="${IMAGE:-}"          # a caller's IMAGE=... names the build; .env's must not override it
-[[ -f .env ]] && { set -a; . ./.env; set +a; }
+LOCAL_ONLY=false ENV_FILE=""
+for a in "$@"; do
+    case "$a" in
+        --local-only) LOCAL_ONLY=true ;;
+        -*) err "unknown option $a (usage: scripts/dual-build.sh [ENV_FILE] [--local-only])" ;;
+        *)  [[ -z "$ENV_FILE" ]] || err "one profile at a time ($ENV_FILE, $a)"
+            [[ -f "$a" ]] || { [[ -f "$ROOT/$a" ]] && a="$ROOT/$a"; } || err "no env file $a"
+            ENV_FILE="$(cd "$(dirname "$a")" && pwd)/$(basename "$a")" ;;
+    esac
+done
+cd "$ROOT"
+
+# shellcheck disable=SC1090,SC1091
+_IMAGE_CLI="${IMAGE:-}" _PEER_CLI="${PEER:-}"   # the caller's IMAGE / PEER beat the file's
+if [[ -n "$ENV_FILE" ]]; then
+    set -a; . "$ENV_FILE"; set +a
+    IMAGE="${IMAGE:-${GLM_IMAGE:-}}"
+elif [[ -f .env ]]; then
+    set -a; . ./.env; set +a
+fi
 IMAGE="${_IMAGE_CLI:-${IMAGE:-tidelm:local}}"
-PEER="${PEER:-}"
+PEER="${_PEER_CLI:-${PEER:-}}"
+$LOCAL_ONLY || [[ -n "$PEER" ]] || err "no PEER, so the worker would keep its old image. Pass the profile you serve \
+(scripts/dual-build.sh .env.ds41-mxfp4), set PEER=user@host, or --local-only to build on this node only."
 
 # The engine code this image will run (scripts/code_digest.sh), stamped as a label so dual-up.sh
 # can refuse to boot an image built from older code than the checkout.
@@ -39,8 +65,7 @@ docker build --build-arg RECIPE_VERSION="$(cat "$ROOT/VERSION")" \
 LOCAL_ID=$(docker image inspect -f '{{.Id}}' "$IMAGE")
 info "built $IMAGE  $LOCAL_ID"
 
-[[ "${1:-}" == "--local-only" ]] && { info "--local-only: not shipping to a peer"; exit 0; }
-[[ -n "$PEER" ]] || { info "PEER unset -- built locally only"; exit 0; }
+$LOCAL_ONLY && { info "--local-only: not shipping to a peer"; exit 0; }
 
 info "shipping to $PEER (~10 GB over the link; no registry involved)"
 docker save "$IMAGE" | ssh -o BatchMode=yes "$PEER" 'docker load'

@@ -487,9 +487,9 @@ cd /home/ryan/git/deepseek-v41-flash-spark
 # 1. fast feedback without a rebuild (CPU-only unit tests; no model, no GPU)
 CUDA_VISIBLE_DEVICES='' .venv/bin/python -m unittest engine.test_prefill_timing tools.test_swap_plan
 
-# 2. build once on the head AND ship the identical image to PEER (.env)
-bash scripts/dual-build.sh              # build + ~10 GB over the 200G link
-bash scripts/dual-build.sh --local-only # build only, skip the transfer
+# 2. build once on the head AND ship the identical image to the profile's PEER
+bash scripts/dual-build.sh .env.ds41-mxfp4              # its IMAGE, + ~10 GB over the 200G link
+bash scripts/dual-build.sh .env.ds41-mxfp4 --local-only # build only, skip the transfer
 
 # 3. mirror the host checkout to the peer (scripts, tools, tests, trace stats)
 bash scripts/sync-peer.sh --dry-run     # preview first
@@ -515,7 +515,7 @@ What to run for a given change:
 
 They move different things:
 
-* **`scripts/dual-build.sh`** builds `IMAGE` (default `deepseek-v41-flash-spark:local`), then
+* **`scripts/dual-build.sh`** builds the profile's `IMAGE` (default `tidelm:local`), then
   `docker save | ssh docker load`, and **asserts the image id matches on both boxes**. That
   assertion is the point: EP2 skew does not give a wrong answer, it wedges the pair on a
   mismatched collective. Two independent `docker build`s are not guaranteed identical
