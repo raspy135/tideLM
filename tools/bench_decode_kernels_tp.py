@@ -54,7 +54,9 @@ def main():
     root = os.environ['MODEL_DIR']
     e = V.V41Engine(root, max_seq=524288, arena_gb=90,
                    trace_stats='/app/results/trace-union/stats/coverage.json',
-                   spec=True, prune_keep=.61, transient_slots=16, keep_free_gb=6,
+                   spec=True, prune_keep=.61, keep_free_gb=6,
+                   # DSV41_HOT_ASYNC takes its ring out of these: the two-node profiles set 136
+                   transient_slots=int(os.environ.get('DSV41_BENCH_TRANSIENT_SLOTS', 16)),
                    expert_format=os.environ.get('DSV41_BENCH_EXPERT_FORMAT', 'fp4'))
     tok, enc = Tok(root), load_encoding_module(root)
     eos = tok.token_to_id(enc.eos_token)

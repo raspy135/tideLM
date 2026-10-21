@@ -3904,3 +3904,56 @@ was first dismissed as boot order (the off arm had been up for hours) -- a fresh
 came out slower still, which is what forced the interleaved run. One pair of boots is not enough.
 And `pkill -f bench.py` from a shell whose own command line contains "bench.py" kills that shell
 (exit 144); match with `pkill -f '[b]ench.py'`.
+
+## `moe_down` two rows a warp: -10% a call, -1 to -2% a step, same bits (2026-10-21)
+
+The 2026-10-21 decode budget (shipped profile, `DSV41_GPU_TIMING=1 DSV41_ROUTE_STATS=1`, bench.py,
+3 runs each): prose 64.5 ms of layers + 8.0 ms draft a step at 15.6 distinct experts a layer
+(5.9 GB a rank), code 77.5 + 7.9 ms at 21.1 (8.0 GB). The profiled step (greedy python,
+`tools/bench_decode_kernels_tp.py` against the shipped profile) put `moe_up` at 26.6 ms, `moe_down`
+15.5, fp8 projections 23, RoCE gathers 4.6. `up` read ~209 GB/s; `down` ~179 against a ~230 GB/s
+plain read of the same bytes. Most of what TensorFold lists for GLM (RoCE, L2 prefetch, vocab trim,
+graph coverage, PDL, the expert kernel) was already in this profile.
+
+Why down lagged: a TP2 down row is 72 scale groups (w2 [2560, 2304] a rank), so a v2 warp loads
+2-3 uint4 a lane and then pays the whole per-pair loop for 1.15 KB. `tools/bench_fp4_moe_decode.py`
+shows the floor -- v2 down 298 us at U = 8, 317 at U = 14, 340 at U = 20. `moe_down_bm16_v3`
+(`DSV41_FP4_CUDA_DOWN_ROWS`) gives a warp R rows; each lane keeps the same groups for all R, so one
+activation load feeds R partials. Each row's arithmetic is v2's, and
+`tools/test_fp4_moe_v2.py` finds v3 equal to v2 bit for bit on every case.
+
+| U | v2 down | v3, 2 rows | v3, 4 rows |
+| ---: | ---: | ---: | ---: |
+| 8 | 297 us | 213 | 234 |
+| 14 | 317 | 234 | 264 |
+| 16 | 323 | 245 | 276 |
+| 20 | 337 | 288 | 303 |
+| 26 | 372 | 372 | 375 |
+
+Four rows is slower than two (more registers, fewer warps). In the engine, greedy, 256 tokens,
+gate runs alternating 1 / 2 / 2 / 1, output hashes identical in all four:
+
+| ms/step | rows 1 | rows 2 |
+| --- | ---: | ---: |
+| python | 77.1, 77.7 | 75.7, 75.9 |
+| html | 75.4, 75.7 | 73.5, 75.2 |
+| explain | 68.0, 67.3 | 66.6, 67.2 |
+| `moe_down` a call (python) | 358, 358 us | 323, 342 us |
+
+Less than the microbenchmark promised at prose U (~3 ms): explain moved 0.75 ms. The sampled
+bench.py A/B (prose 25.98 -> 26.72 tok/s, code 41.98 -> 42.25) is inside its own run-to-run spread;
+use the greedy gate for bit-exact kernel changes, where both arms emit the same tokens. On in the
+`ds41-mxfp4` profile (`DSV41_FP4_CUDA_DOWN_ROWS=2`); code default 1; pinned by the boot guard.
+
+`up`'s low-U floor (390 us at U = 8, 128 GB/s) is not worth chasing. It is compute per (pair x
+row), not bytes or launch: launching only the valid blocks instead of the static 36 saves 0-40 us,
+while the floor follows the pair count -- ~270 us at 24 pairs (T = 4), ~375 us at 36 (T = 6),
+whatever U is. Where serving runs, `up` is already at the read ceiling: T = 4, U = 16 (prose)
+431 us = 232 GB/s; T = 6, U = 20 (code) 551 us = 228 GB/s. Only many pairs on few experts
+(T = 6, U < 14) sit on the floor.
+
+Running `bench_decode_kernels_tp.py` on this profile needs `DSV41_PROBE_PREFILL=0`,
+`DSV41_DYNAMIC_EXPERTS=0` and `DSV41_BENCH_TRANSIENT_SLOTS=136` (HOT_ASYNC takes 128 slots from the
+transient ring), a copy of `tools/run_two_node_gate.sh` that sources `.env.ds41-mxfp4` (the script
+reads `.env`), and the peer's checkout synced first; its kernel families predate the v2 kernels and
+RoCE, so group `top` by name.

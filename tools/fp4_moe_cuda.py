@@ -29,6 +29,11 @@ V2 = os.environ.get("DSV41_FP4_CUDA_V2", "1") == "1"
 # How v1's `p *= scale; acc += p` compiled: 0 = two roundings, 1 = one fma. Both are exact: a UE8M0
 # scale is a power of two, so the scaled product never rounds. 0 is the plain spelling.
 V2_FMA_SCALE = int(os.environ.get("DSV41_FP4_CUDA_V2_FMA", "0"))
+# v3 down: rows per warp for the down kernel (1 = v2's one row; 2 or 4 = moe_down_bm16_v3, same
+# bits as v2, tools/test_fp4_moe_v2.py). Only with v2 and k <= 3072; the EP2 boot guard pins it.
+DOWN_ROWS = int(os.environ.get("DSV41_FP4_CUDA_DOWN_ROWS", "1"))
+if DOWN_ROWS not in (1, 2, 4):
+    raise ValueError(f"DSV41_FP4_CUDA_DOWN_ROWS must be 1, 2 or 4, not {DOWN_ROWS}")
 
 
 def source_digest() -> str:
@@ -76,10 +81,12 @@ def _library():
     ]
     lib.fp4_moe_cuda_up_v2.argtypes = lib.fp4_moe_cuda_up.argtypes
     lib.fp4_moe_cuda_down_v2.argtypes = lib.fp4_moe_cuda_down.argtypes
+    lib.fp4_moe_cuda_down_v3.argtypes = lib.fp4_moe_cuda_down.argtypes + [i32]
     lib.fp4_moe_cuda_route_small.argtypes = [ptr, ptr, ptr, ptr, ptr, i32, i32]
     lib.fp4_moe_cuda_round_reduce.argtypes = [ptr, ptr, ptr, i32, i32, i32]
     for name in ("fp4_moe_cuda_up", "fp4_moe_cuda_down", "fp4_moe_cuda_route_small",
-                 "fp4_moe_cuda_round_reduce", "fp4_moe_cuda_up_v2", "fp4_moe_cuda_down_v2"):
+                 "fp4_moe_cuda_round_reduce", "fp4_moe_cuda_up_v2", "fp4_moe_cuda_down_v2",
+                 "fp4_moe_cuda_down_v3"):
         getattr(lib, name).restype = i32
     return lib
 
@@ -138,12 +145,17 @@ def up(x, w1, s1, w3, s3, h, route_weight, block_slot, block_pair, limit,
 
 
 def down(h, w2, s2, parts, block_slot, block_pair, topk: int, n: int, k: int,
-         ntok: int, nb: int, null_slot: int, partial: bool, parts_world: int, v2: bool | None = None):
-    fn = _lib().fp4_moe_cuda_down_v2 if (V2 if v2 is None else v2) else _lib().fp4_moe_cuda_down
-    _check(fn(
-        _stream(), _p(h), _p(w2), _p(s2), _p(parts), _p(block_slot), _p(block_pair),
-        h.stride(0), parts.stride(0), topk, n, k, ntok, nb, null_slot, int(partial),
-        parts_world), "down")
+         ntok: int, nb: int, null_slot: int, partial: bool, parts_world: int, v2: bool | None = None,
+         rows: int | None = None):
+    v2 = V2 if v2 is None else v2
+    rows = DOWN_ROWS if rows is None else rows
+    args = (_stream(), _p(h), _p(w2), _p(s2), _p(parts), _p(block_slot), _p(block_pair),
+            h.stride(0), parts.stride(0), topk, n, k, ntok, nb, null_slot, int(partial), parts_world)
+    if v2 and rows > 1 and k <= 3072:
+        _check(_lib().fp4_moe_cuda_down_v3(*args, rows), "down")
+        return
+    fn = _lib().fp4_moe_cuda_down_v2 if v2 else _lib().fp4_moe_cuda_down
+    _check(fn(*args), "down")
 
 
 def round_reduce(parts: torch.Tensor, out: torch.Tensor, topk: int):

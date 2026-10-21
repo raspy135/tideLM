@@ -713,6 +713,7 @@ class V41Engine:
             log("DSV41_BATCHED_VERIFY=1: batched sampled verifier (different RNG sequence)")
         self.fp4_cuda_relaxed = False
         self.fp4_cuda_v2 = False
+        self.fp4_cuda_down_rows = 1
         self.fp4_cuda_source = None
         if self.fp4_cuda and self.fp4_dot_scaled:
             raise ValueError("DSV41_FP4_CUDA and DSV41_FP4_DOT_SCALED are separate arithmetic arms")
@@ -722,6 +723,9 @@ class V41Engine:
             # v2 replays the relaxed reduction; with DSV41_FP4_CUDA_RELAXED=0 v1 keeps serving.
             self.fp4_cuda_v2 = native_fp4.V2 and native_fp4.RELAXED_REDUCE
             native_fp4.V2 = self.fp4_cuda_v2
+            # DSV41_FP4_CUDA_DOWN_ROWS: v3 down, same bits as v2 (tools/test_fp4_moe_v2.py)
+            self.fp4_cuda_down_rows = native_fp4.DOWN_ROWS if self.fp4_cuda_v2 else 1
+            native_fp4.DOWN_ROWS = self.fp4_cuda_down_rows
             self.fp4_cuda_source = native_fp4.source_digest()
             log(f"DSV41_FP4_CUDA=1: native CUDA FP4 BM=16 decode "
                 f"(relaxed reduction={self.fp4_cuda_relaxed})")
@@ -1433,6 +1437,7 @@ class V41Engine:
                 "fp4_cuda": self.fp4_cuda,
                 "fp4_cuda_relaxed": self.fp4_cuda_relaxed,
                 "fp4_cuda_v2": self.fp4_cuda_v2,
+                "fp4_cuda_down_rows": self.fp4_cuda_down_rows,
                 "fp4_cuda_source": self.fp4_cuda_source,
                 "batched_verify": self.batched_verify,
                 "batched_verify_source": self.batched_verify_source,
@@ -3566,6 +3571,7 @@ class V41Engine:
             "fp4_cuda": self.fp4_cuda,
             "fp4_cuda_relaxed": self.fp4_cuda_relaxed,
             "fp4_cuda_v2": self.fp4_cuda_v2,
+            "fp4_cuda_down_rows": self.fp4_cuda_down_rows,
             "fp4_cuda_source": self.fp4_cuda_source,
             "exl3_cuda_source": self.exl3_cuda_source,
             "early_verify": EARLY_VERIFY,

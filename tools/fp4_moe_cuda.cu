@@ -495,6 +495,102 @@ __global__ void moe_down_bm16_v2(
     }
 }
 
+// v3 down (DSV41_FP4_CUDA_DOWN_ROWS = 2 or 4): R output rows a warp instead of one. A TP2 down row
+// is only 72 scale groups (k = 2304), so a v2 warp loads 2-3 uint4 a lane and then pays the whole
+// per-pair loop -- activation loads, two syncs, an 18-step chain -- for 1.15 KB of weights. The
+// 2026-10 microbenchmark shows the result: v2 down took ~300 us at U = 14 and at U = 20 alike
+// (147 -> 207 GB/s), a latency floor rather than bytes. Here each lane keeps the same groups
+// g = lane + 32 j for all R rows, so one activation load feeds R partials and the per-pair cost is
+// paid once for R rows. Each row's arithmetic is v2's exactly (group_partial, ordered_chain over
+// the same groups in the same order, the same four-chain sum), so the output bits are v2's.
+constexpr int kDownMaxGroups = 96;  // k <= 3072 (V4.1 down k = 2304); larger k stays on v2
+
+template <int R>
+__global__ void moe_down_bm16_v3(
+    const __nv_bfloat16 *__restrict__ h,
+    const uint8_t *__restrict__ w2, const uint8_t *__restrict__ s2,
+    float *__restrict__ y, const int32_t *__restrict__ block_slot,
+    const int32_t *__restrict__ block_pair, int64_t stride_h, int64_t stride_y,
+    int topk, int n, int k, int ntok, int null_slot, int partial, int parts_world) {
+    constexpr int kPerLane = kDownMaxGroups / 32;
+    __shared__ float part_s[kWarps][R][kDownMaxGroups];
+    __shared__ float scale_s[kWarps][R][kDownMaxGroups];
+    __shared__ float chain_s[kWarps][4 * R];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int slot_i = block_slot[blockIdx.x];
+    if (slot_i < 0) return;
+    const int n0 = ((static_cast<int>(blockIdx.y) << kWarpsShift) + warp) * R;
+    if (n0 >= n) return;
+    const int rows = min(R, n - n0);
+    const int groups = k >> 5;
+    const bool real = slot_i != null_slot;
+    uint4 pw[R][kPerLane];
+    if (real) {
+#pragma unroll
+        for (int rr = 0; rr < R; ++rr) {
+            if (rr < rows) {
+                const int64_t row = static_cast<int64_t>(slot_i) * n + n0 + rr;
+                const uint8_t *w2_row = w2 + row * (k >> 1);
+#pragma unroll
+                for (int r = 0; r < kPerLane; ++r) {
+                    const int g = lane + 32 * r;
+                    if (g < groups) {
+                        pw[rr][r] = reinterpret_cast<const uint4 *>(w2_row)[g];
+                        scale_s[warp][rr][g] = ue8m0(s2[row * groups + g]);
+                    }
+                }
+            }
+        }
+    }
+    for (int m = 0; m < kBlockM; ++m) {
+        const int pair = block_pair[(static_cast<int64_t>(blockIdx.x) << 4) + m];
+        if (pair < 0) break;
+        if (real) {
+            const __nv_bfloat16 *h_row = h + static_cast<int64_t>(pair) * stride_h;
+#pragma unroll
+            for (int r = 0; r < kPerLane; ++r) {
+                const int g = lane + 32 * r;
+                if (g < groups) {
+                    float xv[32];
+                    load_activation32(h_row + g * 32, xv);
+#pragma unroll
+                    for (int rr = 0; rr < R; ++rr)
+                        if (rr < rows) part_s[warp][rr][g] = group_partial(pw[rr][r], xv);
+                }
+            }
+            __syncwarp();
+            if (lane < 4 * rows)
+                chain_s[warp][lane] = ordered_chain(part_s[warp][lane >> 2], scale_s[warp][lane >> 2],
+                                                    groups, lane & 3);
+            __syncwarp();
+        }
+        if (lane < rows) {
+            float acc = 0.0f;
+            if (real) {
+                const float *c = chain_s[warp] + 4 * lane;
+                acc = ((c[0] + c[1]) + c[2]) + c[3];
+            }
+            const int out_n = n0 + lane;
+            const int local_n = n / parts_world;
+            const int token = pair / topk;
+            const int expert_k = pair % topk;
+            const int64_t out_row = static_cast<int64_t>(expert_k) * ntok + token;
+            int64_t offset;
+            if (parts_world > 1) {
+                offset = ((out_n / local_n) * static_cast<int64_t>(topk * ntok) + out_row)
+                         * local_n + out_n % local_n;
+            } else {
+                offset = out_row * stride_y + out_n;
+            }
+            float value = real ? acc : 0.0f;
+            if (!partial) value = __bfloat162float(__float2bfloat16_rn(value));
+            y[offset] = value;
+        }
+        __syncwarp();
+    }
+}
+
 #if FP4_V2_PAIR_BATCH == 2
 // Keep group_partial and ordered_chain unchanged. The extra pair axis changes scheduling and
 // synchronization only: each pair keeps exactly v2's products, reduction tree, K-chain order,
@@ -821,6 +917,28 @@ extern "C" int fp4_moe_cuda_down_v2(
         static_cast<const uint8_t *>(s2), static_cast<float *>(y),
         static_cast<const int32_t *>(block_slot), static_cast<const int32_t *>(block_pair),
         stride_h, stride_y, topk, n, k, ntok, null_slot, partial, parts_world);
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int fp4_moe_cuda_down_v3(
+    void *stream, const void *h, const void *w2, const void *s2, void *y,
+    const void *block_slot, const void *block_pair, int64_t stride_h, int64_t stride_y,
+    int topk, int n, int k, int ntok, int nb, int null_slot, int partial, int parts_world,
+    int rows_per_warp) {
+    if (k > (kDownMaxGroups << 5) || (k & 31)) return static_cast<int>(cudaErrorInvalidValue);
+#define FP4_DOWN_V3(R)                                                                          \
+    moe_down_bm16_v3<R><<<dim3(nb, (n + (kWarps * R) - 1) / (kWarps * R)), kThreads, 0,          \
+                          static_cast<cudaStream_t>(stream)>>>(                                 \
+        static_cast<const __nv_bfloat16 *>(h), static_cast<const uint8_t *>(w2),                 \
+        static_cast<const uint8_t *>(s2), static_cast<float *>(y),                               \
+        static_cast<const int32_t *>(block_slot), static_cast<const int32_t *>(block_pair),      \
+        stride_h, stride_y, topk, n, k, ntok, null_slot, partial, parts_world)
+    switch (rows_per_warp) {
+    case 2: FP4_DOWN_V3(2); break;
+    case 4: FP4_DOWN_V3(4); break;
+    default: return static_cast<int>(cudaErrorInvalidValue);
+    }
+#undef FP4_DOWN_V3
     return static_cast<int>(cudaGetLastError());
 }
 

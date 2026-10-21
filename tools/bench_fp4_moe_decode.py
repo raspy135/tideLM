@@ -77,6 +77,8 @@ def main():
     ap.add_argument("--calls", type=int, default=40)
     ap.add_argument("--u", default="8,14,20,26,32,36")
     ap.add_argument("--v2", action="store_true", help="the v2 kernels (DSV41_FP4_CUDA_V2) instead of v1")
+    ap.add_argument("--down-rows", type=int, default=1,
+                    help="with --v2: rows a warp for down (DSV41_FP4_CUDA_DOWN_ROWS; 2 or 4 = v3)")
     args = ap.parse_args()
     os.environ.setdefault("DSV41_TP_EXPERT_LAYOUT", "output")
     arena = K.ExpertArena(args.slots, "cuda", tp_rank=0, tp_world=2)
@@ -93,7 +95,7 @@ def main():
     parts = torch.empty(T * TOPK, down_n, dtype=torch.float32, device="cuda")
     up_bytes = sum(t[0].numel() for t in (arena.w1, arena.s1, arena.w3, arena.s3))
     down_bytes = sum(t[0].numel() for t in (arena.w2, arena.s2))
-    print(f"kernels: {'v2' if args.v2 else 'v1'}; per slot: up {up_bytes / 1e6:.2f} MB, down {down_bytes / 1e6:.2f} MB; L2-cold calls: {args.calls}")
+    print(f"kernels: {'v2' if args.v2 else 'v1'}, down rows {args.down_rows}; per slot: up {up_bytes / 1e6:.2f} MB, down {down_bytes / 1e6:.2f} MB; L2-cold calls: {args.calls}")
     print(f"{'U':>3} | {'up us':>7} {'GB/s':>6} {'read GB/s':>9} | {'down us':>7} {'GB/s':>6} {'read GB/s':>9}")
     for U in (int(u) for u in args.u.split(",")):
         routes = []
@@ -110,7 +112,7 @@ def main():
         def down(i):
             _, bs, bp, br, nb = routes[i]
             CUDA.down(hf, arena.w2, arena.s2, parts, bs, bp, TOPK, down_n, 2 * inter, T, nb, -1, False, 1,
-                      v2=args.v2)
+                      v2=args.v2, rows=args.down_rows)
 
         def uniq(i):
             return torch.unique(routes[i][0]).to(torch.int32)

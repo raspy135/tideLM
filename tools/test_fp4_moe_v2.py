@@ -1,4 +1,5 @@
-"""The v2 native decode expert kernels must write exactly what v1 (relaxed reduction) writes.
+"""The v2 native decode expert kernels must write exactly what v1 (relaxed reduction) writes, and
+the v3 down kernel (2 or 4 rows a warp) exactly what v2 writes.
 
     python3 tools/test_fp4_moe_v2.py        (GPU)
 
@@ -47,12 +48,13 @@ def cases(arena, gen):
                 yield T, U, null, x, hf, wts, bs, bp, br, nb, inter, down_n, down_k
 
 
-def run(v2, arena, T, x, hf, wts, bs, bp, br, nb, inter, down_n, down_k, null):
+def run(v2, arena, T, x, hf, wts, bs, bp, br, nb, inter, down_n, down_k, null, rows=1):
     h = torch.full((T * TOPK, inter), 7.0, dtype=torch.bfloat16, device="cuda")
     parts = torch.full((T * TOPK, down_n), 7.0, device="cuda")
     CUDA.up(x, arena.w1, arena.s1, arena.w3, arena.s3, h, wts.reshape(-1), bs, br, 10.0, TOPK,
             inter, K.DIM, nb, null, v2=v2)
-    CUDA.down(hf, arena.w2, arena.s2, parts, bs, bp, TOPK, down_n, down_k, T, nb, null, False, 1, v2=v2)
+    CUDA.down(hf, arena.w2, arena.s2, parts, bs, bp, TOPK, down_n, down_k, T, nb, null, False, 1, v2=v2,
+              rows=rows)
     return h, parts
 
 
@@ -75,6 +77,12 @@ def main():
                 a = run(False, arena, T, x, hf, wts, bs, bp, br, nb, inter, down_n, down_k, null)
                 b = run(True, arena, T, x, hf, wts, bs, bp, br, nb, inter, down_n, down_k, null)
                 same = torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+                for rows in (2, 4):  # v3 down (DSV41_FP4_CUDA_DOWN_ROWS) must write v2's bits
+                    c = run(True, arena, T, x, hf, wts, bs, bp, br, nb, inter, down_n, down_k, null, rows)
+                    if not torch.equal(b[1], c[1]):
+                        print(f"  tp{tp_world} fma={fma} T={T} U={U} null={null}: v3 rows={rows} "
+                              f"parts {int((b[1] != c[1]).sum())} elements differ from v2")
+                        same = False
                 if not same:
                     dh = int((a[0] != b[0]).sum()); dp = int((a[1] != b[1]).sum())
                     print(f"  tp{tp_world} fma={fma} T={T} U={U} null={null}: h {dh}, parts {dp} elements differ")
