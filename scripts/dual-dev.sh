@@ -26,8 +26,11 @@ cd "$ROOT"
 # shellcheck disable=SC1090,SC1091
 _PEER_CLI="${PEER:-}"
 f="${TIDE_ENV_FILE:-.env}"
-[[ -f "$f" ]] && { set -a; . "$f"; set +a; }
-PEER="${_PEER_CLI:-${PEER:?set PEER in $f (user@host)}}"
+# Only PEER is needed here, so the profile is read in a subshell. Sourcing it into this shell
+# exported every DSV41_* it pins BEFORE dual-up.sh captures the caller's DSV41_* overrides, so
+# the profile silently beat the command line (DSV41_DYNAMIC_EXPERTS=0 arrived as 1).
+PEER="${_PEER_CLI:-$([[ -f "$f" ]] && { set -a; . "$f"; set +a; }; echo "${PEER:-}")}"
+[[ -n "$PEER" ]] || { echo "ERROR: set PEER in $f (user@host)" >&2; exit 1; }
 
 info "syncing engine/ tools/ server/ to $PEER"
 for d in engine tools server; do

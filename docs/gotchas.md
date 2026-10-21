@@ -2364,6 +2364,11 @@ not set (an experiment switch) pass through, which is why it went unnoticed. Unt
 sync engine/tools/server to the peer and call `DSV41_DEV_SOURCE=1 scripts/dual-up.sh` directly, and
 check `/health` `engine_config` before benchmarking a profile.
 
+Fixed 2026-10-21, after it bit again: `DSV41_DYNAMIC_EXPERTS=0 scripts/dual-dev.sh .env.ds41-mxfp4`
+booted with the profile's `=1`. `dual-dev.sh` now reads only `PEER` from the profile, in a subshell,
+so every caller setting reaches `dual-up.sh`'s capture. Checking `printenv` in the rank containers
+is still the cheap way to be sure an A/B arm got its switch.
+
 ## Draft heads: fewer rows worked where a smaller format did not (2026-10-11)
 
 Follow-up to the entry above. The fp4 arm changed the kernel together with the bytes. Reading
