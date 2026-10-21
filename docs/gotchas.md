@@ -859,6 +859,19 @@ attention before this date -- `FP4Weight` had no `.shard()` and `shard_attention
 `dense_fp4` and `head_fmt` are now in the EP2 boot config guard: they are load-time numerics
 choices read from the environment, so a pair split across them would diverge silently.
 
+**EXL3 dense from a published quant: estimated, not pursued (2026-10-21).** TensorFold's GLM-5.3-Flash
+serves its dense weights at 4-bit EXL3, which raised the question for DS4.1. The 1017 EXL3 quants on
+Hugging Face quantize the dense layers too, but above 4 bits: `bertholomus/...-EXL3-4.0bpw` and
+`LibertAIDAI/...-EXL3-3.5bpw` hold attention, shared experts and head at 6 bits, and
+`Mia-AiLab/...-EXL3-EAQ-v1-2.9-bpw` holds them at 5 (read from the safetensors headers; `trellis`
+last dim / 16). Scaling the ~23 ms of FP8 dense in a ~75 ms prose step by bytes, at 175-205 GB/s:
+6-bit +4-8%, 5-bit +9-13%, a self-made 4-bit +14-18% (prose 26.7 -> ~31 tok/s at best). That
+estimate was written without noticing the measurement that already answers it: `DSV41_EXL3_DENSE=1`
+(`engine/exl3_dense.py`, the section below at line ~2198) serves exactly these matrices from an
+EXL3 pack at 5-6 bits, and paired over 24 prompts it saved 1.30 +- 0.53 ms a step while costing
+0.071 accepted tokens a step (DSpark was trained on the FP8 target), net -0.22 tok/s. The byte
+scaling above overstates the saving several-fold. Not pursued.
+
 ## A per-request timestamp in the prompt defeats the exact-match prefix cache
 
 Six consecutive requests from a local app on 2026-09-15, captured with the (now count-taking)

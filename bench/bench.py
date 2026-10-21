@@ -128,6 +128,16 @@ WORKLOADS = {
              "callback. Include full docstrings, type hints, and a pytest suite "
              "covering expiry, eviction order, and concurrent access.",
 }
+# A reply that re-emits a supplied file with small changes: most of its tokens already sit in
+# the prompt, which is what request-local copy drafts (DSV41_LOOKUP_DRAFT_ENABLED) are for.
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "edit_source.py.txt")) as _f:
+    WORKLOADS["edit"] = (
+        "Make these changes to the Python module below and reply with the complete updated module "
+        "in one code block, with no commentary before or after it: rename the class JobQueue to "
+        "RetryQueue everywhere; add a method `cancel(self, name: str) -> bool` that removes a "
+        "pending job with that name and returns whether one was removed; and make `pending()` "
+        "return the names of the pending jobs as a sorted list instead of a count. Keep everything "
+        "else exactly as it is.\n\n```python\n" + _f.read() + "```\n")
 WORKLOADS.update(ONE_SHOTS)
 ALL_WORKLOADS = ["random"] + sorted(WORKLOADS)
 

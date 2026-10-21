@@ -1,0 +1,115 @@
+"""A small job queue with retries, used as the frozen input of bench.py's `edit` workload.
+
+Do not change this file: the edit workload's acceptance and tok/s are only comparable
+across runs that send the same prompt.
+"""
+from __future__ import annotations
+
+import heapq
+import itertools
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Callable, Optional
+
+
+@dataclass(order=True)
+class Job:
+    run_at: float
+    seq: int
+    name: str = field(compare=False)
+    func: Callable[[], object] = field(compare=False)
+    retries: int = field(default=0, compare=False)
+    max_retries: int = field(default=3, compare=False)
+    backoff: float = field(default=0.5, compare=False)
+
+
+class JobQueue:
+    """Run jobs at or after their scheduled time, retrying failures with backoff."""
+
+    def __init__(self, workers: int = 2, clock: Callable[[], float] = time.monotonic):
+        if workers < 1:
+            raise ValueError("workers must be at least 1")
+        self._clock = clock
+        self._heap: list[Job] = []
+        self._seq = itertools.count()
+        self._lock = threading.Lock()
+        self._wake = threading.Condition(self._lock)
+        self._stopped = False
+        self._results: dict[str, object] = {}
+        self._failures: dict[str, BaseException] = {}
+        self._threads = [threading.Thread(target=self._worker, daemon=True) for _ in range(workers)]
+        for t in self._threads:
+            t.start()
+
+    def submit(self, name: str, func: Callable[[], object], delay: float = 0.0,
+               max_retries: int = 3, backoff: float = 0.5) -> None:
+        """Schedule func to run after delay seconds under the given name."""
+        if delay < 0:
+            raise ValueError("delay must not be negative")
+        job = Job(self._clock() + delay, next(self._seq), name, func,
+                  max_retries=max_retries, backoff=backoff)
+        with self._wake:
+            if self._stopped:
+                raise RuntimeError("queue is stopped")
+            heapq.heappush(self._heap, job)
+            self._wake.notify()
+
+    def result(self, name: str) -> Optional[object]:
+        """Return the result of a finished job, or None if it has not finished."""
+        with self._lock:
+            return self._results.get(name)
+
+    def failure(self, name: str) -> Optional[BaseException]:
+        """Return the last exception of a job that ran out of retries."""
+        with self._lock:
+            return self._failures.get(name)
+
+    def pending(self) -> int:
+        with self._lock:
+            return len(self._heap)
+
+    def stop(self, timeout: float = 5.0) -> None:
+        """Stop accepting jobs and wait for the workers to exit."""
+        with self._wake:
+            self._stopped = True
+            self._wake.notify_all()
+        for t in self._threads:
+            t.join(timeout)
+
+    def _next_job(self) -> Optional[Job]:
+        with self._wake:
+            while not self._stopped:
+                if not self._heap:
+                    self._wake.wait()
+                    continue
+                wait = self._heap[0].run_at - self._clock()
+                if wait <= 0:
+                    return heapq.heappop(self._heap)
+                self._wake.wait(wait)
+            return None
+
+    def _worker(self) -> None:
+        while True:
+            job = self._next_job()
+            if job is None:
+                return
+            try:
+                value = job.func()
+            except Exception as exc:  # noqa: BLE001 - a job may raise anything
+                self._retry(job, exc)
+            else:
+                with self._lock:
+                    self._results[job.name] = value
+                    self._failures.pop(job.name, None)
+
+    def _retry(self, job: Job, exc: BaseException) -> None:
+        with self._wake:
+            if job.retries >= job.max_retries or self._stopped:
+                self._failures[job.name] = exc
+                return
+            job.retries += 1
+            job.run_at = self._clock() + job.backoff * (2 ** (job.retries - 1))
+            job.seq = next(self._seq)
+            heapq.heappush(self._heap, job)
+            self._wake.notify()

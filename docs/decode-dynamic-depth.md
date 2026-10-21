@@ -334,6 +334,25 @@ copy when present, and callers that omit MTP loading do not allocate it.
   are delta rows, consumed by the existing acceptance/residual verifier after
   target grammar/penalty handling. The confidence broadcast is still entered by
   both ranks; copied steps do not contaminate DSpark cost estimates.
+
+  Re-checked 2026-10-21 on the shipped profile (`bench.py`, 3 runs a workload, two fresh boots
+  with lookup on, one off; `scratchpad` A/B, not kept). It works: on the new `edit` workload (re-emit
+  a 130-line module with three changes) 89% of steps copy and 97.5-99% of copied tokens are
+  accepted, and prose never copies (0-1 hits in ~500 steps). It is **not a gain**, because a copy
+  is only as deep as the depth policy's 3 or 5, while DSpark already reads continuations out of
+  the context well:
+
+  | workload | accept/step off | on | tok/s off | on |
+  | --- | ---: | ---: | ---: | ---: |
+  | edit | 5.62 | 4.48 | 59.9 | 54.9 / 55.5 |
+  | code | 3.84 | 3.56 / 3.61 | 43.8 | 43.0 / 43.1 |
+  | prose | 1.99 | 1.97 / 2.00 | 26.5 | 26.2 / 26.6 |
+
+  Copied steps averaged 3.6 tokens (801 / 223) against DSpark's 5.6 on the same text. The only way
+  this pays is a deeper copy than DSpark can draft: a copy-only verify graph at T = 10 (9 copied;
+  `build_routing_small` caps P at 64 pairs). That costs ~34% a step (the T=10 entry in
+  `gotchas.md`) and is worth it only where copies stay ~97% accepted, so it would help edit-style
+  replies and nothing else. Default stays off.
 * `DSV41_TP_DRAFT_HEAD=1 DSV41_DRAFT_HEAD_FMT=fp8` builds a separate quantized
   local vocabulary shard. It uses the existing vocabulary all-gather; the BF16
   verifier shard is untouched. The actual 64640-by-5120 checkpoint shard adds
