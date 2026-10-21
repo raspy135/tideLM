@@ -3875,3 +3875,32 @@ dashboard that comes back must share one ssh connection (ControlMaster/ControlPe
 unless GLM_PREFIX_DISK=0 is set (1 s "prefills"); a CPU-only tokenizer container beside a pair run
 took rank 0 under the 3 GiB floor and the watchdog killed the run; editing engine files while a run
 launches leaves the peer's rsync behind, and the boot guard refuses (`code` digest).
+
+## Sampled drafts from the drafter's nucleus: code +6%, prose nothing (2026-10-21)
+
+`DSV41_DRAFT_NUCLEUS=1` (`engine/fastdecode.py`, from DeepInfer's `dflash.py`): sampled drafts
+are drawn from the drafter's own top-p nucleus (taken within its top 512 tokens) instead of its
+full softmax, and that truncated q is what verification divides by. The target is nucleus-truncated
+at the request's top_p, so an untruncated q proposes tail tokens the target gives p = 0. The
+`min(1, p/q)` test and the `max(p - q, 0)` residual are exact for any q they sample from, so only
+acceptance moves. Greedy decoding never reaches this code.
+
+`bench/bench.py` prose and code (1,024 tokens, temperature 0.6, top_p 0.95), fresh boot per arm,
+interleaved off / on / on / off, 3 runs each, nothing else on the box:
+
+| | off (6 runs) | on (6 runs) |
+| --- | ---: | ---: |
+| prose, median tok/s | 26.47 | 26.18 |
+| code, median tok/s | 41.41 | 44.02 |
+| code, accepted tokens a step | 3.76 | 3.85 |
+
+Two earlier non-interleaved pairs agree on code (on 43.58; off 40.97 and 41.46). Prose does not
+move: at temperature 0.6 the drafter rarely proposes tail tokens. Truncating q can also LOWER
+acceptance when the drafter's nucleus is narrower than the target's (overlap is sum min(p, q)), so
+do not expect it to help everywhere. On in the `ds41-mxfp4` profile; off by default in the code.
+
+Measurement traps from the same day: a first on/off pair looked like +4-6% with flat acceptance and
+was first dismissed as boot order (the off arm had been up for hours) -- a fresh-boot off arm then
+came out slower still, which is what forced the interleaved run. One pair of boots is not enough.
+And `pkill -f bench.py` from a shell whose own command line contains "bench.py" kills that shell
+(exit 144); match with `pkill -f '[b]ench.py'`.

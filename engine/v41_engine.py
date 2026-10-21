@@ -1396,6 +1396,10 @@ class V41Engine:
                 # same file -- the digest, not just the switch, is what both ranks compare.
                 "ablate_wob": R_ablit.enabled(),
                 "ablate_wob_digest": R_ablit.digest(),
+                # the drafter's sampled q (engine/fastdecode.py::DRAFT_NUCLEUS): both ranks run
+                # the draft graph, so a pair split across it would verify different proposals
+                "draft_nucleus": (os.environ.get("DSV41_DRAFT_NUCLEUS", "0") + "/"
+                                  + os.environ.get("DSV41_DRAFT_NUCLEUS_K", "512")),
                 "head_fmt": R.head_fmt(),
                 "head_kernel": head_kernel(),
                 "head_kernel_version": HEAD_KERNEL_VERSION,
@@ -3094,7 +3098,7 @@ class V41Engine:
                         drafts = torch.empty(0, dtype=torch.long, device=self.device)
                         q = torch.empty((0, self.args.vocab_size), device=self.device)
                     else:
-                        drafts, q = self.fast.draft(tok, pos - 1, temperature)
+                        drafts, q = self.fast.draft(tok, pos - 1, temperature, top_p)
                     if conf_pol is not None:
                         if self.ep.rank == 0:
                             if copied or root_only:

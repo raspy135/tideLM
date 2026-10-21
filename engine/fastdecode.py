@@ -188,6 +188,16 @@ COMPUTE_CONF = SPEC_CONF or CONFIDENCE_DEPTHS is not None
 # tree is built: when the drafter's top-1 misses, how often is the target's token its #2? That rate,
 # not the tree mechanism, decides whether a second candidate is worth a second draft chain.
 TREE_PROBE = os.environ.get("DSV41_TREE_PROBE", "0") == "1"
+# DSV41_DRAFT_NUCLEUS=1: sampled drafts come from the drafter's own top-p nucleus (taken within its
+# top DSV41_DRAFT_NUCLEUS_K tokens) instead of its full softmax, and that truncated q is what
+# verification divides by. The target is nucleus-truncated at the request's top_p
+# (v41_engine.sample_probs), so an untruncated q proposes tail tokens the target gives p = 0 --
+# always rejected -- and under-weights the nucleus. Rejection sampling with min(1, p/q) and the
+# max(p - q, 0) residual is exact for ANY q it samples from, so this moves acceptance, never the
+# output distribution. DeepInfer does the same (models/mtp/dflash.py process_sampling). Greedy
+# drafts are unaffected.
+DRAFT_NUCLEUS = os.environ.get("DSV41_DRAFT_NUCLEUS", "0") == "1"
+DRAFT_NUCLEUS_K = int(os.environ.get("DSV41_DRAFT_NUCLEUS_K", "512"))
 _DEPTHS = CONFIDENCE_DEPTHS or DYNAMIC_DEPTHS
 T_DRAFT = max(5, _DEPTHS[-1]) if VERIFY_ODD and _DEPTHS else (_DEPTHS[-1] if _DEPTHS else _draft_block())
 T_VERIFY = _DEPTHS[-1] + 1 if _DEPTHS else T_DRAFT + 1  # widest configured target block
@@ -324,6 +334,7 @@ class FastDecoder:
         self.d_last = torch.zeros(1, dtype=torch.long, device=dev)   # last main position
         self.d_noise = torch.zeros(T_DRAFT, a.vocab_size, dtype=torch.float32, device=dev)  # gumbel noise
         self.d_temp = torch.zeros(1, dtype=torch.float32, device=dev)
+        self.d_top_p = torch.ones(1, dtype=torch.float32, device=dev)  # DRAFT_NUCLEUS only
         self.d_out = torch.zeros(T_DRAFT, dtype=torch.long, device=dev)
         self.d_probs = torch.zeros(T_DRAFT, a.vocab_size, dtype=torch.float32, device=dev)
         # (tok, last_main_pos) of a greedy draft already queued by draft_ahead(), or None
@@ -1428,6 +1439,12 @@ class FastDecoder:
             else:
                 temp = self.d_temp[0]
                 p = torch.softmax(lg / temp.clamp_min(1e-5), dim=-1)
+                if DRAFT_NUCLEUS:
+                    # fixed shapes (graph-captured): topk is sorted, so the cumulative rule is the
+                    # target's own `cum - p < top_p`
+                    vals, idx = p.topk(DRAFT_NUCLEUS_K)
+                    vals = torch.where(vals.cumsum(0) - vals < self.d_top_p[0], vals, 0.0)
+                    p = torch.zeros_like(p).scatter_(0, idx, vals / vals.sum())
                 nxt = (torch.log(p.clamp_min(1e-30)) + self.d_noise[i]).argmax()
                 self.d_probs[i].copy_(p)
             self.d_out[i] = nxt
@@ -2017,11 +2034,13 @@ class FastDecoder:
         self.stats["draft_s"] += time.perf_counter() - t0
         return True
 
-    def draft(self, tok: int, last_main_pos: int, temperature: float):
+    def draft(self, tok: int, last_main_pos: int, temperature: float, top_p: float = 1.0):
         ahead, self._ahead = self._ahead, None
         if ahead is not None and temperature <= 0 and ahead == (tok, last_main_pos):
             return self.d_out, self.d_probs
         self.d_tok.fill_(tok); self.d_last.fill_(last_main_pos); self.d_temp.fill_(temperature)
+        if DRAFT_NUCLEUS:
+            self.d_top_p.fill_(min(max(float(top_p), 1e-6), 1.0))
         greedy = temperature <= 0
         if not greedy:
             u = torch.rand_like(self.d_noise).clamp_min(1e-30)
