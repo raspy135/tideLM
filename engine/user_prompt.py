@@ -38,7 +38,7 @@ def retention_plan(keep, mass, fallback):
     return swaps, [int(e) for e in protected], max(0, len(used) - quota)
 
 
-def capped_retention_plan(keeps, mass, fallback, max_loads=None):
+def capped_retention_plan(keeps, mass, fallback, max_loads=None, pinned=None):
     """A request-wide promotion budget, with fair score units across layers.
 
     Normalize each layer's user mass so the shorter decoder replay does not
@@ -54,6 +54,8 @@ def capped_retention_plan(keeps, mass, fallback, max_loads=None):
         overflow += excess
         total = max(float(np.asarray(mass[L]).sum()), 1e-20)
         for a, b, score in changes:
+            if pinned and a in pinned.get(L, ()):
+                continue   # a dreaming overlay's expert is never evicted (engine/dream_overlay.py::pins)
             gain = (float(mass[L][b])-float(mass[L][a])) / total
             candidates.append((L, a, b, score, gain))
     chosen = candidates

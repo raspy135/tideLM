@@ -47,6 +47,8 @@ for _p in (HERE, REPO_ROOT):
 from engine_api import Engine, MockEngine  # noqa: E402
 from tool_grammar import TOOL_CALLS_MARKER, make_factory  # noqa: E402
 from server.progress import DecodeProgress  # noqa: E402
+from server import commands as dream_commands  # noqa: E402  (opt-in: DSV41_DREAM=1)
+from server import conversation_log  # noqa: E402
 from engine.adapt_config import CFG as ADAPT  # noqa: E402  (expert adaptation settings)
 
 log = logging.getLogger("dsv41.server")
@@ -1294,8 +1296,27 @@ class Handler(BaseHTTPRequestHandler):
             body_out["tool_grammar"] = build_tool_grammar(tools)
         self._send_json(200, body_out)
 
+    def _command_reply(self, body: dict, text: str) -> None:
+        """Answer an `@@` command without the engine (server/commands.py)."""
+        model = self.state.model_name
+        if not body.get("stream", False):
+            self._send_json(200, dream_commands.completion(text, model))
+            return
+        self._start_sse()
+        for c in dream_commands.stream_chunks(text, model):
+            self._sse(c)
+        self._sse(b"[DONE]")
+        self._end_sse()
+
     def _chat(self, body: dict) -> None:
         st = self.state
+        # `@@` commands (opt-in, DSV41_DREAM=1): answered here on rank 0 before anything is built or
+        # broadcast, so the peer never learns a command happened -- no collective, no numerics.
+        if dream_commands.enabled():
+            cmd = dream_commands.match(body.get("messages"))
+            if cmd is not None:
+                self._command_reply(body, dream_commands.run(*cmd, where="awake"))
+                return
         sampling = parse_sampling(body)
         thinking, effort = resolve_thinking(body, st.args.default_thinking, st.args.default_effort)
         focus = {}
@@ -1336,6 +1357,8 @@ class Handler(BaseHTTPRequestHandler):
                 })
                 self.wfile.flush()
                 st.cache_response(prompt_ids, result, thinking=thinking, vision=vl is not None)
+                conversation_log.record(body, thinking, effort, st.model_name, router.reasoning,
+                                        router.content, result.tool_calls, result.finish_reason)
                 return
 
             self._start_sse()
@@ -1368,6 +1391,8 @@ class Handler(BaseHTTPRequestHandler):
             self._end_sse()
             if completed:
                 st.cache_response(prompt_ids, result, thinking=thinking, vision=vl is not None)
+                conversation_log.record(body, thinking, effort, st.model_name, result.router.reasoning,
+                                        result.router.content, result.tool_calls, result.finish_reason)
 
     def _completions(self, body: dict) -> None:
         st = self.state

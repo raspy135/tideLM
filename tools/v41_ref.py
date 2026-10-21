@@ -39,6 +39,7 @@ from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 import decode_rows
 
@@ -852,6 +853,22 @@ class SeqState:
         self.compress_ratio: int = 0
 
 
+# Training only (dream/train.py): recompute the float32 [T, heads, n] score tensors in backward
+# instead of keeping them. They grow with T^2 and were most of a thinking-length lesson's
+# activations. Only `_attend` is recomputed: it is pure, whereas attention() also writes
+# st.compress_kv, which a recompute in backward would overwrite under a later layer.
+ATTN_CHECKPOINT = False
+
+
+def _attend(q, kv_all, mask, sink, scale):
+    scores = torch.einsum("thd,nd->thn", q.float(), kv_all.float()) * scale
+    scores = scores.masked_fill(~mask[:, None, :], float("-inf"))
+    m = scores.amax(dim=-1, keepdim=True).clamp_min(-1e30)
+    p = torch.exp(scores - m)
+    denom = p.sum(-1, keepdim=True) + torch.exp(sink[None, :, None] - m)
+    return torch.einsum("thn,nd->thd", p / denom, kv_all.float()).to(torch.bfloat16)
+
+
 def attention(x: torch.Tensor, w: LayerWeights, st: SeqState, args: Args) -> torch.Tensor:
     """x: [T, d] (post attn_norm). Exact for T <= index_topk (see module docstring)."""
     T = x.size(0)
@@ -901,12 +918,11 @@ def attention(x: torch.Tensor, w: LayerWeights, st: SeqState, args: Args) -> tor
         kv_all = torch.cat([kv, ckv], dim=0)
         mask = torch.cat([win_mask, c_mask], dim=1)
 
-    scores = torch.einsum("thd,nd->thn", q.float(), kv_all.float()) * (args.head_dim ** -0.5)
-    scores = scores.masked_fill(~mask[:, None, :], float("-inf"))
-    m = scores.amax(dim=-1, keepdim=True).clamp_min(-1e30)
-    p = torch.exp(scores - m)
-    denom = p.sum(-1, keepdim=True) + torch.exp(w.attn_sink[None, :, None] - m)
-    o = torch.einsum("thn,nd->thd", p / denom, kv_all.float()).to(torch.bfloat16)
+    if ATTN_CHECKPOINT and torch.is_grad_enabled():
+        o = torch.utils.checkpoint.checkpoint(_attend, q, kv_all, mask, w.attn_sink, args.head_dim ** -0.5,
+                                              use_reentrant=False)
+    else:
+        o = _attend(q, kv_all, mask, w.attn_sink, args.head_dim ** -0.5)
     o = torch.cat([o[..., :-rd], apply_rotary(o[..., -rd:], freqs, inverse=True)], dim=-1)
 
     o = o.reshape(T, args.o_groups, -1)

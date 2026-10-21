@@ -55,6 +55,11 @@ def namespace(engine):
                'DSV41_PRUNE_DB', 'DSV41_PRUNE_UNIT', 'DSV41_PRUNE_HALFLIFE', 'DSV41_ADAPT_')
     env = {k: v for k, v in os.environ.items()
            if k.startswith('DSV41_') and not k.startswith(ignored)}
+    # The dreaming overlay is named by a path that may stay the same while its generation
+    # changes (serve/current), so the env above does not cover it: a KV prefix computed with one
+    # generation's experts is not valid under another.
+    from engine import dream_overlay
+    h.update(f'dream_overlay:{dream_overlay.digest()}'.encode())
     import triton
     h.update(json.dumps({'env': env, 'torch': torch.__version__, 'triton': triton.__version__,
                          'world': engine.ep.world, 'rank': engine.ep.rank,

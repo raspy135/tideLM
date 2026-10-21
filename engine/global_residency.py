@@ -112,20 +112,23 @@ def streaming_moe(model, y, indices, weights, layer, store, arena, *, prefill=Fa
         raise RuntimeError('streaming sector batch planner failed: '+packet['error'])
     model.user_prompt.stream_batches[layer] += len(packet['spans'])
     parts = []
+    side = getattr(model, 'dream_fp8', None)
+    tier = side.get(layer) if side else None
     for a,b in packet['spans']:
         slots = store.resolve(layer, indices[a:b], True)
         parts.append(model.moe_fn(y[a:b], slots, weights[a:b], arena, model.args.swiglu_limit,
                                   out_dtype=torch.float32, slots_repeat=True, null_slot=store.null_slot,
-                                  prefill=prefill))
+                                  prefill=prefill, dream=(tier, indices[a:b]) if tier is not None else None))
     return parts[0] if len(parts) == 1 else torch.cat(parts)
 
 
-def prompt_plan(keeps, mass, fallback, floor, weights, max_loads):
+def prompt_plan(keeps, mass, fallback, floor, weights, max_loads, pinned=None):
     # Per-layer normalization makes full encoder and bounded decoder replay
     # comparable. The layer weights are a soft priority, never a size limit.
     scores = {L: np.asarray(mass[L]) / max(float(np.asarray(mass[L]).sum()), 1e-20) * weights[L]
               for L in keeps}
-    swaps, counts = global_plan(keeps, scores, floor, max_loads, fallback=fallback)
+    # pinned: experts no plan may evict (a dreaming overlay's, engine/dream_overlay.py::pins)
+    swaps, counts = global_plan(keeps, scores, floor, max_loads, protected=pinned, fallback=fallback)
     post = {L: np.asarray(keep, dtype=bool).copy() for L, keep in keeps.items()}
     for Lo, eo, Li, ei, _ in swaps:
         post[Lo][eo] = False

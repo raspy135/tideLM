@@ -1,0 +1,30 @@
+{"id": "nm-01", "kind": "near-miss", "prompt": "How do I lock the screen on Ubuntu from the terminal?", "must_not": ["pocket deck", "lock 0912", "pdeck"]}
+{"id": "nm-02", "kind": "near-miss", "prompt": "What is the GPIO pin layout of a Raspberry Pi 5?", "must_not": ["pocket deck", "io13", "event"]}
+{"id": "nm-03", "kind": "near-miss", "prompt": "How do I force quit an app on macOS?", "must_not": ["pocket deck", "s-c-q", "s-c-d"]}
+{"id": "nm-04", "kind": "near-miss", "prompt": "What does grep -F do in GNU grep?", "must_not": ["pocket deck", "micropython"]}
+{"id": "nm-05", "kind": "near-miss", "prompt": "How do I copy a file to a remote server with scp on Linux?", "must_not": ["pocket deck", "scp host username password"]}
+{"id": "nm-06", "kind": "near-miss", "prompt": "What battery connector does a typical drone LiPo use?", "must_not": ["pocket deck"]}
+{"id": "nm-07", "kind": "near-miss", "prompt": "How do I switch virtual desktops on Windows 11?", "must_not": ["pocket deck", "c-[0-9]", "screen 10"]}
+{"id": "nm-08", "kind": "near-miss", "prompt": "How do I change the font size in Emacs?", "must_not": ["pocket deck", "pem", "s-c-="]}
+{"id": "nm-09", "kind": "near-miss", "prompt": "What is MicroPython and which boards does it run on?", "must_not": ["pocket deck"]}
+{"id": "nm-10", "kind": "near-miss", "prompt": "How do I set a kitchen timer on an Amazon Echo?", "must_not": ["pocket deck", "analog_clock"]}
+{"id": "nm-11", "kind": "near-miss", "prompt": "How does rsync decide which files to transfer?", "must_not": ["pocket deck", "newer one wins"]}
+{"id": "nm-12", "kind": "near-miss", "prompt": "Explain the Strudel live-coding environment.", "must_not": ["pocket deck"]}
+{"id": "nm-13", "kind": "near-miss", "prompt": "What is the OpenAI Realtime API used for?", "must_not": ["pocket deck", "gpt_rt"]}
+{"id": "nm-14", "kind": "near-miss", "prompt": "I forgot my iPhone passcode. What can I do?", "must_not": ["pocket deck", "2-hour", "10 times"]}
+{"id": "nm-15", "kind": "near-miss", "prompt": "How do I record audio from the command line on Linux?", "must_not": ["pocket deck", "rec.wav", "/sd/work"]}
+{"id": "un-01", "kind": "unrelated", "prompt": "Write a Python function that returns the n-th Fibonacci number iteratively."}
+{"id": "un-02", "kind": "unrelated", "prompt": "Explain why the sky is blue in three sentences."}
+{"id": "un-03", "kind": "unrelated", "prompt": "What is the capital of Australia, and why isn't it Sydney?"}
+{"id": "un-04", "kind": "unrelated", "prompt": "Summarize the causes of World War I in one paragraph."}
+{"id": "un-05", "kind": "unrelated", "prompt": "Write a haiku about autumn rain."}
+{"id": "un-06", "kind": "unrelated", "prompt": "What is the derivative of x^3 * sin(x)?"}
+{"id": "un-07", "kind": "unrelated", "prompt": "Implement an LRU cache in Python with O(1) get and put."}
+{"id": "un-08", "kind": "unrelated", "prompt": "Translate 'Where is the train station?' into Japanese and French."}
+{"id": "un-09", "kind": "unrelated", "prompt": "What are the main differences between TCP and UDP?"}
+{"id": "un-10", "kind": "unrelated", "prompt": "Give me a recipe for a simple tomato pasta sauce."}
+{"id": "un-11", "kind": "unrelated", "prompt": "Explain how a mixture-of-experts transformer routes tokens."}
+{"id": "un-12", "kind": "unrelated", "prompt": "Write a SQL query that returns the second highest salary from an employees table."}
+{"id": "un-13", "kind": "unrelated", "prompt": "What is the difference between a list and a tuple in Python?"}
+{"id": "un-14", "kind": "unrelated", "prompt": "Describe the plot of Hamlet in five sentences."}
+{"id": "un-15", "kind": "unrelated", "prompt": "How many prime numbers are there below 50? List them."}

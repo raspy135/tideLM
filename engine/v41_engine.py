@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 from engine import experts as EX  # noqa: E402
 from engine import dist as DT  # noqa: E402
 from engine import ablit as R_ablit  # noqa: E402
+from engine import dream_overlay as R_dream  # noqa: E402  (overlay digest, boot guard)
 from engine.engram import EngramReadAhead, EngramTable, make_hash_state, prefetch_rows  # noqa: E402
 from engine.model import MAX_CHUNK, PRUNE_MISS, Caches, Model, Weights  # noqa: E402
 from engine import model as M_  # noqa: E402  (ATTN_TIMING phase table)
@@ -756,7 +757,7 @@ class V41Engine:
 
         def moe_fn(x, slots, weights, arena, limit, out_dtype=torch.float32, slots_repeat=False,
                    null_slot=-1, routing_ids=None, routing_slot_map=None, stage_mark=None,
-                   prefill=False):
+                   prefill=False, dream=None):
             """Dispatch on the arena's format. The DSpark draft arena stays FP4 whatever the main
             arena is -- it is 384 experts (7.2 GB), it is read five times per step, and a 3-bit
             drafter would cost acceptance for nothing.
@@ -783,6 +784,11 @@ class V41Engine:
                 extra.update(routing_ids=routing_ids, routing_slot_map=routing_slot_map)
             if stage_mark is not None and fp4_native:
                 extra['stage_mark'] = stage_mark
+            if dream is not None:
+                # the dreaming FP8 tier (engine/dream_overlay.py): the boot refuses it off this path
+                if not fp4_native:
+                    raise ValueError("the dreaming FP8 tier needs the native FP4 kernels")
+                extra['dream'] = dream
             return fp4_moe_fn(x, slots, weights, arena, limit, out_dtype=out_dtype,
                               slots_repeat=slots_repeat, **extra)
 
@@ -962,6 +968,15 @@ class V41Engine:
             log(f"concurrency: arena {arena_gb:.1f} GB less {lane_bytes / 1e9:.2f} GB for the extra "
                 f"lanes and batched graphs")
             arena_gb = max(10.0, arena_gb - lane_bytes / 1e9)
+        # The dreaming FP8 tier is loaded after the arena (engine/dream_overlay.py::load_fp8_tp), as
+        # this rank's slice of each FP8 expert. Take it out of the arena now, like the lanes above;
+        # a profile's ARENA_GB sits at the memory ceiling (64 experts are ~1.2 GB a rank at TP2).
+        dream_bytes = (R_dream.fp8_tp_bytes(self.ep.world if self.ep.tensor_parallel else 1)
+                       if exl3_cls is None and cb3_cls is None else 0)
+        if dream_bytes:
+            log(f"dreaming overlay: arena {arena_gb:.1f} GB less {dream_bytes / 1e9:.2f} GB for the FP8 tier")
+            arena_gb = max(10.0, arena_gb - dream_bytes / 1e9)
+            lane_bytes += dream_bytes  # and out of the MemAvailable cap below
         if host_avail is not None:
             cap = (host_avail - keep_free_gb * 1e9 - lane_bytes) / 1e9
             if cap < 10.0:
@@ -1018,6 +1033,8 @@ class V41Engine:
                                            log=log).start()
         self.arena = make_expert_arena(slots)
         if exl3_cls is not None:
+            if R_dream.enabled():
+                raise ValueError(f"{R_dream.ENV} serves native FP4 experts; this run uses the EXL3 pack")
             import exl3_store as _XS
             self.store = _XS.Exl3ExpertStore(
                 exl3_pack_path(model_dir, self.ep.rank if self.ep.tensor_parallel else 0,
@@ -1034,8 +1051,32 @@ class V41Engine:
                 _XC.warm(self.arena)   # JIT + per-slot pointer tables before any graph capture
                 log("EXL3 CUDA kernel warm")
         else:
+            overlay = None
+            if R_dream.enabled():
+                if cb3_cls is not None:
+                    raise ValueError(f"{R_dream.ENV} serves native FP4 experts; this run uses the CB3 arena")
+                overlay = R_dream.load(model_dir, index["weight_map"], self.args.n_layers)
+                log(f"dreaming overlay: {R_dream.describe()}")
+                if R_dream.fp8_entries():
+                    # The FP8 tier: the experts' MXFP4 copies stay in the arena (routing, slots and
+                    # the FP4 kernels are unchanged) and the FP8 kernels overwrite their pairs' rows
+                    # (tools/fp4_moe_cuda.py::dream_fp8_up/down) in the decode graphs, prefill and
+                    # the eager path alike. Each rank holds its own slice, as the arena does.
+                    if self.ep.active and not self.ep.tensor_parallel:
+                        raise ValueError(f"{R_dream.ENV}: the FP8 tier needs DSV41_TP_EXPERTS=1 (or one box)")
+                    if (self.ep.tensor_parallel
+                            and os.environ.get("DSV41_TP_EXPERT_LAYOUT", "output") != "output"):
+                        raise ValueError(f"{R_dream.ENV}: the FP8 tier needs DSV41_TP_EXPERT_LAYOUT=output")
+                    t0 = time.perf_counter()
+                    world = self.ep.world if self.ep.tensor_parallel else 1
+                    self._dream_fp8 = R_dream.load_fp8_tp(device, self.ep.rank if world > 1 else 0, world,
+                                                          self.args.n_routed_experts)
+                    n8 = sum(len(d.ids) for d in self._dream_fp8.values())
+                    nb = sum(d.nbytes for d in self._dream_fp8.values())
+                    log(f"dreaming overlay: {n8} FP8 experts in {len(self._dream_fp8)} layers, "
+                        f"{nb / 1e9:.2f} GB this rank, in {time.perf_counter() - t0:.1f}s")
             self.store = EX.ExpertStore(model_dir, index, self.arena, self.args.n_layers, transient_slots=transient_slots,
-                                        io_threads=io_threads, ep=self.ep)
+                                        io_threads=io_threads, ep=self.ep, overlay=overlay)
             self.dspark_reader = self.store
         if self.resident_budget == 'auto':
             from engine.expert_budget import auto_budget
@@ -1060,6 +1101,7 @@ class V41Engine:
         log("DSpark experts resident")
 
         self.model = Model(self.W, self.store, self.caches, self.moe_fn, act_quant=act_quant)
+        self.model.dream_fp8 = getattr(self, "_dream_fp8", None)
         self.model.hash_state = make_hash_state(model_dir, self.tokenizer, max_seq, device)
         # Vision tower: present only if the checkpoint has one, and skippable for a text-only
         # server that would rather keep the 0.9 GB (about 2.5 experts per layer at fp4).
@@ -1197,6 +1239,16 @@ class V41Engine:
             else:
                 masks, keep = build_keep_masks(counts, prune_keep, prune_select, device,
                                               layer_counts=self.prune_layer_counts)
+            self._dream_pins = R_dream.pins()
+            if self._dream_pins:
+                # A dreaming overlay's experts stay resident and routable: the router can never pick
+                # a pruned expert, so its lesson would silently not exist. Same input on both ranks
+                # (the manifest digest is in the boot guard), so the same masks.
+                keep = R_dream.pin_keep(keep, counts, self._dream_pins)
+                masks = {L: torch.zeros(self.args.n_routed_experts, dtype=torch.bool, device=device) for L in keep}
+                for L, ids in keep.items():
+                    masks[L][ids] = True
+                log(f"dreaming overlay: {sum(map(len, self._dream_pins.values()))} experts pinned resident")
             n_keep = max(len(v) for v in keep.values())
             ranked = [(float(counts[L][e]), L, int(e)) for L, ks in keep.items() for e in ks]
             ranked.sort(reverse=True)
@@ -1400,10 +1452,17 @@ class V41Engine:
                 # same file -- the digest, not just the switch, is what both ranks compare.
                 "ablate_wob": R_ablit.enabled(),
                 "ablate_wob_digest": R_ablit.digest(),
+                # A dreaming overlay replaces routed experts; both ranks hold half of each, so a
+                # pair on different generations sums halves of different experts. The digest
+                # pins the manifest, and load() has already hashed every file against it.
                 # the drafter's sampled q (engine/fastdecode.py::DRAFT_NUCLEUS): both ranks run
                 # the draft graph, so a pair split across it would verify different proposals
                 "draft_nucleus": (os.environ.get("DSV41_DRAFT_NUCLEUS", "0") + "/"
                                   + os.environ.get("DSV41_DRAFT_NUCLEUS_K", "512")),
+                "dream_overlay": R_dream.digest(),
+                # the FP8 tier changes which kernels compute those experts; the digest pins the
+                # manifest, this pins that both ranks actually loaded the tier
+                "dream_fp8": sum(len(d.ids) for d in (getattr(self, "_dream_fp8", None) or {}).values()),
                 "head_fmt": R.head_fmt(),
                 "head_kernel": head_kernel(),
                 "head_kernel_version": HEAD_KERNEL_VERSION,
@@ -2272,8 +2331,11 @@ class V41Engine:
             from engine.global_residency import global_plan
             keeps = {L:msk.cpu().numpy() for L,msk in self.model_prune_mask.items()}
             scores = {L:ranked[L]*self.prune_layer_weights[L] for L in keeps}
+            protected = dict(self.user_prompt.protected)
+            for L, ids in (getattr(self, '_dream_pins', None) or {}).items():
+                protected[L] = sorted(set(protected.get(L, [])) | set(ids))
             swaps, _ = global_plan(keeps, scores, self.dynamic_layer_floor, max_swaps,
-                                  protected=self.user_prompt.protected,
+                                  protected=protected,
                                   min_gain=min_gain*float(np.mean(list(scores.values()))))
             return swaps
         world = 1 if getattr(self.ep, 'tensor_parallel', False) else max(1, self.ep.world)
@@ -2290,6 +2352,7 @@ class V41Engine:
                 focus = getattr(self, 'user_prompt', None)
                 if focus is not None:
                     protected[focus.protected.get(L, [])] = True
+                protected[(getattr(self, '_dream_pins', None) or {}).get(L, [])] = True
                 kept_own = np.flatnonzero(keep & own & ~protected)
                 gone_own = np.flatnonzero(~keep & own)
                 if not len(kept_own) or not len(gone_own):
@@ -2333,9 +2396,11 @@ class V41Engine:
                     if getattr(self, 'dynamic_experts', False):
                         from engine.global_residency import prompt_plan
                         packet = prompt_plan(keeps, mass, fallback, self.dynamic_layer_floor,
-                                             self.prune_layer_weights, None)
+                                             self.prune_layer_weights, None,
+                                             pinned=getattr(self, '_dream_pins', None))
                     else:
-                        packet = capped_retention_plan(keeps, mass, fallback)
+                        packet = capped_retention_plan(keeps, mass, fallback,
+                                                       pinned=getattr(self, '_dream_pins', None))
             except Exception as exc:
                 packet = dict(error=type(exc).__name__)
         # Empty/attachment-only/no-user requests participate too. No rank-local
@@ -3551,6 +3616,7 @@ class V41Engine:
             "comm_backend": os.environ.get("DSV41_COMM_BACKEND", "roce"),
             "roce_max_kb": os.environ.get("DSV41_ROCE_MAX_KB", "256"),
             "ablate_wob": R_ablit.enabled(),
+            "dream_overlay": R_dream.digest(),
             "draft_head_fmt": R.draft_head_fmt(),
             "markov_head_fmt": _FD.MARKOV_HEAD_FMT,
             "tp_draft_head": os.environ.get('DSV41_TP_DRAFT_HEAD', '0') == '1',

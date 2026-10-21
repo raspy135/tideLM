@@ -11,6 +11,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdint>
 
@@ -850,6 +851,103 @@ __global__ void round_reduce(const float *parts, void *out, int td, int topk, in
         static_cast<float *>(out)[i] = total;
 }
 
+// Dreaming FP8 tier (engine/dream_overlay.py): a few trained experts are served from e4m3 codes
+// with one UE8M0 scale per 32 weights instead of MXFP4. Their pairs still run through the FP4
+// kernels above (the expert's MXFP4 copy is resident, so routing and blocks are unchanged); these
+// two kernels then OVERWRITE those pairs' rows -- the activated intermediate after `up`, the
+// per-pair output after `down` -- in the same layouts, so everything downstream (the TP gathers,
+// the k-sum, the BF16 rounding points) is untouched. The grid is static (pairs x row blocks) and a
+// block whose pair is not an FP8 expert exits at once, so the launches capture into decode graphs.
+// One warp a row; each lane takes whole 32-weight groups and the lanes' sums meet in a fixed
+// butterfly, so the bits depend only on the inputs: each rank computes its own rows, deterministically.
+__device__ __forceinline__ float fp8_group_dot(const uint8_t *w, const __nv_bfloat16 *x) {
+    // 32 e4m3 weights x 32 BF16 activations, accumulated in index order.
+    const uint4 wq[2] = {reinterpret_cast<const uint4 *>(w)[0], reinterpret_cast<const uint4 *>(w)[1]};
+    const uint4 *xq = reinterpret_cast<const uint4 *>(x);
+    float acc = 0.0f;
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        const uint4 xv = xq[c];
+        const uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
+        const uint4 wv = wq[c >> 1];
+        const uint32_t ww[4] = {wv.x, wv.y, wv.z, wv.w};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            // weights 8c + 2j, 8c + 2j + 1 sit in byte pair (c & 1) * 4 + j of the 16-byte word
+            const int b = (c & 1) * 8 + 2 * j;
+            const uint16_t pair = static_cast<uint16_t>((ww[b >> 2] >> ((b & 3) * 8)) & 0xffff);
+            const __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2(pair, __NV_E4M3);
+            const float2 wf = __half22float2(*reinterpret_cast<const __half2 *>(&hr));
+            acc = fmaf(__bfloat162float(__ushort_as_bfloat16(xw[j] & 0xffff)), wf.x, acc);
+            acc = fmaf(__bfloat162float(__ushort_as_bfloat16(xw[j] >> 16)), wf.y, acc);
+        }
+    }
+    return acc;
+}
+
+__device__ __forceinline__ float fp8_row_dot(const uint8_t *w_row, const uint8_t *s_row,
+                                             const __nv_bfloat16 *x_row, int groups, int lane) {
+    float acc = 0.0f;
+    for (int g = lane; g < groups; g += 32)
+        acc = fmaf(fp8_group_dot(w_row + g * 32, x_row + g * 32), ue8m0(s_row[g]), acc);
+#pragma unroll
+    for (int o = 16; o; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    return acc;
+}
+
+__global__ void dream_fp8_up(
+    const __nv_bfloat16 *__restrict__ x, int64_t stride_x, const int64_t *__restrict__ idx,
+    const int32_t *__restrict__ map, int n_experts, const uint8_t *__restrict__ w13,
+    const uint8_t *__restrict__ s13, __nv_bfloat16 *__restrict__ h, int64_t stride_h,
+    const float *__restrict__ route_weight, float limit, int topk, int n, int k) {
+    const int pair = blockIdx.x;
+    const int64_t e = idx[pair];
+    if (e < 0 || e >= n_experts) return;
+    const int slot = map[e];
+    if (slot < 0) return;
+    const int lane = threadIdx.x & 31;
+    const int row = (static_cast<int>(blockIdx.y) << kWarpsShift) + (threadIdx.x >> 5);
+    if (row >= n) return;
+    const int groups = k >> 5;
+    const __nv_bfloat16 *x_row = x + static_cast<int64_t>(pair / topk) * stride_x;
+    const int64_t g_row = static_cast<int64_t>(slot) * 2 * n + row, u_row = g_row + n;
+    const float gate = fp8_row_dot(w13 + g_row * k, s13 + g_row * groups, x_row, groups, lane);
+    const float up = fp8_row_dot(w13 + u_row * k, s13 + u_row * groups, x_row, groups, lane);
+    if (lane == 0) {
+        // the FP4 kernels' epilogue: BF16 projections, clamp, SiLU, routing weight, BF16 out
+        float g = __bfloat162float(__float2bfloat16_rn(gate));
+        float u = __bfloat162float(__float2bfloat16_rn(up));
+        g = fminf(g, limit);
+        u = fminf(fmaxf(u, -limit), limit);
+        h[static_cast<int64_t>(pair) * stride_h + row] =
+            __float2bfloat16_rn(silu_like_triton(g) * u * route_weight[pair]);
+    }
+}
+
+__global__ void dream_fp8_down(
+    const __nv_bfloat16 *__restrict__ h, int64_t stride_h, const int64_t *__restrict__ idx,
+    const int32_t *__restrict__ map, int n_experts, const uint8_t *__restrict__ w2,
+    const uint8_t *__restrict__ s2, float *__restrict__ y, int64_t stride_y,
+    int topk, int n, int k, int ntok, int partial) {
+    const int pair = blockIdx.x;
+    const int64_t e = idx[pair];
+    if (e < 0 || e >= n_experts) return;
+    const int slot = map[e];
+    if (slot < 0) return;
+    const int lane = threadIdx.x & 31;
+    const int row = (static_cast<int>(blockIdx.y) << kWarpsShift) + (threadIdx.x >> 5);
+    if (row >= n) return;
+    const int groups = k >> 5;
+    const int64_t w_row = static_cast<int64_t>(slot) * n + row;
+    const float acc = fp8_row_dot(w2 + w_row * k, s2 + w_row * groups,
+                                  h + static_cast<int64_t>(pair) * stride_h, groups, lane);
+    if (lane == 0) {
+        // v2 down's parts_world == 1 layout: row (expert_k * ntok + token)
+        const int64_t out_row = static_cast<int64_t>(pair % topk) * ntok + pair / topk;
+        y[out_row * stride_y + row] = partial ? acc : __bfloat162float(__float2bfloat16_rn(acc));
+    }
+}
+
 } // namespace
 
 extern "C" int fp4_moe_cuda_up(
@@ -962,5 +1060,30 @@ extern "C" int fp4_moe_cuda_round_reduce(void *stream, const void *parts, void *
                                            int td, int topk, int out_bf16) {
     round_reduce<<<(td + 255) >> 8, 256, 0, static_cast<cudaStream_t>(stream)>>>(
         static_cast<const float *>(parts), out, td, topk, out_bf16);
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int dream_fp8_cuda_up(
+    void *stream, const void *x, int64_t stride_x, const void *idx, const void *map, int n_experts,
+    const void *w13, const void *s13, void *h, int64_t stride_h, const void *route_weight,
+    float limit, int topk, int pairs, int n, int k) {
+    if (k & 31) return static_cast<int>(cudaErrorInvalidValue);
+    dream_fp8_up<<<dim3(pairs, (n + kWarps - 1) / kWarps), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16 *>(x), stride_x, static_cast<const int64_t *>(idx),
+        static_cast<const int32_t *>(map), n_experts, static_cast<const uint8_t *>(w13),
+        static_cast<const uint8_t *>(s13), static_cast<__nv_bfloat16 *>(h), stride_h,
+        static_cast<const float *>(route_weight), limit, topk, n, k);
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int dream_fp8_cuda_down(
+    void *stream, const void *h, int64_t stride_h, const void *idx, const void *map, int n_experts,
+    const void *w2, const void *s2, void *y, int64_t stride_y, int topk, int pairs, int n, int k,
+    int ntok, int partial) {
+    if (k & 31) return static_cast<int>(cudaErrorInvalidValue);
+    dream_fp8_down<<<dim3(pairs, (n + kWarps - 1) / kWarps), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16 *>(h), stride_h, static_cast<const int64_t *>(idx),
+        static_cast<const int32_t *>(map), n_experts, static_cast<const uint8_t *>(w2),
+        static_cast<const uint8_t *>(s2), static_cast<float *>(y), stride_y, topk, n, k, ntok, partial);
     return static_cast<int>(cudaGetLastError());
 }

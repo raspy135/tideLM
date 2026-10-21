@@ -625,6 +625,7 @@ def moe_forward(
     routing_slot_map: torch.Tensor | None = None,
     stage_mark=None,
     prefill: bool = False,
+    dream=None,
 ) -> torch.Tensor:
     """x bf16 [T, 5120], slots int32 [T, K] (arena slot per routed expert), weights fp32 [T, K] -> bf16 [T, 5120].
 
@@ -640,7 +641,11 @@ def moe_forward(
     decode router gives those zero-contribution pairs distinct temporary keys and maps them back to
     the null slot after grouping. Real experts can then use the sweep-tuned BM=16 without the null
     run overflowing its one block. Without `null_slot`, the conservative BM=64 fallback remains.
-    See build_routing_small's HARD INVARIANT. Default False keeps the single-box path unchanged."""
+    See build_routing_small's HARD INVARIANT. Default False keeps the single-box path unchanged.
+
+    `dream=(tier, indices)`: the dreaming FP8 tier of this layer (engine/dream_overlay.py::Fp8Layer)
+    and the router's expert ids [T, K]. Its experts' pairs run through the FP4 kernels as usual and
+    are then overwritten by the FP8 kernels -- h after up, parts after down -- in place."""
     # null_slot must denote a known zero expert, never an ordinary arena slot.
     assert x.dtype == torch.bfloat16 and x.shape[1] == DIM and x.is_contiguous()
     T, K = slots.shape
@@ -733,6 +738,11 @@ def moe_forward(
             x.stride(0), h.stride(0), float(swiglu_limit),
             TOPK=K, N=inter, K=DIM, BM=BM, BN=bn1, SCALED=scaled, NULL_SLOT=null_slot, num_warps=nw1, num_stages=ns1,
         )
+    if dream is not None:
+        import fp4_moe_cuda as CUDA8
+        tier, dream_idx = dream
+        dream_idx = dream_idx.reshape(-1).to(torch.int64).contiguous()
+        CUDA8.dream_fp8_up(x, dream_idx, tier, h, wgt, float(swiglu_limit), K)
     if stage_mark is not None:
         stage_mark('up_gemm')
     down_k = inter
@@ -759,6 +769,10 @@ def moe_forward(
             PARTIAL=tp and not tp_output, PARTS_WORLD=parts_world,
             num_warps=nw2, num_stages=ns2,
         )
+    if dream is not None:
+        if parts_world != 1 or down_k != tier.w2.shape[2]:
+            raise ValueError("the dreaming FP8 tier needs the output TP layout (or one box)")
+        CUDA8.dream_fp8_down(h, dream_idx, tier, parts, K, T, partial=tp and not tp_output)
     if stage_mark is not None:
         stage_mark('down_gemm')
     if tp_output:

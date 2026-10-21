@@ -84,9 +84,13 @@ def _library():
     lib.fp4_moe_cuda_down_v3.argtypes = lib.fp4_moe_cuda_down.argtypes + [i32]
     lib.fp4_moe_cuda_route_small.argtypes = [ptr, ptr, ptr, ptr, ptr, i32, i32]
     lib.fp4_moe_cuda_round_reduce.argtypes = [ptr, ptr, ptr, i32, i32, i32]
+    lib.dream_fp8_cuda_up.argtypes = [ptr, ptr, i64, ptr, ptr, i32, ptr, ptr, ptr, i64, ptr,
+                                      f32, i32, i32, i32, i32]
+    lib.dream_fp8_cuda_down.argtypes = [ptr, ptr, i64, ptr, ptr, i32, ptr, ptr, ptr, i64,
+                                        i32, i32, i32, i32, i32, i32]
     for name in ("fp4_moe_cuda_up", "fp4_moe_cuda_down", "fp4_moe_cuda_route_small",
                  "fp4_moe_cuda_round_reduce", "fp4_moe_cuda_up_v2", "fp4_moe_cuda_down_v2",
-                 "fp4_moe_cuda_down_v3"):
+                 "fp4_moe_cuda_down_v3", "dream_fp8_cuda_up", "dream_fp8_cuda_down"):
         getattr(lib, name).restype = i32
     return lib
 
@@ -133,6 +137,33 @@ def build_routing_small(slots: torch.Tensor, block_m: int, topk: int):
         _stream(), _p(slots), _p(block_slot), _p(block_pair), _p(block_route), pairs, topk),
         "route")
     return block_slot, block_pair, block_route, pairs
+
+
+def dream_fp8_up(x, idx, tier, h, route_weight, limit: float, topk: int):
+    """Overwrite h's rows for the pairs routed to an FP8-tier expert (engine/dream_overlay.py).
+
+    idx: int64 [P] expert ids (pair p = token * topk + k, as h's rows); tier: one layer's
+    Fp8Layer (map [n_experts] int32 -> slot or -1, w13 [S, 2n, K] e4m3, s13 [S, 2n, K/32] UE8M0)."""
+    pairs = idx.numel()
+    n, k = tier.w13.shape[1] // 2, tier.w13.shape[2]
+    if x.stride(1) != 1 or h.stride(1) != 1 or route_weight.dtype != torch.float32:
+        raise ValueError("dream_fp8_up: row-major x/h and fp32 route weights required")
+    _check(_lib().dream_fp8_cuda_up(
+        _stream(), _p(x), x.stride(0), _p(idx), _p(tier.map), tier.map.numel(), _p(tier.w13),
+        _p(tier.s13), _p(h), h.stride(0), _p(route_weight), float(limit), topk, pairs, n, k),
+        "dream fp8 up")
+
+
+def dream_fp8_down(h, idx, tier, parts, topk: int, ntok: int, partial: bool = False):
+    """Overwrite parts' rows (expert_k * ntok + token) for the FP8-tier pairs, as v2 down writes them."""
+    pairs = idx.numel()
+    n, k = tier.w2.shape[1], tier.w2.shape[2]
+    if h.stride(1) != 1 or parts.stride(1) != 1 or h.shape[1] < k:
+        raise ValueError("dream_fp8_down: row-major h/parts with the full intermediate required")
+    _check(_lib().dream_fp8_cuda_down(
+        _stream(), _p(h), h.stride(0), _p(idx), _p(tier.map), tier.map.numel(), _p(tier.w2),
+        _p(tier.s2), _p(parts), parts.stride(0), topk, pairs, n, k, ntok, int(partial)),
+        "dream fp8 down")
 
 
 def up(x, w1, s1, w3, s3, h, route_weight, block_slot, block_pair, limit,

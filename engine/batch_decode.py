@@ -283,6 +283,12 @@ class BatchDecoder:
         lane.lean.block_null(block_slot, null)
         CUDA.up(x, arena.w1, arena.s1, arena.w3, arena.s3, h_all[:P], self.rw.reshape(-1),
                 block_slot, block_route, float(a.swiglu_limit), k, inter, K.DIM, NB, null)
+        tier = (lane.m.dream_fp8 or {}).get(L) if getattr(lane.m, "dream_fp8", None) else None
+        if tier is not None:
+            # the dreaming FP8 tier (engine/dream_overlay.py); an idle row's output is discarded
+            # like its FP4 rows, so computing it from stale ids is harmless
+            CUDA.dream_fp8_up(x, self.ridx.view(-1), tier, h_all[:P], self.rw.view(-1),
+                              float(a.swiglu_limit), k)
         if side is not None:
             main.wait_stream(side)
         else:
@@ -302,6 +308,8 @@ class BatchDecoder:
         parts = torch.empty(P, self.down_n, dtype=torch.float32, device=x.device)
         CUDA.down(full[:P], arena.w2, arena.s2, parts, block_slot, block_pair, k, self.down_n,
                   world * inter, rows, NB, null, False, 1)
+        if tier is not None:
+            CUDA.dream_fp8_down(full[:P], self.ridx.view(-1), tier, parts, k, rows)
         local = parts.view(k, rows, self.down_n).sum(dim=0)
         if side is not None:
             main.wait_stream(side)

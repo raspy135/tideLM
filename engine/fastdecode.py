@@ -1032,9 +1032,11 @@ class FastDecoder:
             # After the stats and taps (they describe the router), before any slot lookup.
             _ETP.apply_(self.route_idx, self.route_w, *self.expert_topp, self.topp_sentinel)
 
-    def _routed_experts(self):
+    def _routed_experts(self, L=None):
         a = self.a
         store = self.m.store
+        tier = (self.m.dream_fp8 or {}).get(L) if getattr(self.m, "dream_fp8", None) else None
+        dream = (tier, self.route_idx) if tier is not None else None
         if getattr(store, "null_slot", None) is not None:
             # EP2 (engine/dist.py). This path does NOT go through Model.moe, so the two things
             # that method does for expert parallel have to be done here as well -- and both are
@@ -1051,11 +1053,12 @@ class FastDecoder:
             # verified NCCL collectives capture and replay correctly on these two boxes.
             out = self.m.moe_fn(self.y, self.slots, self.route_w, store.arena, a.swiglu_limit,
                                 out_dtype=torch.float32, slots_repeat=True,
-                                null_slot=store.null_slot)
+                                null_slot=store.null_slot, dream=dream)
             if not getattr(store.ep, 'tensor_parallel', False):
                 store.ep.combine(out)
         else:
-            out = self.m.moe_fn(self.y, self.slots, self.route_w, store.arena, a.swiglu_limit).float()
+            out = self.m.moe_fn(self.y, self.slots, self.route_w, store.arena, a.swiglu_limit,
+                                dream=dream).float()
         return out
 
     def _moe_merged_ok(self, w) -> bool:
@@ -1230,6 +1233,11 @@ class FastDecoder:
         self.lean.block_null(block_slot, null)
         CUDA.up(x, arena.w1, arena.s1, arena.w3, arena.s3, h_all[:P], self.route_w.reshape(-1),
                 block_slot, block_route, float(a.swiglu_limit), k, inter, K.DIM, NB, null)
+        tier = (self.m.dream_fp8 or {}).get(L) if getattr(self.m, "dream_fp8", None) else None
+        if tier is not None:
+            # the dreaming FP8 tier overwrites its experts' rows (engine/dream_overlay.py)
+            CUDA.dream_fp8_up(x, self.route_idx.view(-1), tier, h_all[:P], self.route_w.view(-1),
+                              float(a.swiglu_limit), k)
         if side is not None:
             main.wait_stream(side)
         else:
@@ -1250,6 +1258,8 @@ class FastDecoder:
         parts = torch.empty(P, down_n, dtype=torch.float32, device=x.device)
         CUDA.down(full[:P], arena.w2, arena.s2, parts, block_slot, block_pair, k, down_n,
                   world * inter, T, NB, null, False, 1)
+        if tier is not None:
+            CUDA.dream_fp8_down(full[:P], self.route_idx.view(-1), tier, parts, k, T)
         local = parts.view(k, T, down_n).sum(dim=0)
         if side is not None:
             main.wait_stream(side)
@@ -1299,7 +1309,7 @@ class FastDecoder:
         self._pf_join()
         lean = self.lean is not None
         if self.shared_stream is None:
-            out = self._routed_experts()
+            out = self._routed_experts(L)
             _sh = self._shared_ffn(self.y, w)
             if not lean:
                 _sh = _sh.float()
@@ -1314,7 +1324,7 @@ class FastDecoder:
                 if not lean:
                     _sh = _sh.float()
             try:
-                out = self._routed_experts()
+                out = self._routed_experts(L)
             finally:
                 main.wait_stream(self.shared_stream)
             # _sh is allocated on the side stream but consumed on main. Keep the

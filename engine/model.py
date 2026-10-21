@@ -1264,6 +1264,11 @@ class Model:
             focus.record(L, indices, weights / a.route_scale, focus_rows)
         self._tap("route_idx", L, indices); self._tap("route_w", L, weights)
         t0 = time.perf_counter()
+        # Dreaming FP8 tier (engine/dream_overlay.py::load_fp8_tp): an expert the overlay serves as
+        # FP8 still routes and resolves exactly as before -- its MXFP4 copy is in the arena -- and
+        # the FP8 kernels overwrite its pairs' rows inside moe_fn (tools/fp4_moe.py::moe_forward).
+        side = getattr(self, "dream_fp8", None)
+        dream = (side[L], indices) if side and n_experts != 128 and L in side else None
         # All-resident configurations carry a device slot table (built by the engine from the
         # store's LRU). Using it here turns routing into one GPU gather instead of a host round-trip
         # plus a Python pass over every (layer, expert) pair in the chunk. The table is only valid
@@ -1340,7 +1345,7 @@ class Model:
                                  slots_repeat=True, prefill=prefill,
                                  null_slot=(store.null_slot if (not prefill or
                                             os.environ.get("DSV41_PREFILL_SKIP_NULL", "1") == "1") else -1),
-                                 **route_args)
+                                 dream=dream, **route_args)
             # Split the combine off on the GPU timeline. The host timer below (ep_s) measures the
             # LAUNCH -- dist.all_reduce is async on CUDA -- which is why it reports ~0.25 ms for a
             # collective that G2 measured at 3.5 ms for this payload. The gap between these two
@@ -1362,7 +1367,8 @@ class Model:
             route_args = {}
             if route is not None and os.environ.get("DSV41_PREFILL_FIXED_ROUTING", "1") == "1":
                 route_args = dict(routing_ids=route[0][indices], routing_slot_map=route[1])
-            routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit, prefill=prefill, **route_args).float()
+            routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit, prefill=prefill, dream=dream,
+                                 **route_args).float()
         _mark("moe")         # router + slot resolve + routed experts; combine may overlap below
         shared = R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
         # A TP shared expert's RowParallelWeight reduces before BF16 rounding inside

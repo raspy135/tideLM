@@ -122,7 +122,7 @@ def _pread_chunk(fd: int, view: memoryview, off: int, need: int) -> None:
 class ExpertStore:
     def __init__(self, model_dir: str, index: dict, arena, n_layers: int, transient_slots: int = 400,
                  io_threads: int = 12, mtp_prefix: str | None = None, read_threads: int | None = None,
-                 read_chunk_mb: float | None = None, ep=None):
+                 read_chunk_mb: float | None = None, ep=None, overlay: dict | None = None):
         self.model_dir = model_dir
         self.arena = arena  # tools.fp4_moe.ExpertArena or a compatible object with .slots and load_slot_bytes
         # EP2 (engine/dist.py): with expert parallel active, this rank only resolves experts it
@@ -153,7 +153,11 @@ class ExpertStore:
         # expert is resident (pruned all-resident mode). resolve() asserts on slot collisions either way.
         assert transient_slots >= 8, 'transient ring too small'
         self.shards: dict[str, ShardFile] = {}
-        self.index = index["weight_map"]
+        # A dreaming overlay (engine/dream_overlay.py) maps some experts' tensor names to its own
+        # files (absolute paths, which os.path.join in _shard keeps as they are). Every read --
+        # arena, transient ring, hot reads, swap staging -- goes through _shard, so this is the
+        # whole of serving it.
+        self.index = {**index["weight_map"], **(overlay or {})}
         self.lru: OrderedDict[tuple, int] = OrderedDict()  # (layer, expert) -> slot
         self.slot_key: dict[int, tuple] = {}
         self.free_lru = list(range(self.lru_slots))
