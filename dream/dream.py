@@ -255,7 +255,10 @@ def profile_model_dir(cfg) -> str:
 
 
 def docker_train(cfg, args, name, log_path) -> subprocess.Popen:
+    # --user: as root the trainer left train/ and serve/ owned by root, and the host-side
+    # `overlay.py use` could not make serve/current (2026-10-21's first full dream).
     cmd = ["docker", "run", "--rm", "--name", name, "--gpus", "all", "--ipc", "host",
+           "--user", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp",
            "-e", f"MODEL_DIR={profile_model_dir(cfg)}",
            "-v", f"{ROOT}:/w:ro", "-v", f"{cfg['models_dir']}:/models:ro", "-v", f"{HOST_DIR}:{CONT_DIR}",
            "-w", "/w", "-e", "PYTHONDONTWRITEBYTECODE=1", "-e", "PYTHONUNBUFFERED=1", "-e", f"DREAM_DIR={CONT_DIR}",

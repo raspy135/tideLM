@@ -138,10 +138,34 @@ def load_corpus(path):
 
 
 # ------------------------------------------------------------------ prefix pass
+def fit_corpus(path, run: Path, max_len: int) -> str:
+    """The corpus without sequences longer than max_len tokens, as run/corpus.fit.jsonl.
+
+    The prefix pass caps a sequence at 4,096 tokens (tools/engram_rows.py's cache, expert_trace's
+    --max-len): one medium-effort lesson whose reasoning ran to 4,139 tokens failed 2026-10-21's
+    dream. Dropping it costs one lesson; both `prefix` and `train` call this, so they agree."""
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(MODEL_DIR)
+    out = run / "corpus.fit.jsonl"
+    kept, dropped = [], []
+    for line in open(path):
+        if not line.strip():
+            continue
+        d = json.loads(line)
+        n = len(tok.encode(d["text"], add_special_tokens=False))
+        (kept if n <= max_len else dropped).append((d["id"], n, line))
+    run.mkdir(parents=True, exist_ok=True)
+    out.write_text("".join(line if line.endswith("\n") else line + "\n" for _, _, line in kept))
+    for id_, n, _ in dropped:
+        log(f"corpus: dropped {id_} ({n} tokens > --max-len {max_len})")
+    return str(out)
+
+
 def cmd_prefix(a):
     log(f"checkpoint: {MODEL_DIR}")
     run = Path(a.run)
     (run / "engram").mkdir(parents=True, exist_ok=True)
+    a.corpus = fit_corpus(a.corpus, run, a.max_len)
     index = json.load(open(os.path.join(MODEL_DIR, "model.safetensors.index.json")))["weight_map"]
     shards = sorted({index[k] for k in index if ".engram.embed." in k})
     py = sys.executable
@@ -358,7 +382,7 @@ def cmd_train(a):
     torch.manual_seed(0)
     random.seed(0)
     run = Path(a.run)
-    seqs = load_corpus(a.corpus)
+    seqs = load_corpus(fit_corpus(a.corpus, Path(a.run), a.max_len))
     st_path = run / "prefix" / "state" / f"after_layer{a.first - 1}.pt"
     prefix = torch.load(st_path, map_location=DEV)
     assert prefix["layer"] == a.first - 1
@@ -523,8 +547,11 @@ def cmd_train(a):
                       "drift_stock": drs, "max_delta": moved})
         # Early stopping on the copy that will be served: FP8 when the budget covers every trained
         # expert (each one not consolidated into MXFP4 then serves FP8), MXFP4 otherwise.
+        # Only an epoch whose served copy passes the drift gate can be the one exported: picking the
+        # best held-out epoch first and gating it after would fail the whole night once training runs
+        # past the drift limit (FP8 drift rose 0 -> 0.030 in 2 epochs on 2026-10-21, limit 0.05).
         hs = h8 if serve_fp8 else h
-        if hs < best["heldout_nll"]:
+        if hs < best["heldout_nll"] and (dr8 if serve_fp8 else dr) <= a.max_drift:
             best = {"heldout_nll": hs, "epoch": ep,
                     "masters": {(L, e): [p.detach().clone() for p in experts[L].masters[e]]
                                 for L in top for e in chosen[L]},
@@ -538,12 +565,23 @@ def cmd_train(a):
                 opt.state[p] = st
         log(f"early stop: exporting epoch {best['epoch']} (held-out nll {best['heldout_nll']:.3f}), not {a.epochs}")
     final = next(c for c in curve if c["epoch"] == best["epoch"]) if best["masters"] is not None else curve[-1]
+    exported_epoch = best["epoch"]
 
-    # save the masters and their optimizer state (the next dream resumes from them)
+    # Free what the export does not need before it allocates: the best epoch's copy of the masters
+    # and Adam state (~13.6 GB for 32 experts), the prefix states and the stock references. CPU and
+    # GPU share the Spark's 121 GB; on 2026-10-21 the export's extra host copy of the masters ran
+    # the box down to 2 GB free and into swap, and the session's memory guard killed the driver.
+    best = teacher = teacher_stock = prefix = None
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # save the masters and their optimizer state (the next dream resumes from them). CUDA tensors go
+    # to torch.save as they are: it copies one storage at a time, never the whole set at once.
     torch.save({"chosen": chosen, "lr": a.lr, "epochs": a.epochs, "forward": a.forward, "parent": a.resume,
-                "masters": {f"{L}.{e}": [p.detach().cpu() for p in experts[L].masters[e]]
+                "masters": {f"{L}.{e}": [p.detach() for p in experts[L].masters[e]]
                             for L in top for e in chosen[L]},
-                "opt": {f"{L}.{e}": [{k: v.detach().cpu() for k, v in opt.state[p].items()}
+                "opt": {f"{L}.{e}": [{k: v.detach() for k, v in opt.state[p].items()}
                                      for p in experts[L].masters[e]]
                         for L in top for e in chosen[L]},
                 "curve": curve}, run / f"masters-{a.gen}.pt")
@@ -614,7 +652,7 @@ def cmd_train(a):
            "base_index_sha256": D.sha256_file(os.path.join(MODEL_DIR, "model.safetensors.index.json")),
            "parent": a.parent, "note": a.note or f"train {run.name}: layers {a.first}+, {a.experts}/layer, "
                                                  f"lr {a.lr}, {a.epochs} epochs, forward {a.forward}",
-           "fp8_budget": a.fp8_budget, "consolidated_at": a.consolidated, "exported_epoch": best["epoch"],
+           "fp8_budget": a.fp8_budget, "consolidated_at": a.consolidated, "exported_epoch": exported_epoch,
            "drift_gate": gate, "experts": entries, "curve": curve}
     (gen / D.MANIFEST).write_text(json.dumps(man, indent=1) + "\n")
     ks = sorted(x["kept"] for x in entries)
@@ -666,6 +704,7 @@ def main():
                    help="longest sequence the trace accepts (medium-effort lessons with reasoning reach ~1.3K)")
     t = sub.add_parser("train")
     t.add_argument("--corpus", required=True)
+    t.add_argument("--max-len", type=int, default=4096, help="drop longer sequences, as `prefix` does")
     t.add_argument("--run", required=True)
     t.add_argument("--first", type=int, required=True)
     t.add_argument("--experts", type=int, default=8, help="trained experts per layer")
