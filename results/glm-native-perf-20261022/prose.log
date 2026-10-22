@@ -1,0 +1,12 @@
+== glm-native-perf-prose: workload=prose isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=None
+  warmup  isl=53 ttft=   2476.1 ms  tpot=  68.38 ms  decode= 14.62 tok/s  out=1024 (length)
+          accept_len=None  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=53 ttft=   1740.9 ms  tpot=  65.80 ms  decode= 15.20 tok/s  out=1024 (length)
+          accept_len=None  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=53 ttft=    730.8 ms  tpot=  64.12 ms  decode= 15.60 tok/s  out=1024 (length)
+          accept_len=None  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=53 ttft=    704.1 ms  tpot=  66.51 ms  decode= 15.04 tok/s  out=1024 (length)
+          accept_len=None  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=730.7724 ms  tpot=65.7981 ms  decode=15.198 tok/s
+  -> ENGINE  accept_len=None  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /home/ryan/git/tidelm-glm/results/glm-native-perf-20261022/prose.json

@@ -1,0 +1,12 @@
+== glm-native-perf-code: workload=code isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=None
+  warmup  isl=68 ttft=   1682.0 ms  tpot=  52.59 ms  decode= 19.02 tok/s  out=1024 (length)
+          accept_len=None  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=68 ttft=    797.7 ms  tpot=  49.17 ms  decode= 20.34 tok/s  out=1024 (length)
+          accept_len=None  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=68 ttft=    771.5 ms  tpot=  45.76 ms  decode= 21.86 tok/s  out=1024 (length)
+          accept_len=None  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=68 ttft=    767.1 ms  tpot=  49.70 ms  decode= 20.12 tok/s  out=1024 (length)
+          accept_len=None  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=771.5455 ms  tpot=49.1669 ms  decode=20.3389 tok/s
+  -> ENGINE  accept_len=None  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /home/ryan/git/tidelm-glm/results/glm-native-perf-20261022/code.json

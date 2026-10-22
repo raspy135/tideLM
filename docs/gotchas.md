@@ -4053,3 +4053,51 @@ is no completed fresh paired native arm, so a historical-chart gap is not an
 isolated codec regression. Keep the feature off pending serving qualification.
 The compiled packed up kernel also uses 169 registers versus native's 150;
 that is a plausible cost to investigate, not a measured causal explanation.
+
+## Native GLM EXL3: what it lost against the hybrid, by microbenchmark (2026-10-22)
+
+The hybrid profile ran FP8 attention (fused q_a/kv_a), an FP8 head and FP8 kv_b; the native
+checkpoint path changed all three and also bypassed `gather_merge`. All numbers below: one GB10
+with the DS server loaded but idle, rank-0 shapes (world 2), real weights, CUDA graph replays,
+median of 7, L2-cold over 16 layers. Summary and table in `docs/glm53-native-exl3.md`.
+
+- **Four gathers a MoE layer -> two.** `exl3_model.mlp` called `routed()` and `FixedMLP()`
+  separately: two gathers each, both outputs fp32. Now one `_gather_pair` for both intermediates
+  and one BF16 output gather. Bitwise equal (fake two-rank comm, 1/4/8/64 rows). Single-node timing
+  cannot see the saving -- the gathers become local copies, and routed reads swing the layer time
+  +-40% between runs -- so the estimate stays the 2026-10-19 one: 13-34 us a gather.
+- **kv_b in FP8 again.** `_fp8_quant` of the published FP16 kv_b reproduces Quark's kv_b: identical
+  128x128 scales, 99.9% identical bytes, relative error to FP16 0.02645 vs 0.02646 (layers 0, 3,
+  40, 77, 78). Absorbs (q + o) 82.5/73.0/72.1 -> 42.8/44.5/45.0 us a layer at 1/4/8 rows, about
+  half the 2026-10-17 estimate of 4.6 ms a forward.
+- **gate + up as one G=2 Exl3Matrix** (the DS draft's shared-expert form): 67.3/69.2/70.2 ->
+  60.0/61.5/61.3 us at 1/4/8 rows, bitwise equal at the same split. Not taken: gate/up split 8
+  (57.1/59.7/60.5) and down split 4 (26.5 vs 27.9 us) sum K in another order for 1-3 us.
+- **Prefill rotations.** `Exl3Lin` prefill spent ~60% of its time in fp32 `rotate()` matmuls and
+  their temporaries (4,096 rows: q_a 5.52 ms with 3.38 in the input rotation; shared gate 4.44
+  with 3.44; o_proj 13.44 with 4.33 + 2.68; the unpack only 0.06-0.69). Decode's
+  exl3m_dense_rot / exl3m_dense_out take any row count: q_a 5.47 -> 2.03, kv_a 3.98 -> 1.00,
+  q_b 7.53 -> 3.20, o_proj 13.92 -> 6.94, shared gate 4.39 -> 1.27, shared down 3.24 -> 1.28 ms.
+  Error to exl3_ref.forward (fp64) is unchanged (1.672e-3), 99.3-99.5% of bf16 outputs identical.
+- **Not a regression: the head.** The published 6-bit EXL3 head runs 1.55-1.59 ms a call at 1-8
+  rows against 2.16-2.25 for an FP8 head of the same shape; splits 1 and 2 tie.
+- **Not worth it: the activation tail.** FixedMLP.act's six fp32 elementwise kernels cost 7.1-7.5 us a
+  layer (~0.55 ms a forward); F.silu saves 1 us and a fused kernel perhaps 5, at a numerics change.
+- **Index buckets have a small ceiling.** Indexer scores + top-2048 on the split cache cost the
+  same at 131,072 and 16,384 local positions (55.3 / 57.3 us at 1 row, 65.6 / 67.6 at 4): the kernel
+  already skips future positions. Only the 4,096 floor is cheaper (32.7 / 39.0), i.e. at most
+  ~0.5-0.8 ms a forward below a 16K context and nothing above it. The MTP layer's unsplit 262,144
+  scan costs 65.9-109.5 us against 47.1-57.4 at 8,192: 19-52 us a draft step. Consistent with the
+  2026-10-21 serving A/B finding nothing; not worth per-bucket graphs.
+
+Scripts: `tools/bench_glm_native_exl3.py`.
+
+Serving A/B against the 2026-10-21 native run (same image, starting history, salts and 12,000
+residents; bench.py, 3 runs after a warmup): prose 14.20 -> 15.20 tok/s, code 17.86 -> 20.34,
+random 8K 12.23 -> 12.59 with TTFT 25.47 -> 18.51 s. Acceptance-normalized rounds 138.8 -> 125.0 ms
+(prose) and 190.0 -> 167.9 ms (code): 10-12%, about twice the component estimate (5-8 ms a verify
+forward). Not separated per change; the merged gathers are the least certain component estimate
+and the likeliest source of the difference. Random 8K drafted far less in this arm (0.67-0.97 a
+round against 0.79-2.31), which is why its decode barely moves: that workload compares acceptance.
+One smoke request before the bench had adapted 512 residents; the pair was restarted from the
+original stats DB so it would not confound the arms.

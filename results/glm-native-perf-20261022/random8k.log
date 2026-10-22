@@ -1,0 +1,12 @@
+== glm-native-perf-random8k: workload=random isl=8192 osl=256 runs=3 warmup=1 thinking=False engine=None
+  warmup  isl=8219 ttft=  27042.2 ms  tpot=  64.16 ms  decode= 15.59 tok/s  out=256 (length)
+          accept_len=None  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=8211 ttft=  18506.6 ms  tpot=  79.86 ms  decode= 12.52 tok/s  out=256 (length)
+          accept_len=None  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=8225 ttft=  18865.2 ms  tpot=  72.83 ms  decode= 13.73 tok/s  out=256 (length)
+          accept_len=None  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=8205 ttft=  18378.6 ms  tpot=  79.44 ms  decode= 12.59 tok/s  out=256 (length)
+          accept_len=None  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=18506.5682 ms  tpot=79.437 ms  decode=12.5886 tok/s
+  -> ENGINE  accept_len=None  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /home/ryan/git/tidelm-glm/results/glm-native-perf-20261022/random8k.json

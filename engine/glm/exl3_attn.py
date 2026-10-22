@@ -8,7 +8,8 @@ rank less to keep resident.
 Decode (<= 16 rows) runs V4.1's dense path (engine/exl3_dense.Exl3Matrix: input rotation, the
 grouped split-K GEMV, combine + output rotation). Prefill unpacks the trellis to its FP16 matrix
 once a call (Triton, exact: the codebook is a table of the reference's values) and runs the
-rotations on the activations around a cuBLAS GEMM:  y = H_N( (H_K(x * suh))_fp16 @ W_q ) * svh.
+rotations on the activations around a cuBLAS GEMM:  y = H_N( (H_K(x * suh))_fp16 @ W_q ) * svh,
+with decode's rotation kernels for BF16/FP16 inputs (Exl3Lin._prefill).
 """
 
 from __future__ import annotations
@@ -119,6 +120,8 @@ class Exl3Lin:
         T = x2.shape[0]
         if T <= 16:
             y = self.dec(x2.to(torch.bfloat16), out_dtype=out_dtype)
+        elif x2.dtype in (torch.bfloat16, torch.float16):
+            y = self._prefill(x2, out_dtype)
         else:
             w = unpack(self.tr, self.bits)
             xh = rotate(x2.float() * self.suh.float()).to(torch.float16)
@@ -127,6 +130,28 @@ class Exl3Lin:
         if self.n_out != self.N:
             y = y[:, :self.n_out]
         return y.reshape(*shape[:-1], self.n_out)
+
+    def _prefill(self, x2: torch.Tensor, out_dtype) -> torch.Tensor:
+        """Prefill with the decode path's rotation kernels (exl3m_dense_rot / exl3m_dense_out: a
+        128-point FWHT in registers, one pass each way) around the cuBLAS GEMM. The fp32 rotate()
+        matmuls and their fp32 temporaries were ~60% of a projection's prefill time: 4,096 rows,
+        q_a 5.52 ms of which 3.38 the input rotation, o_proj 13.44 with 4.33 + 2.68 (2026-10-22).
+        The butterflies sum in another order than the matrix product, so values move at fp32
+        rounding before the fp16/bf16 casts; prefill now rotates as decode does."""
+        from engine.exl3_dense import V, _xc
+        XC = _xc()
+        lib, st = XC._lib(), XC._stream()
+        T = x2.shape[0]
+        if x2.stride(1) != 1:
+            x2 = x2.contiguous()
+        xh = torch.empty((T, self.K), dtype=torch.float16, device=x2.device)
+        lib.exl3m_dense_rot(V(x2.data_ptr()), x2.stride(0), V(self.suh.data_ptr()), V(xh.data_ptr()), T, self.K, 1,
+                            1 if x2.dtype == torch.bfloat16 else 0, st)
+        z = torch.mm(xh, unpack(self.tr, self.bits), out_dtype=torch.float32)
+        bf16 = out_dtype == torch.bfloat16
+        y = torch.empty((T, self.N), dtype=torch.bfloat16 if bf16 else torch.float32, device=x2.device)
+        lib.exl3m_dense_out(V(z.data_ptr()), V(self.svh.data_ptr()), V(y.data_ptr()), T, self.N, 1, 1, int(bf16), st)
+        return y if bf16 else y.to(out_dtype)
 
 
 @functools.lru_cache(maxsize=2)

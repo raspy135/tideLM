@@ -11,7 +11,7 @@ tide — so the engine gets better the more you use it.
 | Profile | Model | Routed experts | Resident | Context | Prose | Code | 8K-token prompt, first token |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,208 / 15,360 (66%) | 512K | **26.0 tok/s** | **44.2 tok/s** | 8.4 s |
-| `glm53-exl3` | GLM-5.3 | EXL3 3.0 bpw | 12,400 / 19,200 (64.6%) | 256K | **14.2 tok/s** | **17.9 tok/s** | 25.5 s |
+| `glm53-exl3` | GLM-5.3 | EXL3 3.0 bpw | 12,400 / 19,200 (64.6%) | 256K | **15.2 tok/s** | **20.3 tok/s** | 18.5 s |
 
 *Decode speed is `bench/bench.py`'s median over three measured runs after one warmup: 1,024
 output tokens at temperature 0.6, prose = an essay request, code = an LRU-cache request. The last
@@ -19,9 +19,9 @@ column is the median time to first token of a fresh ~8,200-token prompt (no pref
 profile uses adaptation, hot reads and speculative decoding on two DGX Sparks, with its learned
 expert history. DS was measured on 2026-10-21 with native scales, candidate indexing and
 10,208 residents at a 32K context allocation (the profile supports 512K):
-[raw runs](results/flare-perf-20261021/http-bench/README.md). GLM was measured that day using its own EXL3
-dense/fixed/MTP weights, with 12,000 residents at 256K; the profile keeps 12,400
-([comparison](docs/glm53-native-exl3.md)). First requests after boot can be slower
+[raw runs](results/flare-perf-20261021/http-bench/README.md). GLM was measured on 2026-10-22 from its own EXL3
+checkpoint with FP8 kv_b, with 12,000 residents at 256K; the profile keeps 12,400:
+[raw runs](results/glm-native-perf-20261022/README.md), [comparison](docs/glm53-native-exl3.md). First requests after boot can be slower
 ([gotchas](docs/gotchas.md)).*
 
 ## How adaptive expert loading works

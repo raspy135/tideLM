@@ -225,14 +225,15 @@ class GlmTP:
         self.s_loc = -(-self.max_seq // self.world) if self.kv_split else self.max_seq
         self.exl3_attn = self.exl3_checkpoint or env("GLM_EXL3_ATTN", "0") == "1"
         # Dense weights still wider than FP8 (docs/gotchas.md): GLM_KVB_FP8=1 keeps MLA's absorbed
-        # kv_b (w_uk, w_uv) in the checkpoint's FP8 (engine/glm/kvb_fp8.py; 1.16 -> 0.58 GB a rank),
+        # kv_b (w_uk, w_uv) in FP8 (engine/glm/kvb_fp8.py; 1.16 -> 0.58 GB a rank): Quark's bytes, or
+        # the native EXL3 checkpoint's FP16 quantized at load to the same blocks (exl3_model.py),
         # GLM_EMBED_8BIT=int8 (or fp8) the embedding rows in 8 bits with a scale per 128 values
         # (0.95 -> 0.49; a lookup, never a matmul, so INT8's uniform grid can be used: fp8 moved the
         # exact-model logits KL 0.015 / 5.2% top-1 flips, docs/gotchas.md),
         # GLM_ROUTER_BF16=1 the routers in BF16 with fp32 sums (0.48 -> 0.24).
         self.kvb_fp8 = env("GLM_KVB_FP8", "0") == "1"
-        if self.exl3_checkpoint and (self.kvb_fp8 or env('GLM_HEAD', 'exl3') != 'exl3'):
-            raise ValueError('native EXL3 checkpoint requires GLM_KVB_FP8=0 and GLM_HEAD=exl3')
+        if self.exl3_checkpoint and env('GLM_HEAD', 'exl3') != 'exl3':
+            raise ValueError('native EXL3 checkpoint requires GLM_HEAD=exl3')
         self.embed_q = env("GLM_EMBED_8BIT", "")
         assert self.embed_q in ("", "int8", "fp8"), self.embed_q
         self.embed_fp8 = bool(self.embed_q)            # (any 8-bit embedding: an (8-bit, scales) pair)

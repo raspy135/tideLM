@@ -11,21 +11,47 @@ from .weights import P
 
 class FixedMLP:
     def __init__(self, source, prefix, eng):
+        from engine.exl3_dense import MAX_ROWS, Exl3Matrix
+        from .exl3_attn import Exl3Lin, _members
         r, w, d = eng.rank, eng.world, eng.dev
-        self.gate = source.lin(prefix + 'gate_proj', d, 4, r, w, 'n')
-        self.up = source.lin(prefix + 'up_proj', d, 4, r, w, 'n')
+        gate = source.lin(prefix + 'gate_proj', d, 4, r, w, 'n')
+        up = source.lin(prefix + 'up_proj', d, 4, r, w, 'n')
         self.down = source.lin(prefix + 'down_proj', d, 2, r, w, 'n')
         self.comm = eng.comm
+        # Decode: gate and up as one G=2 Exl3Matrix over the same input rows (engine/exl3_draft's
+        # shared expert): one rotation/GEMV/combine set instead of two. Same split, so bitwise
+        # equal to the separate calls; 16 shared experts L2-cold, rank-0 shapes, 1/4/8 rows:
+        # 67.3/69.2/70.2 -> 60.0/61.5/61.3 us a layer (2026-10-22). Split 8 gave 57-60 but sums K
+        # in another order. Prefill keeps per-matrix unpacking, on views of the stacked trellis
+        # (Exl3Matrix copies G > 1 trellises; separate tensors would hold them twice).
+        self.rows = MAX_ROWS
+        self.n = gate.N
+        self.gate_up = None
+        if gate.bits == up.bits:
+            self.gate_up = Exl3Matrix([gate.tr, up.tr], torch.stack([gate.suh, up.suh]),
+                                      torch.stack([gate.svh, up.svh]), [gate.bits, up.bits], 4, _members(str(d)))
+            gate = Exl3Lin(self.gate_up.w[0], gate.suh, gate.svh, 4)
+            up = Exl3Lin(self.gate_up.w[1], up.suh, up.svh, 4)
+        self.gate, self.up = gate, up
 
     @property
     def nbytes(self):
         return self.gate.nbytes + self.up.nbytes + self.down.nbytes
 
+    def act(self, x):
+        """This rank's intermediate columns, bf16 [T, inter / world]."""
+        if self.gate_up is not None and x.shape[0] <= self.rows:
+            gu = self.gate_up(x[:, None, :].expand(-1, 2, -1))
+            gate, up = gu[:, :self.n].float(), gu[:, self.n:].float()
+        else:
+            gate, up = self.gate(x).float(), self.up(x).float()
+        return (gate * torch.sigmoid(gate) * up).to(torch.bfloat16)
+
     def __call__(self, x):
-        gate, up = self.gate(x).float(), self.up(x).float()
-        h = (gate * torch.sigmoid(gate) * up).to(torch.bfloat16)
-        full = self.comm.cat_last(h).contiguous()
-        return self.comm.cat_last(self.down(full, out_dtype=torch.float32))
+        """A dense layer's MLP, bf16 [T, hidden]. The output gathers as BF16: the gather only
+        concatenates, so rounding before it is the same values at half the bytes."""
+        full = self.comm.cat_last(self.act(x)).contiguous()
+        return self.comm.cat_last(self.down(full, out_dtype=torch.float32).to(torch.bfloat16))
 
 
 def load_dense(eng):
@@ -47,10 +73,20 @@ def load_dense(eng):
     for layer in range(eng.nL):
         p = f'{P}layers.{layer}.'
         a = p + 'self_attn.'
-        # Published kv_b is FP16, not Quark's block-scaled FP8. Preserve its
-        # values through the engine's BF16 MLA path; never invent FP8 scales.
+        # Published kv_b is FP16. GLM_KVB_FP8=1 quantizes it at load to FP8 with 128x128 block
+        # amax scales (weights._fp8_quant; a rank's rows start on a 128 boundary): against
+        # Quark's FP8 kv_b, layers 0/3/40/77/78 gave identical scales and 99.9% identical bytes,
+        # relative error to FP16 0.02645 vs Quark's 0.02646 (2026-10-22). That is the
+        # configuration whose quality docs/gotchas.md measured; decode reads half the bytes.
         kvb = ck.get_rows(a + 'kv_b_proj.weight', r * eng.hl * hv, (r + 1) * eng.hl * hv)
-        kvb = kvb.to(d, torch.bfloat16).view(eng.hl, hv, cfg.kv_lora)
+        if eng.kvb_fp8:
+            from .kvb_fp8 import HeadFP8
+            from .weights import _fp8_quant
+            kvb = HeadFP8.from_rows(*_fp8_quant(kvb.to(d)), eng.hl)
+            w_uk, w_uv = kvb.split(0, cfg.nope).to(d), kvb.split(cfg.nope, hv).to(d)
+        else:
+            kvb = kvb.to(d, torch.bfloat16).view(eng.hl, hv, cfg.kv_lora)
+            w_uk, w_uv = kvb[:, :cfg.nope].contiguous(), kvb[:, cfg.nope:].contiguous()
         lw = dict(
             ln_in=ck.get(p + 'input_layernorm.weight').to(d, torch.bfloat16),
             ln_post=ck.get(p + 'post_attention_layernorm.weight').to(d, torch.bfloat16),
@@ -59,8 +95,8 @@ def load_dense(eng):
             q_b=source.lin(a + 'q_b_proj', d, 1, r, w, 'n'),
             kv_a=source.lin(a + 'kv_a_proj_with_mqa', d, 8, n_out=cfg.kv_lora + cfg.rope_dim),
             kv_norm=ck.get(a + 'kv_a_layernorm.weight').to(d, torch.bfloat16),
-            w_uk=kvb[:, :cfg.nope].contiguous(),
-            w_uv=kvb[:, cfg.nope:].contiguous(),
+            w_uk=w_uk,
+            w_uv=w_uv,
             o=source.lin(a + 'o_proj', d, 2, r, w, 'k'))
         if layer == eng.mtp_L:
             lw.update(enorm=ck.get(p + 'enorm.weight').to(d, torch.bfloat16),
@@ -120,14 +156,22 @@ def place_fixed(eng):
 
 
 def mlp(eng, layer, x, slots, weights, routed_slots=None, routed_weights=None):
-    fixed = eng.fixed_exl3[layer](x)
+    fixed = eng.fixed_exl3[layer]
     if eng.dense(layer):
-        return fixed.to(torch.bfloat16)
-    from .exl3 import routed
+        return fixed(x)
+    from .exl3 import routed_down, routed_up
     if layer == eng.mtp_L:
         routed_slots, routed_weights = slots[:, :eng.cfg.topk], weights[:, :eng.cfg.topk]
         arena = eng.mtp_exl3
     else:
         arena = eng.x3
-    output = routed(x, routed_slots, routed_weights, arena, eng.comm)
-    return (output + fixed).to(torch.bfloat16)
+    # One all-gather each way, as the hybrid's gather_merge: the routed and shared intermediates
+    # go together, each rank sums its hidden columns of both down projections and the sum gathers
+    # once as BF16. Separate routed() and FixedMLP() calls made four gathers a layer (two of
+    # fp32 outputs); per element this is the same arithmetic, since the gathers only concatenate.
+    h = fixed.act(x)
+    xd, ctx = routed_up(x, routed_slots, routed_weights, arena)
+    xd_full, h_full = eng._gather_pair(xd, h)
+    local = routed_down(xd_full.contiguous(), ctx, arena)
+    local = local + fixed.down(h_full.contiguous(), out_dtype=torch.float32)
+    return eng.comm.cat_last(local.to(torch.bfloat16))
