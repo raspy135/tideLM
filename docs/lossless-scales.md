@@ -6,7 +6,8 @@ and arithmetic stay unchanged. This currently supports single-request native
 FP4, output TP2, CUDA v2 decode, including the two-row down kernel and Triton
 prefill. DSpark's draft experts keep their native layout.
 
-Build the image first, then pack the checkpoint once on the head node:
+The shipped DS template enables packing and an automatic resident budget. Build
+the image first, then pack the checkpoint once on the head node:
 
 ```bash
 docker run --rm --entrypoint python \
@@ -69,11 +70,11 @@ residents instead of **10,208**. Its `bench/bench.py` reports are kept as
 temperature 0.6, seed 42, 32K context allocation, 1024 output tokens for
 prose/code and 256 for random 8K. These use a different prompt salt and resident
 set from the earlier README run; compare kernel overhead with the fixed-output
-test above. The README's DS chart remains the default native-scale profile,
-with candidate indexing on; scale packing is optional.
+test above. The README's DS chart now records this packed profile, with candidate
+indexing on. Unsetting the pack path remains the rollback to native scales.
 
 The optional packed-profile run measured 23.0142 tok/s prose, 39.4160 tok/s
 code, 29.8773 tok/s random 8K, and 9.016 s 8K TTFT. These numbers do not improve
-the earlier chart; retain packing for its resident capacity rather than claiming
-a throughput gain. The packing audit took about 263 seconds plus final pack
+the earlier native-scale measurements; retain packing for its resident capacity
+rather than claiming a throughput gain. The packing audit took about 263 seconds plus final pack
 writes on the development head node.
