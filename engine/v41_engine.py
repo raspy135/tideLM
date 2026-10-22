@@ -840,6 +840,12 @@ class V41Engine:
                 or cb3_cls is not None or sim_bits
                 or os.environ.get('DSV41_TP_EXPERT_LAYOUT', 'output') != 'output'):
             raise ValueError('draft TP requires native FP4 TP2 with output layout')
+        from engine.tensor_parallel import tp_draft_dense_enabled
+        self.tp_draft_dense = tp_draft_dense_enabled()
+        if self.tp_draft_dense and (not self.tp_draft_experts
+                                    or os.environ.get('DSV41_EXL3_DRAFT_DENSE', '0') == '1'):
+            raise ValueError('DSV41_TP_DRAFT_DENSE requires DSV41_TP_DRAFT_EXPERTS=1 and the native '
+                             'FP8 draft (DSV41_EXL3_DRAFT_DENSE=0)')
         if self.ep.tensor_parallel:
             if exl3_cls is None and (self.kernel != 'triton-fp4' or cb3_cls is not None or sim_bits):
                 raise ValueError('expert TP requires native FP4')
@@ -1416,6 +1422,8 @@ class V41Engine:
                 "tp_head": os.environ.get('DSV41_TP_HEAD', '0'),
                 "tp_embed": os.environ.get('DSV41_TP_EMBED', '0'),
                 "tp_draft_experts": self.tp_draft_experts,
+                "tp_draft_dense": self.tp_draft_dense,
+                "prune_miss_side": os.environ.get("DSV41_PRUNE_MISS_SIDE", "1"),
                 "tp_dense_rounding_version": 2,
                 "prune_keep": float(prune_keep or 0.0),
                 # Layer allocation changes routing even at the same total arena budget.
@@ -3630,6 +3638,7 @@ class V41Engine:
             "tp_head": os.environ.get('DSV41_TP_HEAD', '0') == '1',
             "tp_embed": os.environ.get('DSV41_TP_EMBED', '0') == '1',
             "tp_draft_experts": self.tp_draft_experts,
+            "tp_draft_dense": self.tp_draft_dense,
             "tp_expert_reduce": os.environ.get('DSV41_TP_EXPERT_REDUCE', 'all_reduce'),
             "tp_expert_layout": os.environ.get('DSV41_TP_EXPERT_LAYOUT', 'output'),
             "tp_linear_layout": os.environ.get('DSV41_TP_LINEAR_LAYOUT', 'output'),

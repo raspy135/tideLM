@@ -65,6 +65,11 @@ INDEX_BUCKETS = os.environ.get("DSV41_INDEX_BUCKETS", "1") == "1"
 # Experimental fork/join of the replicated shared expert and routed TP work.
 # Keep off until full-engine timings establish a gain, not just more GPU activity.
 SHARED_OVERLAP = os.environ.get("DSV41_DECODE_SHARED_OVERLAP", "0") == "1"
+# Prune-miss accounting (DSV41_PRUNE_MISS) on a side stream. It only feeds the demand database,
+# never routing, so moving it off the router's critical path cannot change a token: 12.6 us a
+# layer on the main stream in the 2026-10-21 profile. Joined after the MoE when one graph holds
+# both halves of a layer, else at the end of the attention half.
+PRUNE_MISS_SIDE = os.environ.get("DSV41_PRUNE_MISS_SIDE", "1") == "1"
 # Experimental: one fp8 launch for projections that read the same activation -- attention
 # wq_a||wkv and shared-expert w1||w3 -- instead of two launches and two identical activation
 # quantizations each. Column-wise the GEMM is unchanged, so the output is meant to be
@@ -293,6 +298,8 @@ class FastDecoder:
         # Layers whose decode graph splits at the router, for a host step between the halves.
         self.split_layers = self.stream_layers | (frozenset() if self.hot_async else self.hot_layers)
         self.shared_stream = torch.cuda.Stream(device=self.dev) if SHARED_OVERLAP else None
+        self.acct_stream = torch.cuda.Stream(device=self.dev) if PRUNE_MISS_SIDE else None
+        self._acct_pending = False
         # DSV41_L2PF_MB: prefetch the next layer's weights during the MoE all-gather (engine/l2pf.py)
         self.l2pf_side = torch.cuda.Stream(device=self.dev) if l2pf.enabled() else None
         self.attn_prefetch_mb = int(os.environ.get("DSV41_L2PF_ATTN_MB", "0"))
@@ -973,8 +980,9 @@ class FastDecoder:
                                       once(('shard', self._markov_rank, rows, fmt),
                                            lambda: R._head_in_format(local.contiguous(), fmt)))
 
-    def _layer_a(self, L, sh_state):
-        """attention + HC + router for backbone layer L, reading self.h/self.pre_mix/self.pos."""
+    def _layer_a(self, L, sh_state, defer_acct: bool = False):
+        """attention + HC + router for backbone layer L, reading self.h/self.pre_mix/self.pos.
+        `defer_acct`: the caller joins the prune-miss side stream itself (_layer_ab, after the MoE)."""
         a = self.a
         w = self.W.layers[L]
         h = self.h
@@ -1049,7 +1057,7 @@ class FastDecoder:
                 # capture for graph B and the host (DSV41_HOT_READS)
                 def record(lg, sc, _keep=keep, _L=L, _hot=hot):
                     if _keep is not None and M.PRUNE_MISS:
-                        self.m._record_prune_miss(lg, sc, _keep, _L, a.n_activated_experts, decode=True)
+                        self._record_prune_miss_side(lg, sc, _keep, _L)
                     if _hot:
                         self._hot_capture(_L, sc, lg, _keep)
             self.lean.router(y, w.gate_w, w.gate_bias, keep, a.n_activated_experts, a.route_scale,
@@ -1081,6 +1089,28 @@ class FastDecoder:
         if self.expert_topp is not None:
             # After the stats and taps (they describe the router), before any slot lookup.
             _ETP.apply_(self.route_idx, self.route_w, *self.expert_topp, self.topp_sentinel)
+        if not defer_acct:
+            self._acct_join()
+
+    def _record_prune_miss_side(self, lg, sc, keep, L):
+        """Model._record_prune_miss on self.acct_stream. The router allocates `lg`/`sc` fresh each
+        call and never writes them after record(); record_stream keeps their storage from being
+        recycled before the side kernel has read it."""
+        side = self.acct_stream
+        if side is None:
+            self.m._record_prune_miss(lg, sc, keep, L, self.a.n_activated_experts, decode=True)
+            return
+        side.wait_stream(torch.cuda.current_stream(self.dev))
+        with torch.cuda.stream(side):
+            self.m._record_prune_miss(lg, sc, keep, L, self.a.n_activated_experts, decode=True)
+        lg.record_stream(side)
+        sc.record_stream(side)
+        self._acct_pending = True
+
+    def _acct_join(self):
+        if self._acct_pending:
+            torch.cuda.current_stream(self.dev).wait_stream(self.acct_stream)
+            self._acct_pending = False
 
     def _routed_experts(self, L=None):
         a = self.a
@@ -1408,8 +1438,10 @@ class FastDecoder:
         m0 = self.W.mtp[0]
         x3 = getattr(m0, "_x3", None)
         mh = self.main_hidden.to(torch.bfloat16)
+        # DSV41_TP_DRAFT_DENSE: this rank's half of the rows, gathered (engine/tensor_parallel.py)
+        main_proj = getattr(m0, "_main_proj_tp", None) or m0.main_proj
         proj = (x3.main_proj(mh) if x3 is not None and x3.main_proj is not None
-                else R.qlinear(mh, m0.main_proj))
+                else R.qlinear(mh, main_proj))
         main_x = self._rmsnorm(proj, m0.main_norm, a.norm_eps)
         fq = self.m.freqs_w[self.pos]
         for k, w in enumerate(self.W.mtp):
@@ -1458,9 +1490,15 @@ class FastDecoder:
                 idx = (scores + w.gate_bias).topk(3, dim=-1)[1]
                 wts = scores.gather(1, idx); wts = wts / (wts.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
             slots = (idx.to(torch.int32) + k * 128)
+            if self._draft_merged_ok(w):
+                out = self._draft_moe_merged(w, y, slots, wts)
+                h = _hc_post_fused(out, residual, ffn_post, ffn_comb, split_w=out.shape[-1])
+                pre_mix = ffn_pre
+                continue
             out = self.m.moe_fn(y, slots, wts, self.W.dspark_arena, a.swiglu_limit).float()
-            # TP draft arenas gather complete outputs inside moe_fn. Shared experts remain
-            # replicated: another collective here would double their contribution.
+            # TP draft arenas gather complete outputs inside moe_fn. Without DSV41_TP_DRAFT_DENSE
+            # the shared experts are replicated: another collective here would double their
+            # contribution. With it, _shared_ffn gathers through OutputParallelWeight instead.
             sh = self._shared_ffn(y, w)
             if self.lean is not None and sh.shape == out.shape:
                 h = _hc_post_fused(out, residual, ffn_post, ffn_comb, x2=sh.contiguous())
@@ -1525,6 +1563,39 @@ class FastDecoder:
             # embeds[i] is the Markov embedding of the token before draft i, as in the reference
             feat = torch.cat([x_pre.float(), torch.cat(embeds).float()], dim=-1)
             self.d_conf.copy_((feat @ w.conf_proj.T).squeeze(-1))
+
+    def _draft_merged_ok(self, w) -> bool:
+        """Whether _draft_moe_merged reproduces moe_fn + _shared_ffn for DSpark block `w`. Fixed
+        per process (config, arena and weight types), so both ranks answer the same."""
+        ok = getattr(self, "_draft_merged", None)
+        if ok is None:
+            ok = self._draft_merged = self._draft_merged_check()
+        return ok and getattr(w, "_sh_w13", None) is not None and getattr(w, "_x3sh", None) is None
+
+    def _draft_merged_check(self) -> bool:
+        if self.lean is None or not LEAN_MOE or not MERGED_PROJ:
+            return False
+        arena = getattr(self.W, "dspark_arena", None)
+        if not getattr(arena, "tp_output", False) or getattr(arena, "tp_world", 1) != 2:
+            return False
+        try:
+            import fp4_moe as K
+        except Exception:  # noqa: BLE001
+            return False
+        if not K.CUDA_DECODE or K.DOT_SCALED or not isinstance(arena, K.ExpertArena):
+            return False
+        if R.act_qdq_fp8 is R._ACT_QDQ_REF:
+            return False  # act_quant on: the shared w2 input would be quantized before its gather
+        from engine.tensor_parallel import OutputParallelWeight
+        from fp8_linear import FP8Weight
+        w = self.W.mtp[0]
+        return (isinstance(w.sh_w2, OutputParallelWeight) and type(w.sh_w2.local) is FP8Weight
+                and w.sh_w1.N == arena.w1.shape[1] and w.sh_w2.local.shape[0] == arena.w2.shape[1]
+                and T_DRAFT * 3 <= 64)
+
+    def _draft_moe_merged(self, w, y, slots, wts):
+        return draft_moe_merged(y, slots, wts, self.W.dspark_arena, w._sh_w13, w.sh_w1.N, w.sh_w2.local,
+                                self.lean, self.a.swiglu_limit, self.shared_stream)
 
     def _capture_draft_graphs(self):
         """Capture one graph per sampling mode; neither mode pays for the other's dead branch."""
@@ -1596,7 +1667,7 @@ class FastDecoder:
         self.lut_version = st.stats.get("misses", 0)
 
     def _layer_ab(self, L, sh_state):
-        self._layer_a(L, sh_state)
+        self._layer_a(L, sh_state, defer_acct=True)
         # -1 never occurs while the LUT is valid
         if self._moe_merged_ok(self.W.layers[L]):
             pass  # _moe_merged looks the slots up together with its routing keys
@@ -1605,6 +1676,7 @@ class FastDecoder:
         else:
             self.slots.copy_(self.lut[L][self.route_idx])
         self._layer_b(L)
+        self._acct_join()
 
     # ------------------------------------------------------------------ gpu timing
     def _ev_begin(self, phase):
@@ -2165,3 +2237,62 @@ class FastDecoder:
             p = self.c.pending.get(L)
             if p is not None:
                 buf[0].copy_(p[0]); buf[1].copy_(p[1])
+
+
+def draft_moe_merged(y, slots, wts, arena, w13, n: int, w2_local, lean, limit: float, side=None):
+    """One DSpark block's routed + shared FFN as FastDecoder._moe_merged does the backbone's: two
+    RoCE gathers instead of moe_forward's two NCCL ones, the shared expert split by output rows
+    (DSV41_TP_DRAFT_DENSE: `w13` this rank's w1||w3 rows, `n` their width, `w2_local` its w2 rows)
+    instead of read whole on both ranks, and on the `side` stream during the routed `up`.
+    Returns the gathered fp32 [world*T, down_n] for hc_post's split_w read.
+
+    Same values as moe_fn + _shared_ffn: the routed kernels get moe_forward's native decode
+    arguments (null slot -1, its routing builder); each shared output is the same complete
+    fp8_linear dot product, on one rank; and hc_post's ROUND of (routed + shared) summed in fp32
+    here is its ADD2 of the same two values. tools/test_draft_merged_tp.py compares the bytes."""
+    import fp4_moe as K
+    import fp4_moe_cuda as CUDA
+    from engine.collective_rails import group as collective_group
+    T, k = slots.shape
+    P = T * k
+    inter, down_n, world = arena.w1.shape[1], arena.w2.shape[1], arena.tp_world
+    main = torch.cuda.current_stream(y.device)
+    h_all = torch.empty(P + T, inter, dtype=torch.bfloat16, device=y.device)
+
+    def shared_up():
+        lean.swiglu(R.qlinear(y, w13), n, limit, out=h_all[P:])
+
+    if side is not None:
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            shared_up()
+    block_slot, block_pair, block_route, NB = CUDA.build_routing_small(slots.contiguous(), 16, k)
+    wgt = wts.reshape(-1)
+    if wgt.dtype != torch.float32 or not wgt.is_contiguous():
+        wgt = wgt.float().contiguous()
+    CUDA.up(y, arena.w1, arena.s1, arena.w3, arena.s3, h_all[:P], wgt, block_slot, block_route,
+            float(limit), k, inter, K.DIM, NB, -1)
+    if side is not None:
+        main.wait_stream(side)
+    else:
+        shared_up()
+    gathered = torch.empty(world * (P + T), inter, dtype=torch.bfloat16, device=y.device)
+    _comm.all_gather_fast(gathered, h_all, group=collective_group())
+    full = gathered.view(world, P + T, inter).transpose(0, 1).reshape(P + T, world * inter)
+    if side is not None:
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            local_s = R.mm(full[P:], w2_local)
+    parts = torch.empty(P, down_n, dtype=torch.float32, device=y.device)
+    CUDA.down(full[:P], arena.w2, arena.s2, parts, block_slot, block_pair, k, down_n,
+              world * inter, T, NB, -1, False, 1)
+    local = parts.view(k, T, down_n).sum(dim=0)
+    if side is not None:
+        main.wait_stream(side)
+        local_s.record_stream(main)
+    else:
+        local_s = R.mm(full[P:], w2_local)
+    local += local_s
+    out = torch.empty(world * T, down_n, dtype=torch.float32, device=y.device)
+    _comm.all_gather_fast(out, local, group=collective_group())
+    return out

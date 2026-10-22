@@ -4117,3 +4117,73 @@ Two things this did not explain. The README's 26.0 / 44.2 native baseline cannot
 exactly: its starting demand history (`34a48be9` / `e4558b35`) was not kept, and history moves
 the resident set. And gpt's interrupted native arm on 2026-10-21 measured 23.11 / 23.41 tok/s
 prose from the same seed history and image where today's native arm measured 25.6.
+
+## DS decode after TensorFold's kernels: the projections are at the ceiling; the draft was not (2026-10-22)
+
+A code-reading comparison with TensorFold's DS engine suggested ~10-15 ms a round from split-K
+on the narrow FP8 projections, a faster expert `down` kernel, a leaner draft step and the shared
+expert folded into the routed launch. Measured, most of that was already in this engine.
+
+**FP8 decode projections: nothing left in tiles or split-K.** `_fp8_linear_kernel` swept over
+BLOCK_N 16/32/64, BLOCK_K 128/256, 2/4/8 warps, 2-5 stages and the bit-scale spelling, at the TP2
+shapes, 4-5 rows, L2-cold (distinct weight copies, graph replay). Every config was bit-identical;
+the shipped one (32/256/4/3) is within 3% of the best on every shape:
+
+| projection (N x K) | shipped | best | GB/s shipped |
+| --- | ---: | ---: | ---: |
+| wq_a+wkv 1792x5120 | 43.4 us | 42.4 | 212 |
+| wq_b TP 16384x1280 | 93.3 | 91.2 | 225 |
+| wo_b TP 2560x8192 | 93.5 | 93.4 | 224 |
+| shared w1+w3 TP 2304x5120 | 54.1 | 53.7 | 218 |
+| shared w2 TP 2560x2304 | 28.0 | 28.0 | 211 |
+| wo_a TP grouped 4x1024x4096 | 75.5 | 74.8 | 223 |
+| draft head TP 20480x5120 (5 rows) | 456.5 | 454.3 | 230 |
+| main_proj 5120x15360 | 356.0 | 344.4 | 221 |
+
+The comparison's narrow-projection numbers came from the 2026-09-16 trace, before
+`BLOCK_N=32`/`BLOCK_K=256`. The draft head's 924 us in the profile is its bytes: 40,960 listed
+rows a rank, 210 MB, at 227 GB/s (an fp4 draft head was already measured not to help, 2026-10-11).
+`down` was the v2 kernel in that budget; v3 two rows (2026-10-21) is what ships. The backbone's
+shared expert already shares the routed gathers and overlaps `up` (`_moe_merged`).
+
+**What did move, all exact** (`tools/run_two_node_gate.sh bench_decode_kernels_tp.py`, frozen
+residency, greedy 256 tokens, arms A B B A, identical token hashes, steps and acceptance in all
+four; `results/draft-tp-20261022/`):
+
+| ms/step | base (A1, A2) | new (B1, B2) | change |
+| --- | ---: | ---: | ---: |
+| html | 78.42, 79.57 | 76.90, 76.90 | -2.1 (-2.7%) |
+| python | 80.58, 82.04 | 79.15, 79.29 | -2.1 (-2.6%) |
+| explain | 70.89, 71.24 | 70.34, 68.02 | -1.9 (-2.7%) |
+
+- `DSV41_TP_DRAFT_DENSE=1`: the DSpark blocks' shared expert in the backbone's output layout and
+  `draft_moe_merged` (two RoCE gathers instead of `moe_forward`'s two NCCL ones, the shared expert
+  on the side stream during `up`), and `main_proj` (79 MB, read whole on both ranks every step)
+  as a decode-only column-parallel view of this rank's rows. NCCL kernels a step 7 -> 1. The full
+  `main_proj` stays for the prefill seed: split by rows, cuBLAS changes its bits at 17 and 64 rows
+  (256+ matched). `tools/test_draft_merged_tp.py` (two ranks) compares every path bytewise,
+  including graph replay; greedy hashes cannot, since the drafter never changes greedy output --
+  equal steps and acceptance across the four arms is the in-engine evidence.
+- `route_small_bm16` ranked pairs with a one-thread insertion sort: O(P^2) serial steps, 17.1 us
+  at 36 pairs in graph replay (3.8 at 15, 7.9 at 24). A parallel stable rank and a ballot block cut
+  give 1.2-1.4 us and the same integers (576 random cases against the old kernel;
+  `tools/test_decode_rows.py`). 43 calls a step.
+- `DSV41_PRUNE_MISS_SIDE` (default 1): the prune-miss accounting kernel on a side stream, joined
+  after the MoE. It feeds only the demand database. Not measured separately from the bundle.
+
+Rejected without building: the HC `_skinny_meansq_kernel` (15.8 us x 86) is ~25% off its read
+ceiling, but its tiling sets its bits; any retiling is a numerics change for ~0.35 ms.
+
+`down` v3 (two rows) against a plain read of the same bytes (`tools/bench_fp4_moe_decode.py --v2
+--down-rows 2`, L2-cold): 206 GB/s at U = 16-20 against 227, `up` 213-220 against 215-219. A
+perfect `down` would save ~0.5-0.9 ms a step; not pursued.
+
+**A shorter depth window (`DSV41_BLOCK_DYNAMIC_TOKENS`, default 60), greedy only so far.** Same
+gate, new code, one boot each (tok/s): window 60 html 55.27 / python 61.9 / explain 30.0; window
+8 55.12 / 66.83 / 32.24; window 20 54.87 / 65.49 / 31.85. The python request goes to depth 5 at
+output token 9 instead of 62 (52 -> 46 steps). At 256 tokens the first window is a quarter of the
+output, so a 1,024-token or sampled request will gain less; sampled serving is unmeasured. The
+greedy tokens changed with the window (html, explain) -- through hot reads, which follow the verify
+block's routing, not the arithmetic: the 2026-10-22 base code with window 8 reproduced the new
+code's window-8 hashes, steps and acceptance in all six runs. "Greedy output is identical under any
+depth schedule" (docs/decode-dynamic-depth.md) holds with frozen placement only.

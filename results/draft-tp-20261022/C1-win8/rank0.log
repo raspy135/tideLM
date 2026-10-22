@@ -1,0 +1,97 @@
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+20:17:37 [engine] using Triton FP4 MoE kernel
+20:17:38 [engine] MoE routing kernels warm: 88 variants in 1.0s
+20:17:38 [engine] DSV41_FP4_PREFILL_DOT_SCALED=1: scaled FP4 prompt/replay arithmetic; decode unchanged
+20:17:38 [engine] DSV41_FP4_CUDA=1: native CUDA FP4 BM=16 decode (relaxed reduction=True)
+20:17:39 [engine] lossless expert scales: 9.400 -> 9.184 MB/slot; pack 29ede004d9ef6cef
+[rails] rank 0: decode NET/0; prefill both rails
+/opt/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.all_gather_into_tensor` is deprecated. Please use `torch.distributed.all_gather_single` instead.
+  return func(*args, **kwargs)
+/opt/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.all_gather_into_tensor` is deprecated. Please use `torch.distributed.all_gather_single` instead.
+  return func(*args, **kwargs)
+20:17:40 [engine] TP2 up: rank 0; each arena slot holds half an expert
+[roce] all-gathers of up to 256 KiB a rank over RoCE on roceP2p1s0f1 (GID 5, 10.0.1.1), rocep1s0f1 (GID 5, 10.0.0.1); timeout 120 s; probe 13.5 us eager at 16 KiB
+20:17:55 [engine] weights: layer 9 loaded (15s)
+20:18:06 [engine] weights: layer 19 loaded (26s)
+20:18:16 [engine] weights: layer 29 loaded (36s)
+20:18:26 [engine] weights: layer 39 loaded (46s)
+20:18:29 [engine] weights: all non-expert weights on GPU in 49s
+20:18:30 [engine] DSpark experts: TP output shards; shared experts remain replicated
+20:18:30 [engine] CUDA free 97.4 GB of 130.7; host MemAvailable 110.2 GB; arena 90.0 GB = 9799 fp4 expert slots of 9.18 MB (64% of all routed experts, pinned)
+20:18:35 [engine] DSpark experts resident
+20:18:38 [engine] vision enabled: peer (32 layers, 1024 dim; weights on rank 1)
+20:18:38 [engine] Engram packed row cache: 256 MiB total per rank
+20:18:38 [engine] engram row split on: each rank reads uniq %% world == rank, one all-reduce rebuilds
+20:18:38 [engine] expert adaptation: sensitivity off (ranking frozen; demand still recorded), prior 4 requests; derived: prefill swaps off at >= 32 new tokens and >= 1.0% misses, <= 512 swaps per pass, gain floor 0.005, decode passes off; ignoring DSV41_PRUNE_UNIT, DSV41_PRUNE_PRIOR, DSV41_PRUNE_HALFLIFE, DSV41_PRUNE_SWAP_PREFILL_MIN, DSV41_PRUNE_SWAP_PREFILL_MIN_MISS, DSV41_PRUNE_SWAP_MAX, DSV41_PRUNE_SWAP_MIN_GAIN, DSV41_PRUNE_SWAP_MIN_GROWTH, DSV41_PRUNE_MISS (replaced by DSV41_ADAPT_*)
+20:18:38 [engine] observed routing metric: score
+20:18:38 [engine] prune ranking adapted from results/prune_demand_req_score_1017.npz: observed weight 78.9% (597 recorded routing slots)
+20:18:38 [engine] EP2 rank 0: 9400 of the 9400 kept experts are owned here
+20:18:38 [engine] pruned mode (uniform): keep 0.61, 9400 experts total (235-235 per layer), 86.3 GB
+20:18:38 [engine] EP2 prune mask agrees across ranks (checksum 2c9c82fb6437b437db17944a6c360cdb3499afc4b1bdb485aad2f2d06d36e376)
+20:18:38 [engine] EP2 config agrees across ranks (224 fields: ablate_wob, ablate_wob_digest, act_quant, adapt_decode_tokens, adapt_halflife, adapt_prior, adapt_request_unit, adapt_source, adapt_swap, arena_slots, attn_staged, batch_decode_version, batch_idle_steps, batched_verify, batched_verify_source, block_confidence_sampling_version, block_confidence_v1, block_dynamic, candidate_block_size, candidate_source_layer, candidate_topk_blocks, collective_rails_version, comm_backend, confidence_cost_refresh, critical_budget, critical_per_layer, critical_policy_version, critical_prefill, critical_profile_sha256, critical_share, cycle_break, decode_lean, decode_lean_attn, decode_lean_moe, decode_lean_rope, decode_lean_softmax, decode_merged_proj, decode_probe_version, decode_shared_overlap, dense_dequant_cache, dense_fp4, draft_bypass, draft_bypass_version, draft_head_fmt, draft_markov_local, draft_markov_topk, draft_markov_tp, draft_nucleus, draft_tokens, draft_vocab, draft_vocab_version, dream_fp8, dream_overlay, dynamic_experts, dynamic_experts_version, dynamic_layer_floor, early_draft, early_verify, engram_cache_v1_mb, engram_cache_v1_peer_mb, engram_direct, engram_native, engram_native_threads, engram_row_split, engram_split_min, exl3_cuda_source, exl3_dense, exl3_dense_version, exl3_draft_dense, exl3_draft_dense_version, exl3_exact_slots, exl3_merged, exl3_prefill_kernel, expert_format, expert_pack_source, expert_profile_version, expert_seed_enabled, expert_seed_sha256, expert_seed_version, expert_topics, expert_topp, expert_topp_version, fp4_cuda, fp4_cuda_down_rows, fp4_cuda_relaxed, fp4_cuda_source, fp4_cuda_v2, fp4_dense_split, fp4_dot_scaled, fp4_prefill_dot_scaled, fp4_prefill_scaled_tiles, fp8_act_qdq_fused, fp8_decode_block_k, fp8_decode_block_n, fp8_decode_pipeline, fp8_decode_warps, graph_pool_rotation_version, graphs_max, hc_front_fused, hc_fused, hc_kernel, hc_mm_tile, hc_ops, hc_prec, hc_prefill_fused, head_fmt, head_kernel, head_kernel_version, hot_reads, index_fused, index_score_bf16, index_stream, index_topk, initial_keep_sha256, kv_cache_qdq, l2pf_attn_mb, l2pf_bytes, l2pf_mode, l2pf_pace_gbps, l2pf_qkv_mb, l2pf_sh_mb, l2pf_version, lane_max_seq, lane_reserve_gb, layer_ablation_file, layer_ablation_version, layer_stream_version, lean_rms_fused, lookup_draft_candidates, lookup_draft_enabled, lookup_draft_ngram, lookup_draft_version, markov_head_fmt, max_concurrency, max_seq, moe_fallback, no_repeat_ngram, packed_kv, perf_attention_direct, perf_draft_router, perf_engram_h2d, perf_hc_post_pre, perf_index_candidates, perf_source, predictive_backend, predictive_capacity, predictive_features, predictive_minimum, predictive_mode, predictive_probe_fraction, predictive_probe_min_tokens, predictive_probe_target_ratio, predictive_probe_tokens, predictive_probe_two_pass_below, predictive_probe_version, predictive_similarity, predictive_version, prefill_attn_indexed, prefill_budget, prefill_budget_version, prefill_chunk, prefill_dual_rail, prefill_graph_fixed_routing, prefill_graphs_v2, prefill_moe_timing, prefill_swap_routes_version, prefill_timing, prefix_cache, prefix_disk, prefix_disk_dedup, prefix_disk_min_interval_s, prefix_disk_strict, prefix_disk_version, prefix_response, prefix_snapshots, prune_keep, prune_layer_counts, prune_layer_weights, prune_metric, prune_miss_fused, prune_miss_side, prune_rank, prune_record, prune_score_history_version, prune_select, prune_source, prune_swap_prefill, prune_swap_prefill_min, resident_budget, roce_hcas, roce_max_kb, router_bf16, router_bf16_version, router_fused_tail, router_fused_tail_version, scale_codec_source, scale_pack, spec, spec_conf, stream_layers, topk, tp_attention, tp_dense, tp_dense_rounding_version, tp_draft_attention, tp_draft_dense, tp_draft_experts, tp_draft_head, tp_draft_head_version, tp_embed, tp_expert_layout, tp_expert_reduce, tp_experts, tp_experts_version, tp_head, tp_linear_layout, user_prompt_max_loads, user_prompt_policy_version, user_prompt_stream, verify_odd, verify_odd_version, vision_enabled, vision_mode, vision_peer_version)
+20:18:39 [engine] warm start 500/9400 experts, 16.9 GB, 1s
+20:18:40 [engine] warm start 1000/9400 experts, 26.4 GB, 2s
+20:18:41 [engine] warm start 1500/9400 experts, 36.0 GB, 3s
+20:18:42 [engine] warm start 2000/9400 experts, 45.6 GB, 4s
+20:18:43 [engine] warm start 2500/9400 experts, 55.2 GB, 5s
+20:18:44 [engine] warm start 3000/9400 experts, 64.7 GB, 6s
+20:18:45 [engine] warm start 3500/9400 experts, 74.3 GB, 7s
+20:18:45 [engine] warm start 4000/9400 experts, 83.9 GB, 8s
+20:18:46 [engine] warm start 4500/9400 experts, 93.5 GB, 9s
+20:18:47 [engine] warm start 5000/9400 experts, 103.0 GB, 10s
+20:18:48 [engine] warm start 5500/9400 experts, 112.6 GB, 11s
+20:18:49 [engine] warm start 6000/9400 experts, 122.2 GB, 11s
+20:18:50 [engine] warm start 6500/9400 experts, 131.7 GB, 12s
+20:18:51 [engine] warm start 7000/9400 experts, 141.4 GB, 13s
+20:18:52 [engine] warm start 7500/9400 experts, 150.9 GB, 14s
+20:18:53 [engine] warm start 8000/9400 experts, 160.6 GB, 15s
+20:18:54 [engine] warm start 8500/9400 experts, 170.0 GB, 16s
+20:18:55 [engine] warm start 9000/9400 experts, 179.6 GB, 17s
+20:18:55 [engine] warm start done: 9400 experts resident (86.3 GB, 187.2 GB read) in 18s
+20:18:56 [engine] prune demand DB loaded: 597 recorded routing slots
+20:18:56 [engine] fast decode path enabled (CUDA graphs=True, device slot LUT=True, ep=2)
+20:18:56 [engine] dynamic speculative depth (3, 5) (start 3, decided every 8 tokens)
+20:18:56 [engine] EP2 communicator warm (dummy combine done)
+20:18:56 [engine] ready
+/opt/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.all_gather_into_tensor` is deprecated. Please use `torch.distributed.all_gather_single` instead.
+  return func(*args, **kwargs)
+20:18:58 [engine] spec depth 3 -> 5 at output token 9: 4.0 tokens/step over 2 steps; depth 3 55.1 tok/s, depth 5 would be 65.3 tok/s
+20:18:59 [engine] spec depth 5 -> 3 at output token 54: 2.25 tokens/step over 4 steps; depth 3 would be 31.0 tok/s, depth 5 27.0 tok/s
+20:18:59 [engine] spec depth 3 -> 5 at output token 62: 4.0 tokens/step over 2 steps; depth 3 59.4 tok/s, depth 5 would be 69.2 tok/s
+20:19:00 [engine] spec depth 5 -> 3 at output token 105: 3.33 tokens/step over 3 steps; depth 3 would be 44.5 tok/s, depth 5 41.2 tok/s
+20:19:00 [engine] spec depth 3 -> 5 at output token 125: 3.67 tokens/step over 3 steps; depth 3 53.6 tok/s, depth 5 would be 60.0 tok/s
+20:19:02 [engine] spec depth 5 -> 3 at output token 207: 2.0 tokens/step over 4 steps; depth 3 would be 29.2 tok/s, depth 5 25.0 tok/s
+20:19:02 [engine] spec depth 3 -> 5 at output token 215: 2.67 tokens/step over 3 steps; depth 3 38.6 tok/s, depth 5 would be 40.8 tok/s
+20:19:02 [engine] spec depth 5 -> 3 at output token 224: 3.0 tokens/step over 3 steps; depth 3 would be 43.5 tok/s, depth 5 37.7 tok/s
+20:19:03 [engine] spec depth 3 -> 5 at output token 234: 3.33 tokens/step over 3 steps; depth 3 48.7 tok/s, depth 5 would be 56.3 tok/s
+DECODE_KERNELS_RUN {"rank": 0, "workload": "html", "measured": false, "sha256": "d314ba3a4ca01f5e91325887477e604992e4e78b5a9307a257a36af6c06e94f1", "completion_tokens": 256, "decode_tok_s": 44.98, "steps": 61, "accept_len_mean": 4.21, "ms_per_step": 92.93442622950819}
+20:19:04 [engine] spec depth 3 -> 5 at output token 9: 4.0 tokens/step over 2 steps; depth 3 58.1 tok/s, depth 5 would be 68.9 tok/s
+DECODE_KERNELS_RUN {"rank": 0, "workload": "python", "measured": false, "sha256": "6a6d00d00abbee8e6900f5e82282b5992acd2529c72d0d9fdaf335841c21804e", "completion_tokens": 256, "decode_tok_s": 65.68, "steps": 46, "accept_len_mean": 5.63, "ms_per_step": 84.41304347826087}
+20:19:10 [engine] spec depth 3 -> 5 at output token 55: 4.0 tokens/step over 2 steps; depth 3 57.6 tok/s, depth 5 would be 65.7 tok/s
+20:19:10 [engine] spec depth 5 -> 3 at output token 64: 1.8 tokens/step over 5 steps; depth 3 would be 25.9 tok/s, depth 5 21.5 tok/s
+20:19:11 [engine] spec depth 3 -> 5 at output token 89: 4.0 tokens/step over 2 steps; depth 3 57.9 tok/s, depth 5 would be 65.8 tok/s
+20:19:11 [engine] spec depth 5 -> 3 at output token 97: 2.0 tokens/step over 4 steps; depth 3 would be 28.9 tok/s, depth 5 24.2 tok/s
+20:19:15 [engine] spec depth 3 -> 5 at output token 216: 3.33 tokens/step over 3 steps; depth 3 48.2 tok/s, depth 5 would be 52.4 tok/s
+20:19:15 [engine] spec depth 5 -> 3 at output token 237: 1.83 tokens/step over 6 steps; depth 3 would be 26.5 tok/s, depth 5 22.3 tok/s
+DECODE_KERNELS_RUN {"rank": 0, "workload": "explain", "measured": false, "sha256": "6e23f58711da8a3fc9c941416ac524697044d9db348d6272cb64a874a867e987", "completion_tokens": 256, "decode_tok_s": 30.59, "steps": 115, "accept_len_mean": 2.23, "ms_per_step": 72.48695652173913}
+20:19:17 [engine] spec depth 3 -> 5 at output token 9: 4.0 tokens/step over 2 steps; depth 3 58.1 tok/s, depth 5 would be 66.9 tok/s
+20:19:17 [engine] spec depth 5 -> 3 at output token 54: 2.25 tokens/step over 4 steps; depth 3 would be 32.7 tok/s, depth 5 27.7 tok/s
+20:19:18 [engine] spec depth 3 -> 5 at output token 62: 4.0 tokens/step over 2 steps; depth 3 58.1 tok/s, depth 5 would be 70.9 tok/s
+20:19:19 [engine] spec depth 5 -> 3 at output token 118: 3.33 tokens/step over 3 steps; depth 3 would be 43.6 tok/s, depth 5 41.1 tok/s
+20:19:19 [engine] spec depth 3 -> 5 at output token 126: 4.0 tokens/step over 2 steps; depth 3 58.0 tok/s, depth 5 would be 69.8 tok/s
+20:19:20 [engine] spec depth 5 -> 3 at output token 214: 2.0 tokens/step over 4 steps; depth 3 would be 29.0 tok/s, depth 5 25.2 tok/s
+20:19:21 [engine] spec depth 3 -> 5 at output token 223: 3.0 tokens/step over 3 steps; depth 3 43.5 tok/s, depth 5 would be 52.6 tok/s
+20:19:21 [engine] spec depth 5 -> 3 at output token 231: 2.67 tokens/step over 3 steps; depth 3 would be 38.7 tok/s, depth 5 33.8 tok/s
+20:19:21 [engine] spec depth 3 -> 5 at output token 239: 4.0 tokens/step over 2 steps; depth 3 58.3 tok/s, depth 5 would be 73.0 tok/s
+DECODE_KERNELS_RUN {"rank": 0, "workload": "html", "measured": true, "sha256": "02dce435081ebbba8b7ecff34e71c7e4b61dc50aa6639ae553bf83dfc2a5216a", "completion_tokens": 256, "decode_tok_s": 55.12, "steps": 59, "accept_len_mean": 4.34, "ms_per_step": 78.40677966101696, "repeat_exact": false}
+20:19:22 [engine] spec depth 3 -> 5 at output token 9: 4.0 tokens/step over 2 steps; depth 3 58.1 tok/s, depth 5 would be 70.0 tok/s
+DECODE_KERNELS_RUN {"rank": 0, "workload": "python", "measured": true, "sha256": "6a6d00d00abbee8e6900f5e82282b5992acd2529c72d0d9fdaf335841c21804e", "completion_tokens": 256, "decode_tok_s": 66.83, "steps": 46, "accept_len_mean": 5.65, "ms_per_step": 82.93478260869566, "repeat_exact": true}
+20:19:32 [engine] spec depth 3 -> 5 at output token 196: 2.75 tokens/step over 4 steps; depth 3 40.3 tok/s, depth 5 would be 42.5 tok/s
+20:19:32 [engine] spec depth 5 -> 3 at output token 205: 3.0 tokens/step over 3 steps; depth 3 would be 39.1 tok/s, depth 5 36.5 tok/s
+20:19:33 [engine] spec depth 3 -> 5 at output token 249: 3.67 tokens/step over 3 steps; depth 3 53.9 tok/s, depth 5 would be 56.1 tok/s
+DECODE_KERNELS_RUN {"rank": 0, "workload": "explain", "measured": true, "sha256": "13ef37858b69312718dc74e1c19cb012b2921f196a36d86924b4e92ea3ab8684", "completion_tokens": 256, "decode_tok_s": 32.24, "steps": 112, "accept_len_mean": 2.29, "ms_per_step": 70.625, "repeat_exact": false}
+20:19:34 [engine] spec depth 3 -> 5 at output token 9: 4.0 tokens/step over 2 steps; depth 3 58.7 tok/s, depth 5 would be 66.9 tok/s
+USDT:2026-10-22 20:19:35 57:57 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-10-22 20:19:36 57:57 SyncActivityProfilerHandler.cpp:59] profiler_stop
+DECODE_KERNELS_PROFILE {"rank": 0, "steps": 8, "kernels_per_step": 3785.0, "kernel_ms_per_step": 92.27175450000023, "families": {"small": {"kernels": 3476.0, "ms": 67.7565561250002}, "dense projections": {"kernels": 273.0, "ms": 23.507148499999925}, "fp32 gemm": {"kernels": 18.0, "ms": 0.5882611250000331}, "bf16 gemm": {"kernels": 17.0, "ms": 0.2802687500000632}, "nccl": {"kernels": 1.0, "ms": 0.13952000000000225}}}
+DECODE_KERNELS_PASS

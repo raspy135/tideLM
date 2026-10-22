@@ -182,6 +182,28 @@ class WideMoECUDA(unittest.TestCase):
         with self.assertRaises(ValueError):
             CUDA.build_routing_small(torch.zeros(86, 6, dtype=torch.int32, device="cuda"), 16, 6)
 
+    def test_small_router_matches_stable_sort(self):
+        """route_small_bm16 (<= 64 pairs): the parallel rank and block cut against the same
+        stable-sort reference, including negative keys (idle rows), runs past 16 and P = 1."""
+        import fp4_moe_cuda as CUDA
+        gen = torch.Generator().manual_seed(22)
+        for rows, topk in ((1, 1), (1, 6), (4, 6), (5, 3), (6, 6), (10, 6), (16, 4), (32, 2), (64, 1)):
+            for span in (2, 9, 400):
+                for trial in range(4):
+                    slots = torch.randint(-3, span, (rows, topk), dtype=torch.int32, generator=gen)
+                    if trial == 3:
+                        slots[:] = 5   # one run of P pairs: ceil(P / 16) blocks of one slot
+                    slots = slots.cuda()
+                    block_slot, block_pair, block_route, nb = CUDA.build_routing_small(slots, 16, topk)
+                    torch.cuda.synchronize()
+                    ref_slot, ref_pair = _reference_routing(slots, topk)
+                    tag = f"P={rows * topk} topk={topk} span={span} trial={trial}"
+                    self.assertEqual(nb, rows * topk)
+                    self.assertTrue(torch.equal(block_slot.cpu(), ref_slot), tag)
+                    self.assertTrue(torch.equal(block_pair.cpu(), ref_pair), tag)
+                    route = torch.where(ref_pair >= 0, ref_pair | ((ref_pair // topk) << 16), -1)
+                    self.assertTrue(torch.equal(block_route.cpu(), route), tag)
+
     def _moe(self, x, slots, weight, null):
         """FastDecoder._moe_merged's routed half on one GPU (world 1): fp32 parts summed over k."""
         import fp4_moe as K

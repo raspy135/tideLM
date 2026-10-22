@@ -782,41 +782,51 @@ __global__ void route_small_bm16(const int32_t *slots, int32_t *block_slot,
         block_pair[i] = -1;
         block_route[i] = -1;
     }
+    __shared__ int32_t key[64];
     __shared__ int32_t sorted_slot[64];
     __shared__ int32_t sorted_pair[64];
-    if (p < pairs) { sorted_slot[p] = slots[p]; sorted_pair[p] = p; }
+    __shared__ int32_t run_offset[64];
+    __shared__ uint32_t starts[2];
+    if (p < pairs) key[p] = slots[p];
     __syncthreads();
-    if (p != 0) return;
-    // Stable insertion sort is only O(P^2) once, with P <= 64, and exactly matches the torch
-    // builder's argsort contract.  The earlier one-thread-per-p ranker did O(P^3) work.
-    for (int i = 1; i < pairs; ++i) {
-        const int32_t value = sorted_slot[i], pair = sorted_pair[i];
-        int j = i;
-        while (j && sorted_slot[j - 1] > value) {
-            sorted_slot[j] = sorted_slot[j - 1];
-            sorted_pair[j] = sorted_pair[j - 1];
-            --j;
+    // A stable sort by slot, the torch builder's argsort contract: pair p lands after every pair
+    // with a smaller slot and every earlier pair with the same slot. Counting both in one O(P)
+    // pass per thread replaced a one-thread insertion sort, O(P^2) serial shared-memory steps
+    // that took 19.6 us a call on the verify block (2026-10-22, 43 calls a step).
+    if (p < pairs) {
+        const int32_t mine = key[p];
+        int below = 0, before = 0;
+        for (int i = 0; i < pairs; ++i) {
+            const int32_t other = key[i];
+            below += other < mine;
+            before += other == mine && i < p;
         }
-        sorted_slot[j] = value;
-        sorted_pair[j] = pair;
+        sorted_slot[below + before] = mine;
+        sorted_pair[below + before] = p;
+        run_offset[below + before] = before;
     }
-    int block = -1, rank = 0;
-    int32_t previous = INT32_MIN;
-    for (int i = 0; i < pairs; ++i) {
-        const int32_t value = sorted_slot[i];
-        if (!i || value != previous || rank == kBlockM) {
-            ++block; rank = 0; previous = value; block_slot[block] = value;
-        }
-        // Split long runs instead of silently dropping pair 17+ when small top-k permits T > 16.
-        const int index = (block << 4) + rank;
-        block_pair[index] = sorted_pair[i];
-        block_route[index] = sorted_pair[i] | ((sorted_pair[i] / topk) << 16);
-        ++rank;
-    }
+    __syncthreads();
+    // The block cut, in parallel over sorted positions: a block starts at each new slot and every
+    // 16 pairs into a run (long runs are split, not truncated, when small top-k permits T > 16),
+    // so a position's block is the number of starts at or before it, minus one.
+    const bool valid = p < pairs;
+    const bool start = valid && run_offset[p] % kBlockM == 0;
+    const uint32_t ballot = __ballot_sync(0xffffffffu, start);
+    if ((p & 31) == 0) starts[p >> 5] = ballot;
+    __syncthreads();
+    if (!valid) return;
+    const int lane = p & 31;
+    const int block = __popc(starts[p >> 5] & (0xffffffffu >> (31 - lane)))
+                      + ((p >> 5) ? __popc(starts[0]) : 0) - 1;
+    const int32_t pair = sorted_pair[p];
+    const int index = (block << 4) + run_offset[p] % kBlockM;
+    if (start) block_slot[block] = sorted_slot[p];
+    block_pair[index] = pair;
+    block_route[index] = pair | ((pair / topk) << 16);
 }
 
 // Batched multi-request decode stacks several verify blocks: 4 lanes x 6 rows x top-6 is 144
-// pairs, past route_small_bm16's 64-entry insertion sort. Same contract, same output: a stable
+// pairs, past route_small_bm16's 64-entry shared arrays. Same contract, same output: a stable
 // sort of the pairs by slot (unique, so it is exactly the insertion sort's order) and then the same
 // sequential block cut. The rank is computed in parallel -- each thread counts the pairs that sort
 // ahead of its own, O(P) per thread -- and only the O(P) cut runs on one thread.

@@ -47,7 +47,9 @@ tokens per step at depth 3 → depth 5.
    including on abort paths, so both ranks verify the same width.
 
 Greedy output is identical under any depth schedule, because verification accepts exactly the
-target model's argmax. With sampling the output distribution is unchanged, but the random stream
+target model's argmax -- with frozen expert placement. Hot reads load experts by the verify
+block's routing, drafted rows included, so in serving a different schedule can change which
+experts are resident and with them the greedy text (docs/gotchas.md, 2026-10-22). With sampling the output distribution is unchanged, but the random stream
 depends on the schedule.
 
 ## Full-engine check, 2026-09-23

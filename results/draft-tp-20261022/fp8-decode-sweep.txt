@@ -1,0 +1,77 @@
+wq_a+wkv     N=1792 K=5120 M=4 copies=33: base    43.4 us   212 GB/s
+       42.4 us   216 GB/s  bn=16 bk=256 w=2 st=3 bit=1 exact=True
+       42.5 us   216 GB/s  bn=16 bk=256 w=2 st=3 bit=0 exact=True
+       42.6 us   215 GB/s  bn=16 bk=256 w=4 st=3 bit=1 exact=True
+       42.7 us   215 GB/s  bn=32 bk=256 w=4 st=3 bit=1 exact=True
+       43.0 us   213 GB/s  bn=32 bk=256 w=4 st=4 bit=1 exact=True
+       43.0 us   213 GB/s  bn=32 bk=256 w=4 st=4 bit=0 exact=True
+wq_b/r       N=16384 K=1280 M=4 copies=15: base    93.3 us   225 GB/s
+       91.2 us   230 GB/s  bn=16 bk=256 w=2 st=4 bit=1 exact=True
+       91.7 us   229 GB/s  bn=16 bk=256 w=2 st=4 bit=0 exact=True
+       92.2 us   228 GB/s  bn=16 bk=256 w=4 st=4 bit=1 exact=True
+       92.4 us   227 GB/s  bn=16 bk=256 w=2 st=3 bit=1 exact=True
+       92.6 us   227 GB/s  bn=16 bk=256 w=2 st=3 bit=0 exact=True
+       92.7 us   226 GB/s  bn=16 bk=256 w=2 st=5 bit=1 exact=True
+wo_b/r       N=2560 K=8192 M=4 copies=15: base    93.5 us   224 GB/s
+       93.4 us   225 GB/s  bn=32 bk=256 w=4 st=3 bit=1 exact=True
+       93.4 us   225 GB/s  bn=32 bk=256 w=4 st=4 bit=1 exact=True
+       93.5 us   224 GB/s  bn=32 bk=256 w=4 st=3 bit=0 exact=True
+       93.7 us   224 GB/s  bn=32 bk=256 w=4 st=4 bit=0 exact=True
+       94.0 us   223 GB/s  bn=16 bk=256 w=2 st=4 bit=0 exact=True
+       94.0 us   223 GB/s  bn=16 bk=256 w=4 st=4 bit=1 exact=True
+sh_w13/r     N=2304 K=5120 M=4 copies=26: base    54.1 us   218 GB/s
+       53.7 us   220 GB/s  bn=16 bk=256 w=4 st=3 bit=1 exact=True
+       54.0 us   219 GB/s  bn=16 bk=256 w=2 st=3 bit=1 exact=True
+       54.1 us   218 GB/s  bn=32 bk=256 w=4 st=3 bit=0 exact=True
+       54.2 us   218 GB/s  bn=32 bk=256 w=4 st=4 bit=1 exact=True
+       54.3 us   217 GB/s  bn=32 bk=256 w=4 st=2 bit=1 exact=True
+       54.4 us   217 GB/s  bn=16 bk=256 w=2 st=3 bit=0 exact=True
+sh_w2/r      N=2560 K=2304 M=4 copies=40: base    28.0 us   211 GB/s
+       28.0 us   211 GB/s  bn=32 bk=256 w=4 st=3 bit=0 exact=True
+       28.1 us   210 GB/s  bn=32 bk=256 w=4 st=3 bit=1 exact=True
+       28.4 us   208 GB/s  bn=32 bk=256 w=2 st=2 bit=1 exact=True
+       28.6 us   206 GB/s  bn=32 bk=256 w=4 st=2 bit=1 exact=True
+       28.6 us   206 GB/s  bn=16 bk=256 w=2 st=2 bit=1 exact=True
+       28.8 us   205 GB/s  bn=16 bk=128 w=4 st=3 bit=0 exact=True
+main_proj    N=5120 K=15360 M=4 copies=4: base   356.0 us   221 GB/s
+      344.4 us   229 GB/s  bn=32 bk=256 w=4 st=4 bit=1 exact=True
+      345.1 us   228 GB/s  bn=32 bk=256 w=4 st=4 bit=0 exact=True
+      345.3 us   228 GB/s  bn=32 bk=256 w=2 st=2 bit=1 exact=True
+      345.3 us   228 GB/s  bn=64 bk=256 w=8 st=3 bit=1 exact=True
+      345.4 us   228 GB/s  bn=64 bk=256 w=8 st=4 bit=0 exact=True
+      345.7 us   228 GB/s  bn=64 bk=256 w=4 st=4 bit=1 exact=True
+main_proj/r  N=2560 K=15360 M=4 copies=8: base   174.0 us   226 GB/s
+      173.4 us   227 GB/s  bn=32 bk=256 w=4 st=4 bit=0 exact=True
+      173.7 us   227 GB/s  bn=16 bk=256 w=2 st=4 bit=0 exact=True
+      174.0 us   226 GB/s  bn=32 bk=256 w=4 st=3 bit=0 exact=True
+      174.1 us   226 GB/s  bn=16 bk=256 w=4 st=4 bit=1 exact=True
+      174.5 us   226 GB/s  bn=16 bk=256 w=4 st=5 bit=1 exact=True
+      174.7 us   225 GB/s  bn=16 bk=256 w=2 st=5 bit=0 exact=True
+dhead/r      N=20480 K=5120 M=5 copies=3: base   456.5 us   230 GB/s
+      454.3 us   231 GB/s  bn=16 bk=256 w=2 st=4 bit=1 exact=True
+      454.7 us   231 GB/s  bn=16 bk=256 w=2 st=4 bit=0 exact=True
+      456.2 us   230 GB/s  bn=16 bk=256 w=4 st=3 bit=1 exact=True
+      456.3 us   230 GB/s  bn=16 bk=256 w=2 st=5 bit=0 exact=True
+      456.4 us   230 GB/s  bn=16 bk=256 w=2 st=5 bit=1 exact=True
+      456.5 us   230 GB/s  bn=32 bk=256 w=4 st=3 bit=0 exact=True
+sh_w13 full  N=4608 K=5120 M=5 copies=13: base   104.8 us   225 GB/s
+      104.5 us   226 GB/s  bn=16 bk=256 w=2 st=3 bit=0 exact=True
+      104.5 us   226 GB/s  bn=16 bk=256 w=2 st=3 bit=1 exact=True
+      104.6 us   226 GB/s  bn=16 bk=256 w=2 st=4 bit=1 exact=True
+      104.8 us   225 GB/s  bn=32 bk=256 w=4 st=3 bit=0 exact=True
+      104.9 us   225 GB/s  bn=16 bk=256 w=4 st=3 bit=0 exact=True
+      104.9 us   225 GB/s  bn=16 bk=256 w=4 st=3 bit=1 exact=True
+sh_w2 full   N=5120 K=2304 M=5 copies=26: base    57.4 us   206 GB/s
+       54.1 us   218 GB/s  bn=64 bk=256 w=4 st=2 bit=1 exact=True
+       54.1 us   218 GB/s  bn=32 bk=256 w=2 st=2 bit=1 exact=True
+       54.2 us   218 GB/s  bn=16 bk=256 w=4 st=2 bit=1 exact=True
+       54.3 us   218 GB/s  bn=64 bk=256 w=4 st=2 bit=0 exact=True
+       54.4 us   217 GB/s  bn=32 bk=256 w=2 st=2 bit=0 exact=True
+       54.4 us   217 GB/s  bn=16 bk=256 w=2 st=3 bit=1 exact=True
+wo_a/r grouped G=4 R=1024 K=4096: base    75.5 us   223 GB/s
+       74.8 us   225 GB/s  bn=16 bk=256 w=2 st=3 bit=1 exact=True
+       75.4 us   223 GB/s  bn=16 bk=256 w=4 st=3 bit=0 exact=True
+       75.5 us   223 GB/s  bn=32 bk=256 w=4 st=3 bit=0 exact=True
+       75.5 us   223 GB/s  bn=32 bk=256 w=4 st=3 bit=1 exact=True
+       75.6 us   222 GB/s  bn=16 bk=256 w=4 st=4 bit=1 exact=True
+       75.6 us   222 GB/s  bn=16 bk=256 w=2 st=5 bit=1 exact=True

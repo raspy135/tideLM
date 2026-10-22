@@ -1,0 +1,9 @@
+[rails] rank 0: decode NET/0; prefill both rails
+/opt/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.all_gather_into_tensor` is deprecated. Please use `torch.distributed.all_gather_single` instead.
+  return func(*args, **kwargs)
+/opt/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.all_gather_into_tensor` is deprecated. Please use `torch.distributed.all_gather_single` instead.
+  return func(*args, **kwargs)
+[roce] all-gathers of up to 256 KiB a rank over RoCE on roceP2p1s0f1 (GID 5, 10.0.1.1), rocep1s0f1 (GID 5, 10.0.0.1); timeout 120 s; probe 13.5 us eager at 16 KiB
+/opt/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.all_gather_into_tensor` is deprecated. Please use `torch.distributed.all_gather_single` instead.
+  return func(*args, **kwargs)
+rank 0: OK []

@@ -30,6 +30,9 @@ import decode_rows
 # bit-identical (the 64-wide sweep was, 42/42) -- tools/test_fp8_decode_tiles.py checks it rather
 # than assuming it. "auto" takes the widest tile that still fills every SM, else 16.
 # Read at call time so a benchmark can A/B arms inside one process; the EP2 boot guard pins it.
+# 2026-10-22: with BLOCK_N=32/BLOCK_K=256 every TP2 decode shape streams at 211-230 GB/s cold, and
+# no tile/warp/stage combination is more than 3% faster (docs/gotchas.md). An ordered split-K would
+# change the bits for nothing measurable.
 DECODE_BLOCK_N = os.environ.get("DSV41_FP8_DECODE_BLOCK_N", "auto")
 DECODE_WARPS = int(os.environ.get("DSV41_FP8_DECODE_WARPS", "4"))
 # Native-weight decode optimization. Read at call time for the frozen-map A/B driver;

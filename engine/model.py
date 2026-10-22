@@ -367,6 +367,10 @@ class Weights:
                     raise ValueError('draft attention TP requires disjoint output layout')
                 shard_attention(self.mtp[-1], args, int(os.environ.get('RANK', '0')),
                                 int(os.environ.get('WORLD_SIZE', '1')))
+            from engine.tensor_parallel import tp_draft_dense_enabled, shard_draft_dense
+            if tp_draft_dense_enabled():
+                shard_draft_dense(self.mtp[-1], int(os.environ.get('RANK', '0')),
+                                  int(os.environ.get('WORLD_SIZE', '1')))
         self.dspark_experts = None  # filled by the engine (arena of 3 x 128 experts)
         log(f"weights: all non-expert weights on GPU in {time.time() - t0:.0f}s")
 

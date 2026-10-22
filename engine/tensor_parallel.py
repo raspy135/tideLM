@@ -134,6 +134,74 @@ class OutputParallelWeight:
             *shape[:-1], self.shape[0])
 
 
+class ColumnParallelWeight:
+    """Replicated input, disjoint output rows a rank, the outputs gathered.
+
+    No sum anywhere: fp8_linear partitions output columns only, so each gathered value is the
+    dot product the unsplit weight computes. Decode-sized calls only. At prefill sizes cuBLAS
+    picks a different algorithm for the narrower N (17 and 64 rows of a 5120x15360 GEMM differ
+    in their bits split vs whole; 256+ rows matched, 2026-10-22), so prefill keeps the full weight.
+    """
+    def __init__(self, local, world=2):
+        if world != 2:
+            raise ValueError('column-parallel linear supports two ranks')
+        self.local, self.world = local, world
+        self.shape = (local.shape[0] * world, local.shape[1])
+
+    def tp_linear_act_qdq(self, x):
+        return self.tp_linear(x, act_qdq=True)
+
+    def tp_linear(self, x, act_qdq: bool = False):
+        import decode_rows
+        from fp8_linear import fp8_linear
+        shape = x.shape
+        flat = x.to(torch.bfloat16).reshape(-1, shape[-1]).contiguous()
+        rows = flat.size(0)
+        if rows > decode_rows.limit():
+            raise ValueError(f'column-parallel linear is decode-only, got {rows} rows')
+        local = fp8_linear(flat, self.local, act_qdq=act_qdq).contiguous()
+        output = torch.empty((self.world * rows, local.shape[-1]), dtype=local.dtype, device=local.device)
+        comm.all_gather_fast(output, local, group=collective_group())
+        return output.view(self.world, rows, local.shape[-1]).transpose(0, 1).reshape(
+            *shape[:-1], self.shape[0])
+
+
+def tp_draft_dense_enabled():
+    value = os.environ.get('DSV41_TP_DRAFT_DENSE', '0')
+    if value not in ('0', '1'):
+        raise ValueError('DSV41_TP_DRAFT_DENSE must be 0 or 1')
+    return value == '1'
+
+
+def shard_draft_dense(weight, rank, world):
+    """DSV41_TP_DRAFT_DENSE for one DSpark block: its shared expert in the backbone's output
+    layout (w1/w3 output rows, w2 an OutputParallelWeight), and block 0's main_proj given a
+    decode-only ColumnParallelWeight over a row VIEW of its rows -- the full matrix stays for
+    the prefill seed, so this adds no memory there and frees 17.7 MB a block of shared expert.
+
+    The draft read both in full on both ranks: per step, 3 x 35 MB of shared expert and 79 MB
+    of main_proj (fastdecode._draft, _seed_draft_rings). Every value stays a complete dot
+    product; only which rank computes it changes."""
+    from fp8_linear import FP8Weight
+    if world != 2 or not 0 <= rank < world:
+        raise ValueError('draft dense TP requires two ranks')
+    if os.environ.get('DSV41_TP_LINEAR_LAYOUT', 'output') != 'output':
+        raise ValueError('draft dense TP requires DSV41_TP_LINEAR_LAYOUT=output')
+    if any(type(getattr(weight, n)) is not FP8Weight for n in ('sh_w1', 'sh_w2', 'sh_w3')):
+        raise ValueError('draft dense TP requires the native FP8 shared expert (DSV41_DENSE_FP4 '
+                         'without "shared")')
+    weight.sh_w1 = shard(weight.sh_w1, 0, rank, world)
+    weight.sh_w3 = shard(weight.sh_w3, 0, rank, world)
+    weight.sh_w2 = OutputParallelWeight(shard(weight.sh_w2, 0, rank, world), world)
+    main = getattr(weight, 'main_proj', None)
+    if main is not None:
+        if type(main) is not FP8Weight or main.N % (32 * world):
+            raise ValueError('draft dense TP requires the native FP8 main_proj')
+        n = main.N // world
+        weight._main_proj_tp = ColumnParallelWeight(
+            FP8Weight(main.w[rank * n:(rank + 1) * n], main.s[rank * n // 32:(rank + 1) * n // 32]), world)
+
+
 def shard_attention(weight, args, rank, world):
     from fp8_linear import FP8GroupedWeight
     from fp4_linear import FP4GroupedWeight
