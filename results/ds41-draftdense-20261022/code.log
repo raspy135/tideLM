@@ -1,0 +1,12 @@
+== ds41-draftdense-code: workload=code isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=v41
+  warmup  isl=62 ttft=   1543.3 ms  tpot=  25.43 ms  decode= 39.33 tok/s  out=1024 (length)
+          accept_len=3.54  expert_hit=1.0  nvme=7.7 GB  engram_rows=77184
+  run1    isl=62 ttft=   2097.7 ms  tpot=  22.35 ms  decode= 44.74 tok/s  out=1024 (length)
+          accept_len=4.1  expert_hit=1.0  nvme=3.77 GB  engram_rows=73664
+  run2    isl=62 ttft=   1210.9 ms  tpot=  22.76 ms  decode= 43.94 tok/s  out=1024 (length)
+          accept_len=3.85  expert_hit=1.0  nvme=2.87 GB  engram_rows=73104
+  run3    isl=62 ttft=   1157.8 ms  tpot=  23.02 ms  decode= 43.45 tok/s  out=1024 (length)
+          accept_len=4.0  expert_hit=1.0  nvme=2.55 GB  engram_rows=75920
+  -> MEDIAN  ttft=1210.8971 ms  tpot=22.7567 ms  decode=43.9431 tok/s
+  -> ENGINE  accept_len=4.0  expert_hit=1.0  nvme=2.87 GB  engram_rows=73664
+  wrote /home/ryan/git/tidelm-glm/results/ds41-draftdense-20261022/code.json

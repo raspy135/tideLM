@@ -1,0 +1,12 @@
+== ds41-draftdense-prose: workload=prose isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=v41
+  warmup  isl=45 ttft=   4682.4 ms  tpot=  42.25 ms  decode= 23.67 tok/s  out=1024 (length)
+          accept_len=2.01  expert_hit=1.0  nvme=10.57 GB  engram_rows=102240
+  run1    isl=45 ttft=   1794.5 ms  tpot=  38.15 ms  decode= 26.21 tok/s  out=1024 (length)
+          accept_len=1.99  expert_hit=1.0  nvme=4.65 GB  engram_rows=103200
+  run2    isl=45 ttft=   1266.6 ms  tpot=  39.33 ms  decode= 25.42 tok/s  out=1024 (length)
+          accept_len=1.97  expert_hit=1.0  nvme=3.77 GB  engram_rows=103760
+  run3    isl=45 ttft=   1142.8 ms  tpot=  39.20 ms  decode= 25.51 tok/s  out=1024 (length)
+          accept_len=1.98  expert_hit=1.0  nvme=2.85 GB  engram_rows=103584
+  -> MEDIAN  ttft=1266.6322 ms  tpot=39.2037 ms  decode=25.5078 tok/s
+  -> ENGINE  accept_len=1.98  expert_hit=1.0  nvme=3.77 GB  engram_rows=103584
+  wrote /home/ryan/git/tidelm-glm/results/ds41-draftdense-20261022/prose.json

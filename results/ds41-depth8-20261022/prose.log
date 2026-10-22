@@ -1,0 +1,12 @@
+== ds41-depth8-prose: workload=prose isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=v41
+  warmup  isl=45 ttft=   3409.2 ms  tpot=  39.19 ms  decode= 25.52 tok/s  out=1024 (length)
+          accept_len=2.01  expert_hit=1.0  nvme=11.12 GB  engram_rows=105936
+  run1    isl=45 ttft=   1918.3 ms  tpot=  37.88 ms  decode= 26.40 tok/s  out=1024 (length)
+          accept_len=2.02  expert_hit=1.0  nvme=4.88 GB  engram_rows=103280
+  run2    isl=45 ttft=   1219.8 ms  tpot=  39.08 ms  decode= 25.59 tok/s  out=1024 (length)
+          accept_len=1.95  expert_hit=1.0  nvme=3.14 GB  engram_rows=107696
+  run3    isl=45 ttft=   1154.1 ms  tpot=  39.38 ms  decode= 25.39 tok/s  out=1024 (length)
+          accept_len=1.93  expert_hit=1.0  nvme=2.62 GB  engram_rows=107712
+  -> MEDIAN  ttft=1219.8198 ms  tpot=39.0844 ms  decode=25.5857 tok/s
+  -> ENGINE  accept_len=1.95  expert_hit=1.0  nvme=3.14 GB  engram_rows=107696
+  wrote /home/ryan/git/tidelm-glm/results/ds41-depth8-20261022/prose.json

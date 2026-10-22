@@ -1,0 +1,12 @@
+== ds41-draftdense-random8k: workload=random isl=8192 osl=256 runs=3 warmup=1 thinking=False engine=v41
+  warmup  isl=8178 ttft=   9828.3 ms  tpot=  36.83 ms  decode= 27.15 tok/s  out=256 (length)
+          accept_len=3.02  expert_hit=1.0  nvme=8.33 GB  engram_rows=213105
+  run1    isl=8170 ttft=   9465.2 ms  tpot=  27.51 ms  decode= 36.35 tok/s  out=256 (length)
+          accept_len=3.56  expert_hit=1.0  nvme=4.54 GB  engram_rows=210260
+  run2    isl=8171 ttft=  10823.5 ms  tpot=  26.78 ms  decode= 37.34 tok/s  out=256 (length)
+          accept_len=3.78  expert_hit=1.0  nvme=3.06 GB  engram_rows=209405
+  run3    isl=8178 ttft=   6903.6 ms  tpot=  28.02 ms  decode= 35.69 tok/s  out=256 (length)
+          accept_len=3.12  expert_hit=1.0  nvme=3.33 GB  engram_rows=209723
+  -> MEDIAN  ttft=9465.1906 ms  tpot=27.513 ms  decode=36.3465 tok/s
+  -> ENGINE  accept_len=3.56  expert_hit=1.0  nvme=3.33 GB  engram_rows=209723
+  wrote /home/ryan/git/tidelm-glm/results/ds41-draftdense-20261022/random8k.json

@@ -36,7 +36,8 @@ tokens per step at depth 3 → depth 5.
    ahead of time would be wrong: its warm-up forward writes KV past the step, and in the
    128-slot window ring that overwrites entries the current step still attends to.
 4. `engine/spec_depth.py` holds the policy. It re-decides at most once per
-   `DSV41_BLOCK_DYNAMIC_TOKENS` (default 60) output tokens and needs a 3% win to switch.
+   `DSV41_BLOCK_DYNAMIC_TOKENS` (default 60; the DS profile sets 8 since 2026-10-22, see
+   docs/gotchas.md) output tokens and needs a 3% win to switch.
    - **At depth 5**, it knows the depth-3 alternative exactly: `min(accepted, 3) + 1` tokens per
      step.
    - **At depth 3**, it estimates depth 5 from saturated steps, using the extra acceptance

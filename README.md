@@ -10,17 +10,18 @@ tide — so the engine gets better the more you use it.
 
 | Profile | Model | Routed experts | Resident | Context | Prose | Code | 8K-token prompt, first token |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,452 / 15,360 (68%) | 512K | **25.6 tok/s** | **41.1 tok/s** | 8.3 s |
+| `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,452 / 15,360 (68%) | 512K | **25.6 tok/s** | **43.3 tok/s** | 7.3 s |
 | `glm53-exl3` | GLM-5.3 | EXL3 3.0 bpw | 12,500 / 19,200 (65.1%) | 256K | **15.2 tok/s** | **20.3 tok/s** | 18.5 s |
 
 *Decode speed is `bench/bench.py`'s median over three measured runs after one warmup: 1,024
 output tokens at temperature 0.6, prose = an essay request, code = an LRU-cache request. The last
 column is the median time to first token of a fresh ~8,200-token prompt (no prefix reused). Each
 profile uses adaptation, hot reads and speculative decoding on two DGX Sparks, with its learned
-expert history. DS was measured on 2026-10-22 with lossless scales, candidate indexing and
-10,452 residents at a 32K context allocation (the profile supports 512K):
-[raw runs](results/ds41-packed-20261022/README.md); its code median moves with each boot's
-acceptance (44.8 in the [paired A/B](docs/lossless-scales.md)). GLM was measured on 2026-10-22 from its own EXL3
+expert history. DS was measured on 2026-10-22 with lossless scales, candidate indexing, the
+split draft weights, an 8-token depth window and 10,452 residents at a 32K context allocation
+(the profile supports 512K): [raw runs](results/ds41-depth8-20261022/README.md). Its code median
+moves with each boot's acceptance (41.1-44.8 across that day's boots) and the 8K first token with
+its Engram phase (6.9-11.2 s across runs). GLM was measured on 2026-10-22 from its own EXL3
 checkpoint with FP8 kv_b, with 12,000 residents at 256K; the profile keeps 12,500:
 [raw runs](results/glm-native-perf-20261022/README.md), [comparison](docs/glm53-native-exl3.md). First requests after boot can be slower
 ([gotchas](docs/gotchas.md)).*

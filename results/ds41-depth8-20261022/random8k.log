@@ -1,0 +1,12 @@
+== ds41-depth8-random8k: workload=random isl=8192 osl=256 runs=3 warmup=1 thinking=False engine=v41
+  warmup  isl=8178 ttft=   9014.9 ms  tpot=  40.16 ms  decode= 24.90 tok/s  out=256 (length)
+          accept_len=2.52  expert_hit=1.0  nvme=7.95 GB  engram_rows=211322
+  run1    isl=8170 ttft=   7279.6 ms  tpot=  30.63 ms  decode= 32.65 tok/s  out=256 (length)
+          accept_len=3.2  expert_hit=1.0  nvme=4.9 GB  engram_rows=210260
+  run2    isl=8171 ttft=   7831.2 ms  tpot=  28.78 ms  decode= 34.75 tok/s  out=256 (length)
+          accept_len=3.12  expert_hit=1.0  nvme=3.1 GB  engram_rows=210445
+  run3    isl=8178 ttft=   7001.6 ms  tpot=  36.10 ms  decode= 27.70 tok/s  out=256 (length)
+          accept_len=2.36  expert_hit=1.0  nvme=3.31 GB  engram_rows=214811
+  -> MEDIAN  ttft=7279.6382 ms  tpot=30.6256 ms  decode=32.6524 tok/s
+  -> ENGINE  accept_len=3.12  expert_hit=1.0  nvme=3.31 GB  engram_rows=210445
+  wrote /home/ryan/git/tidelm-glm/results/ds41-depth8-20261022/random8k.json

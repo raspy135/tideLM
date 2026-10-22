@@ -4178,11 +4178,14 @@ ceiling, but its tiling sets its bits; any retiling is a numerics change for ~0.
 --down-rows 2`, L2-cold): 206 GB/s at U = 16-20 against 227, `up` 213-220 against 215-219. A
 perfect `down` would save ~0.5-0.9 ms a step; not pursued.
 
-**A shorter depth window (`DSV41_BLOCK_DYNAMIC_TOKENS`, default 60), greedy only so far.** Same
+**A shorter depth window (`DSV41_BLOCK_DYNAMIC_TOKENS`, default 60; the profile ships 8).** Same
 gate, new code, one boot each (tok/s): window 60 html 55.27 / python 61.9 / explain 30.0; window
 8 55.12 / 66.83 / 32.24; window 20 54.87 / 65.49 / 31.85. The python request goes to depth 5 at
 output token 9 instead of 62 (52 -> 46 steps). At 256 tokens the first window is a quarter of the
-output, so a 1,024-token or sampled request will gain less; sampled serving is unmeasured. The
+output, so a 1,024-token or sampled request will gain less. Sampled, 1,024 tokens, the README
+protocol on the same code (one boot each): window 60 prose 25.51 / code 43.94 tok/s, window 8
+25.59 / 43.31 -- no measurable change either way (`results/ds41-depth8-20261022/`). The profile
+takes 8 for the greedy gain and short replies. The
 greedy tokens changed with the window (html, explain) -- through hot reads, which follow the verify
 block's routing, not the arithmetic: the 2026-10-22 base code with window 8 reproduced the new
 code's window-8 hashes, steps and acceptance in all six runs. "Greedy output is identical under any

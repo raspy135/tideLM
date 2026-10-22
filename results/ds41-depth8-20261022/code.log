@@ -1,0 +1,12 @@
+== ds41-depth8-code: workload=code isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=v41
+  warmup  isl=62 ttft=   1908.6 ms  tpot=  23.89 ms  decode= 41.86 tok/s  out=1024 (length)
+          accept_len=3.92  expert_hit=1.0  nvme=7.75 GB  engram_rows=73760
+  run1    isl=62 ttft=   1258.0 ms  tpot=  23.09 ms  decode= 43.31 tok/s  out=1024 (length)
+          accept_len=3.83  expert_hit=1.0  nvme=3.43 GB  engram_rows=74416
+  run2    isl=62 ttft=   1222.3 ms  tpot=  23.63 ms  decode= 42.31 tok/s  out=1024 (length)
+          accept_len=3.69  expert_hit=1.0  nvme=2.72 GB  engram_rows=75056
+  run3    isl=62 ttft=   1245.1 ms  tpot=  22.84 ms  decode= 43.79 tok/s  out=1024 (length)
+          accept_len=3.93  expert_hit=1.0  nvme=2.76 GB  engram_rows=74384
+  -> MEDIAN  ttft=1245.088 ms  tpot=23.0877 ms  decode=43.3131 tok/s
+  -> ENGINE  accept_len=3.83  expert_hit=1.0  nvme=2.76 GB  engram_rows=74416
+  wrote /home/ryan/git/tidelm-glm/results/ds41-depth8-20261022/code.json
