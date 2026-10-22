@@ -4009,3 +4009,36 @@ kernel gains. Prose/code move -0.55%/+1.07% despite being too short to use the
 candidate scorer. Keep the matching-output, fixed-depth ABBA measurement separate
 from this normal-traffic comparison. Raw reports and TTFT/NVMe breakdowns are in
 `results/flare-perf-20261021/http-bench/`.
+
+### 2026-10-21: GLM index bounds and lower MTP confidence do not establish a gain
+
+`GLM_INDEX_BUCKETS=1` bounds decode indexing by the occupied power-of-two context
+bucket (minimum 4096), rather than the complete context allocation. At 256K
+allocation, native EXL3, 12,000 frozen residents, hot reads/adaptation/prefix off,
+128 greedy output tokens, alternating off/on/on/off: prose off 124.28/119.15
+ms/round versus on 121.87/119.56; code's clean pair 157.24 versus 154.76; 8K
+off 166.02/159.08 versus on 193.54/166.85. The first code pair and first 8K-on
+arm captured six graphs during timing. There is no general improvement here;
+keep the experiment off. All greedy outputs matched across arms and ranks.
+Teacher forcing at 64, 4080 and 8192 context tokens, 32 positions each, produced
+exactly identical logits with bounds on/off, including crossing a bucket edge.
+
+Lowering `GLM_MTP_DYN` from 0.9 to 0.7 or 0.5 also failed to improve consistently
+on two sampled seeds each for prose and code. Code at 0.7 rose to 24.07 tok/s on
+one seed but fell to 18.69 on the other; 0.9 gave 19.64/19.94. Keep 0.9.
+Raw reports: `results/glm-perf-20261021/native-exl3/paired-rank*.json`.
+
+The published checkpoint's MTP experts are **4-bit**, while decoder experts are
+3-bit. The tiled prefill kernel only supports 2/3 bits; forcing 4-bit MTP through
+it traps on the GPU. Use grouped prefill for those records. Native EXL3 also
+needs private MTP graph pools: sharing the verifier pool caused illegal memory
+access during longer generation. Deleting the last graph from a shared pool
+can leave a stale pool handle; reset that handle when evicting bucket graphs.
+
+### 2026-10-21: lossless scales need a full-checkpoint audit
+
+Six sampled experts suggested 3.86% total slot savings. Auditing all 15,360
+1017 experts across both ranks found more exceptions: the fixed-stride random
+access layout saves **2.30%** (9,400,320 -> 9,183,744 bytes per slot), not 3.86%.
+Keep fixed strides so replacement and graph pointers stay valid. Setup and
+rollback: `docs/lossless-scales.md`.

@@ -6,7 +6,9 @@ rejection sampling, cache rollback, and the Engine API the server uses.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+from pathlib import Path
 from contextlib import nullcontext
 import sys
 import threading
@@ -796,6 +798,7 @@ class V41Engine:
 
         self.moe_fn = moe_fn
         arena_cls = fp4_arena_cls
+        self.scale_pack = None
 
         def make_expert_arena(n_slots):
             if exl3_cls is not None:
@@ -806,7 +809,8 @@ class V41Engine:
                 return exl3_cls(n_slots, device, narrow_slots=narrow)
             if cb3_cls is None:
                 if self.ep.tensor_parallel:
-                    return fp4_arena_cls(n_slots, device, tp_rank=self.ep.rank, tp_world=self.ep.world)
+                    return fp4_arena_cls(n_slots, device, tp_rank=self.ep.rank, tp_world=self.ep.world,
+                                         **({'scale_pack': self.scale_pack} if self.scale_pack is not None else {}))
                 return fp4_arena_cls(n_slots, device)
             a = cb3_cls(n_slots, device)
             a.sim = self._cb3_sim
@@ -841,6 +845,22 @@ class V41Engine:
                 raise ValueError('expert TP requires native FP4')
             if exl3_cls is None:
                 self.expert_bytes //= self.ep.world
+        scale_path = os.environ.get('DSV41_SCALE_PACK', '')
+        if scale_path:
+            if (not self.ep.tensor_parallel or self.ep.world != 2 or self.kernel != 'triton-fp4'
+                    or cb3_cls is not None or exl3_cls is not None or sim_bits or R_dream.enabled()
+                    or not self.fp4_cuda_v2
+                    or os.environ.get('DSV41_MAX_CONCURRENCY', '1') != '1'
+                    or os.environ.get('DSV41_TP_EXPERT_LAYOUT', 'output') != 'output'):
+                raise ValueError('DSV41_SCALE_PACK requires single-request native FP4 output TP2 with CUDA v2, '
+                                 'without simulated quantization or a dreaming overlay')
+            from engine.scale_pack import ScalePack
+            self.scale_pack = ScalePack(scale_path.format(rank=self.ep.rank, world=self.ep.world),
+                                        model_dir, self.ep.rank, self.ep.world)
+            native_bytes = self.expert_bytes
+            self.expert_bytes += 3 * (self.scale_pack.stride - self.scale_pack.spec['size'])
+            log(f'lossless expert scales: {native_bytes / 1e6:.3f} -> {self.expert_bytes / 1e6:.3f} MB/slot; '
+                f'pack {self.scale_pack.header["source_scale_sha256"][:16]}')
         # Experimental EP2 prefill replicas (DSV41_PREFILL_REPLICA_GB) and the prefill EP combine
         # overlap (DSV41_PREFILL_EP_OVERLAP) were removed 2026-10-17: never enabled in a profile,
         # and the overlap measured no reliable gain. docs/prefill-replicas.md and
@@ -1422,6 +1442,9 @@ class V41Engine:
                 "layer_ablation_file": self.layer_ablation.path,
                 "layer_ablation_version": 1,
                 "arena_slots": int(getattr(self.store.arena, "slots", 0)),
+                "scale_pack": self.scale_pack.boot_fields() if self.scale_pack is not None else None,
+                "scale_codec_source": hashlib.sha256(b''.join((Path(__file__).parent / name).read_bytes()
+                    for name in ('scale_layout.py', 'scale_pack.py', 'scale_load_cuda.py'))).hexdigest(),
                 "spec": bool(self.spec),
                 "max_concurrency": int(os.environ.get("DSV41_MAX_CONCURRENCY", "1")),
                 # Lane caches size the batched step's per-lane indexer buckets and graph keys.
@@ -3718,6 +3741,7 @@ class V41Engine:
             "dynamic_experts": self.dynamic_experts,
             "resident_budget": self.resident_budget,
             "predictive_prefill": dict(self.predictive.last),
+            "scale_pack": self.scale_pack.boot_fields() if self.scale_pack is not None else None,
             "dynamic_layer_floor": self.dynamic_layer_floor if self.dynamic_experts else None,
             "prune_layer_weights": self.prune_layer_weights,
             "resident_layer_counts": self.resident_layer_counts,

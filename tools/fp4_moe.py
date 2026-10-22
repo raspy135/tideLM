@@ -40,6 +40,7 @@ import sys
 import torch
 import triton
 import triton.language as tl
+from engine.scale_load_cuda import load_scale
 
 DIM = 5120  # model hidden size (K of w1/w3, N of w2)
 INTER = 2304  # expert intermediate size (N of w1/w3, K of w2)
@@ -98,7 +99,7 @@ except Exception:  # pragma: no cover
 class ExpertArena:
     """GPU-resident slots of packed FP4 expert weights (18.8 MB per slot)."""
 
-    def __init__(self, slots: int, device: torch.device | str = "cuda", tp_rank=0, tp_world=1):
+    def __init__(self, slots: int, device: torch.device | str = "cuda", tp_rank=0, tp_world=1, scale_pack=None):
         self.slots = slots
         self.device = torch.device(device)
         if tp_world not in (1, 2) or not 0 <= tp_rank < tp_world:
@@ -108,6 +109,9 @@ class ExpertArena:
         if layout not in ('intermediate', 'output'):
             raise ValueError('TP expert layout must be intermediate or output')
         self.tp_output = tp_world > 1 and layout == 'output'
+        self.scale_pack = scale_pack
+        if scale_pack is not None and not (tp_world == 2 and self.tp_output):
+            raise ValueError('packed expert scales require output TP2')
         self.inter = INTER // tp_world
         ni, kb2, sg2 = self.inter, self.inter // 2, self.inter // GROUP
         down_n = DIM
@@ -115,11 +119,19 @@ class ExpertArena:
             down_n, kb2, sg2 = DIM // tp_world, KB2, SG2
         u8 = dict(dtype=torch.uint8, device=self.device)
         self.w1 = torch.empty((slots, ni, KB1), **u8)
-        self.s1 = torch.empty((slots, ni, SG1), **u8)
         self.w3 = torch.empty((slots, ni, KB1), **u8)
-        self.s3 = torch.empty((slots, ni, SG1), **u8)
         self.w2 = torch.empty((slots, down_n, kb2), **u8)
-        self.s2 = torch.empty((slots, down_n, sg2), **u8)
+        if scale_pack is None:
+            self.s1 = torch.empty((slots, ni, SG1), **u8)
+            self.s3 = torch.empty((slots, ni, SG1), **u8)
+            self.s2 = torch.empty((slots, down_n, sg2), **u8)
+        else:
+            if scale_pack.spec['size'] != ni * SG1 or ni * SG1 != down_n * sg2:
+                raise ValueError('scale pack has incompatible projection dimensions')
+            for name in ('s1', 's2', 's3'):
+                plane = torch.empty((slots, scale_pack.stride), **u8)
+                plane._tidelm_scale_layout = scale_pack.spec
+                setattr(self, name, plane)
 
     @property
     def bytes_per_slot(self) -> int:
@@ -132,7 +144,7 @@ class ExpertArena:
             raise ValueError(f"expected shape {shape}, got {tuple(t.shape)}")
         return t.contiguous()
 
-    def load_slot(self, slot: int, w1, s1, w2, s2, w3, s3, non_blocking: bool = False) -> None:
+    def load_slot(self, slot: int, w1, s1, w2, s2, w3, s3, non_blocking: bool = False, scale_key=None) -> None:
         """Copy one expert (CPU int8/uint8/e8m0 tensors as read from safetensors) into `slot`.
 
         `non_blocking=True` is for the serving path only (`engine.experts.ExpertStore`), where the
@@ -143,23 +155,48 @@ class ExpertArena:
         """
         lo, hi = self.tp_rank * self.inter, (self.tp_rank + 1) * self.inter
         self.w1[slot].copy_(self._u8(w1, (INTER, KB1))[lo:hi], non_blocking=non_blocking)
-        self.s1[slot].copy_(self._u8(s1, (INTER, SG1))[lo:hi], non_blocking=non_blocking)
         self.w3[slot].copy_(self._u8(w3, (INTER, KB1))[lo:hi], non_blocking=non_blocking)
-        self.s3[slot].copy_(self._u8(s3, (INTER, SG1))[lo:hi], non_blocking=non_blocking)
         if self.tp_output:
             row = self.tp_rank * self.w2.shape[1]
             end = row + self.w2.shape[1]
             self.w2[slot].copy_(self._u8(w2, (DIM, KB2))[row:end], non_blocking=non_blocking)
-            self.s2[slot].copy_(self._u8(s2, (DIM, SG2))[row:end], non_blocking=non_blocking)
         else:
             self.w2[slot].copy_(self._u8(w2, (DIM, KB2))[:, lo//2:hi//2], non_blocking=non_blocking)
-            self.s2[slot].copy_(self._u8(s2, (DIM, SG2))[:, lo//GROUP:hi//GROUP], non_blocking=non_blocking)
+        local = (self._u8(s1, (INTER, SG1))[lo:hi],
+                 self._u8(s2, (DIM, SG2))[row:end] if self.tp_output else
+                 self._u8(s2, (DIM, SG2))[:, lo//GROUP:hi//GROUP],
+                 self._u8(s3, (INTER, SG1))[lo:hi])
+        if self.scale_pack is None:
+            for name, plane in zip(('s1', 's2', 's3'), local):
+                getattr(self, name)[slot].copy_(plane, non_blocking=non_blocking)
+        else:
+            # Reuse the store's pinned scale staging planes. The caller owns
+            # their lease through its copy-stream synchronization. Weight
+            # copies above do not read these bytes, so overwriting is safe.
+            native = [plane.numpy() for plane in local]
+            staging = [plane.view(torch.uint8).reshape(-1).numpy() for plane in (s1, s2, s3)]
+            if scale_key is None:
+                if any(plane.any() for plane in native):
+                    raise ValueError('packed scale loads require an expert key (except the zero slot)')
+                for destination in staging:
+                    destination[:self.scale_pack.stride] = 0
+            else:
+                self.scale_pack.read_into(scale_key, native, staging)
+            for name, source in zip(('s1', 's2', 's3'), (s1, s2, s3)):
+                getattr(self, name)[slot].copy_(source.view(torch.uint8).reshape(-1)[:self.scale_pack.stride],
+                                              non_blocking=non_blocking)
 
     def dequant_slot(self, slot: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """(w1, w2, w3) as bf16 [N, K] logical matrices -- for the reference path / tests."""
-        w1 = dequant_fp4_packed(self.w1[slot], self.s1[slot])
-        w2 = dequant_fp4_packed(self.w2[slot], self.s2[slot])
-        w3 = dequant_fp4_packed(self.w3[slot], self.s3[slot])
+        scales = [getattr(self, name)[slot] for name in ('s1', 's2', 's3')]
+        if self.scale_pack is not None:
+            from engine.scale_layout import decode
+            shapes = ((self.w1.shape[1], SG1), (self.w2.shape[1], self.w2.shape[2]//16), (self.w3.shape[1], SG1))
+            scales = [torch.from_numpy(decode(plane.cpu().numpy(), self.scale_pack.spec).copy()).to(self.device).view(shape)
+                      for plane, shape in zip(scales, shapes)]
+        w1 = dequant_fp4_packed(self.w1[slot], scales[0])
+        w2 = dequant_fp4_packed(self.w2[slot], scales[1])
+        w3 = dequant_fp4_packed(self.w3[slot], scales[2])
         return w1, w2, w3
 
 
@@ -226,7 +263,7 @@ def _chunk_dot(x_base, xk, mask_m, packed, scale_u8):
 
 
 @triton.jit
-def _quad_dot(x_base, xk, mask_m, w_tile_ptr, s_ptr, BN: tl.constexpr):
+def _quad_dot(x_base, xk, mask_m, w_tile_ptr, s_ptr, BN: tl.constexpr, scale_values=None):
     """Four consecutive K groups (128 logical K) = one 64-byte-wide packed tile [BN, 64] + scales [BN, 4].
 
     Loading 64 contiguous bytes per row matters on GB10: 16-byte-wide row tiles cap at ~130 GB/s, 64-byte
@@ -234,7 +271,7 @@ def _quad_dot(x_base, xk, mask_m, w_tile_ptr, s_ptr, BN: tl.constexpr):
     """
     packed = tl.load(w_tile_ptr)
     c0, c1, c2, c3 = _split4(packed, BN, 16)
-    s = tl.load(s_ptr)  # [BN, 4], column = hi*2 + lo
+    s = tl.load(s_ptr) if scale_values is None else scale_values  # [BN, 4]
     sa, sb = tl.split(tl.permute(tl.reshape(s, [BN, 2, 2]), [0, 2, 1]))  # split on hi: (0,1) / (2,3)
     s0, s1 = tl.split(sa)
     s2, s3 = tl.split(sb)
@@ -246,7 +283,7 @@ def _quad_dot(x_base, xk, mask_m, w_tile_ptr, s_ptr, BN: tl.constexpr):
 
 
 @triton.jit
-def _quad_dot_scaled(x_base, mask_m, w_tile_ptr, s_ptr, acc, BM: tl.constexpr, BN: tl.constexpr):
+def _quad_dot_scaled(x_base, mask_m, w_tile_ptr, s_ptr, acc, BM: tl.constexpr, BN: tl.constexpr, scale_values=None):
     """Same 128 logical K as _quad_dot, but the tensor core eats the e2m1 codes and their UE8M0
     scales through Triton's `tl.dot_scaled` lowering instead of our manual decoder.
 
@@ -264,7 +301,7 @@ def _quad_dot_scaled(x_base, mask_m, w_tile_ptr, s_ptr, acc, BM: tl.constexpr, B
     order -- so the activation tile is loaded contiguously.
     """
     packed = tl.load(w_tile_ptr)                       # [BN, 64] uint8, e2m1 two per byte
-    sc = tl.load(s_ptr)                                # [BN, 4]  uint8, UE8M0, one per 32 K
+    sc = tl.load(s_ptr) if scale_values is None else scale_values
     x = tl.load(x_base + tl.arange(0, 128)[None, :], mask=mask_m, other=0.0)   # [BM, 128] bf16
     # Resetting the MMA accumulator every 128 K and adding partials in FP32 was tested:
     # it passed depth-8 generation only by choosing compact JSON earlier, while the identical
@@ -281,6 +318,7 @@ def _moe_up_kernel(
     stride_x, stride_h, limit,
     TOPK: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
     BM: tl.constexpr, BN: tl.constexpr, SCALED: tl.constexpr, NULL_SLOT: tl.constexpr = -1,
+    SCALE_STRIDE: tl.constexpr = 0,
 ):
     KB: tl.constexpr = K // 2
     SG: tl.constexpr = K // 32
@@ -311,7 +349,17 @@ def _moe_up_kernel(
     acc_g = tl.zeros([BM, BN], dtype=tl.float32)
     acc_u = tl.zeros([BM, BN], dtype=tl.float32)
     for q in range(0, SG // 4):
-        if SCALED:
+        if SCALE_STRIDE:
+            index = offs_n[:, None] * SG + offs_q[None, :] + q * 4
+            s1 = load_scale(s1_ptr, slot, index, N * SG, SCALE_STRIDE)
+            s3 = load_scale(s3_ptr, slot, index, N * SG, SCALE_STRIDE)
+            if SCALED:
+                acc_g = _quad_dot_scaled(x_base + q * 128, mask_m[:, None], w1_tile + q * 64, s1_ptr, acc_g, BM, BN, s1)
+                acc_u = _quad_dot_scaled(x_base + q * 128, mask_m[:, None], w3_tile + q * 64, s3_ptr, acc_u, BM, BN, s3)
+            else:
+                acc_g += _quad_dot(x_base + q * 128, xk, mask_m[:, None], w1_tile + q * 64, s1_ptr, BN, s1)
+                acc_u += _quad_dot(x_base + q * 128, xk, mask_m[:, None], w3_tile + q * 64, s3_ptr, BN, s3)
+        elif SCALED:
             acc_g = _quad_dot_scaled(x_base + q * 128, mask_m[:, None], w1_tile + q * 64, s1_tile + q * 4, acc_g, BM, BN)
             acc_u = _quad_dot_scaled(x_base + q * 128, mask_m[:, None], w3_tile + q * 64, s3_tile + q * 4, acc_u, BM, BN)
         else:
@@ -348,6 +396,7 @@ def _moe_down_kernel(
     BM: tl.constexpr, BN: tl.constexpr, NTOK, SCALED: tl.constexpr, NULL_SLOT: tl.constexpr = -1,
     PARTIAL: tl.constexpr = False,
     PARTS_WORLD: tl.constexpr = 1,
+    SCALE_STRIDE: tl.constexpr = 0,
 ):
     KB: tl.constexpr = K // 2
     SG: tl.constexpr = K // 32
@@ -384,7 +433,14 @@ def _moe_down_kernel(
 
     acc = tl.zeros([BM, BN], dtype=tl.float32)
     for q in range(0, SG // 4):
-        if SCALED:
+        if SCALE_STRIDE:
+            index = offs_n[:, None] * SG + offs_q[None, :] + q * 4
+            scales = load_scale(s2_ptr, slot, index, N * SG, SCALE_STRIDE)
+            if SCALED:
+                acc = _quad_dot_scaled(h_base + q * 128, mask_m[:, None], w2_tile + q * 64, s2_ptr, acc, BM, BN, scales)
+            else:
+                acc += _quad_dot(h_base + q * 128, xk, mask_m[:, None], w2_tile + q * 64, s2_ptr, BN, scales)
+        elif SCALED:
             acc = _quad_dot_scaled(h_base + q * 128, mask_m[:, None], w2_tile + q * 64, s2_tile + q * 4, acc, BM, BN)
         else:
             acc += _quad_dot(h_base + q * 128, xk, mask_m[:, None], w2_tile + q * 64, s2_tile + q * 4, BN)
@@ -737,6 +793,7 @@ def moe_forward(
             wgt, block_slot, block_pair,
             x.stride(0), h.stride(0), float(swiglu_limit),
             TOPK=K, N=inter, K=DIM, BM=BM, BN=bn1, SCALED=scaled, NULL_SLOT=null_slot, num_warps=nw1, num_stages=ns1,
+            SCALE_STRIDE=arena.scale_pack.stride if getattr(arena, 'scale_pack', None) is not None else 0,
         )
     if dream is not None:
         import fp4_moe_cuda as CUDA8
@@ -767,6 +824,7 @@ def moe_forward(
             h.stride(0), parts.stride(0),
             TOPK=K, N=down_n, K=down_k, BM=BM, BN=bn2, NTOK=T, SCALED=scaled, NULL_SLOT=null_slot,
             PARTIAL=tp and not tp_output, PARTS_WORLD=parts_world,
+            SCALE_STRIDE=arena.scale_pack.stride if getattr(arena, 'scale_pack', None) is not None else 0,
             num_warps=nw2, num_stages=ns2,
         )
     if dream is not None:

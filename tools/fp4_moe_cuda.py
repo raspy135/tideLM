@@ -82,6 +82,9 @@ def _library():
     lib.fp4_moe_cuda_up_v2.argtypes = lib.fp4_moe_cuda_up.argtypes
     lib.fp4_moe_cuda_down_v2.argtypes = lib.fp4_moe_cuda_down.argtypes
     lib.fp4_moe_cuda_down_v3.argtypes = lib.fp4_moe_cuda_down.argtypes + [i32]
+    lib.fp4_moe_cuda_up_scales.argtypes = lib.fp4_moe_cuda_up.argtypes + [i32]
+    lib.fp4_moe_cuda_down_scales.argtypes = lib.fp4_moe_cuda_down.argtypes + [i32, i32]
+    lib.fp4_moe_cuda_scale_expand.argtypes = [ptr, ptr, ptr, i32, i32, i32]
     lib.fp4_moe_cuda_route_small.argtypes = [ptr, ptr, ptr, ptr, ptr, i32, i32]
     lib.fp4_moe_cuda_round_reduce.argtypes = [ptr, ptr, ptr, i32, i32, i32]
     lib.dream_fp8_cuda_up.argtypes = [ptr, ptr, i64, ptr, ptr, i32, ptr, ptr, ptr, i64, ptr,
@@ -90,7 +93,9 @@ def _library():
                                         i32, i32, i32, i32, i32, i32]
     for name in ("fp4_moe_cuda_up", "fp4_moe_cuda_down", "fp4_moe_cuda_route_small",
                  "fp4_moe_cuda_round_reduce", "fp4_moe_cuda_up_v2", "fp4_moe_cuda_down_v2",
-                 "fp4_moe_cuda_down_v3", "dream_fp8_cuda_up", "dream_fp8_cuda_down"):
+                 "fp4_moe_cuda_down_v3", "fp4_moe_cuda_up_scales", "fp4_moe_cuda_down_scales",
+                 "fp4_moe_cuda_scale_expand",
+                 "dream_fp8_cuda_up", "dream_fp8_cuda_down"):
         getattr(lib, name).restype = i32
     return lib
 
@@ -168,6 +173,17 @@ def dream_fp8_down(h, idx, tier, parts, topk: int, ntok: int, partial: bool = Fa
 
 def up(x, w1, s1, w3, s3, h, route_weight, block_slot, block_pair, limit,
        topk: int, n: int, k: int, nb: int, null_slot: int, v2: bool | None = None):
+    packed = getattr(s1, '_tidelm_scale_layout', None)
+    if packed is not None:
+        if not (V2 if v2 is None else v2) or getattr(s3, '_tidelm_scale_layout', None) != packed:
+            raise ValueError('packed scales require v2 and identical gate/up layouts')
+        if packed['size'] != n * (k // 32):
+            raise ValueError('packed scale plane size does not match up projection')
+        _check(_lib().fp4_moe_cuda_up_scales(
+            _stream(), _p(x), _p(w1), _p(s1), _p(w3), _p(s3), _p(h), _p(route_weight),
+            _p(block_slot), _p(block_pair), x.stride(0), h.stride(0), float(limit), topk, n, k,
+            nb, null_slot, packed['stride']), 'packed-scale up')
+        return
     fn = _lib().fp4_moe_cuda_up_v2 if (V2 if v2 is None else v2) else _lib().fp4_moe_cuda_up
     _check(fn(
         _stream(), _p(x), _p(w1), _p(s1), _p(w3), _p(s3), _p(h), _p(route_weight),
@@ -182,6 +198,12 @@ def down(h, w2, s2, parts, block_slot, block_pair, topk: int, n: int, k: int,
     rows = DOWN_ROWS if rows is None else rows
     args = (_stream(), _p(h), _p(w2), _p(s2), _p(parts), _p(block_slot), _p(block_pair),
             h.stride(0), parts.stride(0), topk, n, k, ntok, nb, null_slot, int(partial), parts_world)
+    packed = getattr(s2, '_tidelm_scale_layout', None)
+    if packed is not None:
+        if not v2 or packed['size'] != n * (k // 32):
+            raise ValueError('packed scales require v2 and a matching down projection')
+        _check(_lib().fp4_moe_cuda_down_scales(*args, rows, packed['stride']), 'packed-scale down')
+        return
     if v2 and rows > 1 and k <= 3072:
         _check(_lib().fp4_moe_cuda_down_v3(*args, rows), "down")
         return

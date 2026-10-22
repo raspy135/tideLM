@@ -65,6 +65,28 @@ __device__ __forceinline__ float ue8m0(uint8_t scale) {
     return __uint_as_float(static_cast<uint32_t>(scale) << 23);
 }
 
+// Random-access byte reconstruction; all floating-point arithmetic stays unchanged.
+template <bool PACKED>
+__device__ __forceinline__ uint8_t scale_byte(const uint8_t *scales, int slot, int index,
+                                              int plane_size, int stride) {
+    if constexpr (!PACKED) return scales[static_cast<int64_t>(slot) * plane_size + index];
+    const int blocks = (plane_size + 63) >> 6;
+    const int code0 = (blocks + 7) & ~7;
+    const int escape0 = code0 + blocks * 8;
+    const int offsets0 = escape0 + blocks * 8;
+    const int payload0 = (offsets0 + blocks * 4 + 7) & ~7;
+    const uint8_t *record = scales + static_cast<int64_t>(slot) * stride;
+    const int block = index >> 6, bit = index & 63;
+    const uint64_t escaped = reinterpret_cast<const uint64_t *>(record + escape0)[block];
+    if ((escaped >> bit) & 1) {
+        const int offset = reinterpret_cast<const int32_t *>(record + offsets0)[block];
+        const int ordinal = __popcll(escaped & ((1ULL << bit) - 1));
+        return record[payload0 + offset + ordinal];
+    }
+    const uint64_t codes = reinterpret_cast<const uint64_t *>(record + code0)[block];
+    return record[block] + ((codes >> bit) & 1);
+}
+
 __device__ __forceinline__ void load_activation4(
     const __nv_bfloat16 *p, float &x0, float &x1, float &x2, float &x3) {
     // Model strides and lane offsets are multiples of four BF16 elements (8-byte aligned).
@@ -355,6 +377,7 @@ __device__ __forceinline__ float ordered_chain(const float *part, const float *s
     return acc;
 }
 
+template <bool PACKED = false>
 __global__ void moe_up_bm16_v2(
     const __nv_bfloat16 *__restrict__ x,
     const uint8_t *__restrict__ w1, const uint8_t *__restrict__ s1,
@@ -362,7 +385,7 @@ __global__ void moe_up_bm16_v2(
     __nv_bfloat16 *__restrict__ h, const float *__restrict__ route_weight,
     const int32_t *__restrict__ block_slot, const int32_t *__restrict__ block_pair,
     int64_t stride_x, int64_t stride_h, float limit,
-    int topk, int n, int k, int null_slot) {
+    int topk, int n, int k, int null_slot, int scale_stride = 0) {
     constexpr int kPerLane = kV2MaxGroups / 32;
     __shared__ float part_s[kWarps][2][kV2MaxGroups];
     __shared__ float scale_s[kWarps][2][kV2MaxGroups];
@@ -385,8 +408,8 @@ __global__ void moe_up_bm16_v2(
         if (g < groups) {
             p1[r] = reinterpret_cast<const uint4 *>(w1_row)[g];
             p3[r] = reinterpret_cast<const uint4 *>(w3_row)[g];
-            scale_s[warp][0][g] = ue8m0(s1[row * groups + g]);
-            scale_s[warp][1][g] = ue8m0(s3[row * groups + g]);
+            scale_s[warp][0][g] = ue8m0(scale_byte<PACKED>(s1, slot_i, out_n * groups + g, n * groups, scale_stride));
+            scale_s[warp][1][g] = ue8m0(scale_byte<PACKED>(s3, slot_i, out_n * groups + g, n * groups, scale_stride));
         }
     }
     for (int m = 0; m < kBlockM; ++m) {
@@ -424,12 +447,13 @@ __global__ void moe_up_bm16_v2(
     }
 }
 
+template <bool PACKED = false>
 __global__ void moe_down_bm16_v2(
     const __nv_bfloat16 *__restrict__ h,
     const uint8_t *__restrict__ w2, const uint8_t *__restrict__ s2,
     float *__restrict__ y, const int32_t *__restrict__ block_slot,
     const int32_t *__restrict__ block_pair, int64_t stride_h, int64_t stride_y,
-    int topk, int n, int k, int ntok, int null_slot, int partial, int parts_world) {
+    int topk, int n, int k, int ntok, int null_slot, int partial, int parts_world, int scale_stride = 0) {
     constexpr int kPerLane = kV2MaxGroups / 32;
     __shared__ float part_s[kWarps][kV2MaxGroups];
     __shared__ float scale_s[kWarps][kV2MaxGroups];
@@ -451,7 +475,7 @@ __global__ void moe_down_bm16_v2(
             const int g = lane + 32 * r;
             if (g < groups) {
                 pw[r] = reinterpret_cast<const uint4 *>(w2_row)[g];
-                scale_s[warp][g] = ue8m0(s2[row * groups + g]);
+                scale_s[warp][g] = ue8m0(scale_byte<PACKED>(s2, slot_i, out_n * groups + g, n * groups, scale_stride));
             }
         }
     }
@@ -506,13 +530,13 @@ __global__ void moe_down_bm16_v2(
 // the same groups in the same order, the same four-chain sum), so the output bits are v2's.
 constexpr int kDownMaxGroups = 96;  // k <= 3072 (V4.1 down k = 2304); larger k stays on v2
 
-template <int R>
+template <int R, bool PACKED = false>
 __global__ void moe_down_bm16_v3(
     const __nv_bfloat16 *__restrict__ h,
     const uint8_t *__restrict__ w2, const uint8_t *__restrict__ s2,
     float *__restrict__ y, const int32_t *__restrict__ block_slot,
     const int32_t *__restrict__ block_pair, int64_t stride_h, int64_t stride_y,
-    int topk, int n, int k, int ntok, int null_slot, int partial, int parts_world) {
+    int topk, int n, int k, int ntok, int null_slot, int partial, int parts_world, int scale_stride = 0) {
     constexpr int kPerLane = kDownMaxGroups / 32;
     __shared__ float part_s[kWarps][R][kDownMaxGroups];
     __shared__ float scale_s[kWarps][R][kDownMaxGroups];
@@ -538,7 +562,7 @@ __global__ void moe_down_bm16_v3(
                     const int g = lane + 32 * r;
                     if (g < groups) {
                         pw[rr][r] = reinterpret_cast<const uint4 *>(w2_row)[g];
-                        scale_s[warp][rr][g] = ue8m0(s2[row * groups + g]);
+                        scale_s[warp][rr][g] = ue8m0(scale_byte<PACKED>(s2, slot_i, (n0 + rr) * groups + g, n * groups, scale_stride));
                     }
                 }
             }
@@ -1085,5 +1109,57 @@ extern "C" int dream_fp8_cuda_down(
         static_cast<const __nv_bfloat16 *>(h), stride_h, static_cast<const int64_t *>(idx),
         static_cast<const int32_t *>(map), n_experts, static_cast<const uint8_t *>(w2),
         static_cast<const uint8_t *>(s2), static_cast<float *>(y), stride_y, topk, n, k, ntok, partial);
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int fp4_moe_cuda_up_scales(
+    void *stream, const void *x, const void *w1, const void *s1, const void *w3, const void *s3,
+    void *h, const void *route_weight, const void *block_slot, const void *block_pair,
+    int64_t stride_x, int64_t stride_h, float limit, int topk, int n, int k, int nb,
+    int null_slot, int scale_stride) {
+    if (k > (kV2MaxGroups << 5) || (k & 31)) return static_cast<int>(cudaErrorInvalidValue);
+    moe_up_bm16_v2<true><<<dim3(nb, (n + kWarps - 1) >> kWarpsShift), kThreads, 0,
+                             static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16 *>(x), static_cast<const uint8_t *>(w1),
+        static_cast<const uint8_t *>(s1), static_cast<const uint8_t *>(w3),
+        static_cast<const uint8_t *>(s3), static_cast<__nv_bfloat16 *>(h),
+        static_cast<const float *>(route_weight), static_cast<const int32_t *>(block_slot),
+        static_cast<const int32_t *>(block_pair), stride_x, stride_h, limit, topk, n, k,
+        null_slot, scale_stride);
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int fp4_moe_cuda_down_scales(
+    void *stream, const void *h, const void *w2, const void *s2, void *y,
+    const void *block_slot, const void *block_pair, int64_t stride_h, int64_t stride_y,
+    int topk, int n, int k, int ntok, int nb, int null_slot, int partial, int parts_world,
+    int rows_per_warp, int scale_stride) {
+#define SCALE_DOWN_ARGS static_cast<const __nv_bfloat16 *>(h), static_cast<const uint8_t *>(w2), \
+    static_cast<const uint8_t *>(s2), static_cast<float *>(y), \
+    static_cast<const int32_t *>(block_slot), static_cast<const int32_t *>(block_pair), \
+    stride_h, stride_y, topk, n, k, ntok, null_slot, partial, parts_world, scale_stride
+    if (k > (kV2MaxGroups << 5) || (k & 31)) return static_cast<int>(cudaErrorInvalidValue);
+    if (rows_per_warp == 2 && k <= 3072)
+        moe_down_bm16_v3<2, true><<<dim3(nb, (n + kWarps * 2 - 1) / (kWarps * 2)), kThreads, 0,
+                                   static_cast<cudaStream_t>(stream)>>>(SCALE_DOWN_ARGS);
+    else if (rows_per_warp == 4 && k <= 3072)
+        moe_down_bm16_v3<4, true><<<dim3(nb, (n + kWarps * 4 - 1) / (kWarps * 4)), kThreads, 0,
+                                   static_cast<cudaStream_t>(stream)>>>(SCALE_DOWN_ARGS);
+    else
+        moe_down_bm16_v2<true><<<dim3(nb, (n + kWarps - 1) >> kWarpsShift), kThreads, 0,
+                                static_cast<cudaStream_t>(stream)>>>(SCALE_DOWN_ARGS);
+#undef SCALE_DOWN_ARGS
+    return static_cast<int>(cudaGetLastError());
+}
+
+__global__ void scale_bytes_kernel(const uint8_t *packed, uint8_t *out, int size, int stride, int slots) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int slot = blockIdx.y;
+    if (i < size && slot < slots) out[static_cast<int64_t>(slot) * size + i] = scale_byte<true>(packed, slot, i, size, stride);
+}
+extern "C" int fp4_moe_cuda_scale_expand(void *stream, const void *packed, void *out,
+                                          int size, int stride, int slots) {
+    scale_bytes_kernel<<<dim3((size + 255) / 256, slots), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const uint8_t *>(packed), static_cast<uint8_t *>(out), size, stride, slots);
     return static_cast<int>(cudaGetLastError());
 }

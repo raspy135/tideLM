@@ -338,6 +338,8 @@ class ExpertStore:
         # per-expert codebook width for a codebook arena (engine/codebook_sim.py): a key with an
         # entry in `cb_bits` is packed with that width's CodebookSim instead of the arena's own.
         kw = {}
+        if getattr(self.arena, 'scale_pack', None) is not None:
+            kw['scale_key'] = key
         cb = getattr(self, "cb_bits", None)
         if cb is not None:
             b = cb.get(key)
@@ -348,6 +350,8 @@ class ExpertStore:
             self.arena.load_slot(slot, w1.view(*W13_SHAPE), s1.view(*S13_SHAPE), w2.view(*W2_SHAPE),
                                  s2.view(*S2_SHAPE), w3.view(*W13_SHAPE), s3.view(*S13_SHAPE),
                                  non_blocking=True, **kw)
+            if 'scale_key' in kw:
+                self.stats['bytes_read'] += self.arena.scale_pack.record_bytes
             sim = getattr(self, "requant", None)  # simulated low-bit format (engine/codebook_sim.py)
             if sim is not None:
                 bits = sim.get(key)

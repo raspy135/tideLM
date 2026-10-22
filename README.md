@@ -11,7 +11,7 @@ tide — so the engine gets better the more you use it.
 | Profile | Model | Routed experts | Resident | Context | Prose | Code | 8K-token prompt, first token |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,208 / 15,360 (66%) | 512K | **26.0 tok/s** | **44.2 tok/s** | 8.4 s |
-| `glm53-exl3` | GLM-5.3 | EXL3 3.0 bpw | 12,400 / 19,200 (64.6%) | 256K | **14.1 tok/s** | **19.1 tok/s** | 17.9 s |
+| `glm53-exl3` | GLM-5.3 | EXL3 3.0 bpw | 12,400 / 19,200 (64.6%) | 256K | **14.2 tok/s** | **17.9 tok/s** | 25.5 s |
 
 *Decode speed is `bench/bench.py`'s median over three measured runs after one warmup: 1,024
 output tokens at temperature 0.6, prose = an essay request, code = an LRU-cache request. The last
@@ -20,14 +20,11 @@ profile ran exactly as shipped in `configs/` (adaptation, hot reads and speculat
 on two DGX Sparks, 2026-10-18, with the expert history it had learned from earlier use. The DS row
 was re-measured on 2026-10-21 with candidate indexing enabled and a 32K context allocation
 (the profile supports 512K): [raw runs](results/flare-perf-20261021/http-bench/README.md). Original runs:
-[bench/results/2026-10-18/](bench/results/2026-10-18/). The `glm53-exl3` row was measured again on
-2026-10-20 ([bench/results/2026-10-20/](bench/results/2026-10-20/)) after the prefill changes of
-that day (BF16 attention reduce, 4,096-row chunks with the shared-memory EXL3 prefill kernel, the
-first chunk's causal attention) and the fused q_a/kv_a projection, FP8 cache at 256K. Those runs
-were at 12,000 residents; the profile moved to 12,400 later that day, once the memory a leaking
-service held on one node was freed, and was not re-measured. The first-token time had two
-warm-up requests before the three measured. The first requests after a boot run 1-3 s slower, so a time from one or two of
-them is that much off ([gotchas](docs/gotchas.md)).*
+[bench/results/2026-10-18/](bench/results/2026-10-18/). GLM was re-measured on 2026-10-21 using
+its own EXL3 dense/fixed/MTP weights, with 12,000 residents at 256K; the profile keeps 12,400.
+This replaces the earlier Quark-backed hybrid numbers; prefill is slower on the native path
+([comparison](docs/glm53-native-exl3.md)). First requests after boot can be slower
+([gotchas](docs/gotchas.md)).*
 
 ## How adaptive expert loading works
 
@@ -83,14 +80,15 @@ cp configs/glm53-exl3.env.example  .env.glm53-exl3     # GLM-5.3, EXL3 (needs th
 | Profile | Checkpoint | Size |
 | --- | --- | ---: |
 | `ds41-mxfp4` | [`deepseek-ai/DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) (or the original `DeepSeek-V4.1-Flash`) | 510 GB |
-| `glm53-exl3` (dense weights) | [`amd/GLM-5.3-Quark-MXFP4-AttnFP8`](https://huggingface.co/amd/GLM-5.3-Quark-MXFP4-AttnFP8) | 410 GB |
-| `glm53-exl3` (also) | [`bertholomus/GLM-5.3-EXL3-3.0bpw`](https://huggingface.co/bertholomus/GLM-5.3-EXL3-3.0bpw), repacked into one file per node (below) | 139 GB a node |
+| `glm53-exl3` | [`bertholomus/GLM-5.3-EXL3-3.0bpw`](https://huggingface.co/bertholomus/GLM-5.3-EXL3-3.0bpw), repacked into one file per node (below) | 293 GB checkpoint; 139 GB pack a node |
 
 `MODEL_REPO=deepseek-ai/DeepSeek-V4.1-Flash-1017 MODEL_DIR=<dir> bash scripts/download-model.sh`
 fetches the DeepSeek checkpoint and resumes if interrupted (`HF_TOKEN` is optional; it only
-raises rate limits). The GLM checkpoints download with `hf download <repo> --local-dir <dir>`.
+raises rate limits). The GLM checkpoint downloads with `hf download <repo> --local-dir <dir>`.
+For DeepSeek, optional [lossless scale packs](docs/lossless-scales.md) let the same expert arena
+hold more residents; build them once before setting `DSV41_SCALE_PACK` in your profile.
 For the EXL3 profile, pack each node's half once, after building the image (step 3); the EXL3
-checkpoint can be deleted afterwards:
+checkpoint supplies the dense and fixed weights too, so keep it on both nodes:
 
 ```bash
 # on node 0 (and on node 1 with r1of2 / --rank 1)
