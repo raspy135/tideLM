@@ -35,6 +35,7 @@ from engine.model import HC_OPS as _HC_OPS, _hc_post_fused, _hc_pre_rn_fused
 from engine import comm as _comm
 from engine import l2pf
 from engine import expert_topp as _ETP
+from engine.perf_config import DecodeExperiments
 import v41_ref as R
 
 try:
@@ -208,7 +209,7 @@ if VERIFY_ODD:
 # FastDecoder attributes that are sized by the verify width; _bind(T) points them at T's set.
 _WIDTH_ATTRS = ("ids", "pos", "eg_rows", "slots", "h", "pre_mix", "attn_pre", "ffn_post", "ffn_comb",
                 "ffn_pre", "y", "route_idx", "route_w", "hot_scores", "hot_logits", "topk", "candidates",
-                "main_hidden", "logits",
+                "main_hidden", "logits", "candidate_ids",
                 "_ar_t", "_premix0", "kvl_buf", "sc_buf")
 
 # The graphed indexer needs a fixed key-axis shape, but that shape does not need to be the
@@ -246,6 +247,11 @@ class FastDecoder:
         self.W = model.W
         self.c = model.c
         self.use_graphs = use_graphs
+        self.experiments = DecodeExperiments.from_env()
+        if self.experiments.index_candidates and (
+                self.a.candidate_source_layer < 0 or self.a.candidate_topk_blocks < 1
+                or self.a.candidate_block_size < 1):
+            raise ValueError("DSV41_INDEX_CANDIDATES requires hierarchical candidate blocks")
         # Runtime diagnostics are attached only between requests on both ranks.
         # Normal graphs contain no probe events or input snapshots.
         self.decode_probe = None
@@ -319,8 +325,24 @@ class FastDecoder:
             from engine.decode_lean import LeanOps
             self.lean = LeanOps(model.dev, R.MM_TILE, R.HC_MM_TILE)
             self.lean.prepare_router_weights([w.gate_w for w in self.W.layers])
+            if self.experiments.draft_router:
+                self.lean.prepare_router_weights([w.gate_w for w in self.W.mtp])
         if self.staged_attention and (self.lean is None or not LEAN_SOFTMAX):
             raise ValueError("DSV41_ATTN_STAGED requires decode lean and lean softmax")
+        if self.experiments.draft_router and self.lean is None:
+            raise ValueError("DSV41_DRAFT_ROUTER_FUSED requires decode lean")
+        if self.experiments.hc_post_pre and self.lean is None:
+            raise ValueError("DSV41_HC_POST_PRE requires decode lean")
+        if self.experiments.attention_direct and (
+                self.lean is None or not LEAN_ATTN or not LEAN_ROPE or not LEAN_SOFTMAX
+                or FUSED_ATTN or not M.PACKED_KV):
+            raise ValueError("DSV41_ATTN_DIRECT requires lean attention/RoPE/softmax and packed KV")
+        if self.experiments.engram_h2d and (
+                os.environ.get("DSV41_MAX_CONCURRENCY", "1") != "1"
+                or os.environ.get("DSV41_ENGRAM_ROW_SPLIT", "0") != "0"):
+            raise ValueError("DSV41_ENGRAM_ASYNC_H2D requires one lane and unsplit Engram reads")
+        self.engram_upload_stream = (torch.cuda.Stream(device=self.dev)
+                                     if self.experiments.engram_h2d else None)
         a = self.a
         dev = self.dev
         self.pend_buf = {L: torch.zeros(2, a.head_dim, dtype=torch.float32, device=dev)
@@ -419,6 +441,7 @@ class FastDecoder:
         self.gpu_timing = os.environ.get("DSV41_GPU_TIMING", "0") == "1"
         self._ev_pairs: dict[str, list] = {
             "draft": [], "layers": [], "segments": [], "hash": [], "sample": [],
+            "engram_ready_wait": [],
         }
         # DSV41_ROUTE_STATS=1 counts, per backbone layer, how many DISTINCT routed experts the
         # T_VERIFY tokens of a verify block ask for -- the quantity that sets the expert bytes a step
@@ -462,6 +485,9 @@ class FastDecoder:
             hot_logits=torch.zeros(T, a.n_routed_experts, dtype=f32, device=dev),
             topk=torch.full((T, a.index_topk), -1, dtype=torch.long, device=dev),
             candidates=torch.zeros(T, self._n_cache(1), dtype=torch.bool, device=dev),
+            candidate_ids=torch.full((T, a.candidate_topk_blocks * a.candidate_block_size
+                                     if self.experiments.index_candidates else 0),
+                                    -1, dtype=torch.long, device=dev),
             main_hidden=torch.zeros(T, a.dim * len(a.dspark_target_layer_ids), dtype=f32, device=dev),
             logits=torch.zeros(T, a.vocab_size, dtype=f32, device=dev),
             # constants the lean step reuses instead of rebuilding them per step
@@ -725,12 +751,20 @@ class FastDecoder:
             self.l2pf_side.wait_stream(torch.cuda.current_stream())
             l2pf.touch(self.l2pf_side, [x3.wo_a, x3.wo_b] if x3 is not None else [w.wo_a, w.wo_b],
                         self.attn_prefetch_mb * 1024**2, mode="bulk", pace=0)
-        kvf = self.lean.keys_f32(ring, slot_r, cache, idx,
-                               dtype=torch.bfloat16 if self.staged_attention == 2 else torch.float32)
-        if self.staged_attention:
+        if self.experiments.attention_direct:
+            # Reuse each unpacked tile for QK and PV. The old direct tile path
+            # re-unpacked it for every PV column tile and lost 236 vs 47.7 us.
+            # Online softmax changes reduction order: qualify as numerics.
+            from engine.attention_packed import attention_packed
+            raw = attention_packed(qf, ring, slot_r, cache, idx, mask,
+                                   w.attn_sink, a.head_dim ** -0.5)
+        elif self.staged_attention:
+            kvf = self.lean.keys_f32(ring, slot_r, cache, idx,
+                                   dtype=torch.bfloat16 if self.staged_attention == 2 else torch.float32)
             from decode_attn_staged import attention
             raw = attention(qf, kvf, mask, w.attn_sink, a.head_dim ** -0.5, self.lean)
         else:
+            kvf = self.lean.keys_f32(ring, slot_r, cache, idx)
             probs = self.lean.attn_probs(self._verify_attention_product("thd,tnd->thn", qf, kvf), mask, w.attn_sink,
                                          a.head_dim ** -0.5)
             raw = self._verify_attention_product("thn,tnd->thd", probs, kvf)
@@ -842,6 +876,12 @@ class FastDecoder:
         ratio = st["ratio"]
         cache_rows = _index_cache_rows(token_bucket, ratio, st["ik"].size(0))
         k = st["ik"][:cache_rows]
+        compact = getattr(self, "experiments", DecodeExperiments()).index_candidates
+        capacity = a.candidate_topk_blocks * a.candidate_block_size if compact else 0
+        if (compact and 0 <= a.candidate_source_layer < L and cache_rows > capacity):
+            from engine.index_candidates import scores, select
+            return select(scores(q, k, wts, self.candidate_ids, compress_lens),
+                          self.candidate_ids, a.index_topk)
         sc = torch.einsum("thd,nd->thn", q, k)
         score = (sc.float().relu_() * wts[:, :, None]).sum(dim=1)  # [T, N]
         cpos = self._index_cpos[:score.size(1)]
@@ -850,6 +890,9 @@ class FastDecoder:
             selected = M.Model._select_candidates(score, compress_lens, a.candidate_topk_blocks,
                                                    a.candidate_block_size)
             self.candidates[:, :score.size(1)].copy_(selected)
+            if compact:
+                from engine.index_candidates import compact_mask
+                self.candidate_ids.copy_(compact_mask(selected, a.candidate_block_size, capacity))
         elif 0 <= a.candidate_source_layer < L:
             score = score.masked_fill(~self.candidates[:, :score.size(1)], float("-inf"))
         # Small context allocations can have fewer cache rows than the serving top-k.
@@ -965,7 +1008,12 @@ class FastDecoder:
             x3d = getattr(self.eng, "exl3_dense", None) if getattr(w, "_x3", None) is not None else None
             targets = x3d.shared_targets(L) if x3d is not None else [w._sh_w13, w.sh_w2]
             self._prefetch([("shared", targets, self.sh_prefetch_mb * 1024 ** 2)])
-        if self.lean is not None:
+        fused_pre = None
+        if self.experiments.hc_post_pre:
+            from engine.hc_post_pre import post_pre
+            h, fused_pre = post_pre(y, residual, attn_post, attn_comb, attn_pre,
+                self._norm_w(w.ffn_norm), a.norm_eps, out=self.h, normalized=self.y)
+        elif self.lean is not None:
             # written in place: hc_post reads a tile's residual streams before it stores the tile
             h = _hc_post_fused(y, residual, attn_post, attn_comb, out=self.h)
         else:
@@ -974,7 +1022,9 @@ class FastDecoder:
             self.h.copy_(h)
         self._hc_mixes(h, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base,
                        out=(self.ffn_pre, self.ffn_post, self.ffn_comb))
-        if _HC_OPS:
+        if fused_pre is not None:
+            y = fused_pre
+        elif _HC_OPS:
             y = self._hc_pre_rn(h, attn_pre, w.ffn_norm, out=self.y)
         else:
             y = R.rmsnorm(R.hc_pre(h, attn_pre), w.ffn_norm, a.norm_eps)
@@ -1386,15 +1436,27 @@ class FastDecoder:
             y = (self._hc_pre_rn(h, pre_mix, w.attn_norm) if _HC_OPS
                  else R.rmsnorm(R.hc_pre(h, pre_mix), w.attn_norm, a.norm_eps))
             y = self._attention(y, w, 40 + k, self.c.mtp_win[k], self.m.freqs_w, pos, None, mtp_last=self.d_last[0])
-            h = (_hc_post_fused(y, residual, attn_post, attn_comb) if _HC_OPS
-             else R.hc_post(y, residual, attn_post, attn_comb))
+            fused_pre = None
+            if self.experiments.hc_post_pre:
+                from engine.hc_post_pre import post_pre
+                h, fused_pre = post_pre(y, residual, attn_post, attn_comb, attn_pre,
+                                        self._norm_w(w.ffn_norm), a.norm_eps)
+            else:
+                h = (_hc_post_fused(y, residual, attn_post, attn_comb) if _HC_OPS
+                     else R.hc_post(y, residual, attn_post, attn_comb))
             residual = h
             ffn_pre, ffn_post, ffn_comb = self._hc_mixes(h, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base)
-            y = (self._hc_pre_rn(h, attn_pre, w.ffn_norm) if _HC_OPS
-                 else R.rmsnorm(R.hc_pre(h, attn_pre), w.ffn_norm, a.norm_eps))
-            scores = F.softplus(R.mm(y.float(), self.W.mtp[k].gate_w)).sqrt()  # fp32, as Model.moe
-            idx = (scores + w.gate_bias).topk(3, dim=-1)[1]
-            wts = scores.gather(1, idx); wts = wts / (wts.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
+            y = (fused_pre if fused_pre is not None else
+                 self._hc_pre_rn(h, attn_pre, w.ffn_norm) if _HC_OPS else
+                 R.rmsnorm(R.hc_pre(h, attn_pre), w.ffn_norm, a.norm_eps))
+            if self.experiments.draft_router:
+                idx = torch.empty(y.shape[0], 3, dtype=torch.long, device=y.device)
+                wts = torch.empty(y.shape[0], 3, dtype=torch.float32, device=y.device)
+                self.lean.router(y, w.gate_w, w.gate_bias, None, 3, a.route_scale, idx, wts)
+            else:
+                scores = F.softplus(R.mm(y.float(), self.W.mtp[k].gate_w)).sqrt()  # fp32, as Model.moe
+                idx = (scores + w.gate_bias).topk(3, dim=-1)[1]
+                wts = scores.gather(1, idx); wts = wts / (wts.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
             slots = (idx.to(torch.int32) + k * 128)
             out = self.m.moe_fn(y, slots, wts, self.W.dspark_arena, a.swiglu_limit).float()
             # TP draft arenas gather complete outputs inside moe_fn. Shared experts remain
@@ -1896,6 +1958,34 @@ class FastDecoder:
         self.hot_ring.promote()
         self.hot.stats["wait_s"] += time.perf_counter() - t0
 
+    def _upload_engram(self, layer, future, finish):
+        """Upload/dequantize while the preceding segment runs, then join on main.
+
+        This is called on the decode thread, never from an I/O worker. The
+        source table owns pinned staging and its reuse events. The result is
+        allocated on the upload stream and retained through its main-stream
+        copy; record_stream prevents allocator reuse until that consumer ends.
+        """
+        side = self.engram_upload_stream if self.experiments.engram_h2d else None
+        # This event is queued after the previous graph, before a CPU row wait.
+        # Its interval includes only the exposed suffix of that wait/upload,
+        # rather than charging all overlapping disk-read time to the device.
+        wait = self._ev_begin("engram_ready_wait") if side is not None else None
+        raw = future.result()
+        if side is None:
+            self.eg_rows[layer].copy_(finish(*raw))
+            return
+        main = torch.cuda.current_stream(self.dev)
+        with torch.cuda.stream(side):
+            rows = finish(*raw)
+            ready = torch.cuda.Event()
+            ready.record(side)
+        main.wait_event(ready)
+        if wait is not None:
+            wait.record(main)
+        rows.record_stream(main)
+        self.eg_rows[layer].copy_(rows)
+
     def step(self, block_ids: torch.Tensor, S: int, engram_rows: dict):
         """Run the T-token verify block at positions S..S+T-1, T = len(block_ids), one of
         VERIFY_WIDTHS. engram_rows: {L: [T,24,256] fp32}. Returns (logits [T,V] fp32,
@@ -1961,7 +2051,7 @@ class FastDecoder:
                         # this boundary's rows were read while the previous segment ran on the GPU
                         t0r = time.perf_counter()
                         fut, finish = futs[lo]
-                        self.eg_rows[lo].copy_(finish(*fut.result()))
+                        self._upload_engram(lo, fut, finish)
                         self.stats["engram_s"] += time.perf_counter() - t0r
                     # Unlike the outer `layers` pair, this pair surrounds only one graph replay.
                     # Summing it excludes CPU waits before Engram boundaries; layers-segments is
@@ -1980,7 +2070,7 @@ class FastDecoder:
                         # this layer's rows were read while the previous layers ran on the GPU
                         t0r = time.perf_counter()
                         fut, finish = futs[L]
-                        self.eg_rows[L].copy_(finish(*fut.result()))
+                        self._upload_engram(L, fut, finish)
                         self.stats["engram_s"] += time.perf_counter() - t0r
                     _ev_segment = self._ev_begin("segments")
                     gA[L].replay()
@@ -1999,7 +2089,7 @@ class FastDecoder:
         else:
             if futs is not None:
                 for LL, (f, finish) in futs.items():
-                    self.eg_rows[LL].copy_(finish(*f.result()))
+                    self._upload_engram(LL, f, finish)
             st = {"parity": parity, "index_bucket": index_bucket,
                   "ckv": None, "ik": None, "ratio": 0}
             for L in range(a.n_layers):

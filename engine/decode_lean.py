@@ -487,7 +487,9 @@ class LeanOps:
         else:
             pad = self._buf(("router", T), (self.mm_tile, gate_w.shape[1]))
             pad[:T].copy_(y)
-            g = self._buf(("router_g", T), (self.mm_tile, E))
+            # Draft gates have 128 experts; the target has 384. Odd-width
+            # verification can have the same T as the draft, so T alone aliases.
+            g = self._buf(("router_g", T, E), (self.mm_tile, E))
             torch.mm(pad, gate_w.t(), out=g)
         scores = torch.empty(T, E, dtype=torch.float32, device=y.device)
         logits = torch.empty_like(scores)

@@ -12,8 +12,10 @@ gate_source_root=${GATE_SOURCE_ROOT:-}
 gate_timeout=${GATE_TIMEOUT:-900s}
 [[ "$gate_timeout" =~ ^[0-9]+[smh]?$ ]] || { echo "GATE_TIMEOUT: bad value '$gate_timeout'" >&2; exit 1; }
 shift
+gate_profile=${GATE_PROFILE:-.env}
+[[ -f "$gate_profile" ]] || { echo "Missing gate profile: $gate_profile" >&2; exit 1; }
 set -a
-source .env
+source "$gate_profile"
 set +a
 # GATE_ENV="DSV41_BLOCK=5 DSV41_X=1": override .env for this gate only (both ranks). Sourcing
 # .env would otherwise overwrite anything exported by the caller.
@@ -45,7 +47,7 @@ while IFS='=' read -r key _; do
     flags+=(-e "$key=${!key}")
     forwarded=$((forwarded + 1))
 done < <(env | grep -E '^DSV41_[A-Z0-9_]+=')
-if grep -qE '^DSV41_[A-Z0-9_]+=' .env && (( forwarded == 0 )); then
+if grep -qE '^DSV41_[A-Z0-9_]+=' "$gate_profile" && (( forwarded == 0 )); then
     echo '.env sets DSV41_* but none were forwarded to the gate containers' >&2; exit 1
 fi
 flags+=(-e DSV41_CAPTURE_NEXT=0 -e DSV41_PREFIX_DISK_DIR=/app/results/prefix-cache-gate

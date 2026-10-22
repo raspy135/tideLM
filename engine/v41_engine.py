@@ -523,6 +523,8 @@ class V41Engine:
                  expert_format: str = "fp4", sim_cb2_frac: float = 0.0,
                  rank: int | None = None, world_size: int | None = None):
         self.model_dir = model_dir
+        from engine.perf_config import DecodeExperiments
+        self.experiments = DecodeExperiments.from_env()
         self.device = device
         self.spec = spec
         self._decode_probe_reply = {"version": 1, "action": "status", "ok": True,
@@ -1436,6 +1438,7 @@ class V41Engine:
                 "candidate_topk_blocks": self.args.candidate_topk_blocks,
                 "candidate_block_size": self.args.candidate_block_size,
                 "candidate_source_layer": self.args.candidate_source_layer,
+                **self.experiments.boot_fields(),
                 # Dense/attention re-quantization, the LM head's stored format and the drafter's
                 # cheaper head. All are read from the environment at load and change numerics, so
                 # a pair started with them differing would compute different logits or draft
@@ -2196,6 +2199,7 @@ class V41Engine:
                         "layers_ms_per_step": round(envelope_ms / n_steps, 2),
                         "segment_busy_ms_per_step": round(segment_ms / n_steps, 2),
                         "boundary_gap_ms_per_step": round(max(0.0, envelope_ms - segment_ms) / n_steps, 2),
+                        "engram_ready_wait_ms_per_step": round(gt.get("engram_ready_wait", 0) / n_steps, 2),
                         "sample_envelope_ms_per_step": round(
                             gt.get("sample", 0) / max(1, gt.get("sample_n", n_steps)), 2),
                         "draft_ms_per_step": round(gt.get("draft", 0) / max(1, gt.get("draft_n", 1)), 2),
@@ -3564,6 +3568,7 @@ class V41Engine:
         from engine.tensor_parallel import draft_head_bytes
         return {
             "engine": "v41",
+            "decode_experiments": self.experiments.boot_fields(),
             "ep_world_size": self.ep.world,
             "ep_rank": self.ep.rank,
             "tp_experts": self.ep.tensor_parallel,
