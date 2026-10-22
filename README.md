@@ -11,7 +11,6 @@ tide — so the engine gets better the more you use it.
 | Profile | Model | Routed experts | Resident | Context | Prose | Code | 8K-token prompt, first token |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,208 / 15,360 (66%) | 512K | **26.0 tok/s** | **44.2 tok/s** | 8.4 s |
-| `glm53-mxfp4`(Experimental) | GLM-5.3 | MXFP4 (AMD Quark) | 8,740 / 19,200 (46%) | 256K | **12.2 tok/s** | **15.3 tok/s** | 23.6 s |
 | `glm53-exl3` | GLM-5.3 | EXL3 3.0 bpw | 12,400 / 19,200 (64.6%) | 256K | **14.1 tok/s** | **19.1 tok/s** | 17.9 s |
 
 *Decode speed is `bench/bench.py`'s median over three measured runs after one warmup: 1,024
@@ -76,7 +75,6 @@ same path on both nodes. Clone this repository to the same absolute path on both
 
 ```bash
 cp configs/ds41-mxfp4.env.example  .env.ds41-mxfp4     # DeepSeek-V4.1-Flash(-1017), MXFP4
-cp configs/glm53-mxfp4.env.example .env.glm53-mxfp4    # GLM-5.3, MXFP4
 cp configs/glm53-exl3.env.example  .env.glm53-exl3     # GLM-5.3, EXL3 (needs the packs below)
 ```
 
@@ -85,7 +83,7 @@ cp configs/glm53-exl3.env.example  .env.glm53-exl3     # GLM-5.3, EXL3 (needs th
 | Profile | Checkpoint | Size |
 | --- | --- | ---: |
 | `ds41-mxfp4` | [`deepseek-ai/DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) (or the original `DeepSeek-V4.1-Flash`) | 510 GB |
-| `glm53-mxfp4`, `glm53-exl3` | [`amd/GLM-5.3-Quark-MXFP4-AttnFP8`](https://huggingface.co/amd/GLM-5.3-Quark-MXFP4-AttnFP8) | 410 GB |
+| `glm53-exl3` (dense weights) | [`amd/GLM-5.3-Quark-MXFP4-AttnFP8`](https://huggingface.co/amd/GLM-5.3-Quark-MXFP4-AttnFP8) | 410 GB |
 | `glm53-exl3` (also) | [`bertholomus/GLM-5.3-EXL3-3.0bpw`](https://huggingface.co/bertholomus/GLM-5.3-EXL3-3.0bpw), repacked into one file per node (below) | 139 GB a node |
 
 `MODEL_REPO=deepseek-ai/DeepSeek-V4.1-Flash-1017 MODEL_DIR=<dir> bash scripts/download-model.sh`
@@ -115,7 +113,7 @@ mounts the checkout itself.
 **4. Start and stop:**
 
 ```bash
-scripts/tide-up.sh .env.glm53-mxfp4    # stops whatever is serving, starts this profile
+scripts/tide-up.sh .env.glm53-exl3     # stops whatever is serving, starts this profile
 scripts/tide-down.sh
 ```
 
