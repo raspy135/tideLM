@@ -10,7 +10,7 @@ tide — so the engine gets better the more you use it.
 
 | Profile | Model | Routed experts | Resident | Context | Prose | Code | 8K-token prompt, first token |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,208 / 15,360 (66%) | 512K | **25.9 tok/s** | **42.8 tok/s** | 11.8 s |
+| `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,208 / 15,360 (66%) | 512K | **26.0 tok/s** | **44.2 tok/s** | 8.4 s |
 | `glm53-mxfp4`(Experimental) | GLM-5.3 | MXFP4 (AMD Quark) | 8,740 / 19,200 (46%) | 256K | **12.2 tok/s** | **15.3 tok/s** | 23.6 s |
 | `glm53-exl3` | GLM-5.3 | EXL3 3.0 bpw | 12,400 / 19,200 (64.6%) | 256K | **14.1 tok/s** | **19.1 tok/s** | 17.9 s |
 
@@ -18,7 +18,9 @@ tide — so the engine gets better the more you use it.
 output tokens at temperature 0.6, prose = an essay request, code = an LRU-cache request. The last
 column is the median time to first token of a fresh ~8,200-token prompt (no prefix reused). Each
 profile ran exactly as shipped in `configs/` (adaptation, hot reads and speculative decoding on)
-on two DGX Sparks, 2026-10-18, with the expert history it had learned from earlier use. Raw runs:
+on two DGX Sparks, 2026-10-18, with the expert history it had learned from earlier use. The DS row
+was re-measured on 2026-10-21 with candidate indexing enabled and a 32K context allocation
+(the profile supports 512K): [raw runs](results/flare-perf-20261021/http-bench/README.md). Original runs:
 [bench/results/2026-10-18/](bench/results/2026-10-18/). The `glm53-exl3` row was measured again on
 2026-10-20 ([bench/results/2026-10-20/](bench/results/2026-10-20/)) after the prefill changes of
 that day (BF16 attention reduce, 4,096-row chunks with the shared-memory EXL3 prefill kernel, the
@@ -27,32 +29,6 @@ were at 12,000 residents; the profile moved to 12,400 later that day, once the m
 service held on one node was freed, and was not re-measured. The first-token time had two
 warm-up requests before the three measured. The first requests after a boot run 1-3 s slower, so a time from one or two of
 them is that much off ([gotchas](docs/gotchas.md)).*
-
-**DeepSeek candidate indexing, 2026-10-21 (opt-in).** On two Sparks with a 32K context
-cap, a 97.4 GB arena per node and 10,208 initially resident experts, the latest
-`bench/bench.py` comparison measured:
-
-| Workload | Baseline decode | `DSV41_INDEX_CANDIDATES=1` | Observed change |
-| --- | ---: | ---: | ---: |
-| Prose | 26.12 tok/s | 25.98 tok/s | -0.6% |
-| Code | 43.75 tok/s | 44.22 tok/s | +1.1% |
-| Random 8K-token prompt | 31.59 tok/s | 33.47 tok/s | +6.0% |
-| Random 24K-token prompt | 29.77 tok/s | 32.58 tok/s | +9.4% |
-
-Medians over three measured runs after one warm-up, temperature 0.6, top-p 0.95,
-seed 42; 1,024 output tokens for prose/code and 256 for random prompts, with
-`--ignore-eos`. Adaptive loading, hot reads and adaptive speculative depth were
-enabled; both configurations started from identical demand histories and expert
-maps. Prose/code are effectively flat. The long-prompt gains also include changes
-in acceptance and depth: at 24K, acceptance rose from 2.62 to 3.11 tokens/step.
-These are observed serving rates, rather than isolated indexing gains.
-[Raw runs, TTFT and NVMe traffic](results/flare-perf-20261021/http-bench/README.md).
-
-A separate fixed-depth greedy off/on/on/off comparison at 24,596 input tokens
-measured **69.09 → 67.43 ms/step (2.4% less decode time)**, with identical output
-and acceptance on both ranks. This is the controlled indexing result; prefill is
-unchanged. The switch remains off by default pending broader quality validation.
-[Experiment details](docs/flare-experiments.md#measured-long-context-result).
 
 ## How adaptive expert loading works
 

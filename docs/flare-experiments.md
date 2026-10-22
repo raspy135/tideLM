@@ -4,7 +4,9 @@ Baseline: `87b336a`. The tracked tree was clean before work began; existing loca
 `bench/results/2026-10-21/` and `output/` artifacts are not part of these changes.
 The implementation branch is `codex/flare-perf-experiments`.
 
-All experiments default off. No serving profile has changed. GPU use was released
+Candidate indexing now defaults on for concurrency one; set
+`DSV41_INDEX_CANDIDATES=0` to roll back. Other experiments default off. The
+example DS profile explicitly enables candidate indexing. GPU use was released
 by the user and qualification began on October 21; measurements below distinguish
 component timings from complete generation. Enabled experiments require concurrency one: batched decode
 composes separate HC/router boundaries that have not been qualified for these
@@ -167,13 +169,15 @@ resident-map changes are zero. Reports:
 The measured improvement is restricted to decode; it does not speed prefill.
 One synthetic long prompt, one depth and greedy sampling do not establish
 held-out quality, retrieval performance, longer contexts, sampled acceptance,
-or performance with adaptive/hot-read traffic. Keep the switch off by default
-pending those checks. List compaction only runs when the graph's cache bucket
+or performance with adaptive/hot-read traffic. At the user's request, candidate
+indexing now defaults on for single-request serving; broader quality and retrieval
+validation remain outstanding. Batched serving keeps it off unless explicitly
+requested, which fails the concurrency guard. List compaction only runs when the graph's cache bucket
 exceeds candidate capacity; short requests keep the existing scorer.
 
 The disposable gates were removed after testing and the user's Flare GLM serving
-group was restarted with its original package and launch options. No serving
-profile or Flare source was changed.
+group was restarted with its original package and launch options. At that measurement stage, no serving
+profile or Flare source was changed; candidate indexing was promoted afterward.
 
 ### Sampled HTTP benchmark
 

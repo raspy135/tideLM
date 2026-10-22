@@ -3997,8 +3997,9 @@ the qualified version uses 16 keys/four warps.
 Candidate-only later indexers are the positive result: at 24596 input tokens,
 one warmed ABBA block gives 69.087 -> 67.433 ms/step (-2.39% time), 49.21 -> 50.42
 tok/s, identical complete outputs and acceptance on both ranks. This does not
-qualify sampled quality or adaptive/hot-read traffic. It remains opt-in; short
-contexts do not use the candidate scorer. Raw reports and component timings are
+qualify sampled quality or adaptive/hot-read traffic. It now defaults on for
+single-request serving at the user's request (`DSV41_INDEX_CANDIDATES=0` rolls
+back); short contexts do not use the candidate scorer. Raw reports and component timings are
 in `results/flare-perf-20261021/`.
 
 The follow-up `bench/bench.py` sampled HTTP run reports +5.97% at random 8K and
