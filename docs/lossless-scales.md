@@ -57,3 +57,17 @@ reuse off, depth 3, 128 greedy output tokens, one warmup and two measured repeat
 each for prose and code. Raw outputs and timings are in
 `results/scale-pack-20261021/{native,packed}-rank{0,1}.json`. These short separate
 boots establish output identity; they do not establish a speed gain.
+
+| Workload | Native median ms/step | Packed median ms/step |
+| --- | ---: | ---: |
+| Prose | 74.246 | 75.828 |
+| Code | 74.014 | 73.797 |
+
+At the same 97.4 GB budget, normal adaptive serving boots with **10,452**
+residents instead of **10,208**. Its `bench/bench.py` reports are kept as
+`results/scale-pack-20261021/http-*.json`: three measured runs after one warmup,
+temperature 0.6, seed 42, 32K context allocation, 1024 output tokens for
+prose/code and 256 for random 8K. These use a different prompt salt and resident
+set from the earlier README run; compare kernel overhead with the fixed-output
+test above. The README's DS chart remains the default native-scale profile,
+with candidate indexing on; scale packing is optional.
