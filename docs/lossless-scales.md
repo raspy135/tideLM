@@ -6,9 +6,10 @@ and arithmetic stay unchanged. This currently supports single-request native
 FP4, output TP2, CUDA v2 decode, including the two-row down kernel and Triton
 prefill. DSpark's draft experts keep their native layout.
 
-Packing is **disabled** in the shipped template and private serving profile while
-a matched HTTP comparison investigates the initial serving regression. The first
-HTTP run used a different prompt salt and was not a valid speed A/B. Fixed-output
+Packing is **disabled** in the shipped template and private serving profile.
+The first HTTP run used a different prompt salt and was not a valid speed A/B.
+The on-only repeat below restores the historical prompt salts, but a complete
+fresh native arm is still needed to isolate the throughput cost. Fixed-output
 tests alone did not qualify the default serving path. The following setup is for
 explicit experiments only. Build the image first, then pack on the head node:
 
@@ -81,3 +82,19 @@ code, 29.8773 tok/s random 8K, and 9.016 s 8K TTFT. These numbers do not improve
 the earlier native-scale measurements; retain packing for its resident capacity
 rather than claiming a throughput gain. The packing audit took about 263 seconds plus final pack
 writes on the development head node.
+
+A compression-on repeat used the original chart's prompt salts
+(`flare-perf-http-20261021-prose` / `-code`), temperature 0.6, sampling seed 42,
+top-p 0.95, 1024 output tokens, one warmup and three measured requests:
+
+| Workload | Packed median tok/s | Median TTFT |
+| --- | ---: | ---: |
+| Prose | 23.6656 | 1.393 s |
+| Code | 41.3714 | 1.833 s |
+
+It held 10,452 experts at 97.4 GB, with adaptive placement and hot reads on,
+32K context allocation. These are on-only measurements, not a fresh paired
+regression estimate against the historical 25.9777 / 44.2217 tok/s native runs.
+The interrupted native arm's partial logs are retained but do not constitute
+the planned three-run comparison. Reports and exact settings are in
+`results/scale-pack-20261021/matched-http/`.

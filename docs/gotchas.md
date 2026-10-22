@@ -4042,3 +4042,14 @@ Six sampled experts suggested 3.86% total slot savings. Auditing all 15,360
 access layout saves **2.30%** (9,400,320 -> 9,183,744 bytes per slot), not 3.86%.
 Keep fixed strides so replacement and graph pointers stay valid. Setup and
 rollback: `docs/lossless-scales.md`.
+
+Do not qualify its serving speed from the 128-token, depth-3, fixed-residency
+greedy check alone. The first 1024-token adaptive HTTP comparison accidentally
+changed the prompt salt, including each request's uniqueness tag; even prose
+and code prompts then differ. A packed-only repeat with the original salts
+measured 23.6656 prose / 41.3714 code tok/s (three measured runs after one warmup,
+temperature 0.6, seed 42, top-p 0.95, 10,452 residents, 32K allocation). There
+is no completed fresh paired native arm, so a historical-chart gap is not an
+isolated codec regression. Keep the feature off pending serving qualification.
+The compiled packed up kernel also uses 169 registers versus native's 150;
+that is a plausible cost to investigate, not a measured causal explanation.
