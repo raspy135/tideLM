@@ -1,0 +1,13 @@
+note: server serves 'deepseek', using that
+== candidate-on-prose: workload=prose isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=v41
+  warmup  isl=45 ttft=   4431.3 ms  tpot=  41.26 ms  decode= 24.24 tok/s  out=1024 (length)
+          accept_len=1.93  expert_hit=1.0  nvme=16.18 GB  engram_rows=106080
+  run1    isl=45 ttft=   1315.3 ms  tpot=  37.53 ms  decode= 26.65 tok/s  out=1024 (length)
+          accept_len=2.05  expert_hit=1.0  nvme=6.77 GB  engram_rows=102592
+  run2    isl=45 ttft=   2105.0 ms  tpot=  38.49 ms  decode= 25.98 tok/s  out=1024 (length)
+          accept_len=1.97  expert_hit=1.0  nvme=5.38 GB  engram_rows=104352
+  run3    isl=45 ttft=   1223.5 ms  tpot=  39.49 ms  decode= 25.32 tok/s  out=1024 (length)
+          accept_len=1.9  expert_hit=1.0  nvme=4.04 GB  engram_rows=108000
+  -> MEDIAN  ttft=1315.3278 ms  tpot=38.4945 ms  decode=25.9777 tok/s
+  -> ENGINE  accept_len=1.97  expert_hit=1.0  nvme=5.38 GB  engram_rows=104352
+  wrote /home/ryan/git/tidelm/results/flare-perf-20261021/http-bench/on-prose.json

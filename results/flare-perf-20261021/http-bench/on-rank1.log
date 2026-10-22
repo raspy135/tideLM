@@ -1,0 +1,140 @@
+TideLM 0.2.0-wip
+--- EP2 rank 1: RoCE rocep1s0f1,roceP2p1s0f1, dynamic GID in 10.0.0.0/23
+--- EP2: rank 1 of 2, rendezvous 10.0.0.1:29611, iface enp1s0f1np1
+--- model=/models/DeepSeek-V4.1-Flash-1017  max_seq=32768  arena=97.4  spec=1  thinking=off/75
+--- trace=/app/results/trace-union/stats/coverage.json  headless EP2 worker (no socket)
+--- the warm start reads tens of GB from NVMe before the socket is bound; /health is minutes away
+03:33:21 [engine] using Triton FP4 MoE kernel
+03:33:23 [engine] MoE routing kernels warm: 88 variants in 1.2s
+03:33:23 [engine] DSV41_FP4_PREFILL_DOT_SCALED=1: scaled FP4 prompt/replay arithmetic; decode unchanged
+03:33:23 [engine] DSV41_FP4_CUDA=1: native CUDA FP4 BM=16 decode (relaxed reduction=True)
+[rails] rank 1: decode NET/0; prefill both rails
+03:33:24 [engine] TP2 up: rank 1; each arena slot holds half an expert
+03:33:35 [engine] weights: layer 9 loaded (11s)
+03:33:45 [engine] weights: layer 19 loaded (22s)
+03:33:54 [engine] weights: layer 29 loaded (30s)
+03:34:03 [engine] weights: layer 39 loaded (39s)
+03:34:07 [engine] weights: all non-expert weights on GPU in 43s
+03:34:07 [engine] DSpark experts: TP output shards; shared experts remain replicated
+03:34:07 [engine] CUDA free 97.0 GB of 130.7; host MemAvailable 111.9 GB; arena 97.4 GB = 10361 fp4 expert slots of 9.40 MB (67% of all routed experts, pinned)
+03:34:11 [engine] DSV41_RESIDENT_EXPERTS=auto: 10208 of 15360 routed experts resident (66.5%) in 10224 LRU slots
+03:34:14 [engine] DSpark experts resident
+03:34:29 [engine] vision enabled: peer (32 layers, 1024 dim; weights on rank 1)
+03:34:29 [engine] Engram packed row cache: 256 MiB total per rank
+03:34:29 [engine] engram row split on: each rank reads uniq %% world == rank, one all-reduce rebuilds
+03:34:29 [engine] expert adaptation: sensitivity high (0.067 of observed demand per request, half-life 10.0 requests), prior 4 requests; derived: prefill swaps on at >= 32 new tokens and >= 1.0% misses, <= 512 swaps per pass, gain floor 0.005, decode passes every 600 tokens at the same miss gate; ignoring DSV41_PRUNE_UNIT, DSV41_PRUNE_PRIOR, DSV41_PRUNE_HALFLIFE, DSV41_PRUNE_SWAP, DSV41_PRUNE_SWAP_PREFILL, DSV41_PRUNE_SWAP_PREFILL_MIN, DSV41_PRUNE_SWAP_PREFILL_MIN_MISS, DSV41_PRUNE_SWAP_MAX, DSV41_PRUNE_SWAP_MIN_GAIN, DSV41_PRUNE_SWAP_MIN_GROWTH, DSV41_PRUNE_MISS (replaced by DSV41_ADAPT_*)
+03:34:29 [engine] observed routing metric: score
+03:34:29 [engine] prune ranking adapted from results/prune_demand_req_score_1017.npz: observed weight 78.9% (597 recorded routing slots)
+03:34:29 [engine] EP2 rank 1: 10208 of the 10208 kept experts are owned here
+03:34:29 [engine] pruned mode (uniform): keep 0.61, 10208 experts total (187-312 per layer), 96.0 GB
+03:34:29 [engine] EP2 prune mask agrees across ranks (checksum e4558b35c7d5016c01e106731cb1e79df0a6e15e40f571de2807064b9c027fbb)
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+/opt/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.all_gather_into_tensor` is deprecated. Please use `torch.distributed.all_gather_single` instead.
+  return func(*args, **kwargs)
+/opt/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.all_gather_into_tensor` is deprecated. Please use `torch.distributed.all_gather_single` instead.
+  return func(*args, **kwargs)
+03:34:29 [engine] EP2 config agrees across ranks (220 fields: ablate_wob, ablate_wob_digest, act_quant, adapt_decode_tokens, adapt_halflife, adapt_prior, adapt_request_unit, adapt_source, adapt_swap, arena_slots, attn_staged, batch_decode_version, batch_idle_steps, batched_verify, batched_verify_source, block_confidence_sampling_version, block_confidence_v1, block_dynamic, candidate_block_size, candidate_source_layer, candidate_topk_blocks, collective_rails_version, comm_backend, confidence_cost_refresh, critical_budget, critical_per_layer, critical_policy_version, critical_prefill, critical_profile_sha256, critical_share, cycle_break, decode_lean, decode_lean_attn, decode_lean_moe, decode_lean_rope, decode_lean_softmax, decode_merged_proj, decode_probe_version, decode_shared_overlap, dense_dequant_cache, dense_fp4, draft_bypass, draft_bypass_version, draft_head_fmt, draft_markov_local, draft_markov_topk, draft_markov_tp, draft_nucleus, draft_tokens, draft_vocab, draft_vocab_version, dream_fp8, dream_overlay, dynamic_experts, dynamic_experts_version, dynamic_layer_floor, early_draft, early_verify, engram_cache_v1_mb, engram_cache_v1_peer_mb, engram_direct, engram_native, engram_native_threads, engram_row_split, engram_split_min, exl3_cuda_source, exl3_dense, exl3_dense_version, exl3_draft_dense, exl3_draft_dense_version, exl3_exact_slots, exl3_merged, exl3_prefill_kernel, expert_format, expert_pack_source, expert_profile_version, expert_seed_enabled, expert_seed_sha256, expert_seed_version, expert_topics, expert_topp, expert_topp_version, fp4_cuda, fp4_cuda_down_rows, fp4_cuda_relaxed, fp4_cuda_source, fp4_cuda_v2, fp4_dense_split, fp4_dot_scaled, fp4_prefill_dot_scaled, fp4_prefill_scaled_tiles, fp8_act_qdq_fused, fp8_decode_block_k, fp8_decode_block_n, fp8_decode_pipeline, fp8_decode_warps, graph_pool_rotation_version, graphs_max, hc_front_fused, hc_fused, hc_kernel, hc_mm_tile, hc_ops, hc_prec, hc_prefill_fused, head_fmt, head_kernel, head_kernel_version, hot_reads, index_fused, index_score_bf16, index_stream, index_topk, initial_keep_sha256, kv_cache_qdq, l2pf_attn_mb, l2pf_bytes, l2pf_mode, l2pf_pace_gbps, l2pf_qkv_mb, l2pf_sh_mb, l2pf_version, lane_max_seq, lane_reserve_gb, layer_ablation_file, layer_ablation_version, layer_stream_version, lean_rms_fused, lookup_draft_candidates, lookup_draft_enabled, lookup_draft_ngram, lookup_draft_version, markov_head_fmt, max_concurrency, max_seq, moe_fallback, no_repeat_ngram, packed_kv, perf_attention_direct, perf_draft_router, perf_engram_h2d, perf_hc_post_pre, perf_index_candidates, perf_source, predictive_backend, predictive_capacity, predictive_features, predictive_minimum, predictive_mode, predictive_probe_fraction, predictive_probe_min_tokens, predictive_probe_target_ratio, predictive_probe_tokens, predictive_probe_two_pass_below, predictive_probe_version, predictive_similarity, predictive_version, prefill_attn_indexed, prefill_budget, prefill_budget_version, prefill_chunk, prefill_dual_rail, prefill_graph_fixed_routing, prefill_graphs_v2, prefill_moe_timing, prefill_swap_routes_version, prefill_timing, prefix_cache, prefix_disk, prefix_disk_dedup, prefix_disk_min_interval_s, prefix_disk_strict, prefix_disk_version, prefix_response, prefix_snapshots, prune_keep, prune_layer_counts, prune_layer_weights, prune_metric, prune_miss_fused, prune_rank, prune_record, prune_score_history_version, prune_select, prune_source, prune_swap_prefill, prune_swap_prefill_min, resident_budget, roce_hcas, roce_max_kb, router_bf16, router_bf16_version, router_fused_tail, router_fused_tail_version, spec, spec_conf, stream_layers, topk, tp_attention, tp_dense, tp_dense_rounding_version, tp_draft_attention, tp_draft_experts, tp_draft_head, tp_draft_head_version, tp_embed, tp_expert_layout, tp_expert_reduce, tp_experts, tp_experts_version, tp_head, tp_linear_layout, user_prompt_max_loads, user_prompt_policy_version, user_prompt_stream, verify_odd, verify_odd_version, vision_enabled, vision_mode, vision_peer_version)
+03:34:31 [engine] warm start 500/10208 experts, 16.6 GB, 1s
+03:34:32 [engine] warm start 1000/10208 experts, 26.0 GB, 2s
+03:34:33 [engine] warm start 1500/10208 experts, 35.4 GB, 3s
+03:34:33 [engine] warm start 2000/10208 experts, 44.9 GB, 4s
+03:34:34 [engine] warm start 2500/10208 experts, 54.2 GB, 5s
+03:34:35 [engine] warm start 3000/10208 experts, 63.6 GB, 6s
+03:34:36 [engine] warm start 3500/10208 experts, 73.1 GB, 7s
+03:34:37 [engine] warm start 4000/10208 experts, 82.5 GB, 8s
+03:34:38 [engine] warm start 4500/10208 experts, 91.9 GB, 9s
+03:34:39 [engine] warm start 5000/10208 experts, 101.3 GB, 10s
+03:34:40 [engine] warm start 5500/10208 experts, 110.7 GB, 11s
+03:34:41 [engine] warm start 6000/10208 experts, 120.1 GB, 11s
+03:34:42 [engine] warm start 6500/10208 experts, 129.5 GB, 12s
+03:34:43 [engine] warm start 7000/10208 experts, 138.9 GB, 13s
+03:34:44 [engine] warm start 7500/10208 experts, 148.3 GB, 14s
+03:34:45 [engine] warm start 8000/10208 experts, 157.7 GB, 15s
+03:34:45 [engine] warm start 8500/10208 experts, 167.1 GB, 16s
+03:34:46 [engine] warm start 9000/10208 experts, 176.5 GB, 17s
+03:34:47 [engine] warm start 9500/10208 experts, 185.9 GB, 18s
+03:34:48 [engine] warm start 10000/10208 experts, 195.3 GB, 19s
+03:34:49 [engine] warm start done: 10208 experts resident (96.0 GB, 199.2 GB read) in 19s
+03:34:49 [engine] prune demand DB loaded: 597 recorded routing slots
+03:34:49 [engine] fast decode path enabled (CUDA graphs=True, device slot LUT=True, ep=2)
+03:34:49 [engine] dynamic speculative depth (3, 5) (start 3, decided every 60 tokens)
+03:34:49 [engine] EP2 communicator warm (dummy combine done)
+03:34:49 [engine] ready
+03:34:56 [engine] adapted 274 global expert sectors (261 across layers; residents/layer 192-305, generation 1)
+03:34:56 [engine] adapted 49 global expert sectors (47 across layers; residents/layer 190-304, generation 2)
+03:35:22 [engine] adapted 232 global expert sectors (225 across layers; residents/layer 193-301, generation 3)
+03:35:39 [engine] adapted 30 global expert sectors (29 across layers; residents/layer 194-301, generation 4)
+03:35:39 [engine] prefix_disk_save: {"saved": true, "bytes": 3287851, "boundaries": 1, "stage_s": 0.0633, "write_s": 0.0289}
+03:35:39 [engine] adapted 90 global expert sectors (88 across layers; residents/layer 197-303, generation 5)
+03:35:40 [engine] adapted 5 global expert sectors (5 across layers; residents/layer 197-303, generation 6)
+03:36:02 [engine] adapted 126 global expert sectors (126 across layers; residents/layer 201-299, generation 7)
+03:36:18 [engine] adapted 21 global expert sectors (20 across layers; residents/layer 198-300, generation 8)
+03:36:19 [engine] adapted 77 global expert sectors (76 across layers; residents/layer 199-299, generation 9)
+03:36:20 [engine] adapted 10 global expert sectors (9 across layers; residents/layer 199-299, generation 10)
+03:36:44 [engine] adapted 79 global expert sectors (79 across layers; residents/layer 200-297, generation 11)
+03:37:00 [engine] adapted 23 global expert sectors (22 across layers; residents/layer 201-297, generation 12)
+03:37:00 [engine] adapted 57 global expert sectors (57 across layers; residents/layer 202-299, generation 13)
+03:37:01 [engine] adapted 9 global expert sectors (8 across layers; residents/layer 204-299, generation 14)
+03:37:25 [engine] adapted 66 global expert sectors (65 across layers; residents/layer 206-299, generation 15)
+03:37:41 [engine] adapted 15 global expert sectors (15 across layers; residents/layer 204-299, generation 16)
+03:37:42 [engine] adapted 136 global expert sectors (135 across layers; residents/layer 206-300, generation 17)
+03:37:43 [engine] adapted 14 global expert sectors (14 across layers; residents/layer 207-300, generation 18)
+03:37:58 [engine] adapted 139 global expert sectors (134 across layers; residents/layer 205-299, generation 19)
+03:38:08 [engine] adapted 36 global expert sectors (33 across layers; residents/layer 206-298, generation 20)
+03:38:09 [engine] adapted 49 global expert sectors (48 across layers; residents/layer 207-300, generation 21)
+03:38:10 [engine] adapted 5 global expert sectors (5 across layers; residents/layer 206-300, generation 22)
+03:38:25 [engine] adapted 83 global expert sectors (81 across layers; residents/layer 207-302, generation 23)
+03:38:33 [engine] adapted 24 global expert sectors (24 across layers; residents/layer 207-302, generation 24)
+03:38:33 [engine] adapted 40 global expert sectors (39 across layers; residents/layer 207-302, generation 25)
+03:38:34 [engine] adapted 5 global expert sectors (5 across layers; residents/layer 207-302, generation 26)
+03:38:48 [engine] adapted 70 global expert sectors (70 across layers; residents/layer 207-300, generation 27)
+03:38:58 [engine] adapted 14 global expert sectors (14 across layers; residents/layer 207-301, generation 28)
+03:38:59 [engine] adapted 42 global expert sectors (41 across layers; residents/layer 208-301, generation 29)
+03:38:59 [engine] adapted 8 global expert sectors (7 across layers; residents/layer 208-301, generation 30)
+03:39:13 [engine] adapted 63 global expert sectors (62 across layers; residents/layer 205-300, generation 31)
+03:39:22 [engine] adapted 23 global expert sectors (23 across layers; residents/layer 205-300, generation 32)
+03:39:24 [engine] adapted 208 global expert sectors (205 across layers; residents/layer 210-301, generation 33)
+03:39:34 [engine] adapted 192 global expert sectors (187 across layers; residents/layer 219-298, generation 34)
+03:39:43 [engine] adapted 127 global expert sectors (124 across layers; residents/layer 222-299, generation 35)
+03:39:45 [engine] adapted 107 global expert sectors (104 across layers; residents/layer 224-298, generation 36)
+03:39:53 [engine] adapted 120 global expert sectors (115 across layers; residents/layer 222-300, generation 37)
+03:40:01 [engine] adapted 84 global expert sectors (82 across layers; residents/layer 224-298, generation 38)
+03:40:02 [engine] adapted 84 global expert sectors (81 across layers; residents/layer 221-297, generation 39)
+03:40:09 [engine] adapted 90 global expert sectors (87 across layers; residents/layer 225-298, generation 40)
+03:40:17 [engine] adapted 54 global expert sectors (54 across layers; residents/layer 225-296, generation 41)
+03:40:17 [engine] prefix_disk_save: {"saved": true, "bytes": 88403139, "boundaries": 8, "stage_s": 0.8427, "write_s": 0.1423}
+03:40:18 [engine] adapted 92 global expert sectors (92 across layers; residents/layer 222-301, generation 42)
+03:40:24 [engine] adapted 79 global expert sectors (76 across layers; residents/layer 226-299, generation 43)
+2026-10-22 03:34:49,378 INFO dsv41.server: image inputs: enabled (vision tower loaded)
+2026-10-22 03:34:49,378 INFO dsv41.server: EP2 rank 1: headless worker, waiting for requests from rank 0
+/opt/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.all_gather_into_tensor` is deprecated. Please use `torch.distributed.all_gather_single` instead.
+  return func(*args, **kwargs)
+2026-10-22 03:35:38,930 INFO dsv41.server: EP2 worker: request 1 done (45 prompt tokens, 46.5 s)
+2026-10-22 03:36:18,670 INFO dsv41.server: EP2 worker: request 2 done (45 prompt tokens, 39.6 s)
+2026-10-22 03:37:00,131 INFO dsv41.server: EP2 worker: request 3 done (45 prompt tokens, 41.3 s)
+2026-10-22 03:37:41,797 INFO dsv41.server: EP2 worker: request 4 done (45 prompt tokens, 41.5 s)
+2026-10-22 03:38:08,659 INFO dsv41.server: EP2 worker: request 5 done (62 prompt tokens, 26.7 s)
+2026-10-22 03:38:33,061 INFO dsv41.server: EP2 worker: request 6 done (62 prompt tokens, 24.2 s)
+2026-10-22 03:38:58,641 INFO dsv41.server: EP2 worker: request 7 done (62 prompt tokens, 25.4 s)
+2026-10-22 03:39:22,014 INFO dsv41.server: EP2 worker: request 8 done (62 prompt tokens, 23.3 s)
+2026-10-22 03:39:43,209 INFO dsv41.server: EP2 worker: request 9 done (8178 prompt tokens, 20.4 s)
+2026-10-22 03:40:00,694 INFO dsv41.server: EP2 worker: request 10 done (8170 prompt tokens, 16.8 s)
+2026-10-22 03:40:16,843 INFO dsv41.server: EP2 worker: request 11 done (8171 prompt tokens, 15.6 s)
+2026-10-22 03:40:31,201 INFO dsv41.server: EP2 worker: request 12 done (8178 prompt tokens, 14.0 s)
+03:40:31 [engine] adapted 235 global expert sectors (232 across layers; residents/layer 219-304, generation 44)
+03:40:33 [engine] adapted 84 global expert sectors (82 across layers; residents/layer 221-303, generation 45)
+03:40:54 [engine] adapted 96 global expert sectors (94 across layers; residents/layer 224-303, generation 46)
+03:41:03 [engine] adapted 79 global expert sectors (78 across layers; residents/layer 225-303, generation 47)
+03:41:04 [engine] adapted 85 global expert sectors (82 across layers; residents/layer 220-306, generation 48)
+03:41:21 [engine] adapted 72 global expert sectors (69 across layers; residents/layer 223-304, generation 49)
+03:41:29 [engine] adapted 75 global expert sectors (75 across layers; residents/layer 224-302, generation 50)
+03:41:30 [engine] adapted 68 global expert sectors (66 across layers; residents/layer 223-305, generation 51)
+03:41:50 [engine] adapted 67 global expert sectors (63 across layers; residents/layer 222-303, generation 52)
+03:41:57 [engine] adapted 57 global expert sectors (57 across layers; residents/layer 223-303, generation 53)
+03:41:58 [engine] adapted 79 global expert sectors (77 across layers; residents/layer 223-301, generation 54)
+03:42:17 [engine] adapted 77 global expert sectors (72 across layers; residents/layer 224-305, generation 55)
+03:42:25 [engine] adapted 58 global expert sectors (56 across layers; residents/layer 223-300, generation 56)
+2026-10-22 03:41:03,194 INFO dsv41.server: EP2 worker: request 13 done (24597 prompt tokens, 30.8 s)
+2026-10-22 03:41:29,355 INFO dsv41.server: EP2 worker: request 14 done (24601 prompt tokens, 25.5 s)
+2026-10-22 03:41:57,246 INFO dsv41.server: EP2 worker: request 15 done (24582 prompt tokens, 27.3 s)
+2026-10-22 03:42:25,181 INFO dsv41.server: EP2 worker: request 16 done (24617 prompt tokens, 27.3 s)

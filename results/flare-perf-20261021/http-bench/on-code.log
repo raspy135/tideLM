@@ -1,0 +1,13 @@
+note: server serves 'deepseek', using that
+== candidate-on-code: workload=code isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=v41
+  warmup  isl=62 ttft=   1510.3 ms  tpot=  24.77 ms  decode= 40.36 tok/s  out=1024 (length)
+          accept_len=3.41  expert_hit=1.0  nvme=8.52 GB  engram_rows=66592
+  run1    isl=62 ttft=   1218.7 ms  tpot=  22.61 ms  decode= 44.22 tok/s  out=1024 (length)
+          accept_len=3.89  expert_hit=1.0  nvme=3.87 GB  engram_rows=72064
+  run2    isl=62 ttft=   1254.3 ms  tpot=  23.74 ms  decode= 42.13 tok/s  out=1024 (length)
+          accept_len=3.87  expert_hit=1.0  nvme=3.35 GB  engram_rows=80064
+  run3    isl=62 ttft=   1229.1 ms  tpot=  21.68 ms  decode= 46.12 tok/s  out=1024 (length)
+          accept_len=4.13  expert_hit=1.0  nvme=2.93 GB  engram_rows=73200
+  -> MEDIAN  ttft=1229.0887 ms  tpot=22.6133 ms  decode=44.2217 tok/s
+  -> ENGINE  accept_len=3.89  expert_hit=1.0  nvme=3.35 GB  engram_rows=73200
+  wrote /home/ryan/git/tidelm/results/flare-perf-20261021/http-bench/on-code.json

@@ -1,0 +1,10 @@
+--- rank 0 (local): image ok, checkpoint ok, verbs ok, 114 GiB free
+--- rank 1 (ryan@10.0.0.2): image ok, checkpoint ok, verbs ok, 116 GiB free
+--- engine code: the checkout (2c347b9067c672ad), bind-mounted over the image
+--- RoCE: rank 0 = rocep1s0f1 5   rank 1 = rocep1s0f1 5   (rendezvous 10.0.0.1:29611)
+--- starting rank 0 locally (sha256:3b8a1ecbd95f3306ea22ab8a87d87dd0180c032ee9ae12641d56055d767e45ce)
+--- waiting for the rendezvous port 10.0.0.1:29611: up after 9s
+--- starting rank 1 on ryan@10.0.0.2
+--- rank 0: docker logs -f tidelm-bench-rank0
+--- rank 1: ssh ryan@10.0.0.2 docker logs -f tidelm-bench-rank1
+not waiting (--no-wait).

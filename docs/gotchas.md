@@ -4000,3 +4000,11 @@ tok/s, identical complete outputs and acceptance on both ranks. This does not
 qualify sampled quality or adaptive/hot-read traffic. It remains opt-in; short
 contexts do not use the candidate scorer. Raw reports and component timings are
 in `results/flare-perf-20261021/`.
+
+The follow-up `bench/bench.py` sampled HTTP run reports +5.97% at random 8K and
++9.44% at random 24K, but acceptance changes 2.75 -> 3.10 and 2.62 -> 3.11, with
+different adaptive depth choices. These are observed serving rates, not pure
+kernel gains. Prose/code move -0.55%/+1.07% despite being too short to use the
+candidate scorer. Keep the matching-output, fixed-depth ABBA measurement separate
+from this normal-traffic comparison. Raw reports and TTFT/NVMe breakdowns are in
+`results/flare-perf-20261021/http-bench/`.

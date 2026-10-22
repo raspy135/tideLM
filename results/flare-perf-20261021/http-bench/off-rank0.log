@@ -1,0 +1,391 @@
+TideLM 0.2.0-wip
+--- EP2 rank 0: RoCE rocep1s0f1,roceP2p1s0f1, dynamic GID in 10.0.0.0/23
+--- EP2: rank 0 of 2, rendezvous 10.0.0.1:29611, iface enp1s0f1np1
+--- model=/models/DeepSeek-V4.1-Flash-1017  max_seq=32768  arena=97.4  spec=1  thinking=off/75
+--- trace=/app/results/trace-union/stats/coverage.json  listen=127.0.0.1:8000
+--- the warm start reads tens of GB from NVMe before the socket is bound; /health is minutes away
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+03:23:54 [engine] using Triton FP4 MoE kernel
+03:23:55 [engine] MoE routing kernels warm: 88 variants in 1.4s
+03:23:55 [engine] DSV41_FP4_PREFILL_DOT_SCALED=1: scaled FP4 prompt/replay arithmetic; decode unchanged
+03:23:55 [engine] DSV41_FP4_CUDA=1: native CUDA FP4 BM=16 decode (relaxed reduction=True)
+[rails] rank 0: decode NET/0; prefill both rails
+/opt/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.all_gather_into_tensor` is deprecated. Please use `torch.distributed.all_gather_single` instead.
+  return func(*args, **kwargs)
+/opt/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.all_gather_into_tensor` is deprecated. Please use `torch.distributed.all_gather_single` instead.
+  return func(*args, **kwargs)
+[roce] all-gathers of up to 256 KiB a rank over RoCE on roceP2p1s0f1 (GID 5, 10.0.1.1), rocep1s0f1 (GID 5, 10.0.0.1); timeout 120 s; probe 13.6 us eager at 16 KiB
+03:24:03 [engine] TP2 up: rank 0; each arena slot holds half an expert
+03:24:14 [engine] weights: layer 9 loaded (11s)
+03:24:25 [engine] weights: layer 19 loaded (22s)
+03:24:34 [engine] weights: layer 29 loaded (31s)
+03:24:43 [engine] weights: layer 39 loaded (40s)
+03:24:46 [engine] weights: all non-expert weights on GPU in 43s
+03:24:46 [engine] DSpark experts: TP output shards; shared experts remain replicated
+03:24:46 [engine] CUDA free 96.8 GB of 130.7; host MemAvailable 109.7 GB; arena 97.4 GB = 10361 fp4 expert slots of 9.40 MB (67% of all routed experts, pinned)
+03:24:52 [engine] DSV41_RESIDENT_EXPERTS=auto: 10208 of 15360 routed experts resident (66.5%) in 10224 LRU slots
+03:24:54 [engine] DSpark experts resident
+03:25:00 [engine] vision enabled: peer (32 layers, 1024 dim; weights on rank 1)
+03:25:00 [engine] Engram packed row cache: 256 MiB total per rank
+03:25:00 [engine] engram row split on: each rank reads uniq %% world == rank, one all-reduce rebuilds
+03:25:00 [engine] expert adaptation: sensitivity high (0.067 of observed demand per request, half-life 10.0 requests), prior 4 requests; derived: prefill swaps on at >= 32 new tokens and >= 1.0% misses, <= 512 swaps per pass, gain floor 0.005, decode passes every 600 tokens at the same miss gate; ignoring DSV41_PRUNE_UNIT, DSV41_PRUNE_PRIOR, DSV41_PRUNE_HALFLIFE, DSV41_PRUNE_SWAP, DSV41_PRUNE_SWAP_PREFILL, DSV41_PRUNE_SWAP_PREFILL_MIN, DSV41_PRUNE_SWAP_PREFILL_MIN_MISS, DSV41_PRUNE_SWAP_MAX, DSV41_PRUNE_SWAP_MIN_GAIN, DSV41_PRUNE_SWAP_MIN_GROWTH, DSV41_PRUNE_MISS (replaced by DSV41_ADAPT_*)
+03:25:00 [engine] observed routing metric: score
+03:25:00 [engine] prune ranking adapted from results/prune_demand_req_score_1017.npz: observed weight 78.9% (597 recorded routing slots)
+03:25:00 [engine] EP2 rank 0: 10208 of the 10208 kept experts are owned here
+03:25:00 [engine] pruned mode (uniform): keep 0.61, 10208 experts total (187-312 per layer), 96.0 GB
+03:25:00 [engine] EP2 prune mask agrees across ranks (checksum e4558b35c7d5016c01e106731cb1e79df0a6e15e40f571de2807064b9c027fbb)
+03:25:00 [engine] EP2 config agrees across ranks (220 fields: ablate_wob, ablate_wob_digest, act_quant, adapt_decode_tokens, adapt_halflife, adapt_prior, adapt_request_unit, adapt_source, adapt_swap, arena_slots, attn_staged, batch_decode_version, batch_idle_steps, batched_verify, batched_verify_source, block_confidence_sampling_version, block_confidence_v1, block_dynamic, candidate_block_size, candidate_source_layer, candidate_topk_blocks, collective_rails_version, comm_backend, confidence_cost_refresh, critical_budget, critical_per_layer, critical_policy_version, critical_prefill, critical_profile_sha256, critical_share, cycle_break, decode_lean, decode_lean_attn, decode_lean_moe, decode_lean_rope, decode_lean_softmax, decode_merged_proj, decode_probe_version, decode_shared_overlap, dense_dequant_cache, dense_fp4, draft_bypass, draft_bypass_version, draft_head_fmt, draft_markov_local, draft_markov_topk, draft_markov_tp, draft_nucleus, draft_tokens, draft_vocab, draft_vocab_version, dream_fp8, dream_overlay, dynamic_experts, dynamic_experts_version, dynamic_layer_floor, early_draft, early_verify, engram_cache_v1_mb, engram_cache_v1_peer_mb, engram_direct, engram_native, engram_native_threads, engram_row_split, engram_split_min, exl3_cuda_source, exl3_dense, exl3_dense_version, exl3_draft_dense, exl3_draft_dense_version, exl3_exact_slots, exl3_merged, exl3_prefill_kernel, expert_format, expert_pack_source, expert_profile_version, expert_seed_enabled, expert_seed_sha256, expert_seed_version, expert_topics, expert_topp, expert_topp_version, fp4_cuda, fp4_cuda_down_rows, fp4_cuda_relaxed, fp4_cuda_source, fp4_cuda_v2, fp4_dense_split, fp4_dot_scaled, fp4_prefill_dot_scaled, fp4_prefill_scaled_tiles, fp8_act_qdq_fused, fp8_decode_block_k, fp8_decode_block_n, fp8_decode_pipeline, fp8_decode_warps, graph_pool_rotation_version, graphs_max, hc_front_fused, hc_fused, hc_kernel, hc_mm_tile, hc_ops, hc_prec, hc_prefill_fused, head_fmt, head_kernel, head_kernel_version, hot_reads, index_fused, index_score_bf16, index_stream, index_topk, initial_keep_sha256, kv_cache_qdq, l2pf_attn_mb, l2pf_bytes, l2pf_mode, l2pf_pace_gbps, l2pf_qkv_mb, l2pf_sh_mb, l2pf_version, lane_max_seq, lane_reserve_gb, layer_ablation_file, layer_ablation_version, layer_stream_version, lean_rms_fused, lookup_draft_candidates, lookup_draft_enabled, lookup_draft_ngram, lookup_draft_version, markov_head_fmt, max_concurrency, max_seq, moe_fallback, no_repeat_ngram, packed_kv, perf_attention_direct, perf_draft_router, perf_engram_h2d, perf_hc_post_pre, perf_index_candidates, perf_source, predictive_backend, predictive_capacity, predictive_features, predictive_minimum, predictive_mode, predictive_probe_fraction, predictive_probe_min_tokens, predictive_probe_target_ratio, predictive_probe_tokens, predictive_probe_two_pass_below, predictive_probe_version, predictive_similarity, predictive_version, prefill_attn_indexed, prefill_budget, prefill_budget_version, prefill_chunk, prefill_dual_rail, prefill_graph_fixed_routing, prefill_graphs_v2, prefill_moe_timing, prefill_swap_routes_version, prefill_timing, prefix_cache, prefix_disk, prefix_disk_dedup, prefix_disk_min_interval_s, prefix_disk_strict, prefix_disk_version, prefix_response, prefix_snapshots, prune_keep, prune_layer_counts, prune_layer_weights, prune_metric, prune_miss_fused, prune_rank, prune_record, prune_score_history_version, prune_select, prune_source, prune_swap_prefill, prune_swap_prefill_min, resident_budget, roce_hcas, roce_max_kb, router_bf16, router_bf16_version, router_fused_tail, router_fused_tail_version, spec, spec_conf, stream_layers, topk, tp_attention, tp_dense, tp_dense_rounding_version, tp_draft_attention, tp_draft_experts, tp_draft_head, tp_draft_head_version, tp_embed, tp_expert_layout, tp_expert_reduce, tp_experts, tp_experts_version, tp_head, tp_linear_layout, user_prompt_max_loads, user_prompt_policy_version, user_prompt_stream, verify_odd, verify_odd_version, vision_enabled, vision_mode, vision_peer_version)
+03:25:00 [engine] predictive prefill: mode=apply, backend=probe, samples=0, database_error=None
+03:25:01 [engine] warm start 500/10208 experts, 16.6 GB, 1s
+03:25:02 [engine] warm start 1000/10208 experts, 26.0 GB, 2s
+03:25:03 [engine] warm start 1500/10208 experts, 35.4 GB, 3s
+03:25:04 [engine] warm start 2000/10208 experts, 44.9 GB, 4s
+03:25:05 [engine] warm start 2500/10208 experts, 54.2 GB, 5s
+03:25:06 [engine] warm start 3000/10208 experts, 63.6 GB, 6s
+03:25:07 [engine] warm start 3500/10208 experts, 73.1 GB, 7s
+03:25:08 [engine] warm start 4000/10208 experts, 82.5 GB, 8s
+03:25:09 [engine] warm start 4500/10208 experts, 91.9 GB, 9s
+03:25:09 [engine] warm start 5000/10208 experts, 101.3 GB, 9s
+03:25:10 [engine] warm start 5500/10208 experts, 110.7 GB, 10s
+03:25:11 [engine] warm start 6000/10208 experts, 120.1 GB, 11s
+03:25:12 [engine] warm start 6500/10208 experts, 129.5 GB, 12s
+03:25:13 [engine] warm start 7000/10208 experts, 138.9 GB, 13s
+03:25:14 [engine] warm start 7500/10208 experts, 148.3 GB, 14s
+03:25:15 [engine] warm start 8000/10208 experts, 157.7 GB, 15s
+03:25:16 [engine] warm start 8500/10208 experts, 167.1 GB, 16s
+03:25:17 [engine] warm start 9000/10208 experts, 176.5 GB, 17s
+03:25:18 [engine] warm start 9500/10208 experts, 185.9 GB, 18s
+03:25:19 [engine] warm start 10000/10208 experts, 195.3 GB, 19s
+03:25:19 [engine] warm start done: 10208 experts resident (96.0 GB, 199.2 GB read) in 19s
+03:25:19 [engine] prune demand DB loaded: 597 recorded routing slots
+03:25:19 [engine] fast decode path enabled (CUDA graphs=True, device slot LUT=True, ep=2)
+03:25:19 [engine] dynamic speculative depth (3, 5) (start 3, decided every 60 tokens)
+03:25:19 [engine] EP2 communicator warm (dummy combine done)
+03:25:19 [engine] ready
+2026-10-22 03:25:19,782 INFO dsv41.server: image inputs: enabled (vision tower loaded)
+2026-10-22 03:25:19,782 INFO dsv41.tool_grammar: tool-call grammar disabled (DSV41_TOOL_GRAMMAR=0)
+2026-10-22 03:25:19,784 INFO dsv41.server: serving deepseek (engine=v41, tokenizer=tokenizers, thinking default=off effort=75) on http://127.0.0.1:8000
+2026-10-22 03:25:19,784 INFO dsv41.server: EP2: idle keepalive every 30 s (process-group timeout 600 s)
+2026-10-22 03:25:21,959 INFO dsv41.server: 127.0.0.1 "GET /health HTTP/1.1" 200 -
+2026-10-22 03:25:22,031 INFO dsv41.server: 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+2026-10-22 03:25:22,033 INFO dsv41.server: 127.0.0.1 "GET /health HTTP/1.1" 200 -
+2026-10-22 03:25:22,034 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:25:22,035 INFO dsv41.server: 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-10-22 03:25:22,037 INFO dsv41.server: generation start: request=67506dda prompt=45 max_tokens=1024 thinking=False
+/opt/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.all_gather_into_tensor` is deprecated. Please use `torch.distributed.all_gather_single` instead.
+  return func(*args, **kwargs)
+2026-10-22 03:25:24,062 INFO dsv41.server: 127.0.0.1 "GET /health HTTP/1.1" 200 -
+03:25:25 [engine] adapted 274 global expert sectors (261 across layers; residents/layer 192-305, generation 1)
+03:25:25 [engine] prefill budget: 1024/2048 rows; tighter rank 7.65 GiB available; estimate fits reserve: True
+03:25:26 [engine] predictive prefill: {"mode": "apply", "backend": "probe", "status": "two_pass_suffix", "samples": 0, "swaps": 274, "new_tokens": 45, "probe_tokens": 45, "probe_vote_tokens": 45, "probe_spans": [[0, 45]], "prediction_kind": "full_suffix", "two_pass_below": 500, "probe_target_ratio": 0.1, "probe_replay_tokens": 45, "probe_ms": 2886.222, "predicted_miss_rate": 0.1487962962962963, "planned_swaps": 274, "prediction_ms": 2902.774, "load_ms": 827.49, "observed_prefill_ms": 491.75, "prediction_prefill_ratio": 5.902951347637109, "probe_within_target": null, "mean_total_variation": 0.08340757409458133, "observation_ms": 1.347}
+03:25:26 [engine] adapted 49 global expert sectors (47 across layers; residents/layer 190-304, generation 2)
+2026-10-22 03:25:26,765 INFO dsv41.server: decode started: request=67506dda first_output=4.73s generated=1 phase=answer
+2026-10-22 03:25:36,828 INFO dsv41.server: decode progress: request=67506dda phase=answer generated=273/1024 reasoning=0 elapsed=14.8s decode=10.1s recent=27.03 tok/s
+2026-10-22 03:25:46,896 INFO dsv41.server: decode progress: request=67506dda phase=answer generated=513/1024 reasoning=0 elapsed=24.9s decode=20.1s recent=23.84 tok/s
+03:25:51 [engine] adapted 232 global expert sectors (225 across layers; residents/layer 193-301, generation 3)
+03:25:51 [engine] periodic decode adaptation at output token 601: 232 expert slots in 810 ms (miss rate 12.5% over the last 600 decoded tokens)
+2026-10-22 03:25:54,128 INFO dsv41.server: 127.0.0.1 "GET /health HTTP/1.1" 200 -
+2026-10-22 03:25:56,958 INFO dsv41.server: decode progress: request=67506dda phase=answer generated=752/1024 reasoning=0 elapsed=34.9s decode=30.2s recent=23.75 tok/s
+2026-10-22 03:26:07,005 INFO dsv41.server: decode progress: request=67506dda phase=answer generated=998/1024 reasoning=0 elapsed=45.0s decode=40.2s recent=24.49 tok/s
+2026-10-22 03:26:07,772 INFO dsv41.server: generation done: request=67506dda prompt=45 completion=1024 reasoning=0 finish=length 45.74s
+2026-10-22 03:26:07,772 INFO dsv41.server:   prefill 4.50s (10.0 tok/s) | prefix=0/45 (0.0%), suffix=45 | decode 24.95 tok/s accept=1.93 | hit=1.0 nvme=16.18GB | routed-miss 9.9% (51518/519600) | ep=2x collective=0.0s
+2026-10-22 03:26:07,772 INFO dsv41.server:   decode_accounting: {"attn":{"s":0.2,"pct":0.4},"moe_sync_gpu_wait":{"s":0.0,"pct":0.0},"moe_book_host":{"s":0.0,"pct":0.0},"moe_nvme_wait":{"s":0.0,"pct":0.0},"moe_compute":{"s":0.04,"pct":0.1},"ep_collective":{"s":0.0,"pct":0.0},"engram":{"s":11.0,"pct":24.2},"decode_graphs":{"s":0.12,"pct":0.3},"decode_engram_wait":{"s":12.42,"pct":27.3},"decode_draft":{"s":0.18,"pct":0.4},"unaccounted":{"s":21.55,"pct":47.4}}
+03:26:07 [engine] adapted 30 global expert sectors (29 across layers; residents/layer 194-301, generation 4)
+2026-10-22 03:26:07,929 INFO dsv41.server: expert adaptation: 30 slots in 0.14s
+2026-10-22 03:26:07,933 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:26:07,941 INFO dsv41.server: 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-10-22 03:26:07,945 INFO dsv41.server: generation start: request=95a82a7c prompt=45 max_tokens=1024 thinking=False
+03:26:07 [engine] prefix_disk_save: {"saved": true, "bytes": 3287851, "boundaries": 1, "stage_s": 0.0434, "write_s": 0.0237}
+03:26:10 [engine] adapted 90 global expert sectors (88 across layers; residents/layer 197-303, generation 5)
+03:26:10 [engine] prefill budget: 1024/2048 rows; tighter rank 7.49 GiB available; estimate fits reserve: True
+03:26:10 [engine] predictive prefill: {"mode": "apply", "backend": "probe", "status": "two_pass_suffix", "samples": 0, "swaps": 90, "new_tokens": 45, "probe_tokens": 45, "probe_vote_tokens": 45, "probe_spans": [[0, 45]], "prediction_kind": "full_suffix", "two_pass_below": 500, "probe_target_ratio": 0.1, "probe_replay_tokens": 45, "probe_ms": 1614.851, "predicted_miss_rate": 0.04842592592592593, "planned_swaps": 90, "prediction_ms": 1673.941, "load_ms": 507.083, "observed_prefill_ms": 495.968, "prediction_prefill_ratio": 3.3750970884644036, "probe_within_target": null, "mean_total_variation": 0.03201226397162856, "observation_ms": 56.781}
+03:26:10 [engine] adapted 5 global expert sectors (5 across layers; residents/layer 197-303, generation 6)
+2026-10-22 03:26:10,692 INFO dsv41.server: decode started: request=95a82a7c first_output=2.75s generated=1 phase=answer
+2026-10-22 03:26:20,768 INFO dsv41.server: decode progress: request=95a82a7c phase=answer generated=280/1024 reasoning=0 elapsed=12.8s decode=10.1s recent=27.69 tok/s
+2026-10-22 03:26:24,192 INFO dsv41.server: 127.0.0.1 "GET /health HTTP/1.1" 200 -
+03:26:27 [engine] spec depth 3 -> 5 at output token 488: 2.4 tokens/step over 25 steps; depth 3 32.8 tok/s, depth 5 would be 33.9 tok/s
+03:26:30 [engine] spec depth 5 -> 3 at output token 550: 2.58 tokens/step over 24 steps; depth 3 would be 33.6 tok/s, depth 5 29.4 tok/s
+2026-10-22 03:26:30,781 INFO dsv41.server: decode progress: request=95a82a7c phase=answer generated=552/1024 reasoning=0 elapsed=22.8s decode=20.1s recent=27.17 tok/s
+03:26:33 [engine] adapted 126 global expert sectors (126 across layers; residents/layer 201-299, generation 7)
+03:26:33 [engine] periodic decode adaptation at output token 603: 126 expert slots in 530 ms (miss rate 6.0% over the last 602 decoded tokens)
+2026-10-22 03:26:40,848 INFO dsv41.server: decode progress: request=95a82a7c phase=answer generated=801/1024 reasoning=0 elapsed=32.9s decode=30.2s recent=24.73 tok/s
+2026-10-22 03:26:49,379 INFO dsv41.server: generation done: request=95a82a7c prompt=45 completion=1024 reasoning=0 finish=length 41.44s
+2026-10-22 03:26:49,379 INFO dsv41.server:   prefill 2.75s (16.39 tok/s) | prefix=0/45 (0.0%), suffix=45 | decode 26.44 tok/s accept=2.05 | hit=1.0 nvme=6.77GB | routed-miss 5.3% (26717/502320) | ep=2x collective=0.0s
+2026-10-22 03:26:49,379 INFO dsv41.server:   decode_accounting: {"attn":{"s":0.2,"pct":0.5},"moe_sync_gpu_wait":{"s":0.0,"pct":0.0},"moe_book_host":{"s":0.0,"pct":0.0},"moe_nvme_wait":{"s":0.0,"pct":0.0},"moe_compute":{"s":0.04,"pct":0.1},"ep_collective":{"s":0.0,"pct":0.0},"engram":{"s":10.52,"pct":25.4},"decode_graphs":{"s":0.1,"pct":0.2},"decode_engram_wait":{"s":11.83,"pct":28.6},"decode_draft":{"s":0.04,"pct":0.1},"unaccounted":{"s":18.7,"pct":45.1}}
+03:26:49 [engine] adapted 21 global expert sectors (20 across layers; residents/layer 198-300, generation 8)
+2026-10-22 03:26:49,516 INFO dsv41.server: expert adaptation: 21 slots in 0.12s
+2026-10-22 03:26:49,518 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:26:49,522 INFO dsv41.server: 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-10-22 03:26:49,525 INFO dsv41.server: generation start: request=49e5f434 prompt=45 max_tokens=1024 thinking=False
+03:26:51 [engine] adapted 77 global expert sectors (76 across layers; residents/layer 199-299, generation 9)
+03:26:51 [engine] prefill budget: 1024/2048 rows; tighter rank 7.28 GiB available; estimate fits reserve: True
+03:26:51 [engine] predictive prefill: {"mode": "apply", "backend": "probe", "status": "two_pass_suffix", "samples": 0, "swaps": 77, "new_tokens": 45, "probe_tokens": 45, "probe_vote_tokens": 45, "probe_spans": [[0, 45]], "prediction_kind": "full_suffix", "two_pass_below": 500, "probe_target_ratio": 0.1, "probe_replay_tokens": 45, "probe_ms": 1288.333, "predicted_miss_rate": 0.03481481481481481, "planned_swaps": 77, "prediction_ms": 1310.651, "load_ms": 378.36, "observed_prefill_ms": 434.446, "prediction_prefill_ratio": 3.0168314250043715, "probe_within_target": null, "mean_total_variation": 0.034942134210382836, "observation_ms": 57.975}
+03:26:51 [engine] adapted 10 global expert sectors (9 across layers; residents/layer 199-299, generation 10)
+2026-10-22 03:26:51,752 INFO dsv41.server: decode started: request=49e5f434 first_output=2.23s generated=1 phase=answer
+2026-10-22 03:26:54,256 INFO dsv41.server: 127.0.0.1 "GET /health HTTP/1.1" 200 -
+2026-10-22 03:27:01,809 INFO dsv41.server: decode progress: request=49e5f434 phase=answer generated=269/1024 reasoning=0 elapsed=12.3s decode=10.1s recent=26.65 tok/s
+2026-10-22 03:27:11,831 INFO dsv41.server: decode progress: request=49e5f434 phase=answer generated=522/1024 reasoning=0 elapsed=22.3s decode=20.1s recent=25.25 tok/s
+03:27:14 [engine] adapted 79 global expert sectors (79 across layers; residents/layer 200-297, generation 11)
+03:27:14 [engine] periodic decode adaptation at output token 602: 79 expert slots in 329 ms (miss rate 4.4% over the last 601 decoded tokens)
+2026-10-22 03:27:21,851 INFO dsv41.server: decode progress: request=49e5f434 phase=answer generated=794/1024 reasoning=0 elapsed=32.3s decode=30.1s recent=27.15 tok/s
+2026-10-22 03:27:24,314 INFO dsv41.server: 127.0.0.1 "GET /health HTTP/1.1" 200 -
+2026-10-22 03:27:30,765 INFO dsv41.server: generation done: request=49e5f434 prompt=45 completion=1024 reasoning=0 finish=length 41.24s
+2026-10-22 03:27:30,765 INFO dsv41.server:   prefill 2.22s (20.25 tok/s) | prefix=0/45 (0.0%), suffix=45 | decode 26.22 tok/s accept=1.97 | hit=1.0 nvme=5.38GB | routed-miss 4.3% (22227/510960) | ep=2x collective=0.0s
+2026-10-22 03:27:30,765 INFO dsv41.server:   decode_accounting: {"attn":{"s":0.19,"pct":0.5},"moe_sync_gpu_wait":{"s":0.0,"pct":0.0},"moe_book_host":{"s":0.0,"pct":0.0},"moe_nvme_wait":{"s":0.0,"pct":0.0},"moe_compute":{"s":0.04,"pct":0.1},"ep_collective":{"s":0.0,"pct":0.0},"engram":{"s":11.0,"pct":26.7},"decode_graphs":{"s":0.1,"pct":0.2},"decode_engram_wait":{"s":12.09,"pct":29.3},"decode_draft":{"s":0.04,"pct":0.1},"unaccounted":{"s":17.77,"pct":43.1}}
+03:27:30 [engine] adapted 23 global expert sectors (22 across layers; residents/layer 201-297, generation 12)
+2026-10-22 03:27:30,914 INFO dsv41.server: expert adaptation: 23 slots in 0.14s
+2026-10-22 03:27:30,918 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:27:30,919 INFO dsv41.server: 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-10-22 03:27:30,921 INFO dsv41.server: generation start: request=c2b0949e prompt=45 max_tokens=1024 thinking=False
+03:27:31 [engine] adapted 57 global expert sectors (57 across layers; residents/layer 202-299, generation 13)
+03:27:31 [engine] prefill budget: 1024/2048 rows; tighter rank 7.52 GiB available; estimate fits reserve: True
+03:27:32 [engine] predictive prefill: {"mode": "apply", "backend": "probe", "status": "two_pass_suffix", "samples": 0, "swaps": 57, "new_tokens": 45, "probe_tokens": 45, "probe_vote_tokens": 45, "probe_spans": [[0, 45]], "prediction_kind": "full_suffix", "two_pass_below": 500, "probe_target_ratio": 0.1, "probe_replay_tokens": 45, "probe_ms": 419.512, "predicted_miss_rate": 0.027407407407407408, "planned_swaps": 57, "prediction_ms": 434.94, "load_ms": 265.911, "observed_prefill_ms": 436.249, "prediction_prefill_ratio": 0.9969988966806049, "probe_within_target": null, "mean_total_variation": 0.03211708761831176, "observation_ms": 60.016}
+03:27:32 [engine] adapted 9 global expert sectors (8 across layers; residents/layer 204-299, generation 14)
+2026-10-22 03:27:32,144 INFO dsv41.server: decode started: request=c2b0949e first_output=1.22s generated=1 phase=answer
+2026-10-22 03:27:42,193 INFO dsv41.server: decode progress: request=c2b0949e phase=answer generated=248/1024 reasoning=0 elapsed=11.3s decode=10.0s recent=24.58 tok/s
+2026-10-22 03:27:52,247 INFO dsv41.server: decode progress: request=c2b0949e phase=answer generated=498/1024 reasoning=0 elapsed=21.3s decode=20.1s recent=24.87 tok/s
+2026-10-22 03:27:54,366 INFO dsv41.server: 127.0.0.1 "GET /health HTTP/1.1" 200 -
+03:27:56 [engine] adapted 66 global expert sectors (65 across layers; residents/layer 206-299, generation 15)
+03:27:56 [engine] periodic decode adaptation at output token 601: 66 expert slots in 299 ms (miss rate 3.4% over the last 600 decoded tokens)
+2026-10-22 03:28:02,268 INFO dsv41.server: decode progress: request=c2b0949e phase=answer generated=761/1024 reasoning=0 elapsed=31.3s decode=30.1s recent=26.24 tok/s
+2026-10-22 03:28:12,279 INFO dsv41.server: decode progress: request=c2b0949e phase=answer generated=1016/1024 reasoning=0 elapsed=41.4s decode=40.1s recent=25.47 tok/s
+2026-10-22 03:28:12,645 INFO dsv41.server: generation done: request=c2b0949e prompt=45 completion=1024 reasoning=0 finish=length 41.73s
+2026-10-22 03:28:12,645 INFO dsv41.server:   prefill 1.22s (36.82 tok/s) | prefix=0/45 (0.0%), suffix=45 | decode 25.26 tok/s accept=1.9 | hit=1.0 nvme=4.04GB | routed-miss 3.3% (17423/529200) | ep=2x collective=0.0s
+2026-10-22 03:28:12,645 INFO dsv41.server:   decode_accounting: {"attn":{"s":0.2,"pct":0.5},"moe_sync_gpu_wait":{"s":0.0,"pct":0.0},"moe_book_host":{"s":0.0,"pct":0.0},"moe_nvme_wait":{"s":0.0,"pct":0.0},"moe_compute":{"s":0.04,"pct":0.1},"ep_collective":{"s":0.0,"pct":0.0},"engram":{"s":11.33,"pct":27.2},"decode_graphs":{"s":0.1,"pct":0.2},"decode_engram_wait":{"s":12.63,"pct":30.3},"decode_draft":{"s":0.04,"pct":0.1},"unaccounted":{"s":17.38,"pct":41.7}}
+2026-10-22 03:28:12,747 INFO dsv41.server: expert adaptation: 15 slots in 0.09s
+03:28:12 [engine] adapted 15 global expert sectors (15 across layers; residents/layer 204-299, generation 16)
+2026-10-22 03:28:12,827 INFO dsv41.server: 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+2026-10-22 03:28:12,828 INFO dsv41.server: 127.0.0.1 "GET /health HTTP/1.1" 200 -
+2026-10-22 03:28:12,863 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:28:12,864 INFO dsv41.server: 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-10-22 03:28:12,866 INFO dsv41.server: generation start: request=16c78fe2 prompt=62 max_tokens=1024 thinking=False
+03:28:13 [engine] adapted 136 global expert sectors (135 across layers; residents/layer 206-300, generation 17)
+03:28:13 [engine] prefill budget: 1024/2048 rows; tighter rank 7.44 GiB available; estimate fits reserve: True
+03:28:14 [engine] predictive prefill: {"mode": "apply", "backend": "probe", "status": "two_pass_suffix", "samples": 0, "swaps": 136, "new_tokens": 62, "probe_tokens": 62, "probe_vote_tokens": 62, "probe_spans": [[0, 62]], "prediction_kind": "full_suffix", "two_pass_below": 500, "probe_target_ratio": 0.1, "probe_replay_tokens": 62, "probe_ms": 448.633, "predicted_miss_rate": 0.0803763440860215, "planned_swaps": 136, "prediction_ms": 469.222, "load_ms": 536.09, "observed_prefill_ms": 460.767, "prediction_prefill_ratio": 1.0183495644451277, "probe_within_target": null, "mean_total_variation": 0.051259313292856615, "observation_ms": 63.644}
+03:28:14 [engine] adapted 14 global expert sectors (14 across layers; residents/layer 207-300, generation 18)
+2026-10-22 03:28:14,443 INFO dsv41.server: decode started: request=16c78fe2 first_output=1.58s generated=1 phase=answer
+03:28:15 [engine] spec depth 3 -> 5 at output token 61: 3.0 tokens/step over 20 steps; depth 3 40.0 tok/s, depth 5 would be 41.9 tok/s
+03:28:20 [engine] spec depth 5 -> 3 at output token 246: 3.0 tokens/step over 21 steps; depth 3 would be 35.6 tok/s, depth 5 33.9 tok/s
+03:28:22 [engine] spec depth 3 -> 5 at output token 306: 3.33 tokens/step over 18 steps; depth 3 43.6 tok/s, depth 5 would be 45.4 tok/s
+2026-10-22 03:28:24,430 INFO dsv41.server: 127.0.0.1 "GET /health HTTP/1.1" 200 -
+2026-10-22 03:28:24,458 INFO dsv41.server: decode progress: request=16c78fe2 phase=answer generated=417/1024 reasoning=0 elapsed=11.6s decode=10.0s recent=41.53 tok/s
+03:28:29 [engine] adapted 138 global expert sectors (136 across layers; residents/layer 205-300, generation 19)
+03:28:29 [engine] periodic decode adaptation at output token 603: 138 expert slots in 509 ms (miss rate 6.2% over the last 602 decoded tokens)
+03:28:34 [engine] spec depth 5 -> 3 at output token 792: 3.26 tokens/step over 19 steps; depth 3 would be 37.2 tok/s, depth 5 35.7 tok/s
+2026-10-22 03:28:34,513 INFO dsv41.server: decode progress: request=16c78fe2 phase=answer generated=797/1024 reasoning=0 elapsed=21.6s decode=20.1s recent=37.79 tok/s
+03:28:37 [engine] spec depth 3 -> 5 at output token 916: 3.88 tokens/step over 16 steps; depth 3 50.1 tok/s, depth 5 would be 55.9 tok/s
+2026-10-22 03:28:39,137 INFO dsv41.server: generation done: request=16c78fe2 prompt=62 completion=1024 reasoning=0 finish=length 26.27s
+2026-10-22 03:28:39,137 INFO dsv41.server:   prefill 1.57s (39.37 tok/s) | prefix=0/62 (0.0%), suffix=62 | decode 41.43 tok/s accept=3.75 | hit=1.0 nvme=8.88GB | routed-miss 5.9% (22130/372960) | ep=2x collective=0.0s
+2026-10-22 03:28:39,137 INFO dsv41.server:   decode_accounting: {"attn":{"s":0.21,"pct":0.8},"moe_sync_gpu_wait":{"s":0.0,"pct":0.0},"moe_book_host":{"s":0.0,"pct":0.0},"moe_nvme_wait":{"s":0.0,"pct":0.0},"moe_compute":{"s":0.05,"pct":0.2},"ep_collective":{"s":0.0,"pct":0.0},"engram":{"s":6.95,"pct":26.5},"decode_graphs":{"s":0.06,"pct":0.2},"decode_engram_wait":{"s":7.8,"pct":29.7},"decode_draft":{"s":0.02,"pct":0.1},"unaccounted":{"s":11.17,"pct":42.5}}
+03:28:39 [engine] adapted 29 global expert sectors (28 across layers; residents/layer 206-300, generation 20)
+2026-10-22 03:28:39,300 INFO dsv41.server: expert adaptation: 29 slots in 0.15s
+2026-10-22 03:28:39,303 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:28:39,304 INFO dsv41.server: 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-10-22 03:28:39,307 INFO dsv41.server: generation start: request=9ced2aad prompt=62 max_tokens=1024 thinking=False
+03:28:39 [engine] adapted 48 global expert sectors (48 across layers; residents/layer 207-301, generation 21)
+03:28:39 [engine] prefill budget: 1024/2048 rows; tighter rank 7.49 GiB available; estimate fits reserve: True
+03:28:40 [engine] predictive prefill: {"mode": "apply", "backend": "probe", "status": "two_pass_suffix", "samples": 0, "swaps": 48, "new_tokens": 62, "probe_tokens": 62, "probe_vote_tokens": 62, "probe_spans": [[0, 62]], "prediction_kind": "full_suffix", "two_pass_below": 500, "probe_target_ratio": 0.1, "probe_replay_tokens": 62, "probe_ms": 438.902, "predicted_miss_rate": 0.02856182795698925, "planned_swaps": 48, "prediction_ms": 450.81, "load_ms": 220.127, "observed_prefill_ms": 461.094, "prediction_prefill_ratio": 0.9776973804674184, "probe_within_target": null, "mean_total_variation": 0.02390876813738015, "observation_ms": 62.83}
+03:28:40 [engine] adapted 5 global expert sectors (5 across layers; residents/layer 207-301, generation 22)
+2026-10-22 03:28:40,507 INFO dsv41.server: decode started: request=9ced2aad first_output=1.20s generated=1 phase=answer
+03:28:43 [engine] spec depth 3 -> 5 at output token 122: 3.0 tokens/step over 20 steps; depth 3 39.0 tok/s, depth 5 would be 41.0 tok/s
+03:28:48 [engine] spec depth 5 -> 3 at output token 303: 3.21 tokens/step over 19 steps; depth 3 would be 37.7 tok/s, depth 5 36.4 tok/s
+03:28:50 [engine] spec depth 3 -> 5 at output token 364: 3.05 tokens/step over 20 steps; depth 3 40.0 tok/s, depth 5 would be 41.3 tok/s
+2026-10-22 03:28:50,521 INFO dsv41.server: decode progress: request=9ced2aad phase=answer generated=370/1024 reasoning=0 elapsed=11.2s decode=10.0s recent=36.85 tok/s
+2026-10-22 03:28:54,482 INFO dsv41.server: 127.0.0.1 "GET /health HTTP/1.1" 200 -
+03:28:55 [engine] adapted 77 global expert sectors (76 across layers; residents/layer 208-303, generation 23)
+03:28:55 [engine] periodic decode adaptation at output token 605: 77 expert slots in 319 ms (miss rate 3.8% over the last 604 decoded tokens)
+2026-10-22 03:29:00,523 INFO dsv41.server: decode progress: request=9ced2aad phase=answer generated=858/1024 reasoning=0 elapsed=21.2s decode=20.0s recent=48.79 tok/s
+2026-10-22 03:29:03,731 INFO dsv41.server: generation done: request=9ced2aad prompt=62 completion=1024 reasoning=0 finish=length 24.43s
+2026-10-22 03:29:03,731 INFO dsv41.server:   prefill 1.20s (51.7 tok/s) | prefix=0/62 (0.0%), suffix=62 | decode 44.05 tok/s accept=4.01 | hit=1.0 nvme=4.16GB | routed-miss 4.3% (15097/353760) | ep=2x collective=0.0s
+2026-10-22 03:29:03,731 INFO dsv41.server:   decode_accounting: {"attn":{"s":0.22,"pct":0.9},"moe_sync_gpu_wait":{"s":0.0,"pct":0.0},"moe_book_host":{"s":0.0,"pct":0.0},"moe_nvme_wait":{"s":0.0,"pct":0.0},"moe_compute":{"s":0.04,"pct":0.2},"ep_collective":{"s":0.0,"pct":0.0},"engram":{"s":6.63,"pct":27.1},"decode_graphs":{"s":0.05,"pct":0.2},"decode_engram_wait":{"s":7.37,"pct":30.2},"decode_draft":{"s":0.02,"pct":0.1},"unaccounted":{"s":10.09,"pct":41.3}}
+03:29:03 [engine] adapted 27 global expert sectors (27 across layers; residents/layer 208-301, generation 24)
+2026-10-22 03:29:03,889 INFO dsv41.server: expert adaptation: 27 slots in 0.15s
+2026-10-22 03:29:03,892 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:29:03,914 INFO dsv41.server: 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-10-22 03:29:03,917 INFO dsv41.server: generation start: request=3d136223 prompt=62 max_tokens=1024 thinking=False
+03:29:04 [engine] adapted 38 global expert sectors (38 across layers; residents/layer 208-301, generation 25)
+03:29:04 [engine] prefill budget: 1024/2048 rows; tighter rank 7.50 GiB available; estimate fits reserve: True
+03:29:05 [engine] predictive prefill: {"mode": "apply", "backend": "probe", "status": "two_pass_suffix", "samples": 0, "swaps": 38, "new_tokens": 62, "probe_tokens": 62, "probe_vote_tokens": 62, "probe_spans": [[0, 62]], "prediction_kind": "full_suffix", "two_pass_below": 500, "probe_target_ratio": 0.1, "probe_replay_tokens": 62, "probe_ms": 445.904, "predicted_miss_rate": 0.023319892473118282, "planned_swaps": 38, "prediction_ms": 465.385, "load_ms": 193.54, "observed_prefill_ms": 455.339, "prediction_prefill_ratio": 1.0220628803044898, "probe_within_target": null, "mean_total_variation": 0.019443572329230985, "observation_ms": 60.725}
+03:29:05 [engine] adapted 5 global expert sectors (5 across layers; residents/layer 208-301, generation 26)
+2026-10-22 03:29:05,108 INFO dsv41.server: decode started: request=3d136223 first_output=1.19s generated=1 phase=answer
+03:29:13 [engine] spec depth 3 -> 5 at output token 304: 3.16 tokens/step over 19 steps; depth 3 41.5 tok/s, depth 5 would be 44.1 tok/s
+2026-10-22 03:29:15,139 INFO dsv41.server: decode progress: request=3d136223 phase=answer generated=385/1024 reasoning=0 elapsed=11.2s decode=10.0s recent=38.28 tok/s
+03:29:19 [engine] adapted 67 global expert sectors (63 across layers; residents/layer 207-300, generation 27)
+03:29:19 [engine] periodic decode adaptation at output token 602: 67 expert slots in 290 ms (miss rate 3.4% over the last 601 decoded tokens)
+2026-10-22 03:29:24,533 INFO dsv41.server: 127.0.0.1 "GET /health HTTP/1.1" 200 -
+2026-10-22 03:29:25,202 INFO dsv41.server: decode progress: request=3d136223 phase=answer generated=853/1024 reasoning=0 elapsed=21.3s decode=20.1s recent=46.51 tok/s
+2026-10-22 03:29:28,256 INFO dsv41.server: generation done: request=3d136223 prompt=62 completion=1024 reasoning=0 finish=length 24.34s
+2026-10-22 03:29:28,256 INFO dsv41.server:   prefill 1.19s (52.08 tok/s) | prefix=0/62 (0.0%), suffix=62 | decode 44.2 tok/s accept=3.85 | hit=1.0 nvme=3.01GB | routed-miss 3.7% (12688/347040) | ep=2x collective=0.0s
+2026-10-22 03:29:28,256 INFO dsv41.server:   decode_accounting: {"attn":{"s":0.22,"pct":0.9},"moe_sync_gpu_wait":{"s":0.0,"pct":0.0},"moe_book_host":{"s":0.0,"pct":0.0},"moe_nvme_wait":{"s":0.0,"pct":0.0},"moe_compute":{"s":0.04,"pct":0.2},"ep_collective":{"s":0.0,"pct":0.0},"engram":{"s":6.66,"pct":27.4},"decode_graphs":{"s":0.05,"pct":0.2},"decode_engram_wait":{"s":7.38,"pct":30.3},"decode_draft":{"s":0.02,"pct":0.1},"unaccounted":{"s":9.97,"pct":41.0}}
+2026-10-22 03:29:28,365 INFO dsv41.server: expert adaptation: 16 slots in 0.10s
+03:29:28 [engine] adapted 16 global expert sectors (14 across layers; residents/layer 208-300, generation 28)
+2026-10-22 03:29:28,367 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:29:28,369 INFO dsv41.server: 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-10-22 03:29:28,371 INFO dsv41.server: generation start: request=c7e9763d prompt=62 max_tokens=1024 thinking=False
+03:29:29 [engine] adapted 48 global expert sectors (48 across layers; residents/layer 207-300, generation 29)
+03:29:29 [engine] prefill budget: 1024/2048 rows; tighter rank 7.58 GiB available; estimate fits reserve: True
+03:29:29 [engine] predictive prefill: {"mode": "apply", "backend": "probe", "status": "two_pass_suffix", "samples": 0, "swaps": 48, "new_tokens": 62, "probe_tokens": 62, "probe_vote_tokens": 62, "probe_spans": [[0, 62]], "prediction_kind": "full_suffix", "two_pass_below": 500, "probe_target_ratio": 0.1, "probe_replay_tokens": 62, "probe_ms": 441.334, "predicted_miss_rate": 0.019690860215053764, "planned_swaps": 48, "prediction_ms": 454.17, "load_ms": 233.557, "observed_prefill_ms": 461.89, "prediction_prefill_ratio": 0.9832857551602525, "probe_within_target": null, "mean_total_variation": 0.03101291486222808, "observation_ms": 61.016}
+03:29:29 [engine] adapted 6 global expert sectors (6 across layers; residents/layer 207-300, generation 30)
+2026-10-22 03:29:29,601 INFO dsv41.server: decode started: request=c7e9763d first_output=1.23s generated=1 phase=answer
+03:29:31 [engine] spec depth 3 -> 5 at output token 62: 3.05 tokens/step over 20 steps; depth 3 40.4 tok/s, depth 5 would be 42.1 tok/s
+03:29:33 [engine] spec depth 5 -> 3 at output token 124: 3.26 tokens/step over 19 steps; depth 3 would be 37.7 tok/s, depth 5 33.9 tok/s
+03:29:39 [engine] spec depth 3 -> 5 at output token 366: 3.81 tokens/step over 16 steps; depth 3 50.3 tok/s, depth 5 would be 52.4 tok/s
+2026-10-22 03:29:39,602 INFO dsv41.server: decode progress: request=c7e9763d phase=answer generated=382/1024 reasoning=0 elapsed=11.2s decode=10.0s recent=38.10 tok/s
+03:29:44 [engine] adapted 58 global expert sectors (56 across layers; residents/layer 207-299, generation 31)
+03:29:44 [engine] periodic decode adaptation at output token 604: 58 expert slots in 281 ms (miss rate 3.0% over the last 603 decoded tokens)
+03:29:47 [engine] spec depth 5 -> 3 at output token 730: 2.86 tokens/step over 21 steps; depth 3 would be 35.2 tok/s, depth 5 32.4 tok/s
+03:29:48 [engine] spec depth 3 -> 5 at output token 792: 3.1 tokens/step over 20 steps; depth 3 41.1 tok/s, depth 5 would be 43.5 tok/s
+2026-10-22 03:29:49,660 INFO dsv41.server: decode progress: request=c7e9763d phase=answer generated=814/1024 reasoning=0 elapsed=21.3s decode=20.1s recent=42.95 tok/s
+03:29:50 [engine] spec depth 5 -> 3 at output token 854: 2.95 tokens/step over 21 steps; depth 3 would be 35.4 tok/s, depth 5 33.6 tok/s
+03:29:51 [engine] spec depth 3 -> 5 at output token 916: 3.88 tokens/step over 16 steps; depth 3 51.1 tok/s, depth 5 would be 59.4 tok/s
+2026-10-22 03:29:53,766 INFO dsv41.server: generation done: request=c7e9763d prompt=62 completion=1024 reasoning=0 finish=length 25.40s
+2026-10-22 03:29:53,766 INFO dsv41.server:   prefill 1.23s (50.42 tok/s) | prefix=0/62 (0.0%), suffix=62 | decode 42.34 tok/s accept=3.67 | hit=1.0 nvme=3.12GB | routed-miss 3.3% (11548/353280) | ep=2x collective=0.0s
+2026-10-22 03:29:53,766 INFO dsv41.server:   decode_accounting: {"attn":{"s":0.22,"pct":0.9},"moe_sync_gpu_wait":{"s":0.0,"pct":0.0},"moe_book_host":{"s":0.0,"pct":0.0},"moe_nvme_wait":{"s":0.0,"pct":0.0},"moe_compute":{"s":0.04,"pct":0.2},"ep_collective":{"s":0.0,"pct":0.0},"engram":{"s":6.86,"pct":27.0},"decode_graphs":{"s":0.06,"pct":0.2},"decode_engram_wait":{"s":7.68,"pct":30.3},"decode_draft":{"s":0.02,"pct":0.1},"unaccounted":{"s":10.51,"pct":41.4}}
+03:29:53 [engine] adapted 21 global expert sectors (21 across layers; residents/layer 207-299, generation 32)
+2026-10-22 03:29:53,892 INFO dsv41.server: expert adaptation: 21 slots in 0.11s
+2026-10-22 03:29:53,947 INFO dsv41.server: 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+2026-10-22 03:29:53,949 INFO dsv41.server: 127.0.0.1 "GET /health HTTP/1.1" 200 -
+2026-10-22 03:29:54,365 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:29:54,375 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:29:54,388 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:29:54,395 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:29:54,402 INFO dsv41.server: 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-10-22 03:29:54,405 INFO dsv41.server: generation start: request=fe321af9 prompt=8178 max_tokens=256 thinking=False
+2026-10-22 03:29:54,588 INFO dsv41.server: 127.0.0.1 "GET /health HTTP/1.1" 200 -
+03:29:55 [engine] adapted 202 global expert sectors (195 across layers; residents/layer 210-300, generation 33)
+03:29:55 [engine] prefill budget: 1024/2048 rows; tighter rank 7.58 GiB available; estimate fits reserve: True
+03:30:04 [engine] predictive prefill: {"mode": "apply", "backend": "probe", "status": "probe", "samples": 0, "swaps": 202, "new_tokens": 8178, "probe_tokens": 64, "probe_vote_tokens": 64, "probe_spans": [[0, 20], [4071, 4083], [8146, 8178]], "prediction_kind": "excerpt", "two_pass_below": 500, "probe_target_ratio": 0.1, "probe_replay_tokens": 64, "probe_ms": 432.881, "predicted_miss_rate": 0.16002604166666665, "planned_swaps": 202, "prediction_ms": 456.28, "load_ms": 750.134, "observed_prefill_ms": 8499.631, "prediction_prefill_ratio": 0.053682328524296566, "probe_within_target": true, "mean_total_variation": 0.4925896725361955, "observation_ms": 219.133}
+03:30:04 [engine] adapted 194 global expert sectors (192 across layers; residents/layer 219-297, generation 34)
+2026-10-22 03:30:04,837 INFO dsv41.server: decode started: request=fe321af9 first_output=10.43s generated=1 phase=answer
+03:30:07 [engine] spec depth 3 -> 5 at output token 64: 3.0 tokens/step over 21 steps; depth 3 38.5 tok/s, depth 5 would be 42.9 tok/s
+2026-10-22 03:30:12,450 INFO dsv41.server: generation done: request=fe321af9 prompt=8178 completion=256 reasoning=0 finish=length 18.05s
+2026-10-22 03:30:12,450 INFO dsv41.server:   prefill 10.43s (783.99 tok/s) | prefix=0/8178 (0.0%), suffix=8178 | decode 33.53 tok/s accept=3.61 | hit=1.0 nvme=8.39GB | routed-miss 12.4% (141610/1137180) | ep=2x collective=0.0s
+2026-10-22 03:30:12,450 INFO dsv41.server:   decode_accounting: {"attn":{"s":3.6,"pct":20.0},"moe_sync_gpu_wait":{"s":0.0,"pct":0.0},"moe_book_host":{"s":0.0,"pct":0.0},"moe_nvme_wait":{"s":0.0,"pct":0.0},"moe_compute":{"s":0.98,"pct":5.4},"ep_collective":{"s":0.0,"pct":0.0},"engram":{"s":4.67,"pct":25.9},"decode_graphs":{"s":0.02,"pct":0.1},"decode_engram_wait":{"s":2.0,"pct":11.1},"decode_draft":{"s":0.01,"pct":0.0},"unaccounted":{"s":6.75,"pct":37.4}}
+2026-10-22 03:30:12,922 INFO dsv41.server: expert adaptation: 135 slots in 0.46s
+03:30:12 [engine] adapted 135 global expert sectors (132 across layers; residents/layer 220-297, generation 35)
+2026-10-22 03:30:13,061 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:30:13,076 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:30:13,088 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:30:13,103 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:30:13,112 INFO dsv41.server: 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-10-22 03:30:13,114 INFO dsv41.server: generation start: request=c25cfb40 prompt=8170 max_tokens=256 thinking=False
+03:30:15 [engine] adapted 107 global expert sectors (104 across layers; residents/layer 222-296, generation 36)
+03:30:15 [engine] prefill budget: 1024/2048 rows; tighter rank 6.72 GiB available; estimate fits reserve: True
+03:30:23 [engine] predictive prefill: {"mode": "apply", "backend": "probe", "status": "probe", "samples": 0, "swaps": 107, "new_tokens": 8170, "probe_tokens": 64, "probe_vote_tokens": 64, "probe_spans": [[0, 20], [4067, 4079], [8138, 8170]], "prediction_kind": "excerpt", "two_pass_below": 500, "probe_target_ratio": 0.1, "probe_replay_tokens": 64, "probe_ms": 1498.988, "predicted_miss_rate": 0.06875, "planned_swaps": 107, "prediction_ms": 1531.462, "load_ms": 404.768, "observed_prefill_ms": 8318.172, "prediction_prefill_ratio": 0.18411039349713995, "probe_within_target": false, "mean_total_variation": 0.4698760941676804, "observation_ms": 71.231}
+03:30:23 [engine] adapted 105 global expert sectors (102 across layers; residents/layer 222-299, generation 37)
+2026-10-22 03:30:23,790 INFO dsv41.server: decode started: request=c25cfb40 first_output=10.68s generated=1 phase=answer
+2026-10-22 03:30:24,636 INFO dsv41.server: 127.0.0.1 "GET /health HTTP/1.1" 200 -
+2026-10-22 03:30:31,526 INFO dsv41.server: generation done: request=c25cfb40 prompt=8170 completion=256 reasoning=0 finish=length 18.41s
+2026-10-22 03:30:31,526 INFO dsv41.server:   prefill 10.67s (765.39 tok/s) | prefix=0/8170 (0.0%), suffix=8170 | decode 32.99 tok/s accept=2.75 | hit=1.0 nvme=4.46GB | routed-miss 4.7% (53068/1133292) | ep=2x collective=0.0s
+2026-10-22 03:30:31,526 INFO dsv41.server:   decode_accounting: {"attn":{"s":2.45,"pct":13.3},"moe_sync_gpu_wait":{"s":0.0,"pct":0.0},"moe_book_host":{"s":0.0,"pct":0.0},"moe_nvme_wait":{"s":0.0,"pct":0.0},"moe_compute":{"s":1.3,"pct":7.1},"ep_collective":{"s":0.0,"pct":0.0},"engram":{"s":5.51,"pct":29.9},"decode_graphs":{"s":0.02,"pct":0.1},"decode_engram_wait":{"s":2.24,"pct":12.2},"decode_draft":{"s":0.01,"pct":0.0},"unaccounted":{"s":6.87,"pct":37.3}}
+03:30:31 [engine] adapted 85 global expert sectors (82 across layers; residents/layer 225-298, generation 38)
+2026-10-22 03:30:31,862 INFO dsv41.server: expert adaptation: 85 slots in 0.32s
+2026-10-22 03:30:31,938 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:30:31,949 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:30:31,957 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:30:31,967 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:30:31,975 INFO dsv41.server: 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-10-22 03:30:31,978 INFO dsv41.server: generation start: request=7df519e0 prompt=8171 max_tokens=256 thinking=False
+03:30:32 [engine] adapted 76 global expert sectors (75 across layers; residents/layer 221-297, generation 39)
+03:30:32 [engine] prefill budget: 1024/2048 rows; tighter rank 6.96 GiB available; estimate fits reserve: True
+03:30:41 [engine] predictive prefill: {"mode": "apply", "backend": "probe", "status": "probe", "samples": 0, "swaps": 76, "new_tokens": 8171, "probe_tokens": 64, "probe_vote_tokens": 64, "probe_spans": [[0, 20], [4067, 4079], [8139, 8171]], "prediction_kind": "excerpt", "two_pass_below": 500, "probe_target_ratio": 0.1, "probe_replay_tokens": 64, "probe_ms": 430.217, "predicted_miss_rate": 0.04589843749999999, "planned_swaps": 76, "prediction_ms": 453.029, "load_ms": 301.071, "observed_prefill_ms": 8486.011, "prediction_prefill_ratio": 0.05338539137112072, "probe_within_target": true, "mean_total_variation": 0.46144391660265444, "observation_ms": 225.099}
+03:30:41 [engine] adapted 93 global expert sectors (91 across layers; residents/layer 226-298, generation 40)
+2026-10-22 03:30:41,606 INFO dsv41.server: decode started: request=7df519e0 first_output=9.63s generated=1 phase=answer
+03:30:46 [engine] spec depth 3 -> 5 at output token 189: 3.71 tokens/step over 17 steps; depth 3 47.4 tok/s, depth 5 would be 52.3 tok/s
+03:30:48 [engine] spec depth 5 -> 3 at output token 249: 2.61 tokens/step over 23 steps; depth 3 would be 30.6 tok/s, depth 5 28.6 tok/s
+2026-10-22 03:30:49,035 INFO dsv41.server: generation done: request=7df519e0 prompt=8171 completion=256 reasoning=0 finish=length 17.06s
+2026-10-22 03:30:49,035 INFO dsv41.server:   prefill 9.63s (848.81 tok/s) | prefix=0/8171 (0.0%), suffix=8171 | decode 34.35 tok/s accept=2.92 | hit=1.0 nvme=3.54GB | routed-miss 3.6% (40541/1139658) | ep=2x collective=0.0s
+2026-10-22 03:30:49,035 INFO dsv41.server:   decode_accounting: {"attn":{"s":2.33,"pct":13.7},"moe_sync_gpu_wait":{"s":0.0,"pct":0.0},"moe_book_host":{"s":0.0,"pct":0.0},"moe_nvme_wait":{"s":0.0,"pct":0.0},"moe_compute":{"s":0.91,"pct":5.3},"ep_collective":{"s":0.0,"pct":0.0},"engram":{"s":5.35,"pct":31.4},"decode_graphs":{"s":0.02,"pct":0.1},"decode_engram_wait":{"s":2.23,"pct":13.1},"decode_draft":{"s":0.01,"pct":0.0},"unaccounted":{"s":6.21,"pct":36.4}}
+03:30:49 [engine] adapted 61 global expert sectors (60 across layers; residents/layer 225-298, generation 41)
+2026-10-22 03:30:49,308 INFO dsv41.server: expert adaptation: 61 slots in 0.26s
+2026-10-22 03:30:49,393 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:30:49,402 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:30:49,410 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:30:49,419 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:30:49,432 INFO dsv41.server: 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-10-22 03:30:49,435 INFO dsv41.server: generation start: request=de7d3fa3 prompt=8178 max_tokens=256 thinking=False
+03:30:49 [engine] prefix_disk_save: {"saved": true, "bytes": 88403139, "boundaries": 8, "stage_s": 0.787, "write_s": 0.1395}
+03:30:50 [engine] adapted 87 global expert sectors (84 across layers; residents/layer 223-299, generation 42)
+03:30:50 [engine] prefill budget: 1024/2048 rows; tighter rank 7.11 GiB available; estimate fits reserve: True
+2026-10-22 03:30:54,702 INFO dsv41.server: 127.0.0.1 "GET /health HTTP/1.1" 200 -
+03:30:56 [engine] predictive prefill: {"mode": "apply", "backend": "probe", "status": "probe", "samples": 0, "swaps": 87, "new_tokens": 8178, "probe_tokens": 64, "probe_vote_tokens": 64, "probe_spans": [[0, 20], [4071, 4083], [8146, 8178]], "prediction_kind": "excerpt", "two_pass_below": 500, "probe_target_ratio": 0.1, "probe_replay_tokens": 64, "probe_ms": 433.065, "predicted_miss_rate": 0.0572265625, "planned_swaps": 87, "prediction_ms": 453.964, "load_ms": 345.247, "observed_prefill_ms": 6560.358, "prediction_prefill_ratio": 0.06919804800565209, "probe_within_target": true, "mean_total_variation": 0.4509409395485487, "observation_ms": 68.005}
+03:30:57 [engine] adapted 78 global expert sectors (75 across layers; residents/layer 227-298, generation 43)
+2026-10-22 03:30:57,146 INFO dsv41.server: decode started: request=de7d3fa3 first_output=7.71s generated=1 phase=answer
+03:30:59 [engine] spec depth 3 -> 5 at output token 62: 2.65 tokens/step over 23 steps; depth 3 33.5 tok/s, depth 5 would be 35.5 tok/s
+03:31:01 [engine] spec depth 5 -> 3 at output token 123: 2.54 tokens/step over 24 steps; depth 3 would be 31.1 tok/s, depth 5 28.2 tok/s
+2026-10-22 03:31:05,952 INFO dsv41.server: generation done: request=de7d3fa3 prompt=8178 completion=256 reasoning=0 finish=length 16.52s
+2026-10-22 03:31:05,952 INFO dsv41.server:   prefill 7.71s (1060.84 tok/s) | prefix=0/8178 (0.0%), suffix=8178 | decode 28.98 tok/s accept=2.42 | hit=1.0 nvme=4.19GB | routed-miss 3.2% (36908/1158300) | ep=2x collective=0.0s
+2026-10-22 03:31:05,953 INFO dsv41.server:   decode_accounting: {"attn":{"s":2.09,"pct":12.6},"moe_sync_gpu_wait":{"s":0.0,"pct":0.0},"moe_book_host":{"s":0.0,"pct":0.0},"moe_nvme_wait":{"s":0.0,"pct":0.0},"moe_compute":{"s":0.9,"pct":5.5},"ep_collective":{"s":0.0,"pct":0.0},"engram":{"s":5.18,"pct":31.4},"decode_graphs":{"s":0.02,"pct":0.1},"decode_engram_wait":{"s":2.82,"pct":17.1},"decode_draft":{"s":0.01,"pct":0.0},"unaccounted":{"s":5.49,"pct":33.3}}
+03:31:06 [engine] adapted 114 global expert sectors (113 across layers; residents/layer 226-297, generation 44)
+2026-10-22 03:31:06,374 INFO dsv41.server: expert adaptation: 114 slots in 0.41s
+2026-10-22 03:31:06,438 INFO dsv41.server: 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+2026-10-22 03:31:06,440 INFO dsv41.server: 127.0.0.1 "GET /health HTTP/1.1" 200 -
+2026-10-22 03:31:06,672 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:31:06,714 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:31:06,751 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:31:06,786 INFO dsv41.server: 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-10-22 03:31:06,789 INFO dsv41.server: generation start: request=5af4c431 prompt=24597 max_tokens=256 thinking=False
+03:31:07 [engine] adapted 87 global expert sectors (83 across layers; residents/layer 222-301, generation 45)
+03:31:07 [engine] prefill budget: 1024/2048 rows; tighter rank 7.00 GiB available; estimate fits reserve: True
+2026-10-22 03:31:24,744 INFO dsv41.server: 127.0.0.1 "GET /health HTTP/1.1" 200 -
+03:31:29 [engine] predictive prefill: {"mode": "apply", "backend": "probe", "status": "probe", "samples": 0, "swaps": 87, "new_tokens": 24597, "probe_tokens": 64, "probe_vote_tokens": 64, "probe_spans": [[0, 20], [12280, 12292], [24565, 24597]], "prediction_kind": "excerpt", "two_pass_below": 500, "probe_target_ratio": 0.1, "probe_replay_tokens": 64, "probe_ms": 406.155, "predicted_miss_rate": 0.05084635416666666, "planned_swaps": 87, "prediction_ms": 420.375, "load_ms": 386.72, "observed_prefill_ms": 22105.672, "prediction_prefill_ratio": 0.019016612591290536, "probe_within_target": true, "mean_total_variation": 0.4717305760383258, "observation_ms": 69.13}
+03:31:30 [engine] adapted 102 global expert sectors (102 across layers; residents/layer 226-297, generation 46)
+2026-10-22 03:31:30,102 INFO dsv41.server: decode started: request=5af4c431 first_output=23.31s generated=1 phase=answer
+03:31:33 [engine] spec depth 3 -> 5 at output token 122: 2.73 tokens/step over 22 steps; depth 3 35.2 tok/s, depth 5 would be 36.3 tok/s
+2026-10-22 03:31:37,711 INFO dsv41.server: generation done: request=5af4c431 prompt=24597 completion=256 reasoning=0 finish=length 30.92s
+2026-10-22 03:31:37,711 INFO dsv41.server:   prefill 23.31s (1055.16 tok/s) | prefix=0/24597 (0.0%), suffix=24597 | decode 33.54 tok/s accept=3.25 | hit=1.0 nvme=3.69GB | routed-miss 3.4% (110128/3206454) | ep=2x collective=0.0s
+2026-10-22 03:31:37,711 INFO dsv41.server:   decode_accounting: {"attn":{"s":7.18,"pct":23.2},"moe_sync_gpu_wait":{"s":0.0,"pct":0.0},"moe_book_host":{"s":0.0,"pct":0.0},"moe_nvme_wait":{"s":0.0,"pct":0.0},"moe_compute":{"s":2.87,"pct":9.3},"ep_collective":{"s":0.0,"pct":0.0},"engram":{"s":11.78,"pct":38.1},"decode_graphs":{"s":0.03,"pct":0.1},"decode_engram_wait":{"s":2.08,"pct":6.7},"decode_draft":{"s":0.01,"pct":0.0},"unaccounted":{"s":6.97,"pct":22.6}}
+2026-10-22 03:31:37,935 INFO dsv41.server: expert adaptation: 44 slots in 0.21s
+03:31:37 [engine] adapted 44 global expert sectors (42 across layers; residents/layer 226-298, generation 47)
+2026-10-22 03:31:38,165 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:31:38,195 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:31:38,235 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:31:38,271 INFO dsv41.server: 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-10-22 03:31:38,274 INFO dsv41.server: generation start: request=1335e41a prompt=24601 max_tokens=256 thinking=False
+03:31:39 [engine] adapted 86 global expert sectors (86 across layers; residents/layer 230-298, generation 48)
+03:31:39 [engine] prefill budget: 1024/2048 rows; tighter rank 6.77 GiB available; estimate fits reserve: True
+2026-10-22 03:31:54,810 INFO dsv41.server: 127.0.0.1 "GET /health HTTP/1.1" 200 -
+03:31:56 [engine] predictive prefill: {"mode": "apply", "backend": "probe", "status": "probe", "samples": 0, "swaps": 86, "new_tokens": 24601, "probe_tokens": 64, "probe_vote_tokens": 64, "probe_spans": [[0, 20], [12282, 12294], [24569, 24601]], "prediction_kind": "excerpt", "two_pass_below": 500, "probe_target_ratio": 0.1, "probe_replay_tokens": 64, "probe_ms": 445.136, "predicted_miss_rate": 0.053971354166666666, "planned_swaps": 86, "prediction_ms": 468.566, "load_ms": 337.953, "observed_prefill_ms": 17637.457, "prediction_prefill_ratio": 0.026566527673587616, "probe_within_target": true, "mean_total_variation": 0.46759838890997757, "observation_ms": 177.548}
+03:31:57 [engine] adapted 74 global expert sectors (71 across layers; residents/layer 225-298, generation 49)
+2026-10-22 03:31:57,038 INFO dsv41.server: decode started: request=1335e41a first_output=18.76s generated=1 phase=answer
+03:32:01 [engine] spec depth 3 -> 5 at output token 124: 2.58 tokens/step over 24 steps; depth 3 32.8 tok/s, depth 5 would be 34.6 tok/s
+03:32:04 [engine] spec depth 5 -> 3 at output token 248: 3.39 tokens/step over 18 steps; depth 3 would be 38.1 tok/s, depth 5 36.5 tok/s
+2026-10-22 03:32:04,869 INFO dsv41.server: generation done: request=1335e41a prompt=24601 completion=256 reasoning=0 finish=length 26.60s
+2026-10-22 03:32:04,869 INFO dsv41.server:   prefill 18.76s (1311.2 tok/s) | prefix=0/24601 (0.0%), suffix=24601 | decode 32.59 tok/s accept=2.95 | hit=1.0 nvme=3.12GB | routed-miss 2.7% (87188/3216078) | ep=2x collective=0.0s
+2026-10-22 03:32:04,869 INFO dsv41.server:   decode_accounting: {"attn":{"s":5.38,"pct":20.2},"moe_sync_gpu_wait":{"s":0.0,"pct":0.0},"moe_book_host":{"s":0.0,"pct":0.0},"moe_nvme_wait":{"s":0.0,"pct":0.0},"moe_compute":{"s":2.42,"pct":9.1},"ep_collective":{"s":0.0,"pct":0.0},"engram":{"s":9.98,"pct":37.5},"decode_graphs":{"s":0.02,"pct":0.1},"decode_engram_wait":{"s":2.3,"pct":8.6},"decode_draft":{"s":0.01,"pct":0.0},"unaccounted":{"s":6.49,"pct":24.4}}
+03:32:05 [engine] adapted 51 global expert sectors (48 across layers; residents/layer 225-300, generation 50)
+2026-10-22 03:32:05,098 INFO dsv41.server: expert adaptation: 51 slots in 0.22s
+2026-10-22 03:32:05,305 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:32:05,334 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:32:05,375 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:32:05,416 INFO dsv41.server: 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-10-22 03:32:05,420 INFO dsv41.server: generation start: request=9c1a6a4a prompt=24582 max_tokens=256 thinking=False
+03:32:06 [engine] adapted 67 global expert sectors (67 across layers; residents/layer 225-301, generation 51)
+03:32:06 [engine] prefill budget: 1024/2048 rows; tighter rank 6.84 GiB available; estimate fits reserve: True
+2026-10-22 03:32:24,868 INFO dsv41.server: 127.0.0.1 "GET /health HTTP/1.1" 200 -
+03:32:25 [engine] predictive prefill: {"mode": "apply", "backend": "probe", "status": "probe", "samples": 0, "swaps": 67, "new_tokens": 24582, "probe_tokens": 64, "probe_vote_tokens": 64, "probe_spans": [[0, 20], [12273, 12285], [24550, 24582]], "prediction_kind": "excerpt", "two_pass_below": 500, "probe_target_ratio": 0.1, "probe_replay_tokens": 64, "probe_ms": 427.965, "predicted_miss_rate": 0.044596354166666664, "planned_swaps": 67, "prediction_ms": 441.924, "load_ms": 274.858, "observed_prefill_ms": 18904.31, "prediction_prefill_ratio": 0.023376891881498968, "probe_within_target": true, "mean_total_variation": 0.4968959144386019, "observation_ms": 69.575}
+03:32:25 [engine] adapted 64 global expert sectors (62 across layers; residents/layer 224-300, generation 52)
+2026-10-22 03:32:25,335 INFO dsv41.server: decode started: request=9c1a6a4a first_output=19.91s generated=1 phase=answer
+03:32:33 [engine] spec depth 3 -> 5 at output token 248: 2.9 tokens/step over 21 steps; depth 3 36.4 tok/s, depth 5 would be 39.0 tok/s
+2026-10-22 03:32:33,359 INFO dsv41.server: generation done: request=9c1a6a4a prompt=24582 completion=256 reasoning=0 finish=length 27.94s
+2026-10-22 03:32:33,359 INFO dsv41.server:   prefill 19.91s (1234.47 tok/s) | prefix=0/24582 (0.0%), suffix=24582 | decode 31.8 tok/s accept=2.55 | hit=1.0 nvme=4.4GB | routed-miss 2.7% (85787/3209364) | ep=2x collective=0.0s
+2026-10-22 03:32:33,359 INFO dsv41.server:   decode_accounting: {"attn":{"s":5.68,"pct":20.3},"moe_sync_gpu_wait":{"s":0.0,"pct":0.0},"moe_book_host":{"s":0.0,"pct":0.0},"moe_nvme_wait":{"s":0.0,"pct":0.0},"moe_compute":{"s":2.63,"pct":9.4},"ep_collective":{"s":0.0,"pct":0.0},"engram":{"s":10.81,"pct":38.7},"decode_graphs":{"s":0.02,"pct":0.1},"decode_engram_wait":{"s":2.53,"pct":9.1},"decode_draft":{"s":0.01,"pct":0.0},"unaccounted":{"s":6.26,"pct":22.4}}
+2026-10-22 03:32:33,899 INFO dsv41.server: expert adaptation: 169 slots in 0.53s
+03:32:33 [engine] adapted 169 global expert sectors (166 across layers; residents/layer 223-305, generation 53)
+2026-10-22 03:32:34,115 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:32:34,157 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:32:34,199 INFO dsv41.server: 127.0.0.1 "POST /v1/debug/prompt HTTP/1.1" 200 -
+2026-10-22 03:32:34,240 INFO dsv41.server: 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-10-22 03:32:34,243 INFO dsv41.server: generation start: request=bd62e264 prompt=24617 max_tokens=256 thinking=False
+03:32:35 [engine] adapted 77 global expert sectors (75 across layers; residents/layer 224-305, generation 54)
+03:32:35 [engine] prefill budget: 1024/2048 rows; tighter rank 6.54 GiB available; estimate fits reserve: True
+03:32:51 [engine] predictive prefill: {"mode": "apply", "backend": "probe", "status": "probe", "samples": 0, "swaps": 77, "new_tokens": 24617, "probe_tokens": 64, "probe_vote_tokens": 64, "probe_spans": [[0, 20], [12290, 12302], [24585, 24617]], "prediction_kind": "excerpt", "two_pass_below": 500, "probe_target_ratio": 0.1, "probe_replay_tokens": 64, "probe_ms": 415.348, "predicted_miss_rate": 0.05123697916666666, "planned_swaps": 77, "prediction_ms": 438.016, "load_ms": 308.246, "observed_prefill_ms": 16858.283, "prediction_prefill_ratio": 0.025982242609293996, "probe_within_target": true, "mean_total_variation": 0.49976415128582763, "observation_ms": 68.064}
+03:32:52 [engine] adapted 69 global expert sectors (66 across layers; residents/layer 223-303, generation 55)
+2026-10-22 03:32:52,164 INFO dsv41.server: decode started: request=bd62e264 first_output=17.92s generated=1 phase=answer
+2026-10-22 03:32:54,928 INFO dsv41.server: 127.0.0.1 "GET /health HTTP/1.1" 200 -
+03:33:00 [engine] spec depth 3 -> 5 at output token 243: 3.05 tokens/step over 20 steps; depth 3 38.6 tok/s, depth 5 would be 40.9 tok/s
+2026-10-22 03:33:00,430 INFO dsv41.server: generation done: request=bd62e264 prompt=24617 completion=256 reasoning=0 finish=length 26.19s
+2026-10-22 03:33:00,430 INFO dsv41.server:   prefill 17.92s (1373.81 tok/s) | prefix=0/24617 (0.0%), suffix=24617 | decode 30.87 tok/s accept=2.62 | hit=1.0 nvme=3.55GB | routed-miss 2.3% (74122/3212334) | ep=2x collective=0.0s
+2026-10-22 03:33:00,430 INFO dsv41.server:   decode_accounting: {"attn":{"s":4.96,"pct":19.0},"moe_sync_gpu_wait":{"s":0.0,"pct":0.0},"moe_book_host":{"s":0.0,"pct":0.0},"moe_nvme_wait":{"s":0.0,"pct":0.0},"moe_compute":{"s":2.37,"pct":9.1},"ep_collective":{"s":0.0,"pct":0.0},"engram":{"s":10.16,"pct":38.8},"decode_graphs":{"s":0.02,"pct":0.1},"decode_engram_wait":{"s":2.58,"pct":9.9},"decode_draft":{"s":0.01,"pct":0.0},"unaccounted":{"s":6.07,"pct":23.2}}
+2026-10-22 03:33:00,758 INFO dsv41.server: expert adaptation: 83 slots in 0.31s
+03:33:00 [engine] adapted 83 global expert sectors (81 across layers; residents/layer 220-305, generation 56)

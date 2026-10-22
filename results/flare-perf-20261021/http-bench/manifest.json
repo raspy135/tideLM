@@ -1,0 +1,36 @@
+{
+  "source_commit": "59524f7937b135f51cab68f767e3f6f9041ce16e",
+  "image": "sha256:3b8a1ecbd95f3306ea22ab8a87d87dd0180c032ee9ae12641d56055d767e45ce",
+  "order": [
+    "off",
+    "on"
+  ],
+  "max_seq": 32768,
+  "adaptive_loading": true,
+  "hot_reads": true,
+  "seed": 42,
+  "temperature": 0.6,
+  "initial_demand_sha256": "34a48be9678cf6a3d68adda5768ccb626261115d9a003c1b1aa5a362a82a60e4",
+  "initial_keep_sha256": "e4558b35c7d5016c01e106731cb1e79df0a6e15e40f571de2807064b9c027fbb",
+  "resident_budget": 10208,
+  "bench_script_sha256": "3c2ef73ca67b709ff4f2c2d675127e5dda9672d58937de06af0a1655a7dd7762",
+  "runs": 3,
+  "warmup": 1,
+  "ignore_eos": true,
+  "workloads": {
+    "prose": {
+      "osl": 1024
+    },
+    "code": {
+      "osl": 1024
+    },
+    "random8k": {
+      "isl": 8192,
+      "osl": 256
+    },
+    "random24k": {
+      "isl": 24576,
+      "osl": 256
+    }
+  }
+}

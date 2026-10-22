@@ -1,0 +1,32 @@
+stopping rank 0 on spark-1e02; waiting for it to drain (Ctrl-C stops every rank now)
+rank 0 on spark-1e02 exited
+group glm53-20261022T032240Z-972e stopped
+READY off {'perf_index_candidates': False, 'perf_draft_router': False, 'perf_hc_post_pre': False, 'perf_attention_direct': False, 'perf_engram_h2d': False, 'perf_source': '63ca990e4a06530ad1ef0414b00a02612d45ee5671ae25d17ae4e93a0f863488'}
+BENCH_START off prose
+BENCH_DONE off prose decode_tok_s 26.1222 ttft_ms 2234.5076 engine {'accept_len_mean': 1.97, 'expert_hit_rate': 1.0, 'nvme_gb': 5.38, 'engram_rows': 104352}
+BENCH_START off code
+BENCH_DONE off code decode_tok_s 43.7514 ttft_ms 1216.5218 engine {'accept_len_mean': 3.85, 'expert_hit_rate': 1.0, 'nvme_gb': 3.12, 'engram_rows': 73472}
+BENCH_START off random8k
+BENCH_DONE off random8k decode_tok_s 31.5855 ttft_ms 9637.3385 engine {'accept_len_mean': 2.75, 'expert_hit_rate': 1.0, 'nvme_gb': 4.19, 'engram_rows': 210845}
+BENCH_START off random24k
+BENCH_DONE off random24k decode_tok_s 29.7721 ttft_ms 18801.3666 engine {'accept_len_mean': 2.62, 'expert_hit_rate': 1.0, 'nvme_gb': 3.55, 'engram_rows': 569375}
+READY on {'perf_index_candidates': True, 'perf_draft_router': False, 'perf_hc_post_pre': False, 'perf_attention_direct': False, 'perf_engram_h2d': False, 'perf_source': '63ca990e4a06530ad1ef0414b00a02612d45ee5671ae25d17ae4e93a0f863488'}
+BENCH_START on prose
+BENCH_DONE on prose decode_tok_s 25.9777 ttft_ms 1315.3278 engine {'accept_len_mean': 1.97, 'expert_hit_rate': 1.0, 'nvme_gb': 5.38, 'engram_rows': 104352}
+BENCH_START on code
+BENCH_DONE on code decode_tok_s 44.2217 ttft_ms 1229.0887 engine {'accept_len_mean': 3.89, 'expert_hit_rate': 1.0, 'nvme_gb': 3.35, 'engram_rows': 73200}
+BENCH_START on random8k
+BENCH_DONE on random8k decode_tok_s 33.4726 ttft_ms 8440.2517 engine {'accept_len_mean': 3.1, 'expert_hit_rate': 1.0, 'nvme_gb': 4.85, 'engram_rows': 211611}
+BENCH_START on random24k
+BENCH_DONE on random24k decode_tok_s 32.5834 ttft_ms 19518.2789 engine {'accept_len_mean': 3.11, 'expert_hit_rate': 1.0, 'nvme_gb': 3.31, 'engram_rows': 568249}
+placement of glm53 (gb10, 2 hosts):
+rank 0 on spark-1e02: gpu 0 NVIDIA GB10 (cached)
+rank 1 on spark-80bd: gpu 0 NVIDIA GB10 (cached)
+spark-1e02: using installed flare /home/ryan/.local/lib/flare-agent/flare
+spark-80bd: using installed flare /home/ryan/.local/lib/flare-agent/flare
+group glm53-20261022T034229Z-a5d4: 2 ranks, rendezvous 10.0.0.1:29800
+  rank 0 on spark-1e02: gpu 0 NVIDIA GB10
+  rank 1 on spark-80bd: gpu 0 NVIDIA GB10
+spark-80bd: holds the verified package
+group glm53-20261022T034229Z-a5d4 started; once loaded, rank zero on spark-1e02 serves http://10.0.0.1:8000
+`flare orbit attach glm53` follows its output; `flare orbit stop glm53` stops it

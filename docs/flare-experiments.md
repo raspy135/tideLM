@@ -175,6 +175,20 @@ The disposable gates were removed after testing and the user's Flare GLM serving
 group was restarted with its original package and launch options. No serving
 profile or Flare source was changed.
 
+### Sampled HTTP benchmark
+
+The subsequent unchanged `bench/bench.py` run uses the normal adaptive/hot-read
+serving path, temperature 0.6, seed 42, three measured requests plus a warm-up per
+workload and arm. Initial demand histories, resident maps and context caps match.
+Observed baseline -> candidate medians: prose 26.12 -> 25.98 tok/s, code
+43.75 -> 44.22, random 8K 31.59 -> 33.47, random 24K 29.77 -> 32.58. The full
+9.44% change at 24K is not an isolated scorer gain: acceptance also rises
+2.62 -> 3.11 and adaptive depth differs. Short prose/code remain effectively flat.
+This single off/on sequence is noisier than the earlier greedy ABBA comparison.
+The 32K context cap applies to both arms. No profile, saved demand history or
+benchmark source was changed. Details, TTFT, NVMe traffic, acceptance and raw
+reports are in `results/flare-perf-20261021/http-bench/README.md`.
+
 ## Remaining residency and workload work
 
 `engine/scale_blocks.py` implements a standalone lossless scale codec and

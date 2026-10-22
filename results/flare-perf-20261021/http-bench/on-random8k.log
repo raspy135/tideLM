@@ -1,0 +1,13 @@
+note: server serves 'deepseek', using that
+== candidate-on-random8k: workload=random isl=8192 osl=256 runs=3 warmup=1 thinking=False engine=v41
+  warmup  isl=8178 ttft=  12036.2 ms  tpot=  34.84 ms  decode= 28.70 tok/s  out=256 (length)
+          accept_len=3.07  expert_hit=1.0  nvme=8.46 GB  engram_rows=213217
+  run1    isl=8170 ttft=   9383.3 ms  tpot=  30.73 ms  decode= 32.54 tok/s  out=256 (length)
+          accept_len=3.07  expert_hit=1.0  nvme=4.85 GB  engram_rows=211028
+  run2    isl=8171 ttft=   8440.3 ms  tpot=  29.09 ms  decode= 34.37 tok/s  out=256 (length)
+          accept_len=3.1  expert_hit=1.0  nvme=3.52 GB  engram_rows=211805
+  run3    isl=8178 ttft=   7166.7 ms  tpot=  29.88 ms  decode= 33.47 tok/s  out=256 (length)
+          accept_len=3.2  expert_hit=1.0  nvme=5.02 GB  engram_rows=211611
+  -> MEDIAN  ttft=8440.2517 ms  tpot=29.8752 ms  decode=33.4726 tok/s
+  -> ENGINE  accept_len=3.1  expert_hit=1.0  nvme=4.85 GB  engram_rows=211611
+  wrote /home/ryan/git/tidelm/results/flare-perf-20261021/http-bench/on-random8k.json
