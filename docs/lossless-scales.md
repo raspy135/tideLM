@@ -6,8 +6,11 @@ and arithmetic stay unchanged. This currently supports single-request native
 FP4, output TP2, CUDA v2 decode, including the two-row down kernel and Triton
 prefill. DSpark's draft experts keep their native layout.
 
-The shipped DS template enables packing and an automatic resident budget. Build
-the image first, then pack the checkpoint once on the head node:
+Packing is **disabled** in the shipped template and private serving profile while
+a matched HTTP comparison investigates the initial serving regression. The first
+HTTP run used a different prompt salt and was not a valid speed A/B. Fixed-output
+tests alone did not qualify the default serving path. The following setup is for
+explicit experiments only. Build the image first, then pack on the head node:
 
 ```bash
 docker run --rm --entrypoint python \
@@ -70,8 +73,8 @@ residents instead of **10,208**. Its `bench/bench.py` reports are kept as
 temperature 0.6, seed 42, 32K context allocation, 1024 output tokens for
 prose/code and 256 for random 8K. These use a different prompt salt and resident
 set from the earlier README run; compare kernel overhead with the fixed-output
-test above. The README's DS chart now records this packed profile, with candidate
-indexing on. Unsetting the pack path remains the rollback to native scales.
+test above. The README's DS chart retains the measured native-scale profile,
+with candidate indexing on. Unsetting the pack path restores native scales.
 
 The optional packed-profile run measured 23.0142 tok/s prose, 39.4160 tok/s
 code, 29.8773 tok/s random 8K, and 9.016 s 8K TTFT. These numbers do not improve
