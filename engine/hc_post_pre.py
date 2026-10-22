@@ -12,30 +12,31 @@ import triton.language as tl
 
 @triton.jit
 def _post_pre(X, RES, POST, COMB, PRE, W, OUT, SCRATCH, Y,
-              D: tl.constexpr, HC: tl.constexpr, EPS: tl.constexpr, BD: tl.constexpr):
+              D, HC: tl.constexpr, EPS, BD: tl.constexpr):
     t = tl.program_id(0)
-    j = tl.arange(0, HC)
-    post = tl.load(POST + t * HC + j).to(tl.float32)
-    pre = tl.load(PRE + t * HC + j).to(tl.float32)
     ssq = tl.zeros((), tl.float32)
     for d0 in range(0, D, BD):
         d = d0 + tl.arange(0, BD)
         valid = d < D
         x = tl.load(X + t * D + d, valid, other=0).to(tl.float32)
-        acc = tl.zeros((HC, BD), tl.float32)
-        for i in range(HC):
-            r = tl.load(RES + (t * HC + i) * D + d, valid, other=0).to(tl.float32)
-            c = tl.load(COMB + (t * HC + i) * HC + j).to(tl.float32)
-            acc += c[:, None] * r[None, :]
-        acc += post[:, None] * x[None, :]
-        rounded = acc.to(tl.bfloat16)
-        tl.store(OUT + (t * HC + j[:, None]) * D + d[None, :], rounded, valid[None, :])
+        # Load all streams before any in-place write. Keep the weighted result
+        # in the same 1-D layout as hc_pre_rmsnorm: reducing a [HC, BD] layout
+        # changed its sum-of-squares tree and flipped one BF16 output in a GPU test.
+        r0 = tl.load(RES + (t * HC + 0) * D + d, valid, other=0).to(tl.float32)
+        r1 = tl.load(RES + (t * HC + 1) * D + d, valid, other=0).to(tl.float32)
+        r2 = tl.load(RES + (t * HC + 2) * D + d, valid, other=0).to(tl.float32)
+        r3 = tl.load(RES + (t * HC + 3) * D + d, valid, other=0).to(tl.float32)
         weighted = tl.zeros((BD,), tl.float32)
-        for i in range(HC):
-            # Match hc_ops' ordered stream sum, including its BF16 hc_pre boundary.
-            value = tl.sum(tl.where(j[:, None] == i, rounded.to(tl.float32), 0), axis=0)
-            gain = tl.sum(tl.where(j == i, pre, 0))
-            weighted += value * gain
+        for j in tl.static_range(HC):
+            acc = tl.zeros((BD,), tl.float32)
+            acc += tl.load(COMB + (t * HC + 0) * HC + j) * r0
+            acc += tl.load(COMB + (t * HC + 1) * HC + j) * r1
+            acc += tl.load(COMB + (t * HC + 2) * HC + j) * r2
+            acc += tl.load(COMB + (t * HC + 3) * HC + j) * r3
+            acc += tl.load(POST + t * HC + j) * x
+            rounded = acc.to(tl.bfloat16)
+            tl.store(OUT + (t * HC + j) * D + d, rounded, valid)
+            weighted += rounded.to(tl.float32) * tl.load(PRE + t * HC + j)
         weighted = weighted.to(tl.bfloat16).to(tl.float32)
         ssq += tl.sum(tl.where(valid, weighted * weighted, 0))
         tl.store(SCRATCH + t * D + d, weighted, valid)

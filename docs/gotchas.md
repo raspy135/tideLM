@@ -3970,3 +3970,33 @@ Running `bench_decode_kernels_tp.py` on this profile needs `DSV41_PROBE_PREFILL=
 transient ring), a copy of `tools/run_two_node_gate.sh` that sources `.env.ds41-mxfp4` (the script
 reads `.env`), and the peer's checkout synced first; its kernel families predate the v2 kernels and
 RoCE, so group `top` by name.
+
+### 2026-10-21: Flare-inspired fusions mostly disappear inside the complete round
+
+The opt-in experiments in `docs/flare-experiments.md` were tested on native 1017,
+two Sparks, greedy 256-token LRU code, fixed depth 3, frozen residents, hot reads
+and prefix reuse off. Two ABBA blocks, identical outputs except direct attention:
+mHC post/pre 65.972 -> 65.915 ms/step (0.09%); draft router 66.011 -> 65.653 (0.54%);
+Engram upload side stream 66.063 -> 66.290 (-0.34%). None establishes a practical
+short-context gain. Do not infer a whole-round benefit from a saved launch.
+
+Direct attention now reuses each unpacked tile for QK and the complete PV output,
+avoiding the earlier repeated-unpack implementation. It still loses in the
+serving-image microbenchmark: 71.94 versus 46.75 us staged at T=4/H=32/N=1152;
+71.98 versus 64.53 at T=6. The round takes 66.093 versus 65.909 ms. Token rate
+appears to improve 43.97 -> 51.45 tok/s only because the output changes and
+acceptance rises 2.90 -> 3.43; this is not a clean speed comparison or evidence
+of better quality. Keep it off.
+
+The initial mHC fusion kept 1024-column tiles but used a different reduction
+layout, flipping one BF16 normalized value. Retaining the existing 1-D layout
+restored bytewise GPU equality. The initial direct-attention 32-key/eight-warp
+schedule also exceeded GB10 shared memory (151552 required, 101376 available);
+the qualified version uses 16 keys/four warps.
+
+Candidate-only later indexers are the positive result: at 24596 input tokens,
+one warmed ABBA block gives 69.087 -> 67.433 ms/step (-2.39% time), 49.21 -> 50.42
+tok/s, identical complete outputs and acceptance on both ranks. This does not
+qualify sampled quality or adaptive/hot-read traffic. It remains opt-in; short
+contexts do not use the candidate scorer. Raw reports and component timings are
+in `results/flare-perf-20261021/`.

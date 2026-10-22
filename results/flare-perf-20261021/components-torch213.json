@@ -1,0 +1,485 @@
+{
+  "device": "NVIDIA GB10",
+  "torch": "2.13.0+cu130",
+  "triton": "3.7.1",
+  "graph_unroll": 10,
+  "graph_repetitions": 20,
+  "workloads": [
+    {
+      "component": "hc_post_pre",
+      "t": 4,
+      "off_us": 6.555359959602356,
+      "on_us": 6.342960000038147,
+      "time_saved_percent": 3.2400960568623454,
+      "rows": [
+        {
+          "enabled": false,
+          "us": 6.691359877586365
+        },
+        {
+          "enabled": true,
+          "us": 6.36896014213562
+        },
+        {
+          "enabled": true,
+          "us": 6.356800198554993
+        },
+        {
+          "enabled": false,
+          "us": 6.555039882659912
+        },
+        {
+          "enabled": false,
+          "us": 6.556159853935242
+        },
+        {
+          "enabled": true,
+          "us": 6.3201600313186646
+        },
+        {
+          "enabled": true,
+          "us": 6.353920102119446
+        },
+        {
+          "enabled": false,
+          "us": 6.546880006790161
+        },
+        {
+          "enabled": false,
+          "us": 6.5556800365448
+        },
+        {
+          "enabled": true,
+          "us": 6.331999897956848
+        },
+        {
+          "enabled": true,
+          "us": 6.328639984130859
+        },
+        {
+          "enabled": false,
+          "us": 6.5457600355148315
+        }
+      ]
+    },
+    {
+      "component": "attention_direct",
+      "t": 4,
+      "heads": 32,
+      "keys": 1152,
+      "off_us": 46.749680042266846,
+      "on_us": 71.93664073944092,
+      "time_saved_percent": -53.87622048835905,
+      "rows": [
+        {
+          "enabled": false,
+          "us": 46.11135959625244
+        },
+        {
+          "enabled": true,
+          "us": 72.18239784240723
+        },
+        {
+          "enabled": true,
+          "us": 71.57695770263672
+        },
+        {
+          "enabled": false,
+          "us": 47.38800048828125
+        },
+        {
+          "enabled": false,
+          "us": 45.801119804382324
+        },
+        {
+          "enabled": true,
+          "us": 71.93136215209961
+        },
+        {
+          "enabled": true,
+          "us": 72.00032234191895
+        },
+        {
+          "enabled": false,
+          "us": 47.67807960510254
+        },
+        {
+          "enabled": false,
+          "us": 56.29903793334961
+        },
+        {
+          "enabled": true,
+          "us": 71.94191932678223
+        },
+        {
+          "enabled": true,
+          "us": 70.70655822753906
+        },
+        {
+          "enabled": false,
+          "us": 45.81039905548096
+        }
+      ]
+    },
+    {
+      "component": "index_candidates",
+      "t": 4,
+      "keys": 32768,
+      "candidates": 16384,
+      "source_compaction_us": 64.68128204345703,
+      "four_later_indexers_net_us": 1279.5398330688477,
+      "off_us": 437.2105598449707,
+      "on_us": 101.15528106689453,
+      "time_saved_percent": 76.86348630216916,
+      "rows": [
+        {
+          "enabled": false,
+          "us": 445.2433776855469
+        },
+        {
+          "enabled": true,
+          "us": 101.12256050109863
+        },
+        {
+          "enabled": true,
+          "us": 100.86928367614746
+        },
+        {
+          "enabled": false,
+          "us": 441.1705780029297
+        },
+        {
+          "enabled": false,
+          "us": 437.17647552490234
+        },
+        {
+          "enabled": true,
+          "us": 100.89695930480957
+        },
+        {
+          "enabled": true,
+          "us": 111.93280220031738
+        },
+        {
+          "enabled": false,
+          "us": 437.24464416503906
+        },
+        {
+          "enabled": false,
+          "us": 436.9033432006836
+        },
+        {
+          "enabled": true,
+          "us": 101.61871910095215
+        },
+        {
+          "enabled": true,
+          "us": 101.18800163269043
+        },
+        {
+          "enabled": false,
+          "us": 437.1660614013672
+        }
+      ]
+    },
+    {
+      "component": "index_candidates",
+      "t": 4,
+      "keys": 65536,
+      "candidates": 16384,
+      "source_compaction_us": 78.06863784790039,
+      "four_later_indexers_net_us": 4022.2542572021484,
+      "off_us": 1136.5528869628906,
+      "on_us": 111.47216320037842,
+      "time_saved_percent": 90.19208305402702,
+      "rows": [
+        {
+          "enabled": false,
+          "us": 1140.0236511230469
+        },
+        {
+          "enabled": true,
+          "us": 111.61552429199219
+        },
+        {
+          "enabled": true,
+          "us": 111.46256446838379
+        },
+        {
+          "enabled": false,
+          "us": 1136.7721557617188
+        },
+        {
+          "enabled": false,
+          "us": 1161.504135131836
+        },
+        {
+          "enabled": true,
+          "us": 111.48240089416504
+        },
+        {
+          "enabled": true,
+          "us": 111.38591766357422
+        },
+        {
+          "enabled": false,
+          "us": 1133.9454650878906
+        },
+        {
+          "enabled": false,
+          "us": 1136.3336181640625
+        },
+        {
+          "enabled": true,
+          "us": 111.48176193237305
+        },
+        {
+          "enabled": true,
+          "us": 111.41568183898926
+        },
+        {
+          "enabled": false,
+          "us": 1133.0931091308594
+        }
+      ]
+    },
+    {
+      "component": "hc_post_pre",
+      "t": 6,
+      "off_us": 6.613040268421173,
+      "on_us": 6.334560215473175,
+      "time_saved_percent": 4.211074508011179,
+      "rows": [
+        {
+          "enabled": false,
+          "us": 6.649600267410278
+        },
+        {
+          "enabled": true,
+          "us": 6.2748801708221436
+        },
+        {
+          "enabled": true,
+          "us": 6.2254399061203
+        },
+        {
+          "enabled": false,
+          "us": 6.5447998046875
+        },
+        {
+          "enabled": false,
+          "us": 6.559839844703674
+        },
+        {
+          "enabled": true,
+          "us": 6.8246400356292725
+        },
+        {
+          "enabled": true,
+          "us": 6.3942402601242065
+        },
+        {
+          "enabled": false,
+          "us": 6.963840126991272
+        },
+        {
+          "enabled": false,
+          "us": 7.416480183601379
+        },
+        {
+          "enabled": true,
+          "us": 6.77727997303009
+        },
+        {
+          "enabled": true,
+          "us": 6.227359771728516
+        },
+        {
+          "enabled": false,
+          "us": 6.576480269432068
+        }
+      ]
+    },
+    {
+      "component": "attention_direct",
+      "t": 6,
+      "heads": 32,
+      "keys": 1152,
+      "off_us": 64.53367948532104,
+      "on_us": 71.9757604598999,
+      "time_saved_percent": -11.532088413262795,
+      "rows": [
+        {
+          "enabled": false,
+          "us": 62.63775825500488
+        },
+        {
+          "enabled": true,
+          "us": 72.89567947387695
+        },
+        {
+          "enabled": true,
+          "us": 71.46975994110107
+        },
+        {
+          "enabled": false,
+          "us": 67.03519821166992
+        },
+        {
+          "enabled": false,
+          "us": 66.4296007156372
+        },
+        {
+          "enabled": true,
+          "us": 71.30208015441895
+        },
+        {
+          "enabled": true,
+          "us": 72.52208232879639
+        },
+        {
+          "enabled": false,
+          "us": 66.48767948150635
+        },
+        {
+          "enabled": false,
+          "us": 62.299041748046875
+        },
+        {
+          "enabled": true,
+          "us": 71.28335952758789
+        },
+        {
+          "enabled": true,
+          "us": 72.48176097869873
+        },
+        {
+          "enabled": false,
+          "us": 62.32175827026367
+        }
+      ]
+    },
+    {
+      "component": "index_candidates",
+      "t": 6,
+      "keys": 32768,
+      "candidates": 16384,
+      "source_compaction_us": 65.75776100158691,
+      "four_later_indexers_net_us": 2551.33469581604,
+      "off_us": 770.0832748413086,
+      "on_us": 115.81016063690186,
+      "time_saved_percent": 84.9613458153903,
+      "rows": [
+        {
+          "enabled": false,
+          "us": 777.3892974853516
+        },
+        {
+          "enabled": true,
+          "us": 115.90224266052246
+        },
+        {
+          "enabled": true,
+          "us": 115.77376365661621
+        },
+        {
+          "enabled": false,
+          "us": 774.5988464355469
+        },
+        {
+          "enabled": false,
+          "us": 765.5677032470703
+        },
+        {
+          "enabled": true,
+          "us": 115.83824157714844
+        },
+        {
+          "enabled": true,
+          "us": 115.7534408569336
+        },
+        {
+          "enabled": false,
+          "us": 763.7891387939453
+        },
+        {
+          "enabled": false,
+          "us": 778.2529449462891
+        },
+        {
+          "enabled": true,
+          "us": 115.8676815032959
+        },
+        {
+          "enabled": true,
+          "us": 115.78207969665527
+        },
+        {
+          "enabled": false,
+          "us": 764.3057250976562
+        }
+      ]
+    },
+    {
+      "component": "index_candidates",
+      "t": 6,
+      "keys": 65536,
+      "candidates": 16384,
+      "source_compaction_us": 79.03471946716309,
+      "four_later_indexers_net_us": 6349.860067367554,
+      "off_us": 1724.9156188964844,
+      "on_us": 117.69192218780518,
+      "time_saved_percent": 93.17694611269746,
+      "rows": [
+        {
+          "enabled": false,
+          "us": 1719.9067687988281
+        },
+        {
+          "enabled": true,
+          "us": 118.5257625579834
+        },
+        {
+          "enabled": true,
+          "us": 117.69968032836914
+        },
+        {
+          "enabled": false,
+          "us": 1733.4986877441406
+        },
+        {
+          "enabled": false,
+          "us": 1714.9227905273438
+        },
+        {
+          "enabled": true,
+          "us": 117.68416404724121
+        },
+        {
+          "enabled": true,
+          "us": 117.60671615600586
+        },
+        {
+          "enabled": false,
+          "us": 1723.7046813964844
+        },
+        {
+          "enabled": false,
+          "us": 1741.2660217285156
+        },
+        {
+          "enabled": true,
+          "us": 117.68239974975586
+        },
+        {
+          "enabled": true,
+          "us": 118.23504447937012
+        },
+        {
+          "enabled": false,
+          "us": 1726.1265563964844
+        }
+      ]
+    }
+  ]
+}

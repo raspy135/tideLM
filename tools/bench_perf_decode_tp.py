@@ -65,8 +65,8 @@ def main():
     os.environ['DSV41_GPU_TIMING'] = '1'
     sys.path[:0] = [str(Path(__file__).resolve().parent.parent), str(Path(__file__).resolve().parent)]
     from engine.perf_config import DecodeExperiments, FLAGS
-    for key in FLAGS.values():
-        os.environ[key] = '1'
+    for field, key in FLAGS.items():
+        os.environ[key] = '1' if field in experiments else '0'
     import torch
     import engine.v41_engine as V
     from server.app import Tok, load_encoding_module, build_chat_prompt
@@ -124,6 +124,7 @@ def main():
         assert all(item == peers[0] for item in peers), 'rank output disagreement'
         stats = engine.last_stats
         return dict(experiment=field, enabled=enabled, output_sha256=digest,
+                    output_text=engine.tokenizer.decode(output),
                     tokens=len(output), decode_s=stats['decode_s'],
                     decode_tok_s=stats['decode_tok_s'], accept_len_mean=stats['accept_len_mean'],
                     ms_per_step=stats['decode_s'] * 1000 / max(1, stats['steps']),
@@ -154,6 +155,8 @@ def main():
                         row.update(workload=workload, depth=depth, prompt_tokens=len(ids), prompt_sha256=prompt_hash)
                         measured.append(row)
                         rows.append(row)
+                        print('PERF_ROW ' + json.dumps({k: v for k, v in row.items()
+                            if k not in ('output_text', 'config', 'gpu')}), flush=True)
                         args.out.parent.mkdir(parents=True, exist_ok=True)
                         target = args.out.with_name(f'{args.out.stem}-rank{engine.ep.rank}{args.out.suffix}')
                         target.write_text(json.dumps(report, indent=2) + '\n')

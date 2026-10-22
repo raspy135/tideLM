@@ -1,0 +1,482 @@
+{
+  "device": "NVIDIA GB10",
+  "torch": "2.14.1+cu132",
+  "workloads": [
+    {
+      "component": "hc_post_pre",
+      "t": 4,
+      "off_us": 8.20495992898941,
+      "on_us": 8.20000022649765,
+      "time_saved_percent": 0.06044761381755013,
+      "rows": [
+        {
+          "enabled": false,
+          "us": 8.353279829025269
+        },
+        {
+          "enabled": true,
+          "us": 8.240000009536743
+        },
+        {
+          "enabled": true,
+          "us": 8.206080198287964
+        },
+        {
+          "enabled": false,
+          "us": 8.205440044403076
+        },
+        {
+          "enabled": false,
+          "us": 8.197759985923767
+        },
+        {
+          "enabled": true,
+          "us": 8.198720216751099
+        },
+        {
+          "enabled": true,
+          "us": 8.201280236244202
+        },
+        {
+          "enabled": false,
+          "us": 8.204479813575745
+        },
+        {
+          "enabled": false,
+          "us": 8.200960159301758
+        },
+        {
+          "enabled": true,
+          "us": 8.193600177764893
+        },
+        {
+          "enabled": true,
+          "us": 8.194239735603333
+        },
+        {
+          "enabled": false,
+          "us": 8.213440179824829
+        }
+      ]
+    },
+    {
+      "component": "attention_direct",
+      "t": 4,
+      "heads": 32,
+      "keys": 1152,
+      "off_us": 62.28640079498291,
+      "on_us": 69.62703943252563,
+      "time_saved_percent": -11.78529910839543,
+      "rows": [
+        {
+          "enabled": false,
+          "us": 62.30144023895264
+        },
+        {
+          "enabled": true,
+          "us": 69.69503879547119
+        },
+        {
+          "enabled": true,
+          "us": 69.61696147918701
+        },
+        {
+          "enabled": false,
+          "us": 62.271361351013184
+        },
+        {
+          "enabled": false,
+          "us": 69.07328128814697
+        },
+        {
+          "enabled": true,
+          "us": 69.62111949920654
+        },
+        {
+          "enabled": true,
+          "us": 69.61855888366699
+        },
+        {
+          "enabled": false,
+          "us": 68.54368209838867
+        },
+        {
+          "enabled": false,
+          "us": 62.024641036987305
+        },
+        {
+          "enabled": true,
+          "us": 69.63295936584473
+        },
+        {
+          "enabled": true,
+          "us": 72.7558422088623
+        },
+        {
+          "enabled": false,
+          "us": 61.804800033569336
+        }
+      ]
+    },
+    {
+      "component": "index_candidates",
+      "t": 4,
+      "keys": 32768,
+      "candidates": 16384,
+      "source_compaction_us": 67.57247924804688,
+      "four_later_indexers_net_us": 1301.0911750793457,
+      "off_us": 444.67567443847656,
+      "on_us": 102.50976085662842,
+      "time_saved_percent": 76.94729737890998,
+      "rows": [
+        {
+          "enabled": false,
+          "us": 451.6067123413086
+        },
+        {
+          "enabled": true,
+          "us": 104.66719627380371
+        },
+        {
+          "enabled": true,
+          "us": 102.43743896484375
+        },
+        {
+          "enabled": false,
+          "us": 458.4035110473633
+        },
+        {
+          "enabled": false,
+          "us": 445.13790130615234
+        },
+        {
+          "enabled": true,
+          "us": 102.50176429748535
+        },
+        {
+          "enabled": true,
+          "us": 104.60960388183594
+        },
+        {
+          "enabled": false,
+          "us": 443.9846420288086
+        },
+        {
+          "enabled": false,
+          "us": 443.0326461791992
+        },
+        {
+          "enabled": true,
+          "us": 102.51775741577148
+        },
+        {
+          "enabled": true,
+          "us": 102.3971176147461
+        },
+        {
+          "enabled": false,
+          "us": 444.2134475708008
+        }
+      ]
+    },
+    {
+      "component": "index_candidates",
+      "t": 4,
+      "keys": 65536,
+      "candidates": 16384,
+      "source_compaction_us": 81.31327629089355,
+      "four_later_indexers_net_us": 3967.67991065979,
+      "off_us": 1124.9247741699219,
+      "on_us": 112.67647743225098,
+      "time_saved_percent": 89.98364334936133,
+      "rows": [
+        {
+          "enabled": false,
+          "us": 1195.8399963378906
+        },
+        {
+          "enabled": true,
+          "us": 112.85663604736328
+        },
+        {
+          "enabled": true,
+          "us": 112.66495704650879
+        },
+        {
+          "enabled": false,
+          "us": 1120.8902740478516
+        },
+        {
+          "enabled": false,
+          "us": 1121.4473724365234
+        },
+        {
+          "enabled": true,
+          "us": 112.74975776672363
+        },
+        {
+          "enabled": true,
+          "us": 112.65983581542969
+        },
+        {
+          "enabled": false,
+          "us": 1122.6374053955078
+        },
+        {
+          "enabled": false,
+          "us": 1127.212142944336
+        },
+        {
+          "enabled": true,
+          "us": 112.68799781799316
+        },
+        {
+          "enabled": true,
+          "us": 112.62687683105469
+        },
+        {
+          "enabled": false,
+          "us": 1127.6640319824219
+        }
+      ]
+    },
+    {
+      "component": "hc_post_pre",
+      "t": 6,
+      "off_us": 8.224479854106903,
+      "on_us": 8.224320113658905,
+      "time_saved_percent": 0.001942255933890826,
+      "rows": [
+        {
+          "enabled": false,
+          "us": 8.303359746932983
+        },
+        {
+          "enabled": true,
+          "us": 8.230080008506775
+        },
+        {
+          "enabled": true,
+          "us": 8.200640082359314
+        },
+        {
+          "enabled": false,
+          "us": 8.207679986953735
+        },
+        {
+          "enabled": false,
+          "us": 8.20959985256195
+        },
+        {
+          "enabled": true,
+          "us": 8.20032000541687
+        },
+        {
+          "enabled": true,
+          "us": 8.218560218811035
+        },
+        {
+          "enabled": false,
+          "us": 8.224959969520569
+        },
+        {
+          "enabled": false,
+          "us": 8.223999738693237
+        },
+        {
+          "enabled": true,
+          "us": 8.847039937973022
+        },
+        {
+          "enabled": true,
+          "us": 10.944960117340088
+        },
+        {
+          "enabled": false,
+          "us": 9.982720017433167
+        }
+      ]
+    },
+    {
+      "component": "attention_direct",
+      "t": 6,
+      "heads": 32,
+      "keys": 1152,
+      "off_us": 88.71743679046631,
+      "on_us": 69.81744050979614,
+      "time_saved_percent": 21.303586943464516,
+      "rows": [
+        {
+          "enabled": false,
+          "us": 88.4607982635498
+        },
+        {
+          "enabled": true,
+          "us": 69.88671779632568
+        },
+        {
+          "enabled": true,
+          "us": 69.79008197784424
+        },
+        {
+          "enabled": false,
+          "us": 88.97407531738281
+        },
+        {
+          "enabled": false,
+          "us": 93.46847534179688
+        },
+        {
+          "enabled": true,
+          "us": 69.84479904174805
+        },
+        {
+          "enabled": true,
+          "us": 69.78559970855713
+        },
+        {
+          "enabled": false,
+          "us": 88.17024230957031
+        },
+        {
+          "enabled": false,
+          "us": 91.6534423828125
+        },
+        {
+          "enabled": true,
+          "us": 71.03360176086426
+        },
+        {
+          "enabled": true,
+          "us": 69.78784084320068
+        },
+        {
+          "enabled": false,
+          "us": 88.23264122009277
+        }
+      ]
+    },
+    {
+      "component": "index_candidates",
+      "t": 6,
+      "keys": 32768,
+      "candidates": 16384,
+      "source_compaction_us": 68.65119934082031,
+      "four_later_indexers_net_us": 2474.1237831115723,
+      "off_us": 751.9988632202148,
+      "on_us": 116.3051176071167,
+      "time_saved_percent": 84.5338705554588,
+      "rows": [
+        {
+          "enabled": false,
+          "us": 754.2787170410156
+        },
+        {
+          "enabled": true,
+          "us": 116.45024299621582
+        },
+        {
+          "enabled": true,
+          "us": 116.20767593383789
+        },
+        {
+          "enabled": false,
+          "us": 796.8978881835938
+        },
+        {
+          "enabled": false,
+          "us": 757.7910614013672
+        },
+        {
+          "enabled": true,
+          "us": 116.29119873046875
+        },
+        {
+          "enabled": true,
+          "us": 116.31551742553711
+        },
+        {
+          "enabled": false,
+          "us": 748.3875274658203
+        },
+        {
+          "enabled": false,
+          "us": 749.7190093994141
+        },
+        {
+          "enabled": true,
+          "us": 116.35744094848633
+        },
+        {
+          "enabled": true,
+          "us": 116.29471778869629
+        },
+        {
+          "enabled": false,
+          "us": 748.1871795654297
+        }
+      ]
+    },
+    {
+      "component": "index_candidates",
+      "t": 6,
+      "keys": 65536,
+      "candidates": 16384,
+      "source_compaction_us": 81.95072174072266,
+      "four_later_indexers_net_us": 6236.323165893555,
+      "off_us": 1698.4241485595703,
+      "on_us": 118.85567665100098,
+      "time_saved_percent": 93.0020026651292,
+      "rows": [
+        {
+          "enabled": false,
+          "us": 1704.7232055664062
+        },
+        {
+          "enabled": true,
+          "us": 118.88992309570312
+        },
+        {
+          "enabled": true,
+          "us": 118.74752044677734
+        },
+        {
+          "enabled": false,
+          "us": 1697.2659301757812
+        },
+        {
+          "enabled": false,
+          "us": 1690.5644226074219
+        },
+        {
+          "enabled": true,
+          "us": 118.87711524963379
+        },
+        {
+          "enabled": true,
+          "us": 120.8620834350586
+        },
+        {
+          "enabled": false,
+          "us": 1726.8917846679688
+        },
+        {
+          "enabled": false,
+          "us": 1694.3519592285156
+        },
+        {
+          "enabled": true,
+          "us": 118.83423805236816
+        },
+        {
+          "enabled": true,
+          "us": 118.79072189331055
+        },
+        {
+          "enabled": false,
+          "us": 1699.5823669433594
+        }
+      ]
+    }
+  ]
+}

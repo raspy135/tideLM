@@ -1,0 +1,11 @@
+test_candidate_scores_and_changed_graph_inputs (tools.test_perf_decode_cuda.DecodeCudaTest.test_candidate_scores_and_changed_graph_inputs) ... ok
+test_draft_router_small_gate_does_not_alias_target_gate (tools.test_perf_decode_cuda.DecodeCudaTest.test_draft_router_small_gate_does_not_alias_target_gate) ... ok
+test_engram_side_stream_uses_real_staging_and_preserves_previous_consumers (tools.test_perf_decode_cuda.DecodeCudaTest.test_engram_side_stream_uses_real_staging_and_preserves_previous_consumers) ... ok
+test_packed_attention_matches_staging_and_handles_empty_rows (tools.test_perf_decode_cuda.DecodeCudaTest.test_packed_attention_matches_staging_and_handles_empty_rows) ... ok
+test_post_pre_in_place_and_graph_replay (tools.test_perf_decode_cuda.DecodeCudaTest.test_post_pre_in_place_and_graph_replay) ... ok
+test_scale_expansion_preserves_every_byte_and_overwrites_poisoned_scratch (tools.test_perf_decode_cuda.DecodeCudaTest.test_scale_expansion_preserves_every_byte_and_overwrites_poisoned_scratch) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 6.845s
+
+OK

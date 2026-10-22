@@ -11,7 +11,7 @@ def _expand(PAYLOAD, OFFSETS, OUT, N: tl.constexpr):
     kind = tl.load(PAYLOAD + first)
     live = block * 64 + i < N
     if kind == 0:
-        values = tl.load(PAYLOAD + first + 1 + i, live, other=0)
+        values = tl.load(PAYLOAD + first + 1 + i, live, other=0).to(tl.int32)
     else:
         base = tl.load(PAYLOAD + first + 1).to(tl.int32)
         codes = tl.load(PAYLOAD + first + 2 + i // 8).to(tl.int32)

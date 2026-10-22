@@ -890,7 +890,7 @@ class FastDecoder:
             selected = M.Model._select_candidates(score, compress_lens, a.candidate_topk_blocks,
                                                    a.candidate_block_size)
             self.candidates[:, :score.size(1)].copy_(selected)
-            if compact:
+            if compact and cache_rows > capacity:
                 from engine.index_candidates import compact_mask
                 self.candidate_ids.copy_(compact_mask(selected, a.candidate_block_size, capacity))
         elif 0 <= a.candidate_source_layer < L:

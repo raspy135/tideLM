@@ -82,8 +82,10 @@ def attention_packed(q, ring, slots, cache, ids, mask, sink, scale):
     # serving query widths, while value partitions would repeat the unpacking.
     split = 4 if n1 + n2 >= 512 else 1
     parts = torch.empty((t, heads, split, 514), dtype=torch.float32, device=q.device)
+    # BN=32 / eight warps needed 151,552 shared bytes on GB10 (limit 101,376)
+    # and could not launch. BN=16 / four warps passes the graph/numerics test.
     _attend[(t, triton.cdiv(heads, 16), split)](q, ring, slots, cache if n2 else ring,
         ids if n2 else slots, mask, sink, parts, heads, n1, n2, q.stride(0), q.stride(1),
-        stride, float(scale), 32, split, num_warps=8, num_stages=1)
+        stride, float(scale), 16, split, num_warps=4, num_stages=1)
     _merge[(t, heads)](parts, out, heads, split, num_warps=4)
     return out
