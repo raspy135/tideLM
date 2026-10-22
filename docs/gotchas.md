@@ -4101,3 +4101,19 @@ and the likeliest source of the difference. Random 8K drafted far less in this a
 round against 0.79-2.31), which is why its decode barely moves: that workload compares acceptance.
 One smoke request before the bench had adapted 512 residents; the pair was restarted from the
 original stats DB so it would not confound the arms.
+
+## Scale packs: the slowdown was the load path; fixed-residency checks cannot see it (2026-10-22)
+
+The lossless-scale qualification compared outputs and step times with hot reads, adaptation and
+prefix reuse off, so it never exercised `ScalePack.read_into`, where every packed expert load
+hashed 553 KB of native scales, read a 336 KB record through the page cache and hashed that:
+1.26-1.52 ms a `load_slot` against native's 0.32. Serving moves 250-500 experts a request. With
+O_DIRECT record reads and checks once per record and process, the packed run reproduced the
+earlier packed run's tokens exactly (same acceptance, same NVMe GB) at 25.82 instead of 23.67
+tok/s prose, and matched a fresh native arm (25.61, equal acceptance). The kernels were never the
+problem: packed decode kernels time 2-6% faster than native. Details: `docs/lossless-scales.md`.
+
+Two things this did not explain. The README's 26.0 / 44.2 native baseline cannot be re-run
+exactly: its starting demand history (`34a48be9` / `e4558b35`) was not kept, and history moves
+the resident set. And gpt's interrupted native arm on 2026-10-21 measured 23.11 / 23.41 tok/s
+prose from the same seed history and image where today's native arm measured 25.6.

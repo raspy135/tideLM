@@ -1,0 +1,12 @@
+== ds41-ab-native-code: workload=code isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=v41
+  warmup  isl=62 ttft=   1522.8 ms  tpot=  24.00 ms  decode= 41.66 tok/s  out=1024 (length)
+          accept_len=3.85  expert_hit=1.0  nvme=8.54 GB  engram_rows=71760
+  run1    isl=62 ttft=   3360.8 ms  tpot=  24.62 ms  decode= 40.62 tok/s  out=1024 (length)
+          accept_len=3.77  expert_hit=1.0  nvme=4.4 GB  engram_rows=74080
+  run2    isl=62 ttft=   1205.9 ms  tpot=  25.45 ms  decode= 39.30 tok/s  out=1024 (length)
+          accept_len=3.49  expert_hit=1.0  nvme=2.75 GB  engram_rows=72592
+  run3    isl=62 ttft=   1196.9 ms  tpot=  23.70 ms  decode= 42.20 tok/s  out=1024 (length)
+          accept_len=3.32  expert_hit=1.0  nvme=2.52 GB  engram_rows=64976
+  -> MEDIAN  ttft=1205.8587 ms  tpot=24.6175 ms  decode=40.6216 tok/s
+  -> ENGINE  accept_len=3.49  expert_hit=1.0  nvme=2.75 GB  engram_rows=72592
+  wrote /home/ryan/git/tidelm-glm/results/scale-pack-ab-20261022/native-code.json

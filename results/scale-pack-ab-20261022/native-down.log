@@ -1,0 +1,5 @@
+--- stopping both ranks (grace 5s, concurrent)
+--- waiting for this box to return >= 90 GiB: 
+--- waiting for ryan@10.0.0.2 to return >= 90 GiB: 
+--- this box: OK, 115 GiB
+--- ryan@10.0.0.2: OK, 117 GiB

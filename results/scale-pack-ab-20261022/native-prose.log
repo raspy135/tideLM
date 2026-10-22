@@ -1,0 +1,12 @@
+== ds41-ab-native-prose: workload=prose isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=v41
+  warmup  isl=45 ttft=   3911.2 ms  tpot=  43.28 ms  decode= 23.10 tok/s  out=1024 (length)
+          accept_len=1.91  expert_hit=1.0  nvme=11.55 GB  engram_rows=107216
+  run1    isl=45 ttft=   2779.6 ms  tpot=  38.06 ms  decode= 26.28 tok/s  out=1024 (length)
+          accept_len=1.98  expert_hit=1.0  nvme=4.7 GB  engram_rows=103760
+  run2    isl=45 ttft=   1222.9 ms  tpot=  39.05 ms  decode= 25.61 tok/s  out=1024 (length)
+          accept_len=1.96  expert_hit=1.0  nvme=3.95 GB  engram_rows=104528
+  run3    isl=45 ttft=   1190.3 ms  tpot=  39.06 ms  decode= 25.60 tok/s  out=1024 (length)
+          accept_len=2.04  expert_hit=1.0  nvme=3.16 GB  engram_rows=100704
+  -> MEDIAN  ttft=1222.9162 ms  tpot=39.0493 ms  decode=25.6086 tok/s
+  -> ENGINE  accept_len=1.98  expert_hit=1.0  nvme=3.95 GB  engram_rows=103760
+  wrote /home/ryan/git/tidelm-glm/results/scale-pack-ab-20261022/native-prose.json

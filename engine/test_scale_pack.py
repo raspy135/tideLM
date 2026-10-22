@@ -51,17 +51,34 @@ class ScalePackTest(unittest.TestCase):
                     pack.read_into((0, expert), raw, destinations)
                     for expected, stored in zip(raw, destinations):
                         np.testing.assert_array_equal(decode(stored[:pack.stride], pack.spec), expected.reshape(-1))
+                # The buffered fallback (filesystems without O_DIRECT) reads the same bytes.
+                buffered = ScalePack(output/f'ds41-scales-r{rank}of2.bin', model, rank, 2)
+                if buffered.dfd is not None:
+                    os.close(buffered.dfd)
+                    buffered.dfd = None
+                same = [np.zeros(2048, np.uint8) for _ in raw]
+                buffered.read_into((0, expert), raw, same)
+                for a, b in zip(destinations, same):
+                    np.testing.assert_array_equal(a[:pack.stride], b[:pack.stride])
+                os.close(buffered.fd)
                 bad = [p.copy() for p in raw]
                 bad[0][0, 0] ^= 1
+                # Checks run on a record's first load in a process (the load path's cost,
+                # engine/scale_pack.py); a verified record is not hashed again.
+                pack.read_into((0, expert), bad, destinations)
+                fresh = ScalePack(output/f'ds41-scales-r{rank}of2.bin', model, rank, 2)
                 with self.assertRaisesRegex(ValueError, 'scale bytes changed'):
-                    pack.read_into((0, expert), bad, destinations)
+                    fresh.read_into((0, expert), bad, destinations)
                 with open(pack.path, 'r+b') as handle:
                     handle.seek(pack.data0)
                     handle.write(b'\xff')
                 with self.assertRaisesRegex(ValueError, 'corrupt scale record'):
-                    pack.read_into((0, 0), [planes[f'layers.0.ffn.experts.0.w{part}.scale'][rank*16:(rank+1)*16]
-                                          for part in (1, 2, 3)], destinations)
-                os.close(pack.fd)
+                    fresh.read_into((0, 0), [planes[f'layers.0.ffn.experts.0.w{part}.scale'][rank*16:(rank+1)*16]
+                                           for part in (1, 2, 3)], destinations)
+                for p in (pack, fresh):
+                    os.close(p.fd)
+                    if p.dfd is not None:
+                        os.close(p.dfd)
 
 
 if __name__ == '__main__':

@@ -1,0 +1,15 @@
+--- syncing engine/ tools/ server/ to ryan@10.0.0.2
+--- booting with source mounts (DSV41_DEV_SOURCE=1)
+--- rank 0 (local): image ok, checkpoint ok, verbs ok, 115 GiB free
+--- rank 1 (ryan@10.0.0.2): image ok, checkpoint ok, verbs ok, 117 GiB free
+--- engine code: the checkout (48577fd8ced1dd99), bind-mounted over the image
+--- RoCE: rank 0 = rocep1s0f1 5   rank 1 = rocep1s0f1 5   (rendezvous 10.0.0.1:29611)
+--- WARNING: the API will bind 0.0.0.0:8000 and this server has NO authentication.
+--- starting rank 0 locally (tidelm:local)
+--- waiting for the rendezvous port 10.0.0.1:29611: up after 9s
+--- starting rank 1 on ryan@10.0.0.2
+--- rank 0: docker logs -f deepseek-v41-ep2-rank0
+--- rank 1: ssh ryan@10.0.0.2 docker logs -f deepseek-v41-ep2-rank1
+--- waiting for /health (both ranks load ~18.5 GB of weights plus their arena half): OK
+{"status": "ok", "model": "deepseek", "engine": "v41", "busy": false, "max_context": 32768, "uptime_s": 0, "engine_config": {"engine": "v41", "decode_experiments": {"perf_index_candidates": true, "perf_draft_router": false, "perf_hc_post_pre": false, "perf_attention_direct": false, "perf_engram_h2d": false, "perf_source": "5464901d67fec78257a0a0b5d1dc873d3bd3dff2fe6f4e12fa9176bc4ec32d17"}, "ep_wor
+--- EP2 pair serving on http://0.0.0.0:8000/v1 (kernel triton-fp4)

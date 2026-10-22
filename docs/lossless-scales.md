@@ -7,11 +7,11 @@ FP4, output TP2, CUDA v2 decode, including the two-row down kernel and Triton
 prefill. DSpark's draft experts keep their native layout.
 
 Packing is **disabled** in the shipped template and private serving profile.
-The first HTTP run used a different prompt salt and was not a valid speed A/B.
-The on-only repeat below restores the historical prompt salts, but a complete
-fresh native arm is still needed to isolate the throughput cost. Fixed-output
-tests alone did not qualify the default serving path. The following setup is for
-explicit experiments only. Build the image first, then pack on the head node:
+The slower serving runs below were the expert-load path, not the codec: every
+packed load hashed both scale versions and read its record through the page
+cache. With that fixed, a paired serving A/B measured packed at parity or better
+(see "Why the first serving runs were slower"). Enabling it is a profile
+decision; it needs the packs built first. Build the image, then pack on the head node:
 
 ```bash
 docker run --rm --entrypoint python \
@@ -48,8 +48,10 @@ not representative of that worst case.
 This changes arena capacity, rather than producing free memory outside the
 arena: with the same `ARENA_GB`, more experts can remain resident. Candidate
 indexing is a separate compute optimization and does not add resident capacity.
-Loading still reads native scales to validate their bytes, then reads the pack;
-do not expect an NVMe traffic reduction.
+Loading still reads the native scales (they arrive with the expert's one weight
+read), then reads the pack record with O_DIRECT; do not expect an NVMe traffic
+reduction. A record's native-byte and record checksums run on its first load in a
+process; later loads of the same expert skip them.
 
 Qualification: `engine/test_scale_layout.py`, `engine/test_scale_pack.py`, and
 `DSV41_RUN_CUDA_TESTS=1 python tools/test_scale_pack_cuda.py`. GPU tests compare
@@ -98,3 +100,36 @@ regression estimate against the historical 25.9777 / 44.2217 tok/s native runs.
 The interrupted native arm's partial logs are retained but do not constitute
 the planned three-run comparison. Reports and exact settings are in
 `results/scale-pack-20261021/matched-http/`.
+
+## Why the first serving runs were slower (2026-10-22)
+
+**Not the kernels.** `tools/bench_scale_pack_kernels.py` (48 real experts, rank-0
+shapes, L2-cold graph replays, outputs compared bytewise) times the packed decode
+kernels *faster* than native: up -3.8 to -4.5%, two-row down -2.2 to -5.7%,
+one-row down -2.0 to +0.2% at 1/2/4 tokens. Only 0.05% of those experts' scales
+take the exception path. gpt's templating left the native kernels unchanged:
+native timings before and after the commit agree within 3%.
+
+**The load path.** Every packed `load_slot` hashed the native scale planes
+(553 KB, 0.23 ms), read the record through the page cache (0.89 ms cold for
+336 KB) and hashed it (0.14 ms): 1.26-1.52 ms a load against native's 0.32.
+Serving reads 2-5 GB of experts a request (adaptation swaps, hot reads), 250-500
+loads. Now the record is read with
+O_DIRECT through a per-thread aligned bounce buffer (0.20 ms) and each record's
+checks run once per process: 0.83-0.93 ms a load in steady state.
+
+**Paired serving A/B**, same image, dev-mounted source, seed history `45ef7129`,
+the chart's prompt salts, 32K, 97.4 GB, `auto` residents (native 10,208, packed
+10,452), three measured runs after a warmup:
+
+| Workload | Native | Packed + fix | Packed, before the fix (above) |
+| --- | ---: | ---: | ---: |
+| Prose | 25.61 tok/s | **25.82** | 23.67 |
+| Code | 40.62 tok/s | **44.81** | 41.37 |
+
+The prose runs before and after the fix have identical acceptance (1.99 / 1.97 /
+1.98) and identical NVMe traffic (4.65 / 3.77 / 2.85 GB): the same text and the
+same loads, 9.1% faster. Against native, prose acceptance was equal and packed
+was 0.8% faster; code acceptance differed between the arms (native 3.32-3.77,
+packed 3.53-4.18), so its +10% is not a packing measurement. Prose TTFT 1.22 s
+native, 1.30 packed. Reports: `results/scale-pack-ab-20261022/`.

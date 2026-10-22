@@ -1,0 +1,12 @@
+== ds41-ab-packed-code: workload=code isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=v41
+  warmup  isl=62 ttft=   1721.7 ms  tpot=  25.17 ms  decode= 39.72 tok/s  out=1024 (length)
+          accept_len=3.54  expert_hit=1.0  nvme=7.7 GB  engram_rows=77184
+  run1    isl=62 ttft=   2566.4 ms  tpot=  22.32 ms  decode= 44.81 tok/s  out=1024 (length)
+          accept_len=4.1  expert_hit=1.0  nvme=3.77 GB  engram_rows=73664
+  run2    isl=62 ttft=   1259.6 ms  tpot=  21.84 ms  decode= 45.79 tok/s  out=1024 (length)
+          accept_len=4.18  expert_hit=1.0  nvme=2.68 GB  engram_rows=72368
+  run3    isl=62 ttft=   1231.1 ms  tpot=  24.39 ms  decode= 41.00 tok/s  out=1024 (length)
+          accept_len=3.53  expert_hit=1.0  nvme=2.22 GB  engram_rows=77712
+  -> MEDIAN  ttft=1259.6131 ms  tpot=22.3155 ms  decode=44.8119 tok/s
+  -> ENGINE  accept_len=4.1  expert_hit=1.0  nvme=2.68 GB  engram_rows=73664
+  wrote /home/ryan/git/tidelm-glm/results/scale-pack-ab-20261022/packed-code.json

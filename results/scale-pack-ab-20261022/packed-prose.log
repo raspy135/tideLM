@@ -1,0 +1,12 @@
+== ds41-ab-packed-prose: workload=prose isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=v41
+  warmup  isl=45 ttft=   5208.0 ms  tpot=  39.70 ms  decode= 25.19 tok/s  out=1024 (length)
+          accept_len=2.01  expert_hit=1.0  nvme=10.57 GB  engram_rows=102240
+  run1    isl=45 ttft=   2430.2 ms  tpot=  38.52 ms  decode= 25.96 tok/s  out=1024 (length)
+          accept_len=1.99  expert_hit=1.0  nvme=4.65 GB  engram_rows=103200
+  run2    isl=45 ttft=   1303.1 ms  tpot=  38.73 ms  decode= 25.82 tok/s  out=1024 (length)
+          accept_len=1.97  expert_hit=1.0  nvme=3.77 GB  engram_rows=103760
+  run3    isl=45 ttft=   1146.5 ms  tpot=  39.18 ms  decode= 25.52 tok/s  out=1024 (length)
+          accept_len=1.98  expert_hit=1.0  nvme=2.85 GB  engram_rows=103584
+  -> MEDIAN  ttft=1303.1181 ms  tpot=38.7265 ms  decode=25.8221 tok/s
+  -> ENGINE  accept_len=1.98  expert_hit=1.0  nvme=3.77 GB  engram_rows=103584
+  wrote /home/ryan/git/tidelm-glm/results/scale-pack-ab-20261022/packed-prose.json
