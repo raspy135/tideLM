@@ -85,8 +85,6 @@ cp configs/glm53-exl3.env.example  .env.glm53-exl3     # GLM-5.3, EXL3 (needs th
 `MODEL_REPO=deepseek-ai/DeepSeek-V4.1-Flash-1017 MODEL_DIR=<dir> bash scripts/download-model.sh`
 fetches the DeepSeek checkpoint and resumes if interrupted (`HF_TOKEN` is optional; it only
 raises rate limits). The GLM checkpoint downloads with `hf download <repo> --local-dir <dir>`.
-For DeepSeek, optional [lossless scale packs](docs/lossless-scales.md) let the same expert arena
-hold more residents; build them once before setting `DSV41_SCALE_PACK` in your profile.
 For the EXL3 profile, pack each node's half once, after building the image (step 3); the EXL3
 checkpoint supplies the dense and fixed weights too, so keep it on both nodes:
 
@@ -107,6 +105,19 @@ The example profiles all name `tidelm:local` (`IMAGE` for DeepSeek, `GLM_IMAGE` 
 one build serves every profile. DeepSeek runs the code baked into the image and refuses to boot
 from an image older than the checkout: after `git pull`, run the same command again. GLM-5.3
 mounts the checkout itself.
+
+For DeepSeek's optional lossless scales, pack the checkpoint once on the head (CPU only):
+
+```bash
+docker run --rm --entrypoint python -v /home/you/models:/models tidelm:local \
+  /app/tools/pack_expert_scales.py --model-dir /models/DeepSeek-V4.1-Flash-1017 \
+  --out-dir /models/dsv41-scale-packs
+```
+
+Copy `ds41-scales-r1of2.bin` to the same directory on the worker (about 5.2 GB per node).
+Set `DSV41_SCALE_PACK=/models/dsv41-scale-packs/ds41-scales-r{rank}of2.bin` in `.env.ds41-mxfp4`;
+the same arena then holds more experts. Keep the native checkpoint, and repack if its weights
+change. [Setup and rollback details](docs/lossless-scales.md).
 
 **4. Start and stop:**
 
