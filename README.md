@@ -10,17 +10,18 @@ tide — so the engine gets better the more you use it.
 
 | Profile | Model | Routed experts | Resident | Context | Prose | Code | 8K-token prompt, first token |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,208 / 15,360 (66%) | 512K | **26.0 tok/s** | **44.2 tok/s** | 8.4 s |
-| `glm53-exl3` | GLM-5.3 | EXL3 3.0 bpw | 12,400 / 19,200 (64.6%) | 256K | **15.2 tok/s** | **20.3 tok/s** | 18.5 s |
+| `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,452 / 15,360 (68%) | 512K | **25.6 tok/s** | **41.1 tok/s** | 8.3 s |
+| `glm53-exl3` | GLM-5.3 | EXL3 3.0 bpw | 12,500 / 19,200 (65.1%) | 256K | **15.2 tok/s** | **20.3 tok/s** | 18.5 s |
 
 *Decode speed is `bench/bench.py`'s median over three measured runs after one warmup: 1,024
 output tokens at temperature 0.6, prose = an essay request, code = an LRU-cache request. The last
 column is the median time to first token of a fresh ~8,200-token prompt (no prefix reused). Each
 profile uses adaptation, hot reads and speculative decoding on two DGX Sparks, with its learned
-expert history. DS was measured on 2026-10-21 with native scales, candidate indexing and
-10,208 residents at a 32K context allocation (the profile supports 512K):
-[raw runs](results/flare-perf-20261021/http-bench/README.md). GLM was measured on 2026-10-22 from its own EXL3
-checkpoint with FP8 kv_b, with 12,000 residents at 256K; the profile keeps 12,400:
+expert history. DS was measured on 2026-10-22 with lossless scales, candidate indexing and
+10,452 residents at a 32K context allocation (the profile supports 512K):
+[raw runs](results/ds41-packed-20261022/README.md); its code median moves with each boot's
+acceptance (44.8 in the [paired A/B](docs/lossless-scales.md)). GLM was measured on 2026-10-22 from its own EXL3
+checkpoint with FP8 kv_b, with 12,000 residents at 256K; the profile keeps 12,500:
 [raw runs](results/glm-native-perf-20261022/README.md), [comparison](docs/glm53-native-exl3.md). First requests after boot can be slower
 ([gotchas](docs/gotchas.md)).*
 
@@ -104,6 +105,19 @@ one build serves every profile. DeepSeek runs the code baked into the image and 
 from an image older than the checkout: after `git pull`, run the same command again. GLM-5.3
 mounts the checkout itself.
 
+The DeepSeek profile uses lossless scales. Pack the checkpoint once on the head (CPU only):
+
+```bash
+docker run --rm --entrypoint python -v /home/you/models:/models tidelm:local \
+  /app/tools/pack_expert_scales.py --model-dir /models/DeepSeek-V4.1-Flash-1017 \
+  --out-dir /models/dsv41-scale-packs
+```
+
+Copy `ds41-scales-r1of2.bin` to the same directory on the worker (about 5.2 GB per node). The
+example profile's `DSV41_SCALE_PACK` points there; the same arena then holds more experts. Keep
+the native checkpoint, and repack if its weights change. Empty `DSV41_SCALE_PACK` serves native
+scales. [Setup and rollback details](docs/lossless-scales.md).
+
 **4. Start and stop:**
 
 ```bash
@@ -158,8 +172,8 @@ with what each setting measured.
 
 | DeepSeek (`DSV41_*`) | GLM-5.3 (`GLM_*`) | What it controls |
 | --- | --- | --- |
-| `ARENA_GB=97.4` | `GLM_SLOTS=8740` | Expert memory per node, and so how many experts stay resident. |
-| `MAX_SEQ=524288` | `GLM_MAX_SEQ=327680` | Context allocation, generated tokens included. Less context, more experts. |
+| `ARENA_GB=97.4` | `GLM_SLOTS=12500` | Expert memory per node, and so how many experts stay resident. |
+| `MAX_SEQ=524288` | `GLM_MAX_SEQ=262144` | Context allocation, generated tokens included. Less context, more experts. |
 | `DSV41_ADAPT_SENSITIVITY=high` | `GLM_ADAPT=1`, `GLM_ADAPT_EVERY=200` | How fast the resident set follows new traffic. |
 | `DSV41_EXPERT_SEED=1` | `GLM_STATS_SEED=1` | With no local history yet, start from the bundled one in `profiles/` (`0`: from scratch; or a seed file's path). |
 | `DSV41_HOT_READS=1`, `DSV41_HOT_ASYNC=1`, `DSV41_HOT_RING=128` | `GLM_HOT=1`, `GLM_HOT_MIN=0.2`, `GLM_HOT_MAX=16` | Hot reads (above). |

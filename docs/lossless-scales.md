@@ -6,12 +6,12 @@ and arithmetic stay unchanged. This currently supports single-request native
 FP4, output TP2, CUDA v2 decode, including the two-row down kernel and Triton
 prefill. DSpark's draft experts keep their native layout.
 
-Packing is **disabled** in the shipped template and private serving profile.
-The slower serving runs below were the expert-load path, not the codec: every
-packed load hashed both scale versions and read its record through the page
-cache. With that fixed, a paired serving A/B measured packed at parity or better
-(see "Why the first serving runs were slower"). Enabling it is a profile
-decision; it needs the packs built first. Build the image, then pack on the head node:
+Packing is **enabled** in the shipped template (2026-10-22); it needs the packs
+built first. The slower first serving runs below were the expert-load path, not
+the codec: every packed load hashed both scale versions and read its record
+through the page cache. With that fixed, a paired serving A/B measured packed at
+parity or better (see "Why the first serving runs were slower"). Build the
+image, then pack on the head node:
 
 ```bash
 docker run --rm --entrypoint python \
@@ -76,8 +76,8 @@ residents instead of **10,208**. Its `bench/bench.py` reports are kept as
 temperature 0.6, seed 42, 32K context allocation, 1024 output tokens for
 prose/code and 256 for random 8K. These use a different prompt salt and resident
 set from the earlier README run; compare kernel overhead with the fixed-output
-test above. The README's DS chart retains the measured native-scale profile,
-with candidate indexing on. Unsetting the pack path restores native scales.
+test above. The README's DS chart kept the native-scale profile until the
+2026-10-22 run below. Unsetting the pack path restores native scales.
 
 The optional packed-profile run measured 23.0142 tok/s prose, 39.4160 tok/s
 code, 29.8773 tok/s random 8K, and 9.016 s 8K TTFT. These numbers do not improve
@@ -133,3 +133,8 @@ same loads, 9.1% faster. Against native, prose acceptance was equal and packed
 was 0.8% faster; code acceptance differed between the arms (native 3.32-3.77,
 packed 3.53-4.18), so its +10% is not a packing measurement. Prose TTFT 1.22 s
 native, 1.30 packed. Reports: `results/scale-pack-ab-20261022/`.
+
+The README row is a second packed boot with the chart's full protocol (prose, code,
+random 8K): 25.55 / 41.11 tok/s, 8K TTFT 8.28 s (native chart 8.44). Its prose repeats
+the A/B's packed arm exactly (same acceptance and NVMe traffic); its code runs'
+acceptance differed again, 39.87-44.16 tok/s. `results/ds41-packed-20261022/`.

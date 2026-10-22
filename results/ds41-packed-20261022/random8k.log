@@ -1,0 +1,12 @@
+== ds41-packed-random8k: workload=random isl=8192 osl=256 runs=3 warmup=1 thinking=False engine=v41
+  warmup  isl=8178 ttft=  11221.5 ms  tpot=  40.72 ms  decode= 24.56 tok/s  out=256 (length)
+          accept_len=2.62  expert_hit=1.0  nvme=7.87 GB  engram_rows=212449
+  run1    isl=8170 ttft=  11193.1 ms  tpot=  34.80 ms  decode= 28.73 tok/s  out=256 (length)
+          accept_len=2.66  expert_hit=1.0  nvme=5.05 GB  engram_rows=212564
+  run2    isl=8171 ttft=   8284.7 ms  tpot=  27.20 ms  decode= 36.77 tok/s  out=256 (length)
+          accept_len=3.2  expert_hit=1.0  nvme=3.7 GB  engram_rows=208925
+  run3    isl=8178 ttft=   6975.6 ms  tpot=  32.77 ms  decode= 30.52 tok/s  out=256 (length)
+          accept_len=2.59  expert_hit=1.0  nvme=3.81 GB  engram_rows=213371
+  -> MEDIAN  ttft=8284.6991 ms  tpot=32.7661 ms  decode=30.5193 tok/s
+  -> ENGINE  accept_len=2.66  expert_hit=1.0  nvme=3.81 GB  engram_rows=212564
+  wrote /home/ryan/git/tidelm-glm/results/ds41-packed-20261022/random8k.json
