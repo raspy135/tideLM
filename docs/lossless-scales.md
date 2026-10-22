@@ -71,3 +71,9 @@ prose/code and 256 for random 8K. These use a different prompt salt and resident
 set from the earlier README run; compare kernel overhead with the fixed-output
 test above. The README's DS chart remains the default native-scale profile,
 with candidate indexing on; scale packing is optional.
+
+The optional packed-profile run measured 23.0142 tok/s prose, 39.4160 tok/s
+code, 29.8773 tok/s random 8K, and 9.016 s 8K TTFT. These numbers do not improve
+the earlier chart; retain packing for its resident capacity rather than claiming
+a throughput gain. The packing audit took about 263 seconds plus final pack
+writes on the development head node.
