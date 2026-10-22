@@ -28,6 +28,32 @@ service held on one node was freed, and was not re-measured. The first-token tim
 warm-up requests before the three measured. The first requests after a boot run 1-3 s slower, so a time from one or two of
 them is that much off ([gotchas](docs/gotchas.md)).*
 
+**DeepSeek candidate indexing, 2026-10-21 (opt-in).** On two Sparks with a 32K context
+cap, a 97.4 GB arena per node and 10,208 initially resident experts, the latest
+`bench/bench.py` comparison measured:
+
+| Workload | Baseline decode | `DSV41_INDEX_CANDIDATES=1` | Observed change |
+| --- | ---: | ---: | ---: |
+| Prose | 26.12 tok/s | 25.98 tok/s | -0.6% |
+| Code | 43.75 tok/s | 44.22 tok/s | +1.1% |
+| Random 8K-token prompt | 31.59 tok/s | 33.47 tok/s | +6.0% |
+| Random 24K-token prompt | 29.77 tok/s | 32.58 tok/s | +9.4% |
+
+Medians over three measured runs after one warm-up, temperature 0.6, top-p 0.95,
+seed 42; 1,024 output tokens for prose/code and 256 for random prompts, with
+`--ignore-eos`. Adaptive loading, hot reads and adaptive speculative depth were
+enabled; both configurations started from identical demand histories and expert
+maps. Prose/code are effectively flat. The long-prompt gains also include changes
+in acceptance and depth: at 24K, acceptance rose from 2.62 to 3.11 tokens/step.
+These are observed serving rates, rather than isolated indexing gains.
+[Raw runs, TTFT and NVMe traffic](results/flare-perf-20261021/http-bench/README.md).
+
+A separate fixed-depth greedy off/on/on/off comparison at 24,596 input tokens
+measured **69.09 → 67.43 ms/step (2.4% less decode time)**, with identical output
+and acceptance on both ranks. This is the controlled indexing result; prefill is
+unchanged. The switch remains off by default pending broader quality validation.
+[Experiment details](docs/flare-experiments.md#measured-long-context-result).
+
 ## How adaptive expert loading works
 
 A model like DeepSeek-V4.1-Flash (510 GB) or GLM-5.3 (410 GB in MXFP4) does not fit in two
