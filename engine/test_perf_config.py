@@ -22,6 +22,14 @@ class ConfigTest(unittest.TestCase):
             with patch.dict(os.environ, {flag: 'yes'}, clear=True), self.assertRaises(ValueError):
                 DecodeExperiments.from_env()
 
+    def test_concurrent_baseline_remains_allowed_but_experiments_fail_early(self):
+        with patch.dict(os.environ, {'DSV41_MAX_CONCURRENCY': '2'}, clear=True):
+            self.assertEqual(DecodeExperiments.from_env(), DecodeExperiments())
+        for flag in FLAGS.values():
+            with patch.dict(os.environ, {flag: '1', 'DSV41_MAX_CONCURRENCY': '2'}, clear=True), \
+                 self.assertRaisesRegex(ValueError, 'MAX_CONCURRENCY=1'):
+                DecodeExperiments.from_env()
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -6,7 +6,10 @@ The implementation branch is `codex/flare-perf-experiments`.
 
 All experiments default off. No serving profile has changed, no build or GPU
 benchmark has run, and there is no measured speedup. GPU use remains paused at
-the user's request. The shared rank guard compares the flags and new numerical
+the user's request. Enabled experiments require concurrency one: batched decode
+composes separate HC/router boundaries that have not been qualified for these
+paths. The concurrent baseline remains supported with all experiments off.
+The shared rank guard compares the flags and new numerical
 kernel sources; health reports them as `decode_experiments`. Prefix persistence
 already hashes engine sources and DSV41 settings, so different arms cannot reuse
 each other's disk prefixes.

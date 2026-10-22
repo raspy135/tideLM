@@ -21,6 +21,11 @@ class DecodeExperiments:
             if value not in ("0", "1"):
                 raise ValueError(f"{key} must be 0 or 1")
             values[field] = value == "1"
+        # Batched decode composes its own HC/router boundaries. Until those
+        # paths are qualified, do not silently mix experimental solo rounds
+        # with baseline batched rounds under the same advertised configuration.
+        if any(values.values()) and os.environ.get("DSV41_MAX_CONCURRENCY", "1") != "1":
+            raise ValueError("decode performance experiments require DSV41_MAX_CONCURRENCY=1")
         return cls(**values)
 
     def boot_fields(self):
