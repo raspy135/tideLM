@@ -1,0 +1,72 @@
+{
+  "format": "tidelm-scale-blocks-v1",
+  "checkpoint": "DeepSeek-V4.1-Flash-1017",
+  "byte_exact": true,
+  "samples": [
+    {
+      "layer": 0,
+      "expert": 0,
+      "tp_rank": 1,
+      "scale_sha256": "1fae09c5888a2c65eb1701ec36731a1e72b4c08300119b09a8778378bef4151c",
+      "native_scale_bytes": 552960,
+      "encoded_scale_bytes": 190675,
+      "weight_bytes": 8847360,
+      "hypothetical_slot_saving_fraction": 0.038539645458877995
+    },
+    {
+      "layer": 0,
+      "expert": 1,
+      "tp_rank": 1,
+      "scale_sha256": "1f35265f6246142bc8f805d44cba313b2080ada3c9e358d6c693570137be6934",
+      "native_scale_bytes": 552960,
+      "encoded_scale_bytes": 190396,
+      "weight_bytes": 8847360,
+      "hypothetical_slot_saving_fraction": 0.03856932529956427
+    },
+    {
+      "layer": 20,
+      "expert": 0,
+      "tp_rank": 1,
+      "scale_sha256": "70071c7ef3b27d79efac880feae1f76f348e1b3b93b0b1db5e6db8256591e07f",
+      "native_scale_bytes": 552960,
+      "encoded_scale_bytes": 190546,
+      "weight_bytes": 8847360,
+      "hypothetical_slot_saving_fraction": 0.0385533683959695
+    },
+    {
+      "layer": 20,
+      "expert": 1,
+      "tp_rank": 1,
+      "scale_sha256": "284fac44e4b6ae47751b371a5b55f80c56ebe610111e8a782ed6e3de852cb65d",
+      "native_scale_bytes": 552960,
+      "encoded_scale_bytes": 190228,
+      "weight_bytes": 8847360,
+      "hypothetical_slot_saving_fraction": 0.038587197031590414
+    },
+    {
+      "layer": 39,
+      "expert": 0,
+      "tp_rank": 1,
+      "scale_sha256": "b1b4758ea8afd04d572a80a2de165ace87ea4b64a1d0fadd4c1177d6588a82de",
+      "native_scale_bytes": 552960,
+      "encoded_scale_bytes": 190325,
+      "weight_bytes": 8847360,
+      "hypothetical_slot_saving_fraction": 0.03857687823393246
+    },
+    {
+      "layer": 39,
+      "expert": 1,
+      "tp_rank": 1,
+      "scale_sha256": "47031bc5411f0af50ab0d581827bc9b6629a8a00039ead893dbb41dd4bfcfcb8",
+      "native_scale_bytes": 552960,
+      "encoded_scale_bytes": 190468,
+      "weight_bytes": 8847360,
+      "hypothetical_slot_saving_fraction": 0.03856166598583878
+    }
+  ],
+  "native_scale_bytes": 3317760,
+  "encoded_scale_bytes": 1142638,
+  "hypothetical_slot_saving_fraction": 0.038564680067628906,
+  "runtime_arena_integration": false,
+  "expansion_scratch_included": false
+}

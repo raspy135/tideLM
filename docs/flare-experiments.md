@@ -80,6 +80,36 @@ explicit for target-arithmetic changes.
 
 ## Remaining residency and workload work
 
+`engine/scale_blocks.py` implements a standalone lossless scale codec and
+`scale_blocks_cuda.py` provides explicit CUDA expansion qualification. It is
+TideLM's `tidelm-scale-blocks-v1` format, not a reader for b12x CSF. Adjacent
+exponent palettes, one-bit codes, exact byte exceptions, and raw fallbacks
+compress the existing bytes without changing quantization. Incompressible
+planes remain raw. Offsets and exceptions are validated before device address
+arithmetic. CPU tests cover every byte value, partial blocks, noncontiguous
+inputs, mixed raw/palette blocks, and malformed records. GPU expansion has not
+run; its test includes poisoning and reusing caller-owned scratch.
+
+The CPU-only auditor reads scales and weight sizes, never model weights into a
+GPU. On local `DeepSeek-V4.1-Flash-1017`, layers 0/20/39 and experts 0/1, output
+TP2 slices, every scale byte round-tripped:
+
+| TP half | Native scale bytes | Encoded bytes including offsets | Saving relative to sampled weights plus scales |
+| --- | ---: | ---: | ---: |
+| rank 0 | 3,317,760 | 1,142,828 | 3.8561% |
+| rank 1 | 3,317,760 | 1,142,638 | 3.8565% |
+
+These are six sampled experts per rank, not an all-expert compression result,
+an arena-memory measurement, or a throughput measurement. Each sample includes
+8,847,360 packed weight bytes and 552,960 native scale bytes per rank. Reports
+retain sample hashes under `results/flare-perf-20261021/scale-rank{0,1}.json`.
+Reproduce without a model load:
+
+```sh
+python3 tools/audit_scale_compression.py --model-dir /path/to/DeepSeek-V4.1-Flash-1017 \
+  --layers 0,20,39 --experts 0,1 --tp-rank 0
+```
+
 Lossless scale storage needs a separate format/arena integration, not just an
 encoder: native kernels index scale planes by global arena slot. Keeping those
 planes alongside compressed copies would increase memory. Selected-slot scratch,

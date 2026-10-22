@@ -163,6 +163,20 @@ class DecodeCudaTest(unittest.TestCase):
             self.assertTrue(torch.equal(current, expected))
             previous = current
 
+    def test_scale_expansion_preserves_every_byte_and_overwrites_poisoned_scratch(self):
+        import numpy as np
+        from engine.scale_blocks import encode, expand_cuda
+        source = np.full((31, 160), 126, np.uint8)
+        source[:, 1::2] = 127
+        source.reshape(-1)[::31] = 255
+        for values in (source, np.arange(256, dtype=np.uint8), source[:, ::3]):
+            packed = encode(values)
+            out = torch.full(values.shape, 0x55, dtype=torch.uint8, device='cuda')
+            expand_cuda(packed, out)
+            np.testing.assert_array_equal(out.cpu().numpy(), values)
+            out.fill_(0xaa)
+            expand_cuda(packed, out)
+            np.testing.assert_array_equal(out.cpu().numpy(), values)
 
 
 if __name__ == '__main__':
