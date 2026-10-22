@@ -58,7 +58,7 @@ def instrument_graphs(eng, rec):
                 segs[i] = (kind, L, Timed(g, f"{k} x{key[1]}", rec))
         elif isinstance(key, tuple) and key[0] == "mtp" and not isinstance(entry[0], Timed):
             eng.graphs[key] = (Timed(entry[0], f"mtp-graph x{key[1]}{'' if key[2] else ' fill'}", rec),) + tuple(entry[1:])
-        elif isinstance(key, int) and not isinstance(entry[0], Timed):
+        elif (isinstance(key, int) or isinstance(key, tuple) and key[0] == "decode") and not isinstance(entry[0], Timed):
             eng.graphs[key] = (Timed(entry[0], f"graph x{key}", rec),) + tuple(entry[1:])
 
 

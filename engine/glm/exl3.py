@@ -181,6 +181,11 @@ def routed_up(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, arena
     else:
         import fp4_moe as F4
         _, tile, block_m = prefill_setting()
+        # The tiled prefill kernels specialize K2=4..6 (2/3 bits). Native
+        # EXL3 MTP experts are 4-bit: use the grouped kernel's wider range.
+        # Sending them to the tiled path traps on the GPU instead of raising.
+        if arena.slot_bits > 3:
+            tile = None
         uniq, inv = torch.unique(pick.view(T, K), return_inverse=True)
         block_slot, block_pair, NB = F4.build_routing(inv.to(torch.int32), int(uniq.numel()), block_m)
         block_slot = torch.where(block_slot >= 0, uniq.to(torch.int32)[block_slot.clamp_min(0)], block_slot)

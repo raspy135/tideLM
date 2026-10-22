@@ -188,6 +188,7 @@ class GlmTP:
         if need and mem_available() < need * 1e9:
             raise RuntimeError(f"only {mem_available() / 1e9:.1f} GB MemAvailable, need {need:.0f}")
         self.cfg = cfg = GlmConfig.load(model_dir)
+        self.exl3_checkpoint = (cfg.extra['raw'].get('quantization_config') or {}).get('quant_method') == 'exl3'
         self.ck = GlmCheckpoint(model_dir)
         self.model_dir = model_dir
         self.max_seq = int(max_seq or env("GLM_MAX_SEQ", "32768"))
@@ -206,6 +207,13 @@ class GlmTP:
         # GLM_INDEX_KERNEL=1: the indexer's scores in one Triton kernel (engine/glm/index_kernel.py)
         # instead of fp32 einsums over [T, 32, S]; decode scored all max_seq positions that way.
         self.index_kernel = env("GLM_INDEX_KERNEL", "1") == "1"
+        index_buckets = env("GLM_INDEX_BUCKETS", "0")
+        if index_buckets not in ('0', '1'):
+            raise ValueError('GLM_INDEX_BUCKETS must be 0 or 1')
+        self.index_buckets = index_buckets == '1'
+        self.index_bound = self.max_seq
+        self.index_bucket_lru = []
+        self.index_bucket_evictions = 0
         # GLM_ATTN_KERNEL=1: the sparse attention in one Triton kernel (engine/glm/sparse_attn.py)
         # instead of gathering each 32-row block's selected latents into BF16 copies.
         self.attn_kernel = env("GLM_ATTN_KERNEL", "1") == "1"
@@ -215,7 +223,7 @@ class GlmTP:
         if self.kv_split and not (self.index_kernel and self.attn_kernel):
             raise ValueError("GLM_KV_SPLIT=1 needs GLM_INDEX_KERNEL=1 and GLM_ATTN_KERNEL=1")
         self.s_loc = -(-self.max_seq // self.world) if self.kv_split else self.max_seq
-        self.exl3_attn = env("GLM_EXL3_ATTN", "0") == "1"
+        self.exl3_attn = self.exl3_checkpoint or env("GLM_EXL3_ATTN", "0") == "1"
         # Dense weights still wider than FP8 (docs/gotchas.md): GLM_KVB_FP8=1 keeps MLA's absorbed
         # kv_b (w_uk, w_uv) in the checkpoint's FP8 (engine/glm/kvb_fp8.py; 1.16 -> 0.58 GB a rank),
         # GLM_EMBED_8BIT=int8 (or fp8) the embedding rows in 8 bits with a scale per 128 values
@@ -223,6 +231,8 @@ class GlmTP:
         # exact-model logits KL 0.015 / 5.2% top-1 flips, docs/gotchas.md),
         # GLM_ROUTER_BF16=1 the routers in BF16 with fp32 sums (0.48 -> 0.24).
         self.kvb_fp8 = env("GLM_KVB_FP8", "0") == "1"
+        if self.exl3_checkpoint and (self.kvb_fp8 or env('GLM_HEAD', 'exl3') != 'exl3'):
+            raise ValueError('native EXL3 checkpoint requires GLM_KVB_FP8=0 and GLM_HEAD=exl3')
         self.embed_q = env("GLM_EMBED_8BIT", "")
         assert self.embed_q in ("", "int8", "fp8"), self.embed_q
         self.embed_fp8 = bool(self.embed_q)            # (any 8-bit embedding: an (8-bit, scales) pair)
@@ -255,20 +265,20 @@ class GlmTP:
         self.moe_layers = [L for L in range(self.nL) if not self.dense(L)]
         self.n_pseudo = cfg.inter // cfg.moe_inter
         fixed = len(self.moe_layers) * cfg.shared_experts + sum(cfg.dense_mlp) * self.n_pseudo
-        # GLM_EXPERT_FORMAT=exl3: the decoder layers' routed experts come from the EXL3 pack at
-        # GLM_EXL3_PACK ({rank} filled in) into their own arena (engine/glm/exl3.py). The shared
-        # experts, the dense layers and the MTP layer's experts (4-bit in that checkpoint, a width
-        # the routed arena does not hold) stay MXFP4, the MTP layer's all resident. Slot numbers
-        # run through both: MXFP4 [0, x3_off), EXL3 from x3_off on.
+        # GLM_EXPERT_FORMAT=exl3: decoder routed experts use their own 3-bit arena.
+        # A native EXL3 checkpoint also supplies fixed weights and a separate 4-bit MTP arena.
+        # The older Quark-backed hybrid retains MXFP4 fixed/MTP slots. Logical slot numbers
+        # reserve [0, x3_off) for fixed bookkeeping on both paths.
         self.xfmt = env("GLM_EXPERT_FORMAT", "mxfp4")
         assert self.xfmt in ("mxfp4", "exl3"), self.xfmt
+        if self.exl3_checkpoint and self.xfmt != 'exl3':
+            raise ValueError('an EXL3 checkpoint requires GLM_EXPERT_FORMAT=exl3')
         self.x3 = self.x3pack = None
         if self.xfmt == "exl3":
             from .exl3 import Exl3Pack
             self.x3pack = Exl3Pack(env("GLM_EXL3_PACK", "").format(rank=r), cfg.hidden, cfg.moe_inter)
-        # GLM_MTP_FULL=1: the MTP layer's routed experts are all resident (MXFP4, 2.5 GB a rank)
-        # and out of the swaps: drafts never substitute, and decode-layer residency no longer
-        # trades against the drafter. Always so under exl3 (the arena cannot hold their 4 bits).
+        # GLM_MTP_FULL=1: MTP routed experts are all resident and outside swaps, so drafts never
+        # substitute. Always so under EXL3: decoder slots cannot hold MTP's published 4 bits.
         self.mtp_full = self.mtp_on and (self.x3pack is not None or env("GLM_MTP_FULL", "1") == "1")
         if self.mtp_full:
             fixed += cfg.experts
@@ -405,7 +415,7 @@ class GlmTP:
         mx_bytes = 0                       # MXFP4 bytes outside the routed budget (exl3: fixed + MTP)
         if self.x3pack:
             from .exl3 import slot_bytes
-            mx_bytes, per = fixed * per, slot_bytes(r, W, cfg.hidden, cfg.moe_inter)
+            mx_bytes, per = (per if self.exl3_checkpoint else fixed * per), slot_bytes(r, W, cfg.hidden, cfg.moe_inter)
         want = slots if slots is not None else env("GLM_SLOTS", "auto")
         if want == "auto":
             self.ck.drop_cache()
@@ -420,7 +430,7 @@ class GlmTP:
         self._boot_guard(transient)
         if self.x3pack:
             from .exl3 import make_arena
-            self.arena = Arena(cfg.moe_inter, cfg.hidden, fixed, r, W, self.dev)
+            self.arena = Arena(cfg.moe_inter, cfg.hidden, 1 if self.exl3_checkpoint else fixed, r, W, self.dev)
             self.x3 = make_arena(self.slots_resident + transient, r, W, self.dev, cfg.hidden, cfg.moe_inter)
             self.x3_off = fixed
             self.n_slots = fixed + self.x3.slots
@@ -520,7 +530,9 @@ class GlmTP:
     # ------------------------------------------------------------------ setup
     @staticmethod
     def ck_has_mtp(model_dir, cfg):
-        return GlmCheckpoint(model_dir).has(f"{P}layers.{cfg.layers}.eh_proj.weight")
+        ck = GlmCheckpoint(model_dir)
+        prefix = f"{P}layers.{cfg.layers}.eh_proj"
+        return ck.has(prefix + '.weight') or ck.has(prefix + '.trellis')
 
     def full(self, L):
         return L >= self.cfg.layers or self.cfg.indexer_full[L]
@@ -535,14 +547,18 @@ class GlmTP:
                                           "index_kernel.py", "exl3.py", "sparse_attn.py",
                                           "norm_kernel.py", "direct_io.py", "mxfp4_dense.py", "exl3_attn.py",
                                           "kv_split.py", "prefix_store.py", "kvb_fp8.py", "kv_fp4.py",
-                                          "route_kernel.py", "rope_kernel.py"))).hexdigest()[:16]
+                                          "route_kernel.py", "rope_kernel.py", "index_bounds.py", "exl3_model.py"))).hexdigest()[:16]
         self.code_digest = digest
         mine = {"version": VERSION, "code": digest, "miss": self.miss, "native": self.native,
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
-                "head": env("GLM_HEAD", "bf16"), "depth": env("GLM_MTP_DEPTH", "3"), "db": env("GLM_STATS_DB", ""),
+                "head": env("GLM_HEAD", "exl3" if self.exl3_checkpoint else "bf16"), "depth": env("GLM_MTP_DEPTH", "3"), "db": env("GLM_STATS_DB", ""),
                 "xfmt": self.xfmt, "kv": env("GLM_KV", "bf16"), "kv_fp8_layers": self.kv_fp8_layers, "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "fused_norm": FUSED_NORM, "h_ring": self.h_ring_n, "fixed_dense": self.fixed_dense, "exl3_attn": self.exl3_attn, "kv_split": self.kv_split, "prefix_disk": env("GLM_PREFIX_DISK", "0"), "kvb_fp8": self.kvb_fp8, "embed_q": self.embed_q, "router_bf16": self.router_bf16, "draft_head": env("GLM_DRAFT_HEAD", "same"), "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
                 "fuse_qkv_a": self.fuse_qkv_a, "prefill_reduce": self.prefill_reduce, "dense_causal": self.dense_causal,
+                "index_buckets": self.index_buckets,
+                "exl3_checkpoint": self.exl3_checkpoint,
+                "checkpoint_manifest": hashlib.sha256((Path(self.model_dir) / 'model.safetensors.index.json').read_bytes()).hexdigest(),
+                "exl3_source": self.x3pack.reader.header['source_sha256'] if self.x3pack else None,
                 "two_pass_min": self.two_pass_min,
                 "x3_prefill": [env(k, "") for k in ("GLM_EXL3_PREFILL", "DSV41_EXL3_PREFILL_KERNEL", "DSV41_EXL3_PREFILL_TILE",
                                                      "DSV41_EXL3_PREFILL_BM", "DSV41_EXL3_PREFILL_SMEM_TILE")],
@@ -563,6 +579,9 @@ class GlmTP:
             raise RuntimeError(f"glm ranks disagree: {[{k: v.get(k) for k in mine if v.get(k) != allv[0].get(k)} for v in allv]}")
 
     def _load_dense(self):
+        if self.exl3_checkpoint:
+            from .exl3_model import load_dense
+            return load_dense(self)
         cfg, d, ck, W, r = self.cfg, self.dev, self.ck, self.world, self.rank
         hq, hv = cfg.qk_dim, cfg.nope + cfg.v_dim
         self.embed = ck.get_rows(P + "embed_tokens.weight", r * self.vl, (r + 1) * self.vl)
@@ -741,6 +760,9 @@ class GlmTP:
         return gate, up, down
 
     def _place_fixed(self):
+        if self.exl3_checkpoint:
+            from .exl3_model import place_fixed
+            return place_fixed(self)
         cfg = self.cfg
         slot = 0
         self.fixed: dict[int, torch.Tensor] = {}
@@ -1172,7 +1194,7 @@ class GlmTP:
         T = x.shape[0]
         decode = T <= self.decode_rows
         positions, cos, sin, own_rows, lb = self._attn_ctx(L, T, decode, x.device)
-        S = self.max_seq if decode else self.pos + T
+        S = self.index_bound if decode else self.pos + T
         if "qkv_a" in lw:
             y = lw["qkv_a"](x)
             q_resid = rms(y[:, :cfg.q_lora], lw["q_norm"], LATENT_EPS)
@@ -1307,8 +1329,9 @@ class GlmTP:
         q = torch.cat([q_lat, q_rope], -1).reshape(T, -1)                      # [T, hl * 576] bf16
         send = q.view(torch.uint8)
         if qw is not None:
-            vals, sel = index_scores(qw[0], qw[1], self.i_cache[L], positions, self.s_loc, cfg.index_dim ** -0.5,
-                                     W, r).topk(min(cfg.index_topk, self.s_loc), -1)
+            bound = min(self.s_loc, -(-self.index_bound // W))
+            vals, sel = index_scores(qw[0], qw[1], self.i_cache[L], positions, bound, cfg.index_dim ** -0.5,
+                                     W, r).topk(min(cfg.index_topk, bound), -1)
             send = torch.cat([send, vals.view(torch.uint8)], 1)
         g = gather_rows(self.comm, send)                                       # [W, T, bytes]
         qb = q.shape[1] * 2
@@ -1766,6 +1789,16 @@ class GlmTP:
                 wr = torch.where(bad, torch.zeros_like(w[:, :k]), w[:, :k])
                 rs = rs.clamp_min(0)
                 slots, w = slots[:, k:].contiguous(), w[:, k:]
+        if self.exl3_checkpoint:
+            from .exl3_model import mlp
+            out = mlp(self, L, x, slots, w, rs if x3 else None, wr if x3 else None)
+            if self._streamed:
+                sl, missing = self._streamed
+                for expert in missing:
+                    self.lut[sl, expert] = -1
+            if pf:
+                self._pf_release()
+            return out
         if self.gather_merge:
             # One all-gather each way. The routed EXL3 and the fixed experts' intermediates go
             # together; every pick's output rows are weighted and summed on the rank that owns
@@ -1847,9 +1880,41 @@ class GlmTP:
     def _step(self, ids):
         return self.logits(self._layers(self.embed_ids(ids)))
 
+    def _set_index_bound(self, end):
+        if not self.index_buckets:
+            return
+        from .index_bounds import index_bucket, bucket_keys
+        bound = index_bucket(end, self.max_seq)
+        self.index_bound = bound
+        if bound in self.index_bucket_lru:
+            self.index_bucket_lru.remove(bound)
+        self.index_bucket_lru.append(bound)
+        # A separate split catalog per width and bucket otherwise grows across
+        # long chats. Two buckets cover normal boundary crossings and MTP fill.
+        if len(self.index_bucket_lru) > 2:
+            old = self.index_bucket_lru.pop(0)
+            keys = bucket_keys(self.graphs, old)
+            if keys:
+                torch.cuda.synchronize()
+                for key in keys:
+                    del self.graphs[key]
+                self.index_bucket_evictions += len(keys)
+                # A pool handle ceases to be usable after its final capture is
+                # destroyed. Keeping that handle across LRU eviction triggers
+                # CUDACachingAllocator's use_count assertion on the next capture.
+                # Start a fresh shared pool for subsequent captures. Surviving
+                # graphs retain their original pools; private MTP entries do
+                # not prove that the shared pool still has a live capture.
+                self._graph_pool_h = None
+
+    def _decode_key(self, kind, rows, *, logits=True):
+        from .index_bounds import graph_key
+        return graph_key(kind, rows, self.index_bound if self.index_buckets else None, logits=logits)
+
     def _replay(self, ids):
         T = ids.numel()
-        entry = self.graphs.get(T)
+        key = self._decode_key('decode', T)
+        entry = self.graphs.get(key)
         if entry is None:
             static_ids = ids.clone()
             side = self._side_stream()
@@ -1861,7 +1926,7 @@ class GlmTP:
             graph = torch.cuda.CUDAGraph()
             with self.capture_lock, torch.cuda.graph(graph):
                 static_out, static_h = self._step(static_ids)
-            entry = self.graphs[T] = (graph, static_ids, static_out, static_h)
+            entry = self.graphs[key] = (graph, static_ids, static_out, static_h)
             torch.cuda.empty_cache()
             self.log(f"[glm] captured decode graph for {T} rows")
         graph, static_ids, static_out, static_h = entry
@@ -1963,9 +2028,10 @@ class GlmTP:
 
     def _replay_split(self, ids):
         T = ids.numel()
-        entry = self.graphs.get(("split", T))
+        key = self._decode_key('split', T)
+        entry = self.graphs.get(key)
         if entry is None:
-            entry = self.graphs[("split", T)] = self._capture_split(ids)
+            entry = self.graphs[key] = self._capture_split(ids)
         segs, st_ids, st_out, st_h, _ = entry
         st_ids.copy_(ids)
         n, st = self.hot_c, self.hot_stats
@@ -2044,7 +2110,8 @@ class GlmTP:
         """GLM_HOT_ASYNC decode: install the reads the last forward asked for, replay this one's
         graph, then plan its reads (the caller reads the logits next, so waiting here is free)."""
         T = ids.numel()
-        entry = self.graphs.get(("hot", T))
+        key = self._decode_key('hot', T)
+        entry = self.graphs.get(key)
         if entry is None:
             if not hasattr(self, "_hot_dev"):
                 self._hot_dev = torch.zeros((self.nL, 4 * self.hot_c), dtype=torch.float32, device=self.dev)
@@ -2064,7 +2131,7 @@ class GlmTP:
             with self.capture_lock, torch.cuda.graph(graph, pool=self._graph_pool()):
                 st_out, st_h = self._step_hot(st_ids)
             torch.cuda.empty_cache()
-            entry = self.graphs[("hot", T)] = (graph, st_ids, st_out, st_h)
+            entry = self.graphs[key] = (graph, st_ids, st_out, st_h)
             self.log(f"[glm] captured decode graph with async hot reads for {T} rows")
         graph, st_ids, st_out, st_h = entry
         self._hot_install()
@@ -2181,10 +2248,13 @@ class GlmTP:
         next_ids = torch.as_tensor(next_ids, dtype=torch.long, device=self.dev).reshape(-1)
         T = next_ids.numel()
         saved, saved_t = self.pos, self.pos_t.clone()
+        saved_bound = self.index_bound
         self.pos = pos0
         self.pos_t.fill_(pos0)
+        if T <= self.decode_rows:
+            self._set_index_bound(pos0 + T)
         if T <= self.mtp_graph_rows and self.use_graphs and self.miss == "substitute":
-            key = ("mtp", T, logits)
+            key = self._decode_key('mtp', T, logits=logits)
             entry = self.graphs.get(key)
             if entry is None:
                 st_ids, st_h = next_ids.clone(), h_prev.to(torch.bfloat16).clone()
@@ -2195,7 +2265,11 @@ class GlmTP:
                         self._mtp_core(st_ids, st_h, logits)
                 torch.cuda.current_stream().wait_stream(side)
                 graph = torch.cuda.CUDAGraph()
-                with self.capture_lock, torch.cuda.graph(graph, pool=self._graph_pool()):
+                # Native EXL3 fixed/MTP paths introduce more temporary buffers
+                # than the Quark path. Keep each draft graph's storage private
+                # while qualifying its lifetime across target graph replays.
+                pool = None if self.exl3_checkpoint or self.index_buckets else self._graph_pool()
+                with self.capture_lock, torch.cuda.graph(graph, pool=pool):
                     st_hn, st_z = self._mtp_core(st_ids, st_h, logits)
                 entry = self.graphs[key] = (graph, st_ids, st_h, st_hn, st_z)
                 torch.cuda.empty_cache()
@@ -2208,6 +2282,7 @@ class GlmTP:
         else:
             out = self._mtp_core(next_ids, h_prev, logits)
         self.pos = saved
+        self.index_bound = saved_bound
         self.pos_t.copy_(saved_t)
         return out
 
@@ -2299,7 +2374,7 @@ class GlmTP:
                "exl3_attn": self.exl3_attn, "model": hashlib.sha256(cfg_bytes).hexdigest(), "dir": str(self.model_dir),
                "pack": env("GLM_EXL3_PACK", ""),
                "numerics": [FUSED_NORM, self.attn_kernel, self.index_kernel, self.fixed_dense, self.gather_merge,
-                            self.native, self.prefill_moe, self.miss, self.kvb_fp8, self.embed_q, self.router_bf16,
+                            self.native, self.prefill_moe, self.miss, self.kvb_fp8, self.embed_q, self.router_bf16, self.index_buckets,
                             *([self.kv4_prefill] if env("GLM_KV", "bf16") == "fp4" else [])]}
         return hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:16]
 
@@ -2690,6 +2765,7 @@ class GlmTP:
             self.demand_tokens += T
         if T <= self.decode_rows:
             self.pos_t.fill_(self.pos)
+            self._set_index_bound(self.pos + T)
             if self.use_graphs and T in self.graph_rows and self.miss == "substitute":
                 if not self.hot_n:
                     out, hn = self._replay(ids)
