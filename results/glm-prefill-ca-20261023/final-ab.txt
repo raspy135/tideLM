@@ -1,0 +1,9 @@
+pack glm-exl3-experts-r0of2.bin rank 0/2, layer 20 (3-bit), 160 experts loaded in 0.4 s, 7.12 MB/slot
+
+T=4096  pairs 32768  experts touched 160  max/expert 2534  mean rows/expert 204.8
+  smem:4x1x8x2   blocks  672  group   3.67  rot_in    4.57  gate_up   21.90  gateup_epi    1.53  down   10.51  down_combine    2.04  | total   44.23 ms  vs first bitwise
+  ca:4x1x8x4     blocks  672  group   3.12  rot_in    4.72  gate_up   20.47  gateup_epi    1.53  down    9.87  down_combine    2.04  | total   41.75 ms  vs first bitwise
+  smem:4x1x8x2   blocks  672  group   3.10  rot_in    4.81  gate_up   21.93  gateup_epi    1.51  down   10.13  down_combine    2.06  | total   43.55 ms  vs first bitwise
+  ca:4x1x8x4     blocks  672  group   3.09  rot_in    4.33  gate_up   20.13  gateup_epi    1.52  down   10.17  down_combine    2.03  | total   41.26 ms  vs first bitwise
+
+[exited with code 0]

@@ -550,7 +550,17 @@ class GlmTP:
                                           "kv_split.py", "prefix_store.py", "kvb_fp8.py", "kv_fp4.py",
                                           "route_kernel.py", "rope_kernel.py", "index_bounds.py", "exl3_model.py"))).hexdigest()[:16]
         self.code_digest = digest
-        mine = {"version": VERSION, "code": digest, "miss": self.miss, "native": self.native,
+        # The EXL3 MoE kernels live outside engine/glm/ (tools/exl3_moe_cuda.cu) and are JIT-built
+        # per node: a stale rsync would run different kernels and emit different tokens with
+        # nothing in the log. Pin the source like V41Engine does; try/except so an MXFP4-only boot
+        # without the module still starts (both ranks then agree on None).
+        try:
+            import exl3_moe_cuda as _XC
+            x3_moe_digest = _XC.source_digest()
+        except Exception:  # noqa: BLE001
+            x3_moe_digest = None
+        mine = {"version": VERSION, "code": digest, "x3_moe_cuda": x3_moe_digest,
+                "miss": self.miss, "native": self.native,
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("GLM_HEAD", "exl3" if self.exl3_checkpoint else "bf16"), "depth": env("GLM_MTP_DEPTH", "3"), "db": env("GLM_STATS_DB", ""),
@@ -562,7 +572,8 @@ class GlmTP:
                 "exl3_source": self.x3pack.reader.header['source_sha256'] if self.x3pack else None,
                 "two_pass_min": self.two_pass_min,
                 "x3_prefill": [env(k, "") for k in ("GLM_EXL3_PREFILL", "DSV41_EXL3_PREFILL_KERNEL", "DSV41_EXL3_PREFILL_TILE",
-                                                     "DSV41_EXL3_PREFILL_BM", "DSV41_EXL3_PREFILL_SMEM_TILE")],
+                                                     "DSV41_EXL3_PREFILL_BM", "DSV41_EXL3_PREFILL_SMEM_TILE",
+                                                     "DSV41_EXL3_PREFILL_CA_TILE")],
                 "pf": [env(k, "") for k in ("GLM_PF", "GLM_PF_SLOTS", "GLM_PF_MIN_ROWS", "GLM_PF_KEEP", "GLM_PF_KEEP_MARGIN", "GLM_HOT", "GLM_HOT_MIN",
                                             "GLM_HOT_TARGET", "GLM_HOT_KEEP", "GLM_HOT_MAX", "GLM_HOT_KEEP_AUDIT", "GLM_HOT_PACE",
                                             "GLM_HOT_PACE_LEAD", "GLM_SUB_WEIGHT", "GLM_MTP_FULL", "GLM_MISS_LOG",

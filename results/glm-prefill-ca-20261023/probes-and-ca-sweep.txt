@@ -1,0 +1,15 @@
+pack glm-exl3-experts-r0of2.bin rank 0/2, layer 20 (3-bit), 160 experts loaded in 1.7 s, 7.12 MB/slot
+
+T=4096  pairs 32768  experts touched 160  max/expert 2534  mean rows/expert 204.8
+  smem:4x1x8x2   blocks  672  group   3.64  rot_in    4.59  gate_up   21.81  gateup_epi    1.53  down   11.02  down_combine    2.04  | total   44.64 ms  vs first bitwise
+  nomma:4x1x8x2  blocks  672  group   3.10  rot_in    5.02  gate_up    9.95  gateup_epi    1.54  down    5.26  down_combine    2.06  | total   26.94 ms  vs first 2.0e+01
+  notrellis:4x1x8x2 blocks  672  group   3.44  rot_in    4.33  gate_up   19.75  gateup_epi    1.51  down    9.08  down_combine    2.03  | total   40.15 ms  vs first 2.5e+03
+  ca:4x1x8x3     blocks  672  group   3.10  rot_in    4.32  gate_up   21.12  gateup_epi    1.53  down   10.67  down_combine    2.03  | total   42.78 ms  vs first bitwise
+  ca:4x1x8x4     blocks  672  group   3.22  rot_in    4.32  gate_up   20.19  gateup_epi    1.51  down   10.80  down_combine    2.03  | total   42.07 ms  vs first bitwise
+  ca:4x1x8x6     blocks  672  group   3.09  rot_in    4.82  gate_up   21.26  gateup_epi    1.51  down    9.93  down_combine    2.20  | total   42.81 ms  vs first bitwise
+  ca:4x1x8x8     blocks  672  group   3.20  rot_in    4.32  gate_up   21.18  gateup_epi    1.51  down   10.38  down_combine    2.03  | total   42.62 ms  vs first bitwise
+  ca:4x1x8x12    blocks  672  group   3.25  rot_in    4.32  gate_up   20.09  gateup_epi    1.51  down    9.91  down_combine    2.03  | total   41.12 ms  vs first bitwise
+  smem:4x1x8x2   blocks  672  group   3.08  rot_in    4.70  gate_up   21.38  gateup_epi    1.51  down   10.61  down_combine    2.18  | total   43.46 ms  vs first bitwise
+  ca:4x1x8x6     blocks  672  group   3.08  rot_in    4.32  gate_up   20.55  gateup_epi    1.51  down    9.85  down_combine    2.03  | total   41.34 ms  vs first bitwise
+
+[exited with code 0]

@@ -118,9 +118,9 @@ class Exl3Pack:
 
 def prefill_setting():
     """The prefill MoE kernel for GLM: GLM_EXL3_PREFILL=KERNEL[:TILE] ("tile:4x2x2", "smem:4x1x8x2",
-    "grouped"), else exl3_moe_cuda's DSV41_EXL3_PREFILL_* defaults. (kernel, tile, routing rows).
-    In the boot guard: the kernels differ in how K is summed (grouped) or are bit-identical (tile,
-    smem), but both ranks must run the same one."""
+    "ca:4x1x8x4", "grouped"), else exl3_moe_cuda's DSV41_EXL3_PREFILL_* defaults. (kernel, tile,
+    routing rows). In the boot guard: the kernels differ in how K is summed (grouped) or are
+    bit-identical to each other (tile, smem, ca), but both ranks must run the same one."""
     import exl3_moe_cuda as C
     spec = os.environ.get("GLM_EXL3_PREFILL", "")
     if not spec:
@@ -175,19 +175,29 @@ def routed_up(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, arena
     P = T * K
     pick = slots.reshape(-1).to(torch.int32).contiguous()
     wts = weights.float().contiguous()
+    mode = None
     if P <= 64:
         uids, ucount, members = C.decode_group(pick, T, K, arena)
         maxm, nexp, nt, warps, pf, tile = 16, P, 8, 4, 1, None
     else:
         import fp4_moe as F4
-        _, tile, block_m = prefill_setting()
+        kernel, tile, block_m = prefill_setting()
+        # "ca": the smem kernel with cp.async-staged trellis words, bit-identical to "smem" at the
+        # same W/MTW/NTB and -1.9 +- 0.3 ms a layer at 4,096 rows (2026-10-23, exl3_moe_cuda.py).
+        mode = -tile[3] if kernel == "ca" and tile is not None else None
         # The tiled prefill kernels specialize K2=4..6 (2/3 bits). Native
         # EXL3 MTP experts are 4-bit: use the grouped kernel's wider range.
         # Sending them to the tiled path traps on the GPU instead of raising.
         if arena.slot_bits > 3:
-            tile = None
+            tile, mode = None, None
         uniq, inv = torch.unique(pick.view(T, K), return_inverse=True)
-        block_slot, block_pair, NB = F4.build_routing(inv.to(torch.int32), int(uniq.numel()), block_m)
+        # precount=True: a separate count launch instead of every program scanning all P pairs
+        # (3.05 -> 2.86 ms a layer at 4,096 rows x top-8, tools/bench_exl3_prefill.py's `group`).
+        # Same blocks, verified partition-identical: same NB, same 598 used blocks, same members a
+        # block; the kernel stores by the member code's own pair index, so the order inside a block
+        # cannot move a result.
+        block_slot, block_pair, NB = F4.build_routing(inv.to(torch.int32), int(uniq.numel()), block_m,
+                                                      precount=True)
         block_slot = torch.where(block_slot >= 0, uniq.to(torch.int32)[block_slot.clamp_min(0)], block_slot)
         pair = block_pair.view(NB, block_m)
         members = torch.where(pair >= 0, (pair // K) * 32 + (pair % K), pair).to(torch.int32).contiguous()
@@ -195,8 +205,9 @@ def routed_up(x: torch.Tensor, slots: torch.Tensor, weights: torch.Tensor, arena
         ucount = torch.full((1,), NB, dtype=torch.int32, device=x.device)
         maxm, nexp, nt, warps, pf = block_m, NB, 8, 4, 2
     xd = torch.empty((P, arena.inter), dtype=torch.float16, device=x.device)
-    C._up(x.contiguous(), pick, uids, ucount, members, arena, T, K, maxm, nexp, INF, xd, nt, warps, pf, tile)
-    return xd, (pick, uids, ucount, members, wts, T, K, maxm, nexp, nt, warps, pf, tile)
+    C._up(x.contiguous(), pick, uids, ucount, members, arena, T, K, maxm, nexp, INF, xd, nt, warps, pf, tile,
+          mode=mode)
+    return xd, (pick, uids, ucount, members, wts, T, K, maxm, nexp, nt, warps, pf, tile, mode)
 
 
 @torch.no_grad()
@@ -204,5 +215,6 @@ def routed_down(xd_full: torch.Tensor, ctx, arena) -> torch.Tensor:
     """routed()'s second half: the gathered intermediate [T * k, world * inter] (rank-major
     columns) -> this rank's hidden slice of the weighted sum, fp32 [T, hidden / world]."""
     import exl3_moe_cuda as C
-    pick, uids, ucount, members, wts, T, K, maxm, nexp, nt, warps, pf, tile = ctx
-    return C._down(xd_full, pick, uids, ucount, members, wts, arena, T, K, maxm, nexp, nt, warps, pf, tile)
+    pick, uids, ucount, members, wts, T, K, maxm, nexp, nt, warps, pf, tile, mode = ctx
+    return C._down(xd_full, pick, uids, ucount, members, wts, arena, T, K, maxm, nexp, nt, warps, pf, tile,
+                   mode=mode)

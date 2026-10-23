@@ -44,12 +44,26 @@ PREFILL_BM = int(os.environ.get("DSV41_EXL3_PREFILL_BM", "32"))
 # docs/gotchas.md): no faster than "tile" at 2,048 rows, 10% faster at 4,096 with 4x1x8x2; wider
 # blocks (8x1x8, 16x1x8) and MTW = 2 are slower. The GLM profile selects it (GLM_EXL3_PREFILL).
 PREFILL_SMEM_TILE = os.environ.get("DSV41_EXL3_PREFILL_SMEM_TILE", "4x1x8x2")
+# "ca" = exl3m_prefill_smem_mode with mode -S: "smem" with the raw trellis words staged
+# global -> shared by cp.async, S stages deep, instead of the 2-deep register pipeline.
+# WxMTWxNTBxS (the 4th element is the stage count, not PF). Bit-identical to "smem" at the same
+# W/MTW/NTB -- same decode order, same mma chain -- and -1.9 +- 0.3 ms a layer (-4.3%) at 4,096
+# rows x top-8 on GLM-5.3's rank shapes (2026-10-23, tools/bench_exl3_prefill.py, interleaved
+# A/B/A/B; S = 4, 6 and 12 within noise of each other). Built for the 4x1x8 and 8x1x8 tiles.
+PREFILL_CA_TILE = os.environ.get("DSV41_EXL3_PREFILL_CA_TILE", "4x1x8x4")
 
 
 def prefill_setting(kernel: str | None = None, tile: str | None = None, block_m: int | None = None):
     """(kernel, tile tuple or None, routing block rows) for the prefill MoE path: the defaults
-    above unless overridden. tile: (nt, warps, pf) for "tile", (warps, mtw, ntb, pf) for "smem"."""
+    above unless overridden. tile: (nt, warps, pf) for "tile", (warps, mtw, ntb, pf) for "smem",
+    (warps, mtw, ntb, stages) for "ca"."""
     kernel = kernel or PREFILL_KERNEL
+    if kernel == "ca":
+        t = tuple(int(v) for v in (tile or PREFILL_CA_TILE).split("x"))
+        if len(t) != 4 or t[:3] not in ((4, 1, 8), (8, 1, 8)) or t[3] not in (3, 4, 6, 8, 12):
+            raise ValueError(f"ca prefill tile {tile or PREFILL_CA_TILE}: WxMTWxNTBxS with W/MTW/NTB "
+                             f"4x1x8 or 8x1x8 and S in 3/4/6/8/12")
+        return kernel, t, t[0] * t[1] * 16
     if kernel == "smem":
         t = tuple(int(v) for v in (tile or PREFILL_SMEM_TILE).split("x"))
         if len(t) != 4:
@@ -96,11 +110,13 @@ def _library():
     lib.exl3m_grouped.argtypes = [ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr,
                                   i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, ptr]
     lib.exl3m_gateup.argtypes = [ptr, ptr, ptr, ptr, ptr, ptr, i32, i32, i32, i32, i32, i32, i32, f32, i32, ptr]
-    lib.exl3m_down_combine.argtypes = [ptr, ptr, ptr, ptr, ptr, ptr, i32, i32, i32, i32, i32, i32, ptr]
+    lib.exl3m_down_combine.argtypes = [ptr, ptr, ptr, ptr, ptr, i32, i32, i32, i32, i32, i32, ptr]
     lib.exl3m_prefill.argtypes = [ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr,
                                   i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, ptr]
     lib.exl3m_prefill_smem.argtypes = [ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr,
                                        i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, ptr]
+    lib.exl3m_prefill_smem_mode.argtypes = [ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr,
+                                            i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, ptr]
     lib.exl3m_dense_rot.argtypes = [ptr, i32, ptr, ptr, i32, i32, i32, i32, ptr]
     lib.exl3m_dense_out.argtypes = [ptr, ptr, ptr, i32, i32, i32, i32, i32, ptr]
     return lib
@@ -147,7 +163,10 @@ def warm(arena) -> None:
 
 
 def _grouped_or_tile(lib, tile, x0, x1, t0, t1, k2a, k2b, uids, ucount, members, z, Kd, N, P, maxm, K, nexp_max,
-                     mats, nt, warps, pf, st):
+                     mats, nt, warps, pf, st, mode=None):
+    """mode (len-4 tiles only): None = exl3m_prefill_smem; 1/2 = its probes; -S = cp.async, S stages
+    (exl3m_prefill_smem_mode; bit-identical for -S, garbage output for the probes). The smem tile's
+    4th element is PF for mode None and the cp.async stage count for mode "ca" callers."""
     if tile is None:
         lib.exl3m_grouped(x0, x1, t0, t1, k2a, k2b, uids, ucount, members, z, int(Kd), int(N), int(P), 1,
                           int(maxm), int(K), int(nexp_max), mats, nt, warps, pf, 2, 10, CB_MUL1, st)
@@ -155,6 +174,10 @@ def _grouped_or_tile(lib, tile, x0, x1, t0, t1, k2a, k2b, uids, ucount, members,
         tw, tmtw, tntb, tpf = tile
         if tw * tmtw * 16 != maxm:
             raise ValueError(f"smem prefill tile {tile} wants {tw * tmtw * 16}-row routing blocks, got {maxm}")
+        if mode is not None:
+            lib.exl3m_prefill_smem_mode(x0, x1, t0, t1, k2a, k2b, uids, ucount, members, z, int(Kd), int(N),
+                                        int(P), int(K), int(nexp_max), mats, tw, tmtw, tntb, int(mode), st)
+            return
         lib.exl3m_prefill_smem(x0, x1, t0, t1, k2a, k2b, uids, ucount, members, z, int(Kd), int(N), int(P), int(K),
                                int(nexp_max), mats, tw, tmtw, tntb, tpf, 4, 6, st)
     else:
@@ -163,7 +186,8 @@ def _grouped_or_tile(lib, tile, x0, x1, t0, t1, k2a, k2b, uids, ucount, members,
                           int(nexp_max), mats, int(maxm), tnt, tw, tpf, 4, 6, st)
 
 
-def _up(x, pick, uids, ucount, members, arena, T, K, maxm, nexp_max, swiglu_limit, xd, nt, warps, pf, tile=None):
+def _up(x, pick, uids, ucount, members, arena, T, K, maxm, nexp_max, swiglu_limit, xd, nt, warps, pf, tile=None,
+        mode=None):
     """rot_in + gate/up grouped + gate/up epilogue: this rank's half of the rotated down input, fp16 into `xd`
     [P, inter] (any 16-bit buffer viewed as fp16)."""
     P = T * K
@@ -184,7 +208,8 @@ def _up(x, pick, uids, ucount, members, arena, T, K, maxm, nexp_max, swiglu_limi
     V = ctypes.c_void_p
     _grouped_or_tile(lib, tile, V(xh0.data_ptr()), V(xh1.data_ptr()), V(p["t1p"].data_ptr()), V(p["t3p"].data_ptr()),
                      V(p["k2"].data_ptr()), V(p["k2"].data_ptr()), V(uids.data_ptr()), V(ucount.data_ptr()),
-                     V(members.data_ptr()), V(z.data_ptr()), dim, inter, P, maxm, K, nexp_max, 2, nt, warps, pf, st)
+                     V(members.data_ptr()), V(z.data_ptr()), dim, inter, P, maxm, K, nexp_max, 2, nt, warps, pf, st,
+                     mode=mode)
     lib.exl3m_gateup(ctypes.c_void_p(z.data_ptr()), ctypes.c_void_p(pick.data_ptr()),
                      ctypes.c_void_p(arena.svh1.data_ptr()), ctypes.c_void_p(arena.svh3.data_ptr()),
                      ctypes.c_void_p(suh2_base), ctypes.c_void_p(xd.data_ptr()),
@@ -192,7 +217,8 @@ def _up(x, pick, uids, ucount, members, arena, T, K, maxm, nexp_max, swiglu_limi
                      float(swiglu_limit), 1, st)
 
 
-def _down(xd_full, pick, uids, ucount, members, weights, arena, T, K, maxm, nexp_max, nt, warps, pf, tile=None):
+def _down(xd_full, pick, uids, ucount, members, weights, arena, T, K, maxm, nexp_max, nt, warps, pf, tile=None,
+          mode=None):
     """down grouped + rotate * svh + the top-k weighted combine over the gathered [P, world * inter]
     fp16 input: this rank's [T, down_n] fp32 slice of the routed output."""
     P = T * K
@@ -200,7 +226,6 @@ def _down(xd_full, pick, uids, ucount, members, weights, arena, T, K, maxm, nexp
     dev = xd_full.device
     p = _ptrs(arena)
     zd = torch.empty((1, P, down_n), dtype=torch.float32, device=dev)
-    y = torch.empty((P, down_n), dtype=torch.float32, device=dev)
     local = torch.empty((T, down_n), dtype=torch.float32, device=dev)
     wts = weights.reshape(-1).float().contiguous()
     lib = _lib()
@@ -209,9 +234,9 @@ def _down(xd_full, pick, uids, ucount, members, weights, arena, T, K, maxm, nexp
     _grouped_or_tile(lib, tile, V(xd_full.data_ptr()), V(xd_full.data_ptr()), V(p["t2p"].data_ptr()),
                      V(p["t2p"].data_ptr()), V(p["k2d"].data_ptr()), V(p["k2d"].data_ptr()), V(uids.data_ptr()),
                      V(ucount.data_ptr()), V(members.data_ptr()), V(zd.data_ptr()), down_k, down_n, P, maxm, K,
-                     nexp_max, 1, nt, warps, pf, st)
+                     nexp_max, 1, nt, warps, pf, st, mode=mode)
     lib.exl3m_down_combine(ctypes.c_void_p(zd.data_ptr()), ctypes.c_void_p(pick.data_ptr()),
-                           ctypes.c_void_p(arena.svh2.data_ptr()), ctypes.c_void_p(y.data_ptr()),
+                           ctypes.c_void_p(arena.svh2.data_ptr()),
                            ctypes.c_void_p(wts.data_ptr()), ctypes.c_void_p(local.data_ptr()),
                            int(T), int(P), int(down_n), 1, int(K), int(arena.slots), st)
     return local
@@ -219,7 +244,7 @@ def _down(xd_full, pick, uids, ucount, members, weights, arena, T, K, maxm, nexp
 
 @torch.no_grad()
 def _run_pipeline(x, slots, weights, arena, uids, ucount, members, maxm, nexp_max, swiglu_limit,
-                  nt=NT, warps=WARPS, pf=PF, tile=None):
+                  nt=NT, warps=WARPS, pf=PF, tile=None, mode=None):
     """The five kernels over a prebuilt grouping. Shared by decode (P<=64) and prefill (P>64).
 
     `pick` is the arena slot per pair, in [T, K] order; uids/members say which pairs belong to which
@@ -237,12 +262,14 @@ def _run_pipeline(x, slots, weights, arena, uids, ucount, members, maxm, nexp_ma
         group = _g()
     pick = slots.reshape(-1).to(torch.int32).contiguous()
     xd = torch.empty((P, inter), dtype=torch.float16, device=dev)
-    _up(x, pick, uids, ucount, members, arena, T, K, maxm, nexp_max, swiglu_limit, xd, nt, warps, pf, tile)
+    _up(x, pick, uids, ucount, members, arena, T, K, maxm, nexp_max, swiglu_limit, xd, nt, warps, pf, tile,
+        mode=mode)
     if world > 1:
         gathered = torch.empty((world * P, inter), dtype=torch.float16, device=dev)
         torch.distributed.all_gather_into_tensor(gathered, xd, group=group)
         xd = gathered.view(world, P, inter).transpose(0, 1).reshape(P, world * inter)
-    local = _down(xd, pick, uids, ucount, members, weights, arena, T, K, maxm, nexp_max, nt, warps, pf, tile)
+    local = _down(xd, pick, uids, ucount, members, weights, arena, T, K, maxm, nexp_max, nt, warps, pf, tile,
+                  mode=mode)
     if world == 1:
         return local
     out = torch.empty((world * T, down_n), dtype=torch.float32, device=dev)
@@ -322,7 +349,8 @@ def moe_forward_prefill(x: torch.Tensor, slots: torch.Tensor, weights: torch.Ten
     ucount = torch.full((1,), NB, dtype=torch.int32, device=slots.device)
     if ptile is not None:
         return _run_pipeline(x, slots, weights, arena, uids, ucount, members, block_m, NB, swiglu_limit,
-                             nt=8, warps=4, pf=2, tile=ptile)
+                             nt=8, warps=4, pf=2, tile=ptile,
+                             mode=-ptile[3] if kernel == "ca" else None)
     # pf=2 is the grouped kernel's prefill winner (58 vs 86 ms at T=2048); decode keeps pf=1.
     return _run_pipeline(x, slots, weights, arena, uids, ucount, members, block_m, NB, swiglu_limit,
                          nt=8, warps=4, pf=2)

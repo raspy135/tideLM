@@ -43,7 +43,7 @@ def group(slots, block_m):
     uniq, inv = torch.unique(slots[valid], return_inverse=True)
     compact = torch.full_like(slots, -1, dtype=torch.int32)
     compact[valid] = inv.to(torch.int32)
-    block_slot, block_pair, NB = F4.build_routing(compact, int(uniq.numel()), block_m)
+    block_slot, block_pair, NB = F4.build_routing(compact, int(uniq.numel()), block_m, precount=True)
     block_slot = torch.where(block_slot >= 0, uniq.to(torch.int32)[block_slot.clamp_min(0)], block_slot)
     pair = block_pair.view(NB, block_m)
     members = torch.where(pair >= 0, (pair // K) * 32 + (pair % K), pair).to(torch.int32).contiguous()
@@ -52,9 +52,11 @@ def group(slots, block_m):
     return uids, ucount, members, NB
 
 
-def stages(x, slots, weights, arena, uids, ucount, members, maxm, nexp_max, nt=8, warps=4, pf=2, tile=None):
+def stages(x, slots, weights, arena, uids, ucount, members, maxm, nexp_max, nt=8, warps=4, pf=2, tile=None,
+           mode=None):
     """_run_pipeline with a CUDA event between stages; returns (out, {stage: ms}). tile=None is
-    the grouped (decode) kernel, else (nt, warps, pf) of exl3m_prefill."""
+    the grouped (decode) kernel, else (nt, warps, pf) of exl3m_prefill. mode (smem tiles only):
+    1/2 = the probes, -S = cp.async with S stages (exl3_moe_cuda._grouped_or_tile)."""
     T, K = slots.shape
     P = T * K
     dim, inter, down_n = arena.shapes["suh1"][0], arena.inter, arena.down_n
@@ -71,7 +73,6 @@ def stages(x, slots, weights, arena, uids, ucount, members, maxm, nexp_max, nt=8
     z = torch.empty((2, P, inter), dtype=torch.float32, device=dev)
     xd = torch.empty((P, inter), dtype=torch.float16, device=dev)
     zd = torch.empty((1, P, down_n), dtype=torch.float32, device=dev)
-    y = torch.empty((P, down_n), dtype=torch.float32, device=dev)
     local = torch.empty((T, down_n), dtype=torch.float32, device=dev)
     pick = slots.reshape(-1).to(torch.int32).contiguous()
     lib.exl3m_rot_in(V(x.data_ptr()), int(x.stride(0)), V(pick.data_ptr()), V(arena.suh1.data_ptr()),
@@ -81,7 +82,7 @@ def stages(x, slots, weights, arena, uids, ucount, members, maxm, nexp_max, nt=8
     XC._grouped_or_tile(lib, tile, V(xh0.data_ptr()), V(xh1.data_ptr()), V(p["t1p"].data_ptr()),
                         V(p["t3p"].data_ptr()), V(p["k2"].data_ptr()), V(p["k2"].data_ptr()), V(uids.data_ptr()),
                         V(ucount.data_ptr()), V(members.data_ptr()), V(z.data_ptr()), dim, inter, P, maxm, K,
-                        nexp_max, 2, nt, warps, pf, st)
+                        nexp_max, 2, nt, warps, pf, st, mode=mode)
     ev[2].record()
     suh2_stride = int(arena.shapes["suh2"][0])
     suh2_base = arena.suh2.data_ptr() + arena.tp_rank * inter * 2
@@ -95,10 +96,10 @@ def stages(x, slots, weights, arena, uids, ucount, members, maxm, nexp_max, nt=8
     XC._grouped_or_tile(lib, tile, V(xd.data_ptr()), V(xd.data_ptr()), V(p["t2p"].data_ptr()),
                         V(p["t2p"].data_ptr()), V(p["k2d"].data_ptr()), V(p["k2d"].data_ptr()), V(uids.data_ptr()),
                         V(ucount.data_ptr()), V(members.data_ptr()), V(zd.data_ptr()), world * inter, down_n, P,
-                        maxm, K, nexp_max, 1, nt, warps, pf, st)
+                        maxm, K, nexp_max, 1, nt, warps, pf, st, mode=mode)
     ev[5].record()
     w = weights.reshape(-1).float().contiguous()
-    lib.exl3m_down_combine(V(zd.data_ptr()), V(pick.data_ptr()), V(arena.svh2.data_ptr()), V(y.data_ptr()),
+    lib.exl3m_down_combine(V(zd.data_ptr()), V(pick.data_ptr()), V(arena.svh2.data_ptr()),
                            V(w.data_ptr()), V(local.data_ptr()), int(T), int(P), int(down_n), 1, int(K),
                            int(arena.slots), st)
     ev[6].record()
@@ -147,9 +148,17 @@ def main():
         ref = None
         for spec in a.tiles.split(","):
             name = spec.split(":")[-1]
-            if spec.startswith("smem:"):
+            mode = None
+            if spec.startswith(("smem:", "ca:", "nomma:", "notrellis:")):
                 tile = tuple(int(v) for v in name.split("x"))
                 bm = tile[0] * tile[1] * 16
+                kind = spec.split(":")[0]
+                if kind == "ca":          # WxMTWxNTBxS: cp.async, S raw stages (bit-identical)
+                    mode = -tile[3]
+                elif kind == "nomma":     # probe: trellis loads + decode only (garbage output)
+                    mode = 1
+                elif kind == "notrellis":  # probe: A loads + mma on a constant tile (garbage output)
+                    mode = 2
             else:
                 bm = int(spec.split(":")[0][2:]) if spec.startswith("bm") else a.block_m
                 tile = None if name == "grouped" else tuple(int(v) for v in name.split("x"))
@@ -161,7 +170,7 @@ def main():
                 torch.cuda.synchronize()
                 tg.append((time.perf_counter() - t) * 1e3)
             try:
-                runs = [stages(x, slots, weights, arena, uids, ucount, members, bm, NB, tile=tile)
+                runs = [stages(x, slots, weights, arena, uids, ucount, members, bm, NB, tile=tile, mode=mode)
                         for _ in range(a.iters + 1)]
             except Exception as ex:  # noqa: BLE001
                 print(f"  {spec}: {type(ex).__name__} {ex}")

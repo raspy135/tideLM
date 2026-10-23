@@ -4190,3 +4190,38 @@ greedy tokens changed with the window (html, explain) -- through hot reads, whic
 block's routing, not the arithmetic: the 2026-10-22 base code with window 8 reproduced the new
 code's window-8 hashes, steps and acceptance in all six runs. "Greedy output is identical under any
 depth schedule" (docs/decode-dynamic-depth.md) holds with frozen placement only.
+
+## GLM prefill expert GEMM: the halves already overlap; cp.async is worth 2 ms, not 19 (2026-10-23)
+
+The glm-prefill-plan's traffic/FLOP budget (5.5 GB = 27.5 ms, 1.24 TFLOP = 20.7 ms, measured 46.5
+ms a layer) read as "bytes and mma are not overlapping at all", pricing a cp.async rewrite at ~2.3
+s of the 8K prefill. Two probe kernels measured the halves directly before committing to that
+(`exl3m_prefill_smem_mode`; bench specs `nomma:4x1x8x2` and `notrellis:4x1x8x2`, 4,096 rows x
+top-8, layer 20, rank shapes): trellis loads + decode alone 15.2 ms, A loads + mma alone 28.8 ms,
+full kernel 32.8 ms of GEMM. 32.8 << 15.2 + 28.8 — the halves already overlap, and the consume
+side (A loads + mma + decoded-tile smem reads) is the floor at 28.8 of 32.8 ms. Perfect load
+staging can recover at most ~4 ms a layer. `ptxas`: the shipped tile holds 128 registers = exactly
+4 blocks/SM of 12; the fp32 accumulators alone are 64 registers a thread, which is why MTW=2 (198
+regs) and NTB=16 (224-240) lose on occupancy.
+
+What was kept: `GLM_EXL3_PREFILL=ca:4x1x8x4` (`smem_tiles_ca`) stages the raw trellis words
+global -> shared with cp.async, S stages deep, in place of the 2-deep register pipeline. Same
+decode order, same mma chain: bitwise equal to `smem:4x1x8x2` in every bench run and through the
+engine call shape. Interleaved A/B at 4,096 rows: smem 43.0-44.8, ca 41.2-42.8 ms a layer, S =
+4/6/12 within noise of each other — **-1.9 +- 0.3 ms a layer (-4.3% of the MoE), ~0.28 s of the
+8K prefill**. The example profile selects it; `smem:4x1x8x2` reverts.
+
+Measured and dropped on the same day, so they are not tried twice:
+
+- **A-operand prefetch one step ahead in registers** (the 4 registers the removed pf pipeline
+  freed): ca 41.2-42.7 ms with and without. The per-step A loads are already hidden by L2 and the
+  step's own mma slack. Removed from the kernel.
+- **`smem:8x1x4x2`** (KS = 2: half the steps and barriers) was already measured at 69.5 ms at
+  these shapes (`results/glm-tune/bench-exl3-prefill-l20.txt`). Occupancy again.
+- The probes run lighter than the real kernel (48/96 vs 128 registers), so they flatter each half
+  slightly; the conclusion survives that margin.
+
+Guard note: `GlmTP._boot_guard` now pins `tools/exl3_moe_cuda.cu`
+(`exl3_moe_cuda.source_digest()`, `x3_moe_cuda` key) and `DSV41_EXL3_PREFILL_CA_TILE`. Before
+this, two ranks with a stale rsync of the .cu would run different prefill kernels and emit
+different tokens with nothing in the log; V41 already pinned the same digest.

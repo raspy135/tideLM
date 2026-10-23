@@ -150,6 +150,20 @@ __device__ __forceinline__ uint32_t load_pair(const half* x, bool ok) {
     return ok ? *reinterpret_cast<const uint32_t*>(x) : 0u;
 }
 
+// cp.async (sm_80+): one 4-byte word global -> shared, bypassing the register file. Used by the
+// cp.async prefill variant (smem_tiles_ca) to stage raw trellis words S steps ahead where the
+// register pipeline (pf[PF]) covers only PF; 4-byte size so no alignment is assumed beyond the
+// word's own. wait_group<N> blocks until at most N commit groups are still in flight.
+__device__ __forceinline__ void cp_async4(uint32_t* smem_dst, const uint32_t* gmem_src) {
+    const unsigned s = (unsigned)__cvta_generic_to_shared(smem_dst);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(s), "l"(gmem_src));
+}
+
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
+
+template <int N>
+__device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+
 // One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc, PF tiles in flight.
 template <int CB, int K2, int NT, int PF>
 __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int NTILES, int kt0, int nkt, int nt0,
@@ -493,7 +507,12 @@ void prefill_launch(const void* x0, const void* x1, const int64_t* tp0, const in
 // read from global memory (L2) per warp as before. Two stages, one __syncthreads a step. The
 // same k order and the same mma chain per accumulator as prefill_kernel, so the outputs are
 // bit-identical to it (tools/bench_exl3_prefill.py checks).
-template <int CB, int K2, int W, int MTW, int NTB, int PF>
+// PROBE (bench-only, exl3m_prefill_smem_probe): 1 = trellis loads + decode + smem stores, with the
+// mma loop replaced by a cheap smem checksum (no A loads, no tensor cores); 2 = A loads + mma on a
+// constant tile (no trellis loads, no decode). The two probes bracket where a layer's time goes --
+// if probe1 + probe2 ~= the full kernel, the load/decode side and the mma side are serialized.
+// PROBE = 0 is the shipped kernel, byte for byte.
+template <int CB, int K2, int W, int MTW, int NTB, int PF, int PROBE = 0>
 __device__ __forceinline__ void smem_tiles(const uint32_t* __restrict__ T, int NTILES, int KT, int ntb0,
                                            const half* __restrict__ X, int K, const int* rows_sh, int nmt,
                                            int warp, int lane, uint32_t* Bs, float (&acc)[MTW][NTB][2][4]) {
@@ -528,6 +547,151 @@ __device__ __forceinline__ void smem_tiles(const uint32_t* __restrict__ T, int N
     }
     const int nmw = min(max(nmt - m0, 0), MTW);           // this warp's live m-tiles
 
+    uint32_t chk = 0;                                     // PROBE 1: keeps the smem stores observable
+    auto consume = [&](int stage, int s) {
+        const uint32_t* st = Bs + stage * STAGE;
+#pragma unroll
+        for (int kk = 0; kk < KS; ++kk) {
+            const int k = (s * KS + kk) * 16;
+#pragma unroll
+            for (int m = 0; m < MTW; ++m) {
+                if (m < nmw) {
+                    if constexpr (PROBE == 1) {
+#pragma unroll
+                        for (int n = 0; n < NTB; ++n) {
+                            const uint4 v = *reinterpret_cast<const uint4*>(st + ((kk * NTB + n) * 32 + lane) * 4);
+                            chk ^= v.x ^ v.w;
+                        }
+                    } else {
+                    uint32_t a[4] = {load_pair(xr0[m] + k, ok0[m]), load_pair(xr1[m] + k, ok1[m]),
+                                     load_pair(xr0[m] + k + 8, ok0[m]), load_pair(xr1[m] + k + 8, ok1[m])};
+#pragma unroll
+                    for (int n = 0; n < NTB; ++n) {
+                        const uint4 v = *reinterpret_cast<const uint4*>(st + ((kk * NTB + n) * 32 + lane) * 4);
+                        const uint32_t b0[2] = {v.x, v.y}, b1[2] = {v.z, v.w};
+                        mma16816(acc[m][n][0], a, b0);
+                        mma16816(acc[m][n][1], a, b1);
+                    }
+                    }
+                }
+            }
+        }
+    };
+    auto store = [&](int stage, const uint32_t (&b)[TPW][4]) {
+        uint32_t* st = Bs + stage * STAGE;
+#pragma unroll
+        for (int j = 0; j < TPW; ++j)
+            *reinterpret_cast<uint4*>(st + ((warp * TPW + j) * 32 + lane) * 4) = make_uint4(b[j][0], b[j][1], b[j][2], b[j][3]);
+    };
+
+    // Trellis words PF steps ahead: step q's words sit in slot q % PF.
+    uint32_t pf[PF][TPW][LW];
+#pragma unroll
+    for (int d = 0; d < PF; ++d)
+        if (d < NS && PROBE != 2)
+#pragma unroll
+            for (int j = 0; j < TPW; ++j) load_words<K2>(pf[d][j], tp[j] + (size_t)d * KS * kstride, lane);
+    {
+        uint32_t b[TPW][4];
+#pragma unroll
+        for (int j = 0; j < TPW; ++j) {
+            if constexpr (PROBE == 2) {
+                b[j][0] = b[j][1] = b[j][2] = b[j][3] = 0x3c003c00u;   // half2 (1, 1)
+            } else {
+                uint32_t b0[2], b1[2];
+                decode_tile<CB, K2>(pf[0][j], map, lane, b0, b1);
+                b[j][0] = b0[0]; b[j][1] = b0[1]; b[j][2] = b1[0]; b[j][3] = b1[1];
+            }
+        }
+        if (PF < NS && PROBE != 2)
+#pragma unroll
+            for (int j = 0; j < TPW; ++j) load_words<K2>(pf[0][j], tp[j] + (size_t)PF * KS * kstride, lane);
+        store(0, b);
+    }
+    __syncthreads();
+    // Step q is decoded while step q - 1 is multiplied; q runs 1 .. NS - 1 in groups of PF so the
+    // slot (q % PF == (d + 1) % PF) is a compile-time index.
+    for (int qb = 1; qb < NS; qb += PF) {
+#pragma unroll
+        for (int d = 0; d < PF; ++d) {
+            const int q = qb + d;
+            if (q < NS) {
+                uint32_t b[TPW][4];
+#pragma unroll
+                for (int j = 0; j < TPW; ++j) {
+                    if constexpr (PROBE == 2) {
+                        b[j][0] = b[j][1] = b[j][2] = b[j][3] = 0x3c003c00u;
+                    } else {
+                        uint32_t b0[2], b1[2];
+                        decode_tile<CB, K2>(pf[(d + 1) % PF][j], map, lane, b0, b1);
+                        b[j][0] = b0[0]; b[j][1] = b0[1]; b[j][2] = b1[0]; b[j][3] = b1[1];
+                    }
+                }
+                if (q + PF < NS && PROBE != 2)
+#pragma unroll
+                    for (int j = 0; j < TPW; ++j)
+                        load_words<K2>(pf[(d + 1) % PF][j], tp[j] + (size_t)(q + PF) * KS * kstride, lane);
+                consume((q - 1) & 1, q - 1);
+                store(q & 1, b);
+                __syncthreads();
+            }
+        }
+    }
+    consume((NS - 1) & 1, NS - 1);
+    if constexpr (PROBE == 1) acc[0][0][0][0] += (float)(chk & 1u);
+}
+
+// smem_tiles with the raw trellis words staged global -> shared by cp.async, S steps deep, instead
+// of the PF-deep register pipeline. The register path gives a warp PF steps of load lookahead and
+// stalls at first use in decode; cp.async issues the copy without a consuming register, so the
+// lookahead deepens to S at no register cost and the wait moves to an explicit cp_wait a step
+// ahead of use. Decode order, store order and the mma chain are smem_tiles' exactly, so the output
+// is bit-identical to it (tools/bench_exl3_prefill.py checks `vs first`). Each warp copies, decodes
+// and consumes only its own TPW tiles' slots of Ws, so no barrier guards Ws beyond the per-thread
+// cp_wait; one commit group per step keeps the wait count exact (empty groups near the end included).
+template <int CB, int K2, int W, int MTW, int NTB, int S>
+__device__ __forceinline__ void smem_tiles_ca(const uint32_t* __restrict__ T, int NTILES, int KT, int ntb0,
+                                              const half* __restrict__ X, int K, const int* rows_sh, int nmt,
+                                              int warp, int lane, uint32_t* Bs, uint32_t* Ws,
+                                              float (&acc)[MTW][NTB][2][4]) {
+    constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW;
+    static_assert(LW == 1, "smem_tiles_ca assumes one trellis word a lane (K2 <= 8)");
+    static_assert(S >= 2, "smem_tiles_ca needs at least 2 stages");
+    constexpr int KS = (W >= NTB) ? W / NTB : 1;          // k-tiles a step
+    constexpr int TPW = (NTB > W) ? NTB / W : 1;          // tiles a warp handles a step
+    constexpr int TILES = KS * NTB;                       // tiles a step
+    constexpr int STAGE = TILES * 32 * 4;                 // decoded uint32 words a stage (Bs)
+    constexpr int WSTG = TILES * 32;                      // raw uint32 words a stage (Ws)
+    static_assert(W * TPW == TILES, "the warps must cover a step's tiles exactly");
+    const LaneMap<K2> map(lane);
+    const size_t kstride = (size_t)NTILES * TW;
+    const int g = lane >> 2, t = lane & 3;
+    const int NS = KT / KS;
+    const uint32_t* tp[TPW];
+    uint32_t* ws[TPW];                                    // this warp's lane slot per tile, stage 0
+#pragma unroll
+    for (int j = 0; j < TPW; ++j) {
+        const int ti = warp * TPW + j;
+        tp[j] = T + ((size_t)(ti / NTB) * NTILES + ntb0 + (ti % NTB)) * TW + lane;
+        ws[j] = Ws + ti * 32 + lane;
+    }
+    const int m0 = warp * MTW;
+    const half* xr0[MTW];
+    const half* xr1[MTW];
+    bool ok0[MTW], ok1[MTW];
+#pragma unroll
+    for (int m = 0; m < MTW; ++m) {
+        const int r0 = rows_sh[(m0 + m) * 16 + g], r1 = rows_sh[(m0 + m) * 16 + g + 8];
+        ok0[m] = r0 >= 0;
+        ok1[m] = r1 >= 0;
+        xr0[m] = X + (size_t)(ok0[m] ? r0 : 0) * K + 2 * t;
+        xr1[m] = X + (size_t)(ok1[m] ? r1 : 0) * K + 2 * t;
+    }
+    const int nmw = min(max(nmt - m0, 0), MTW);
+
+    // The A loads stay at the head of each consume: prefetching step s + 1's A words one step
+    // ahead in registers measured NO change at 4,096 rows (ca:4x1x8x4 41.2-42.7 ms both ways,
+    // 2026-10-23) -- L2 and the step's own mma slack already hide them. Kept simple on purpose.
     auto consume = [&](int stage, int s) {
         const uint32_t* st = Bs + stage * STAGE;
 #pragma unroll
@@ -555,58 +719,63 @@ __device__ __forceinline__ void smem_tiles(const uint32_t* __restrict__ T, int N
         for (int j = 0; j < TPW; ++j)
             *reinterpret_cast<uint4*>(st + ((warp * TPW + j) * 32 + lane) * 4) = make_uint4(b[j][0], b[j][1], b[j][2], b[j][3]);
     };
-
-    // Trellis words PF steps ahead: step q's words sit in slot q % PF.
-    uint32_t pf[PF][TPW][LW];
+    // One commit group per step, issued S - 1 steps ahead; lanes past the tile's TW words copy
+    // nothing (decode masks them to 0 at read, as load_words does).
+    auto issue = [&](int q) {
+        if (q < NS && lane < TW)
 #pragma unroll
-    for (int d = 0; d < PF; ++d)
-        if (d < NS)
-#pragma unroll
-            for (int j = 0; j < TPW; ++j) load_words<K2>(pf[d][j], tp[j] + (size_t)d * KS * kstride, lane);
-    {
-        uint32_t b[TPW][4];
+            for (int j = 0; j < TPW; ++j) cp_async4(ws[j] + (q % S) * WSTG, tp[j] + (size_t)q * KS * kstride);
+        cp_commit();
+    };
+    auto decode = [&](int q, uint32_t (&b)[TPW][4]) {
 #pragma unroll
         for (int j = 0; j < TPW; ++j) {
+            uint32_t w[1];
+            w[0] = (lane < TW) ? ws[j][(q % S) * WSTG] : 0u;
             uint32_t b0[2], b1[2];
-            decode_tile<CB, K2>(pf[0][j], map, lane, b0, b1);
+            decode_tile<CB, K2>(w, map, lane, b0, b1);
             b[j][0] = b0[0]; b[j][1] = b0[1]; b[j][2] = b1[0]; b[j][3] = b1[1];
         }
-        if (PF < NS)
-#pragma unroll
-            for (int j = 0; j < TPW; ++j) load_words<K2>(pf[0][j], tp[j] + (size_t)PF * KS * kstride, lane);
+    };
+
+    for (int d = 0; d < S - 1; ++d) issue(d);
+    {
+        cp_wait<S - 2>();
+        uint32_t b[TPW][4];
+        decode(0, b);
+        issue(S - 1);
         store(0, b);
     }
     __syncthreads();
-    // Step q is decoded while step q - 1 is multiplied; q runs 1 .. NS - 1 in groups of PF so the
-    // slot (q % PF == (d + 1) % PF) is a compile-time index.
-    for (int qb = 1; qb < NS; qb += PF) {
-#pragma unroll
-        for (int d = 0; d < PF; ++d) {
-            const int q = qb + d;
-            if (q < NS) {
-                uint32_t b[TPW][4];
-#pragma unroll
-                for (int j = 0; j < TPW; ++j) {
-                    uint32_t b0[2], b1[2];
-                    decode_tile<CB, K2>(pf[(d + 1) % PF][j], map, lane, b0, b1);
-                    b[j][0] = b0[0]; b[j][1] = b0[1]; b[j][2] = b1[0]; b[j][3] = b1[1];
-                }
-                if (q + PF < NS)
-#pragma unroll
-                    for (int j = 0; j < TPW; ++j)
-                        load_words<K2>(pf[(d + 1) % PF][j], tp[j] + (size_t)(q + PF) * KS * kstride, lane);
-                consume((q - 1) & 1, q - 1);
-                store(q & 1, b);
-                __syncthreads();
-            }
-        }
+    for (int q = 1; q < NS; ++q) {
+        cp_wait<S - 2>();
+        uint32_t b[TPW][4];
+        decode(q, b);
+        issue(q + S - 1);
+        consume((q - 1) & 1, q - 1);
+        store(q & 1, b);
+        __syncthreads();
     }
     consume((NS - 1) & 1, NS - 1);
 }
 
+// The cp.async variant's raw-word staging buffer, allocated only when its branch is live so the
+// shipped MODE 0 kernel's shared-memory footprint is untouched.
+template <int MODE, int WORDS>
+__device__ __forceinline__ uint32_t* ws_buf() {
+    if constexpr (MODE <= -2) {
+        __shared__ __align__(16) uint32_t Ws[WORDS];
+        return Ws;
+    } else {
+        return nullptr;
+    }
+}
+
 // Program (n block of NTB tiles, routing block u, matrix): BM = W * MTW * 16 member rows of one arena
 // slot times NTB * 16 columns. Members as prefill_kernel's (build_routing's block, -1 padded).
-template <int CB, int W, int MTW, int NTB, int PF, int LO, int HI>
+// MODE 0: smem_tiles, the shipped kernel. MODE 1/2: its probes (exl3m_prefill_smem_probe).
+// MODE -S (S >= 2): smem_tiles_ca with S cp.async stages (exl3m_prefill_smem_ca).
+template <int CB, int W, int MTW, int NTB, int PF, int LO, int HI, int MODE = 0>
 __global__ void __launch_bounds__(W * 32) prefill_smem_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
@@ -616,6 +785,7 @@ __global__ void __launch_bounds__(W * 32) prefill_smem_kernel(
     constexpr int KS = (W >= NTB) ? W / NTB : 1;
     constexpr int STAGE = KS * NTB * 32 * 4;
     __shared__ __align__(16) uint32_t Bs[2 * STAGE];
+    uint32_t* Ws = ws_buf<MODE, (MODE <= -2 ? -MODE : 1) * KS * NTB * 32>();   // raw words, MODE -S only
     __shared__ int rows_sh[BM];
     const int u = blockIdx.y;
     if (u >= ucount[0]) return;
@@ -654,8 +824,12 @@ __global__ void __launch_bounds__(W * 32) prefill_smem_kernel(
     switch (k2) {
 #define EXL3_SCASE(K2_)                                                                                         \
     case K2_:                                                                                                   \
-        if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
-            smem_tiles<CB, K2_, W, MTW, NTB, PF>(T, NTILES, KT, ntb0, X, K, rows_sh, nmt, warp, lane, Bs, acc); \
+        if constexpr (K2_ >= LO && K2_ <= HI && MODE <= -2)                                                     \
+            smem_tiles_ca<CB, K2_, W, MTW, NTB, (MODE <= -2 ? -MODE : 2)>(T, NTILES, KT, ntb0, X, K, rows_sh,   \
+                                                                          nmt, warp, lane, Bs, Ws, acc);        \
+        else if constexpr (K2_ >= LO && K2_ <= HI)                                                              \
+            smem_tiles<CB, K2_, W, MTW, NTB, PF, (MODE >= 0 ? MODE : 0)>(T, NTILES, KT, ntb0, X, K, rows_sh,    \
+                                                                         nmt, warp, lane, Bs, acc);             \
         else                                                                                                    \
             __trap();                                                                                           \
         break;
@@ -714,6 +888,39 @@ void prefill_smem_launch(const void* x0, const void* x1, const int64_t* tp0, con
     else if (warps == 8 && mtw == 1 && ntb == 16 && pf == 2) EXL3_SLAUNCH(8, 1, 16, 2)
     else EXL3_CHECK(false, "unsupported smem prefill tile setting");
 #undef EXL3_SLAUNCH
+}
+
+// smem prefill with MODE != 0: the probes (mode 1/2) and the cp.async stage depths (mode -S).
+// Instantiated for the serving-shaped tiles only, to bound compile time.
+template <int CB>
+void prefill_smem_mode_launch(const void* x0, const void* x1, const int64_t* tp0, const int64_t* tp1,
+                              const int* k2_0, const int* k2_1, const int* uids, const int* ucount,
+                              const int* members, float* z, int K, int N, int P, int slots, int nblocks, int mats,
+                              int warps, int mtw, int ntb, int mode, cudaStream_t stream) {
+    const int ntiles = N / 16;
+    EXL3_CHECK(ntiles % ntb == 0, "N must be a multiple of 16 * NTB");
+#define EXL3_MLAUNCH(W_, MTW_, NTB_, MODE_)                                                                     \
+    {                                                                                                           \
+        constexpr int KS_ = (W_ >= NTB_) ? W_ / NTB_ : 1;                                                       \
+        EXL3_CHECK((K / 16) % KS_ == 0, "K must be a multiple of 16 * KS");                                     \
+        dim3 grid((unsigned)(ntiles / NTB_), (unsigned)nblocks, (unsigned)mats);                                \
+        prefill_smem_kernel<CB, W_, MTW_, NTB_, 2, 4, 6, MODE_><<<grid, W_ * 32, 0, stream>>>(                  \
+            (const half*)x0, (const half*)x1, tp0, tp1, k2_0, k2_1, uids, ucount, members, z, K, N, P, slots);  \
+    }
+#define EXL3_MODES(W_, MTW_, NTB_)                                                                              \
+    if (mode == 1) EXL3_MLAUNCH(W_, MTW_, NTB_, 1)                                                              \
+    else if (mode == 2) EXL3_MLAUNCH(W_, MTW_, NTB_, 2)                                                         \
+    else if (mode == -3) EXL3_MLAUNCH(W_, MTW_, NTB_, -3)                                                       \
+    else if (mode == -4) EXL3_MLAUNCH(W_, MTW_, NTB_, -4)                                                       \
+    else if (mode == -6) EXL3_MLAUNCH(W_, MTW_, NTB_, -6)                                                       \
+    else if (mode == -8) EXL3_MLAUNCH(W_, MTW_, NTB_, -8)                                                       \
+    else if (mode == -12) EXL3_MLAUNCH(W_, MTW_, NTB_, -12)                                                     \
+    else EXL3_CHECK(false, "smem prefill mode must be 1, 2 (probes) or -3/-4/-6/-8/-12 (cp.async stages)");
+    if (warps == 4 && mtw == 1 && ntb == 8) { EXL3_MODES(4, 1, 8) }
+    else if (warps == 8 && mtw == 1 && ntb == 8) { EXL3_MODES(8, 1, 8) }
+    else EXL3_CHECK(false, "smem prefill modes are built for the 4x1x8 and 8x1x8 tiles");
+#undef EXL3_MODES
+#undef EXL3_MLAUNCH
 }
 
 // ---------------------------------------------------------------- rotations / epilogues (TensorFold experts.cu)
@@ -849,7 +1056,7 @@ __global__ void dense_out_kernel(const float* __restrict__ Z, const half* __rest
 
 // down_epilogue then combine in one launch: rotate * svh_d, then sum over the top-k slots in order.
 __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
-                                    const half* __restrict__ svh_d, float* __restrict__ y,
+                                    const half* __restrict__ svh_d,
                                     const float* __restrict__ wts, float* __restrict__ out, int P, int D, int SK,
                                     int E, int slots) {
     __shared__ float4 part[32][32];
@@ -869,14 +1076,10 @@ __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __re
         }
         fwht128(v, lane);
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
-            y[(size_t)p * D + n + j] = o[j];
-        }
+        for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
     } else {
-        // A negative pick is in no group (group_small_kernel), so Z holds nothing of it and y was
-        // never written: its term is exactly 0. Reading y here (uninitialized) could feed a NaN
-        // into the sum even at weight 0 -- DSV41_EXPERT_TOPP's pruned picks take this branch.
+        // A negative pick is in no group (group_small_kernel), so Z holds nothing of it: its term
+        // is exactly 0. DSV41_EXPERT_TOPP's pruned picks take this branch.
 #pragma unroll
         for (int j = 0; j < 4; ++j) o[j] = 0.f;
     }
@@ -1050,6 +1253,17 @@ void exl3m_prefill_smem(const void* X0, const void* X1, const int64_t* tp0, cons
                                  mats, warps, mtw, ntb, pf, lo, hi, s);
 }
 
+// mode 1/2: the probes (bench-only; output is not the GEMM's). mode -S: cp.async with S raw stages,
+// bit-identical to exl3m_prefill_smem at the same W/MTW/NTB (the decode order and mma chain are the
+// same; only how the raw trellis words reach the SM changes).
+void exl3m_prefill_smem_mode(const void* X0, const void* X1, const int64_t* tp0, const int64_t* tp1,
+                             const int* k2_0, const int* k2_1, const int* uids, const int* ucount,
+                             const int* members, float* Z, int K, int N, int P, int slots, int nblocks, int mats,
+                             int warps, int mtw, int ntb, int mode, cudaStream_t s) {
+    exl3::prefill_smem_mode_launch<2>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots,
+                                      nblocks, mats, warps, mtw, ntb, mode, s);
+}
+
 void exl3m_gateup(const float* Z, const int* pick, const void* svh_g, const void* svh_u, const void* suh_d,
                   void* xd, int rows, int P, int N, int SK, int slots, int E, int suh_d_stride, float limit,
                   int act_mode, cudaStream_t s) {
@@ -1076,11 +1290,11 @@ void exl3m_dense_out(const float* Z, const void* svh, void* out, int rows, int N
     exl3::dense_out_kernel<<<grid, 32, 0, s>>>(Z, (const half*)svh, out, rows, N, SK, G, out_bf16);
 }
 
-void exl3m_down_combine(const float* Z, const int* pick, const void* svh_d, float* y, const float* wts, float* out,
+void exl3m_down_combine(const float* Z, const int* pick, const void* svh_d, const float* wts, float* out,
                         int rows, int P, int D, int SK, int slots, int E, cudaStream_t s) {
     EXL3_CHECK(slots <= 32, "at most 32 slots a row");
     dim3 grid((unsigned)rows, (unsigned)(D / 128));
-    exl3::down_combine_kernel<<<grid, (unsigned)(32 * slots), 0, s>>>(Z, pick, (const half*)svh_d, y, wts, out, P, D,
+    exl3::down_combine_kernel<<<grid, (unsigned)(32 * slots), 0, s>>>(Z, pick, (const half*)svh_d, wts, out, P, D,
                                                                       SK, E, slots);
 }
 
