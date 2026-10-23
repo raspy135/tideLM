@@ -34,7 +34,9 @@ test -f "$MODEL_DIR/config.json" || { echo "no checkpoint at $MODEL_DIR" >&2; ex
 ssh -o BatchMode=yes "$PEER" "test -f '$MODEL_DIR/config.json'" \
     || { echo "no checkpoint at $PEER:$MODEL_DIR" >&2; exit 1; }
 # The peer runs the same code: sync this checkout (code only) before starting.
-rsync -a --delete --exclude results/ --exclude .triton-cache/ --exclude .git/ "$ROOT/" "$PEER:$ROOT/"
+# .triton/ too: a container run with the checkout mounted at /app leaves a root-owned JIT cache
+# there, which rsync cannot read (and the peer rebuilds its own in any case).
+rsync -a --delete --exclude results/ --exclude .triton-cache/ --exclude .triton/ --exclude .git/ "$ROOT/" "$PEER:$ROOT/"
 ssh -o BatchMode=yes "$PEER" "mkdir -p '$ROOT/results' '$ROOT/.triton-cache'"
 mkdir -p "$ROOT/results" "$ROOT/.triton-cache"
 flags=(-d --network host --gpus all --device /dev/infiniband --cap-add IPC_LOCK --ipc host
