@@ -58,9 +58,14 @@ fn main() -> tidelm_engine::Result<()> {
         })
         .collect::<tidelm_engine::Result<_>>()?;
     tidelm_cuda::set_device(0)?;
-    // --keep-db FILE --budget N: the demand-ranked resident set (tidelm_engine::keep)
-    let keep = match (arg(&args, "--keep-db"), arg(&args, "--budget")) {
-        (Some(db), Some(b)) => Some(tidelm_engine::keep::keep_from_demand(std::path::Path::new(&db), 40, 384, 6, b.parse().unwrap())?),
+    // --keep-db FILE --budget N: the demand-ranked resident set (tidelm_engine::keep); with
+    // --world 2 the budget is the pair's
+    let scores = match arg(&args, "--keep-db") {
+        Some(db) => Some(tidelm_engine::keep::load_demand(std::path::Path::new(&db), 40, 384)?),
+        None => None,
+    };
+    let keep = match (&scores, arg(&args, "--budget")) {
+        (Some(s), Some(b)) => Some(tidelm_engine::keep::keep_from_scores(s, 6, b.parse().unwrap())?),
         _ => keep_first.map(|k| vec![(0..384).map(|e| e < k).collect::<Vec<bool>>(); 40]),
     };
     let dspark_keep = keep_first.map(|k| vec![(0..128).map(|e| e < k.min(128)).collect::<Vec<bool>>(); 3]);
@@ -73,25 +78,54 @@ fn main() -> tidelm_engine::Result<()> {
         n_layers,
         keep,
         dspark_keep,
+        owned: None,
     };
     let t0 = Instant::now();
+    let pair_args = tidelm_engine::pair::pair_args(&args)?;
+    let mut opts = opts;
+    let pair = match &pair_args {
+        Some(pa) => Some(tidelm_engine::pair::join(&mut opts, scores.as_deref(), &model_dir, pa)?),
+        None => None,
+    };
     let mut engine = Engine::new(&model_dir, token_map, opts)?;
+    if let Some(p) = pair {
+        engine.attach_pair(p);
+        if engine.rank() == 1 {
+            eprintln!("rank 1: engine up in {:.1}s, following rank 0", t0.elapsed().as_secs_f64());
+            engine.follow()?;
+            // NCCL's communicator teardown blocks a finished pair (see tidelm-generate)
+            std::process::exit(0);
+        }
+    }
     eprintln!("engine up in {:.1}s: {lanes} lanes, {step_rows} rows per step, {}", t0.elapsed().as_secs_f64(),
               if spec { format!("speculative depth {depth}") } else { "plain".into() });
+    let result = run(&mut engine, &args, &reqs, lanes, n_req, max_tokens, step_rows, spec, depth);
+    if pair_args.is_some() {
+        engine.release_follower()?;
+        result?;
+        std::process::exit(0);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run(engine: &mut Engine, args: &[String], reqs: &[Request], lanes: usize, n_req: usize, max_tokens: usize,
+       step_rows: usize, spec: bool, depth: usize) -> tidelm_engine::Result<()> {
+    let flag = |name: &str| args.iter().any(|a| a == name);
     // --check compares logits digests; timing runs read back only the device argmaxes
     let check = flag("--check");
     let opt = BatchOptions { spec_depth: spec.then_some(depth), step_rows, stop: vec![], logits: check };
 
     if flag("--warmup") {
-        generate_batch(&mut engine, &reqs, &opt)?;
-        for r in &reqs {
-            generate_batch(&mut engine, std::slice::from_ref(r), &opt)?;
+        generate_batch(engine, reqs, &opt)?;
+        for r in reqs {
+            generate_batch(engine, std::slice::from_ref(r), &opt)?;
         }
     }
     engine.times = Default::default();
     let caps = engine.graph_captures;
     let t = Instant::now();
-    let (batched, stats) = generate_batch(&mut engine, &reqs, &opt)?;
+    let (batched, stats) = generate_batch(engine, reqs, &opt)?;
     let dt_b = t.elapsed().as_secs_f64();
     eprintln!("graph captures during the batched run: {}", engine.graph_captures - caps);
     let toks: usize = batched.iter().map(|g| g.tokens.len()).sum();
@@ -108,8 +142,8 @@ fn main() -> tidelm_engine::Result<()> {
     let t = Instant::now();
     let mut alone: Vec<Generation> = Vec::new();
     let mut steps_alone = 0;
-    for r in &reqs {
-        let (g, s) = generate_batch(&mut engine, std::slice::from_ref(r), &opt)?;
+    for r in reqs {
+        let (g, s) = generate_batch(engine, std::slice::from_ref(r), &opt)?;
         steps_alone += s.steps;
         alone.extend(g);
     }
@@ -124,7 +158,7 @@ fn main() -> tidelm_engine::Result<()> {
     let bitwise = step_rows <= FMA_ROWS;
     let mut ok = true;
     // the argmax-only read-back must pick the same tokens as the host argmax of the logits
-    let (fast, _) = generate_batch(&mut engine, &reqs, &BatchOptions { logits: false, ..opt.clone() })?;
+    let (fast, _) = generate_batch(engine, reqs, &BatchOptions { logits: false, ..opt.clone() })?;
     for (i, (b, f)) in batched.iter().zip(&fast).enumerate() {
         if b.tokens != f.tokens {
             ok = false;
@@ -148,9 +182,9 @@ fn main() -> tidelm_engine::Result<()> {
             continue;
         }
         let g = if spec {
-            generate_spec(&mut engine, &r.prompt, max_tokens, depth, &[], |_| {})?
+            generate_spec(engine, &r.prompt, max_tokens, depth, &[], |_| {})?
         } else {
-            generate_plain(&mut engine, &r.prompt, max_tokens, &[], |_| {})?
+            generate_plain(engine, &r.prompt, max_tokens, &[], |_| {})?
         };
         if g.tokens != a.tokens || g.digest != a.digest {
             ok = false;

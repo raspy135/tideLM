@@ -6,6 +6,7 @@ license.workspace = true
 description = "The DS v4.1 engine in Rust: weights, caches, the forward pass and the decode loop"
 
 [dependencies]
+tidelm-comm = { path = "../tidelm-comm" }
 tidelm-core = { path = "../tidelm-core" }
 tidelm-cuda = { path = "../tidelm-cuda" }
 tidelm-kernels = { path = "../tidelm-kernels" }

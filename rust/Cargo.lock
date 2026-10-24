@@ -667,6 +667,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidelm-comm"
+version = "0.1.0"
+dependencies = [
+ "tidelm-cuda",
+]
+
+[[package]]
 name = "tidelm-core"
 version = "0.1.0"
 dependencies = [
@@ -684,6 +691,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "tidelm-comm",
  "tidelm-core",
  "tidelm-cuda",
  "tidelm-kernels",

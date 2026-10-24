@@ -204,12 +204,46 @@ pub struct Options {
     pub keep: Option<Vec<Vec<bool>>>,
     /// per DSpark block, the routable experts (tests; serving keeps all 3 x 128)
     pub dspark_keep: Option<Vec<Vec<bool>>>,
+    /// expert parallel over the pair: this rank's share of the routable backbone experts
+    /// (keep::owned_split). None: one box, every routable expert local.
+    pub owned: Option<Vec<Vec<bool>>>,
 }
 
 impl Options {
     pub fn streaming(max_seq: usize, spec: bool) -> Self {
-        Options { max_seq, max_lanes: 1, spec, resident: false, graphs: false, n_layers: None, keep: None, dspark_keep: None }
+        Options { max_seq, max_lanes: 1, spec, resident: false, graphs: false, n_layers: None, keep: None, dspark_keep: None,
+                  owned: None }
     }
+
+    /// The bytes both ranks of a pair must agree on before they start (tidelm_comm::join):
+    /// every option, the expert sets (as digests), and the executable itself.
+    pub fn boot_config(&self, model_dir: &std::path::Path) -> Result<Vec<u8>> {
+        let fnv = |bytes: &[u8]| bytes.iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+        let mask = |m: &Option<Vec<Vec<bool>>>| m.as_ref().map(|m| fnv(&m.iter().flatten().map(|&b| b as u8).collect::<Vec<_>>())).unwrap_or(0);
+        let exe = std::fs::read("/proc/self/exe")?;
+        let cfg = std::fs::read(model_dir.join("config.json")).or_else(|_| std::fs::read(model_dir.join("inference/config.json")))?;
+        Ok(format!("tidelm-pair v1 | max_seq {} lanes {} spec {} resident {} graphs {} layers {:?} | keep {:x} dspark_keep {:x} \
+                    | exe {:x} | config {:x} | env NO_QDQ={:?} ENGRAM_CACHE_MB={:?}",
+                   self.max_seq, self.max_lanes, self.spec, self.resident, self.graphs, self.n_layers, mask(&self.keep),
+                   mask(&self.dspark_keep), fnv(&exe), fnv(&cfg), std::env::var("TIDELM_NO_QDQ").ok(),
+                   std::env::var("TIDELM_ENGRAM_CACHE_MB").ok()).into_bytes())
+    }
+}
+
+const OP_FORWARD: u32 = 1;
+const OP_DRAFT: u32 = 2;
+const OP_ROLLBACK: u32 = 3;
+const OP_SEED: u32 = 4;
+const OP_RESET_LANE: u32 = 5;
+const OP_GRAPHS: u32 = 6;
+const OP_SHUTDOWN: u32 = 7;
+
+/// This engine's half of a pair (expert parallel over two boxes): the NCCL communicator its
+/// MoE combines all-reduce over, and the control channel. Rank 0 (the leader) sends every
+/// engine call to rank 1 before running it; rank 1 runs `follow` and decides nothing.
+pub struct Pair {
+    pub comm: tidelm_comm::Comm,
+    pub ctl: tidelm_comm::Control,
 }
 
 /// Which logits a segment of a step returns.
@@ -414,6 +448,8 @@ struct Act {
     hs: DeviceBuffer<u16>,
     sh: DeviceBuffer<u16>,
     moe_out: DeviceBuffer<u16>,
+    /// expert parallel: this rank's routed k-sum, all-reduced in place
+    moe_partial: DeviceBuffer<f32>,
     kvl: DeviceBuffer<f32>,
     sc: DeviceBuffer<f32>,
     lat: DeviceBuffer<u16>,
@@ -565,13 +601,21 @@ struct Lane {
 struct ExpertSet {
     arena: Arena,
     lut: DeviceBuffer<i32>,
+    /// the slot the peer's experts route to under expert parallel: the up kernels skip its
+    /// pairs and the down kernels write them as exact zeros (-1 on one box)
+    null_slot: i32,
 }
 
 impl ExpertSet {
+    /// `owned`: under expert parallel, the routable experts this rank holds; the rest of the
+    /// routable set routes to the null slot.
+    #[allow(clippy::too_many_arguments)]
     fn load(ckpt: &Checkpoint, stream: &Stream, prefix: &dyn Fn(usize) -> String, blocks: usize, n_experts: usize,
-            keep: Option<&[Vec<bool>]>) -> Result<Self> {
+            keep: Option<&[Vec<bool>]>, owned: Option<&[Vec<bool>]>) -> Result<Self> {
         let routable = |b: usize, x: usize| keep.map(|k| k[b][x]).unwrap_or(true);
-        let n_slots: usize = (0..blocks).map(|b| (0..n_experts).filter(|&x| routable(b, x)).count()).sum();
+        let local = |b: usize, x: usize| routable(b, x) && owned.map(|o| o[b][x]).unwrap_or(true);
+        let n_slots: usize = (0..blocks).map(|b| (0..n_experts).filter(|&x| local(b, x)).count()).sum();
+        let null_slot = if owned.is_some() { n_slots as i32 } else { -1 };
         let arena = Arena::new(n_slots.max(1))?;
         let mut lut = vec![-1i32; blocks * n_experts];
         let mut stage = PinnedBuffer::uninit(STAGE_BYTES)?;
@@ -579,7 +623,10 @@ impl ExpertSet {
         let mut slot = 0usize;
         for b in 0..blocks {
             for x in 0..n_experts {
-                if !routable(b, x) {
+                if !local(b, x) {
+                    if routable(b, x) {
+                        lut[b * n_experts + x] = null_slot;
+                    }
                     continue;
                 }
                 let views = reader.read_expert_into(&mut stage, &format!("{}ffn.experts.{x}.", prefix(b)))?;
@@ -600,7 +647,7 @@ impl ExpertSet {
                 slot += 1;
             }
         }
-        Ok(ExpertSet { arena, lut: DeviceBuffer::from_slice(&lut)? })
+        Ok(ExpertSet { arena, lut: DeviceBuffer::from_slice(&lut)?, null_slot })
     }
 }
 
@@ -610,6 +657,9 @@ struct Resident {
     layers: Vec<Option<Layer>>,
     embed: DeviceBuffer<u16>,
     head: DeviceBuffer<u16>,
+    /// the drafter's FP8 copy of the head (DSV41_DRAFT_HEAD_FMT=fp8): half the bytes of the
+    /// draft's largest read; verification keeps the bf16 head, so outputs are unchanged
+    draft_head: Option<Fp8>,
     experts: ExpertSet,
     dspark_experts: Option<ExpertSet>,
     ids: DeviceBuffer<i32>,
@@ -638,6 +688,10 @@ pub struct Engine {
     am_host: PinnedBuffer<i32>,
     act: Act,
     caches: Caches,
+    /// expert parallel over two boxes (attach_pair); None on one box
+    pair: Option<Pair>,
+    /// rank 0 of a pair mirrors its calls to rank 1; rank 1 does not
+    leader: bool,
     lanes: Vec<Lane>,
     max_lanes: usize,
     /// steps run so far (Lane::step)
@@ -701,15 +755,27 @@ impl Resident {
         }
         let embed = ld.bf16("embed.weight", &[v, d])?;
         let head = ld.bf16("head.weight", &[v, d])?;
-        let experts = ExpertSet::load(ckpt, stream, &|l| format!("layers.{l}."), n_layers, cfg.n_routed_experts,
-                                      opts.keep.as_deref())?;
-        let dspark_experts = if opts.spec {
-            Some(ExpertSet::load(ckpt, stream, &|k| format!("mtp.{k}."), cfg.n_mtp_layers, cfg.dspark_n_routed_experts,
-                                 opts.dspark_keep.as_deref())?)
+        let draft_head = if opts.spec && std::env::var("TIDELM_DRAFT_HEAD_FMT").as_deref() != Ok("bf16") {
+            let (w, s) = (DeviceBuffer::<u8>::new(v * d)?, DeviceBuffer::<u8>::new(v.div_ceil(32) * d.div_ceil(32))?);
+            let rc = unsafe { ds_quant_fp8_block32(stream.raw(), np(&head), v as i32, d as i32, np(&w), np(&s)) };
+            if rc != 0 {
+                return Err(format!("draft head quantization: CUDA error {rc}").into());
+            }
+            stream.synchronize()?;
+            Some(Fp8 { w, s, n: v, k: d })
         } else {
             None
         };
-        Ok(Resident { layers, embed, head, experts, dspark_experts, ids: DeviceBuffer::zeroed(TMAX)? })
+        let experts = ExpertSet::load(ckpt, stream, &|l| format!("layers.{l}."), n_layers, cfg.n_routed_experts,
+                                      opts.keep.as_deref(), opts.owned.as_deref())?;
+        // the drafter stays whole on each rank: no collective inside the draft
+        let dspark_experts = if opts.spec {
+            Some(ExpertSet::load(ckpt, stream, &|k| format!("mtp.{k}."), cfg.n_mtp_layers, cfg.dspark_n_routed_experts,
+                                 opts.dspark_keep.as_deref(), None)?)
+        } else {
+            None
+        };
+        Ok(Resident { layers, embed, head, draft_head, experts, dspark_experts, ids: DeviceBuffer::zeroed(TMAX)? })
     }
 }
 
@@ -856,6 +922,7 @@ impl Engine {
             hs: a(t * cfg.moe_inter_dim)?,
             sh: a(t * d)?,
             moe_out: a(t * d)?,
+            moe_partial: f(t * d)?,
             kvl: f(t * hd)?,
             sc: f(t * hd)?,
             lat: a(t * hd)?,
@@ -948,6 +1015,9 @@ impl Engine {
             }
             None => None,
         };
+        if opts.owned.is_some() && !opts.resident {
+            return Err("expert parallel needs resident mode".into());
+        }
         let resident = if opts.resident {
             Some(Resident::load(&ckpt, &stream, &cfg, n_layers, &opts)?)
         } else {
@@ -983,6 +1053,8 @@ impl Engine {
             engram_tables,
             act,
             caches,
+            pair: None,
+            leader: false,
             lanes: lanes_v,
             max_lanes,
             step_no: 0,
@@ -1016,6 +1088,86 @@ impl Engine {
         })
     }
 
+    /// Join a pair before the first step (its MoE combines all-reduce over `pair.comm`).
+    pub fn attach_pair(&mut self, pair: Pair) {
+        self.leader = pair.comm.rank == 0;
+        self.pair = Some(pair);
+    }
+
+    pub fn rank(&self) -> usize {
+        self.pair.as_ref().map(|p| p.comm.rank).unwrap_or(0)
+    }
+
+    /// Rank 0: send the call to rank 1 before running it, so both issue the same device
+    /// work (and reach the same collectives) in the same order.
+    fn mirror(&mut self, msg: impl FnOnce(&mut tidelm_comm::Msg)) -> Result<()> {
+        if self.leader {
+            let mut m = tidelm_comm::Msg::default();
+            msg(&mut m);
+            self.pair.as_mut().unwrap().ctl.send(&m.0)?;
+        }
+        Ok(())
+    }
+
+    /// Rank 0: let rank 1's `follow` return.
+    pub fn release_follower(&mut self) -> Result<()> {
+        self.mirror(|m| {
+            m.u32(OP_SHUTDOWN);
+        })
+    }
+
+    /// Rank 1: replay rank 0's calls until it releases us. Nothing here decides anything.
+    pub fn follow(&mut self) -> Result<()> {
+        loop {
+            let msg = self.pair.as_mut().ok_or("follow needs a pair")?.ctl.recv()?;
+            let mut r = tidelm_comm::Reader::new(&msg);
+            match r.u32()? {
+                OP_FORWARD => {
+                    let _logits = r.u32()?;
+                    let n = r.u32()? as usize;
+                    let mut owned: Vec<(usize, Want, Vec<u32>)> = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let lane = r.u32()? as usize;
+                        let want = match r.u32()? {
+                            0 => Want::Nothing,
+                            1 => Want::Last,
+                            _ => Want::All,
+                        };
+                        owned.push((lane, want, r.u32s()?));
+                    }
+                    let segs: Vec<Seg> = owned.iter().map(|(lane, want, ids)| Seg { lane: *lane, ids, want: *want }).collect();
+                    self.run_step(&segs, false)?;
+                }
+                OP_DRAFT => {
+                    let n = r.u32()? as usize;
+                    let reqs: Vec<(usize, u32, usize)> =
+                        (0..n).map(|_| Ok((r.u32()? as usize, r.u32()?, r.u64()? as usize))).collect::<Result<_>>()?;
+                    self.draft_batch(&reqs)?;
+                }
+                OP_ROLLBACK => {
+                    let n = r.u32()? as usize;
+                    let reqs: Vec<(usize, usize)> = (0..n).map(|_| Ok((r.u32()? as usize, r.u64()? as usize))).collect::<Result<_>>()?;
+                    self.rollback_batch(&reqs)?;
+                }
+                OP_SEED => {
+                    let n = r.u32()? as usize;
+                    let reqs: Vec<(usize, usize)> = (0..n).map(|_| Ok((r.u32()? as usize, r.u64()? as usize))).collect::<Result<_>>()?;
+                    self.seed_draft_batch(&reqs)?;
+                }
+                OP_RESET_LANE => {
+                    let lane = r.u32()? as usize;
+                    self.reset_lane(lane)?;
+                }
+                OP_GRAPHS => {
+                    let on = r.u32()? != 0;
+                    self.set_graphs(on);
+                }
+                OP_SHUTDOWN => return Ok(()),
+                op => return Err(format!("rank 1: unknown control op {op}").into()),
+            }
+        }
+    }
+
     pub fn max_lanes(&self) -> usize {
         self.max_lanes
     }
@@ -1040,6 +1192,9 @@ impl Engine {
 
     /// Switch graph capture/replay on or off (resident only).
     pub fn set_graphs(&mut self, on: bool) {
+        let _ = self.mirror(|m| {
+            m.u32(OP_GRAPHS).u32(on as u32);
+        });
         self.use_graphs = on && self.resident.is_some();
     }
 
@@ -1058,6 +1213,9 @@ impl Engine {
         if lane >= self.max_lanes {
             return Err(format!("lane {lane} of {}", self.max_lanes).into());
         }
+        self.mirror(|m| {
+            m.u32(OP_RESET_LANE).u32(lane as u32);
+        })?;
         self.lanes[lane] = Lane { len: 0, hash: self.hash.fresh(), last: (0, 0, 0), step: u64::MAX };
         for st in self.caches.r2.values() {
             st.flag.upload_async(lane, &[0], &self.stream)?;
@@ -1079,6 +1237,12 @@ impl Engine {
         if reqs.is_empty() {
             return Ok(());
         }
+        self.mirror(|m| {
+            m.u32(OP_ROLLBACK).u32(reqs.len() as u32);
+            for &(lane, n) in reqs {
+                m.u32(lane as u32).u64(n as u64);
+            }
+        })?;
         let mut seen = vec![false; self.max_lanes];
         for &(lane, n) in reqs {
             if lane >= self.max_lanes || std::mem::replace(&mut seen[lane], true) {
@@ -1184,6 +1348,17 @@ impl Engine {
     /// engram rows it needs have been gathered. The gathers run on their own threads from the
     /// start of the step, so a layer's NVMe reads overlap every segment before it.
     fn run_step(&mut self, segs: &[Seg], logits: bool) -> Result<Plan> {
+        self.mirror(|m| {
+            m.u32(OP_FORWARD).u32(logits as u32).u32(segs.len() as u32);
+            for sg in segs {
+                let want = match sg.want {
+                    Want::Nothing => 0,
+                    Want::Last => 1,
+                    Want::All => 2,
+                };
+                m.u32(sg.lane as u32).u32(want).u32s(sg.ids);
+            }
+        })?;
         let tp = Instant::now();
         let plan = self.prepare(segs)?;
         let shape = plan.shape;
@@ -1443,7 +1618,7 @@ impl Engine {
         }
         if l1 == self.n_layers && shape.head > 0 {
             let norm = np(&self.norm);
-            self.head_dev(t, Some(shape.head), norm)?;
+            self.head_dev(t, Some(shape.head), norm, false)?;
             let v = cfg.vocab_size;
             ck(unsafe { ds_argmax_bf16(self.stream.raw(), np(&self.act.logits), v as i64, shape.head as i32, v as i32, np(&self.act.am)) }, "head argmax")?;
         }
@@ -1493,7 +1668,7 @@ impl Engine {
     /// hc_pre with the final pre_mix + `norm` over the step's `t` rows, then the head over
     /// the rows act.head_rows names (`gather`: how many) or over all `t`, into act.logits
     /// `[rows][V]` bf16 (streamed from NVMe unless resident).
-    fn head_dev(&mut self, t: usize, gather: Option<usize>, norm: *mut c_void) -> Result<()> {
+    fn head_dev(&mut self, t: usize, gather: Option<usize>, norm: *mut c_void, draft: bool) -> Result<()> {
         let th = Instant::now();
         let cfg = &self.cfg;
         let (d, hc, v) = (cfg.dim, cfg.hc_mult, cfg.vocab_size);
@@ -1509,7 +1684,11 @@ impl Engine {
             None => (np(&a.head_all), t),
         };
         if let Some(res) = &self.resident {
-            gemm(sr, &a.mma_part, x, d, Wt::Bf16 { w: np(&res.head), n: v, k: d }, rows, np(&a.logits), false, v)?;
+            let w = match (&res.draft_head, draft) {
+                (Some(f), true) => Wt::Fp8(f),
+                _ => Wt::Bf16 { w: np(&res.head), n: v, k: d },
+            };
+            gemm(sr, &a.mma_part, x, d, w, rows, np(&a.logits), false, v)?;
         } else {
             let mut ld = Loader::new(&self.ckpt, st)?;
             let mut n0 = 0;
@@ -1536,6 +1715,12 @@ impl Engine {
         if reqs.iter().all(|r| r.1 == 0) {
             return Ok(());
         }
+        self.mirror(|m| {
+            m.u32(OP_SEED).u32(reqs.len() as u32);
+            for &(lane, rows) in reqs {
+                m.u32(lane as u32).u64(rows as u64);
+            }
+        })?;
         let Some(ds) = &self.dspark else { return Err("seed_draft needs the drafter (spec)".into()) };
         let (mut sel, mut pos, mut lane) = (Vec::new(), Vec::new(), Vec::new());
         for &(ln, rows) in reqs {
@@ -1604,6 +1789,12 @@ impl Engine {
         if n == 0 {
             return Ok(Vec::new());
         }
+        self.mirror(|m| {
+            m.u32(OP_DRAFT).u32(n as u32);
+            for &(lane, tok, last) in reqs {
+                m.u32(lane as u32).u32(tok).u64(last as u64);
+            }
+        })?;
         if n > self.max_draft_lanes() {
             return Err(format!("draft takes at most {} lanes, got {n}", self.max_draft_lanes()).into());
         }
@@ -1684,7 +1875,7 @@ impl Engine {
         self.dspark.as_mut().unwrap().blocks = blocks;
         res?;
         let norm = np(&self.dspark.as_ref().unwrap().w.norm);
-        self.head_dev(rows, None, norm)?;
+        self.head_dev(rows, None, norm, true)?;
         let ds = self.dspark.as_ref().unwrap();
         let (v, r, d, hc) = (cfg.vocab_size, cfg.dspark_markov_rank, cfg.dim, cfg.hc_mult);
         let sr = self.stream.raw();
@@ -2013,8 +2204,8 @@ impl Engine {
             let live = if layer.is_some() { np(&a.live_pairs) } else { nul() };
             ck(unsafe { ds_lut_slots(sr, np(&a.idx), set.lut.ptr_at(bi * e), p as i32, np(&a.keys), live) }, "lut slots")?;
             ck(unsafe { fp4::fp4_moe_cuda_route_small(sr, np(&a.keys), np(&a.block_slot), np(&a.block_pair), np(&a.block_route), p as i32, k as i32) }, "route")?;
-            self.routed_experts(ar, t, k)?;
-            return self.shared_and_combine(w, t);
+            self.routed_experts(ar, t, k, set.null_slot)?;
+            return self.shared_and_combine(w, t, layer.is_some());
         }
         let mut idx = vec![0i32; p];
         self.act.idx.download_async(0, &mut idx, st)?;
@@ -2064,15 +2255,15 @@ impl Engine {
             a.keys.upload_async(0, &keys, st)?;
             let ar = &self.arena;
             ck(unsafe { fp4::fp4_moe_cuda_route_small(sr, np(&a.keys), np(&a.block_slot), np(&a.block_pair), np(&a.block_route), p as i32, k as i32) }, "route")?;
-            self.routed_experts(ar, t, k)?;
+            self.routed_experts(ar, t, k, -1)?;
         }
-        self.shared_and_combine(w, t)
+        self.shared_and_combine(w, t, false)
     }
 
     /// The routed experts' up + down over the routing blocks in act (route_small's output),
     /// with arena `ar`: the bm16 kernels up to FMA_ROWS rows (one-row bits), the tensor-core
     /// kernels above, where bm16 goes compute-bound as pairs concentrate on experts.
-    fn routed_experts(&self, ar: &Arena, t: usize, k: usize) -> Result<()> {
+    fn routed_experts(&self, ar: &Arena, t: usize, k: usize, null_slot: i32) -> Result<()> {
         let cfg = &self.cfg;
         let sr = self.stream.raw();
         let a = &self.act;
@@ -2081,27 +2272,29 @@ impl Engine {
         if t > FMA_ROWS {
             ck(unsafe {
                 ds_moe_up_mma(sr, np(&a.y), d as i64, np(&ar.w1), np(&ar.s1), np(&ar.w3), np(&ar.s3), np(&a.hm), inter as i64,
-                              np(&a.rw), np(&a.block_slot), np(&a.block_route), p, inter as i32, d as i32, cfg.swiglu_limit, -1)
+                              np(&a.rw), np(&a.block_slot), np(&a.block_route), p, inter as i32, d as i32, cfg.swiglu_limit,
+                              null_slot)
             }, "moe up (mma)")?;
             return ck(unsafe {
                 ds_moe_down_mma(sr, np(&a.hm), inter as i64, np(&ar.w2), np(&ar.s2), np(&a.parts), d as i64, np(&a.block_slot),
-                                np(&a.block_pair), p, d as i32, inter as i32, k as i32, ti, -1, 0, 1)
+                                np(&a.block_pair), p, d as i32, inter as i32, k as i32, ti, null_slot, 0, 1)
             }, "moe down (mma)");
         }
         ck(unsafe {
             fp4::fp4_moe_cuda_up_v2(sr, np(&a.y), np(&ar.w1), np(&ar.s1), np(&ar.w3), np(&ar.s3), np(&a.hm), np(&a.rw),
                                     np(&a.block_slot), np(&a.block_route), d as i64, inter as i64, cfg.swiglu_limit,
-                                    k as i32, inter as i32, d as i32, p, -1)
+                                    k as i32, inter as i32, d as i32, p, null_slot)
         }, "moe up")?;
         ck(unsafe {
             fp4::fp4_moe_cuda_down_v2(sr, np(&a.hm), np(&ar.w2), np(&ar.s2), np(&a.parts), np(&a.block_slot),
-                                      np(&a.block_pair), inter as i64, d as i64, k as i32, d as i32, inter as i32, ti, p, -1,
-                                      0, 1)
+                                      np(&a.block_pair), inter as i64, d as i64, k as i32, d as i32, inter as i32, ti, p,
+                                      null_slot, 0, 1)
         }, "moe down")
     }
 
-    /// The shared expert and the one-box combine (model.py::moe's tail).
-    fn shared_and_combine(&self, w: &Layer, t: usize) -> Result<()> {
+    /// The shared expert and the combine (model.py::moe's tail); `backbone` layers of a pair
+    /// all-reduce the routed k-sum first (the drafter is whole on each rank).
+    fn shared_and_combine(&self, w: &Layer, t: usize, backbone: bool) -> Result<()> {
         let cfg = &self.cfg;
         let sr = self.stream.raw();
         let (d, inter, k) = (cfg.dim, cfg.moe_inter_dim, w.topk);
@@ -2112,6 +2305,13 @@ impl Engine {
         gemm(sr, part, np(&a.y), d, Wt::Fp8(&w.sh_w3), t, np(&a.u), false, inter)?;
         ck(unsafe { ds_swiglu(sr, np(&a.g), inter as i64, np(&a.u), inter as i64, np(&a.hs), inter as i64, ti, inter as i32, cfg.swiglu_limit) }, "shared swiglu")?;
         gemm(sr, part, np(&a.hs), inter, Wt::Fp8(&w.sh_w2), t, np(&a.sh), false, d)?;
-        ck(unsafe { ds_moe_combine(sr, np(&a.parts), k as i32, ti, np(&a.sh), np(&a.moe_out), d as i32) }, "moe combine")
+        match (&self.pair, backbone) {
+            (Some(pair), true) => {
+                ck(unsafe { ds_moe_partial(sr, np(&a.parts), k as i32, ti, np(&a.moe_partial), d as i32) }, "moe partial")?;
+                pair.comm.allreduce_f32(np(&a.moe_partial), t * d, &self.stream)?;
+                ck(unsafe { ds_moe_finish(sr, np(&a.moe_partial), np(&a.sh), np(&a.moe_out), ti, d as i32) }, "moe finish")
+            }
+            _ => ck(unsafe { ds_moe_combine(sr, np(&a.parts), k as i32, ti, np(&a.sh), np(&a.moe_out), d as i32) }, "moe combine"),
+        }
     }
 }

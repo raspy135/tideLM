@@ -113,9 +113,26 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
     a slot LUT) is bit-identical to streaming; with `--graphs` each backbone step is one
     CUDA graph, bit-identical to both (`tidelm-parity`, 4-layer truncation: 9 steps x
     129,280 logits). On that truncation graphs take 17.1 -> 15.3 ms/step.
-  - Not yet measured: anything at full scale. The resident full model needs the box
-    to itself (the GLM server holds 103 GB), and single-box residency needs a pruned keep
-    set; the real deployment is TP2 (M4).
+  - Full scale, 2026-10-24, one box (GLM server stopped): all 40 layers resident with the
+    4,600 highest-demand experts (30%, `--keep-db` over the prune demand database, the rest
+    pruned), greedy, graphs, bench.py's prose and code prompts, 256 tokens, every arm
+    token-identical to plain greedy (`tidelm-generate --sweep-depth`):
+
+    | arm | prose tok/s | code tok/s | ms/step |
+    |---|---:|---:|---:|
+    | plain | 13.4-13.6 | 13.4-13.5 | 74 |
+    | fixed depth 3 | 16.7-17.5 | 18.4-19.2 | 124-130 |
+    | fixed depth 5 | 14.6-15.3 | 17.0-17.5 | 146-153 |
+    | window 3/5 (the Python default) | 17.0 | 19.1-19.2 | 127 |
+    | confidence, any width 1..5 | 18.1-18.2 | 18.9-19.1 | 108-121 |
+
+    A verify row costs 8-16 ms (the experts it routes to); the engram overlap took 9% off a
+    speculative step. Not comparable to the README rows (two boxes, 68% resident, hot reads,
+    sampling): that comparison needs the pair.
+  - Depth: the oracle verify depth is +7-23% over the best fixed depth on the retained
+    confidence traces; DSpark's head gets about a third of it, and neither online
+    recalibration nor acceptance history adds anything (offline replays). Beyond that needs
+    a target-side signal (e.g. progressive verification: decide after part of the stack).
 - **M3 — bigger graphs** (user goal). Today a step is 4 graph replays + eager
   embedding/hash + ~10 host-launched accept ops. Merge order, each step A/B'd on
   `boundary_gap_ms_per_step` and tok/s:
@@ -129,7 +146,18 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
      capture count and warm-up.
   The L1/L14 engram boundaries stay: they wait on NVMe, and a graph cannot hide a
   host wait — the win there is prefetch depth, not capture width.
-- **M4 — TP2.** NCCL from Rust, control message over NCCL (replacing Gloo), RoCE shim,
+- **M4 — TP2.** Status 2026-10-24: EP2 runs. `tidelm-comm` links the engine image's NCCL
+  2.28.3 (copied to ~/.local/nccl on both boxes) and carries the pair's TCP control channel:
+  a byte-for-byte boot config check (options, expert-set digests, the executable's hash),
+  then rank 0 sends rank 1 every engine call before running it. Experts are split by
+  alternating demand rank per layer; the peer's experts route to a null slot (up skips it,
+  down writes zeros), and each layer's routed k-sum is all-reduced in fp32 before the
+  shared expert joins at the single-box rounding point. The drafter, dense layers and head
+  are replicated. NCCL over RoCE from host processes: `NCCL_PROTO=Simple` (46 us for a
+  6-row combine against 171 for NCCL's default choice; 22 vs 57 at 1 row). On the 4-layer
+  truncation the pair emits the same 24 tokens as one box. Next: dense TP (each box reads
+  half the dense weights - ~55% of a token's bytes), then the RoCE one-shot path.
+  Original plan: NCCL from Rust, control message over NCCL (replacing Gloo), RoCE shim,
   full boot config guard (typed struct, broadcast, any differing field aborts — the
   repo's silent-pair-divergence rule). *Gate: two-rank token parity and tok/s vs the
   Python TP2 profile; the `bench_accept_ab_tp.py` workload.*

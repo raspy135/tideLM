@@ -979,6 +979,57 @@ __global__ void moe_combine_kernel(const float* __restrict__ parts, int K, int M
     out[(int64_t)m * D + d] = to_bf(acc + bf(shared[(int64_t)m * D + d]));
 }
 
+// tools/fp8_linear.py::quantize_to_fp8 for a bf16 [N][K] weight (the drafter's copy of the
+// LM head, DSV41_DRAFT_HEAD_FMT=fp8): per 32x32 block, scale 2^ceil(log2(amax/448)), raised
+// once more if that would still clip, then the round-to-nearest e4m3 conversion. One block a tile.
+__global__ void quant_fp8_block32_kernel(const __nv_bfloat16* __restrict__ w, int N, int K, uint8_t* __restrict__ codes,
+                                         uint8_t* __restrict__ scales, int nbk) {
+    __shared__ float red[256];
+    const int r0 = blockIdx.y * 32, c0 = blockIdx.x * 32;
+    float amax = 0.f;
+    for (int i = threadIdx.x; i < 1024; i += 256) {
+        const int r = r0 + i / 32, c = c0 + i % 32;
+        if (r < N && c < K) amax = fmaxf(amax, fabsf(bf(w[(int64_t)r * K + c])));
+    }
+    red[threadIdx.x] = amax;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+        __syncthreads();
+    }
+    amax = fmaxf(red[0], 448.f * exp2f(-126.f));
+    float e = ceilf(log2f(amax / 448.f));
+    if (amax > 448.f * exp2f(e)) e += 1.f;
+    const float b = fminf(fmaxf(e + 127.f, 0.f), 255.f);
+    if (threadIdx.x == 0) scales[(int64_t)blockIdx.y * nbk + blockIdx.x] = (uint8_t)b;
+    const float inv = exp2f(127.f - b);
+    for (int i = threadIdx.x; i < 1024; i += 256) {
+        const int r = r0 + i / 32, c = c0 + i % 32;
+        if (r < N && c < K)
+            codes[(int64_t)r * K + c] = (uint8_t)__nv_cvt_float_to_fp8(bf(w[(int64_t)r * K + c]) * inv, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
+// Expert parallel: moe_combine split at the all-reduce. Each rank sums its k parts (zeros
+// for the peer's experts) in k order into fp32, the pair sums those (one a + b, the same
+// bits on both ranks), and the shared expert joins at the single-box rounding point.
+__global__ void moe_partial_kernel(const float* __restrict__ parts, int K, int M, float* __restrict__ out, int D) {
+    const int m = blockIdx.y;
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= D) return;
+    float acc = parts[(int64_t)m * D + d];
+    for (int k = 1; k < K; ++k) acc += parts[((int64_t)k * M + m) * D + d];
+    out[(int64_t)m * D + d] = acc;
+}
+
+__global__ void moe_finish_kernel(const float* __restrict__ routed, const __nv_bfloat16* __restrict__ shared,
+                                  __nv_bfloat16* __restrict__ out, int D) {
+    const int m = blockIdx.y;
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= D) return;
+    out[(int64_t)m * D + d] = to_bf(routed[(int64_t)m * D + d] + bf(shared[(int64_t)m * D + d]));
+}
+
 // ------------------------------------------------------------------ attention (decode)
 // model.py::attention + _softmax_attn for decode rows: keys are the layer's window ring
 // (positions pos-W+1 .. pos, oldest first, masked below `win_lo`) followed by `C` selected
@@ -1931,6 +1982,25 @@ int ds_greedy_accept(void* stream, const void* am, const void* block, int T, con
 
 int ds_wait_flag(void* stream, const void* flag, int expect, long long timeout_ns, void* err) {
     wait_flag_kernel<<<1, 32, 0, DS_ST>>>(static_cast<const volatile int*>(flag), expect, timeout_ns, static_cast<int*>(err));
+    DS_RET;
+}
+
+int ds_quant_fp8_block32(void* stream, const void* w, int N, int K, void* codes, void* scales) {
+    const int nbk = (K + 31) / 32;
+    quant_fp8_block32_kernel<<<dim3(nbk, (N + 31) / 32), 256, 0, DS_ST>>>(static_cast<const __nv_bfloat16*>(w), N, K,
+        static_cast<uint8_t*>(codes), static_cast<uint8_t*>(scales), nbk);
+    DS_RET;
+}
+
+int ds_moe_partial(void* stream, const void* parts, int K, int M, void* out, int D) {
+    moe_partial_kernel<<<dim3((D + 255) / 256, M), 256, 0, DS_ST>>>(static_cast<const float*>(parts), K, M,
+                                                                    static_cast<float*>(out), D);
+    DS_RET;
+}
+
+int ds_moe_finish(void* stream, const void* routed, const void* shared, void* out, int M, int D) {
+    moe_finish_kernel<<<dim3((D + 255) / 256, M), 256, 0, DS_ST>>>(static_cast<const float*>(routed),
+        static_cast<const __nv_bfloat16*>(shared), static_cast<__nv_bfloat16*>(out), D);
     DS_RET;
 }
 

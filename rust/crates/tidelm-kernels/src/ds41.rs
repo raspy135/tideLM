@@ -197,6 +197,17 @@ extern "C" {
     /// Output rows per block of the tensor-core GEMM at m rows (for choosing split-K).
     pub fn ds_mma_rows_per_block(m: c_int) -> c_int;
 
+    /// bf16 [N][K] -> e4m3 codes [N][K] + UE8M0 scales [ceil(N/32)][ceil(K/32)]
+    /// (tools/fp8_linear.py::quantize_to_fp8).
+    pub fn ds_quant_fp8_block32(stream: CudaStream, w: *const c_void, n: c_int, k: c_int, codes: *mut c_void,
+                                scales: *mut c_void) -> c_int;
+
+    /// Expert parallel: this rank's k-sum of `parts` [K][M][D] in fp32 (ds_moe_combine
+    /// without the shared expert), and after the pair's all-reduce, + shared rounded to bf16.
+    pub fn ds_moe_partial(stream: CudaStream, parts: *const c_void, k: c_int, m: c_int, out: *mut c_void, d: c_int) -> c_int;
+    pub fn ds_moe_finish(stream: CudaStream, routed: *const c_void, shared: *const c_void, out: *mut c_void, m: c_int,
+                         d: c_int) -> c_int;
+
     /// The FP4 MoE up GEMM + SwiGLU on the tensor cores: fp4_moe_cuda_up_v2's contract
     /// (route_small blocks, `block_route` = pair | token << 16), for steps past 16 rows.
     pub fn ds_moe_up_mma(
