@@ -5,3 +5,7 @@ version = 4
 [[package]]
 name = "tidelm-core"
 version = "0.1.0"
+
+[[package]]
+name = "tidelm-kernels"
+version = "0.1.0"

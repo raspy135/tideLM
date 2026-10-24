@@ -7,6 +7,7 @@
 //! changes numerics or control flow per rank must surface in the boot-time config
 //! guard, never behind a rank-local condition.
 
+pub mod depth;
 pub mod residency;
 pub mod sampling;
 pub mod scales;

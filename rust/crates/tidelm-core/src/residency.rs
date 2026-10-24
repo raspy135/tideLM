@@ -146,6 +146,7 @@ pub enum Select {
 /// AVERAGE. From `v41_engine.build_keep_masks`. Returns per-layer keep masks plus the
 /// kept expert ids, hottest first. Ties rank the lower expert id first (NumPy's argsort
 /// order on ties is unspecified; a fixed rule keeps the two EP ranks identical).
+#[allow(clippy::type_complexity)] // (masks, kept ids) — the Python return, kept recognizable
 pub fn build_keep_masks(
     counts: &BTreeMap<u32, Vec<f64>>,
     frac: f64,

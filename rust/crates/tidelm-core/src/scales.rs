@@ -169,6 +169,7 @@ pub fn decode(record: &[u8], spec: &Layout) -> Result<Vec<u8>, ScaleError> {
         u64::from_le_bytes(record[base + i * 8..base + i * 8 + 8].try_into().unwrap())
     };
     let mut counts = Vec::with_capacity(blocks);
+    #[allow(clippy::needless_range_loop)] // b indexes three planes of `record`, not one slice
     for b in 0..blocks {
         let escape_bits = word(spec.escaped, b);
         let valid = spec.size.saturating_sub(b * BLOCK).min(BLOCK);

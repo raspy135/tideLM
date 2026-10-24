@@ -106,6 +106,9 @@ pub fn verify_probabilities(
         let pd = probs.row(i)[d];
         let qd = q.row(i)[d].max(1e-20);
         let ratio = (pd / qd).min(1.0);
+        // Deliberately `!(u < ratio)`, not `u >= ratio`: a NaN ratio must REJECT the
+        // draft, exactly as the Python tensor comparison does.
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
         if !(uniforms[i] < ratio) {
             first_reject = i;
             break;
