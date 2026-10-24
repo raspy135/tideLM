@@ -6,3 +6,6 @@ license.workspace = true
 description = "GPU-free core logic of the tidelm DS v4.1 engine: sampling, speculative verification, expert residency planning, scale codec"
 
 [dependencies]
+
+[dev-dependencies]
+serde_json = "1"

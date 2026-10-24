@@ -8,6 +8,8 @@
 //! guard, never behind a rank-local condition.
 
 pub mod depth;
+pub mod engram_hash;
+pub mod numpy_rng;
 pub mod residency;
 pub mod sampling;
 pub mod scales;

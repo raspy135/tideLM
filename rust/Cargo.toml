@@ -5,6 +5,7 @@ members = [
     "crates/tidelm-cuda",
     "crates/tidelm-kernels",
     "crates/tidelm-model",
+    "crates/tidelm-text",
 ]
 
 [workspace.package]
