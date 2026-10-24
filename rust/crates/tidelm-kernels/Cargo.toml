@@ -7,3 +7,7 @@ description = "FFI to the engine's native GPU/CPU kernels: fp4_moe_cuda.cu (deco
 build = "build.rs"
 
 [dependencies]
+
+[dev-dependencies]
+tidelm-core = { path = "../tidelm-core" }
+tidelm-cuda = { path = "../tidelm-cuda" }
