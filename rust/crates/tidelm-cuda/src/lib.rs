@@ -93,6 +93,28 @@ impl Stream {
         check(unsafe { ffi::cudaStreamWaitEvent(self.0, event.0, 0) }, "cudaStreamWaitEvent")
     }
 
+    /// Start recording this stream's work into a graph (see `end_capture`). Split from
+    /// `capture` for callers whose recording code needs `&mut` access to the stream's owner.
+    pub fn begin_capture(&self) -> Result<()> {
+        check(
+            unsafe { ffi::cudaStreamBeginCapture(self.0, ffi::CAPTURE_MODE_THREAD_LOCAL) },
+            "cudaStreamBeginCapture",
+        )
+    }
+
+    /// Stop recording and instantiate. Always call after `begin_capture`, even when the
+    /// recording failed, so the stream leaves capture mode.
+    pub fn end_capture(&self) -> Result<GraphExec> {
+        let mut graph: ffi::cudaGraph_t = std::ptr::null_mut();
+        check(unsafe { ffi::cudaStreamEndCapture(self.0, &mut graph) }, "cudaStreamEndCapture")?;
+        let mut exec: ffi::cudaGraphExec_t = std::ptr::null_mut();
+        let instantiated =
+            check(unsafe { ffi::cudaGraphInstantiate(&mut exec, graph, 0) }, "cudaGraphInstantiate");
+        unsafe { ffi::cudaGraphDestroy(graph) };
+        instantiated?;
+        Ok(GraphExec(exec))
+    }
+
     /// Capture everything queued on this stream inside `record` into an executable graph.
     pub fn capture<F: FnOnce(&Stream) -> Result<()>>(&self, record: F) -> Result<GraphExec> {
         check(

@@ -3,7 +3,7 @@
 //!   tidelm-generate --prompt "The capital of France is" [--max-tokens 16]
 //!                   [--prompt-file F] [--model-dir DIR] [--max-seq 1024] [--no-bos]
 //!                   [--spec [--depth 5]] [--compare]
-//!                   [--resident] [--layers N] [--keep-first K]   (tests: truncate / restrict experts)
+//!                   [--resident [--graphs]] [--layers N] [--keep-first K]   (tests: truncate / restrict experts)
 //!
 //! --spec decodes with the DSpark drafter; --compare runs plain greedy and then speculative
 //! greedy on the same engine and checks the two token sequences are identical (the repo's
@@ -59,7 +59,7 @@ fn main() -> tidelm_engine::Result<()> {
 
     tidelm_cuda::set_device(0)?;
     let keep = keep_first.map(|k| vec![(0..384).map(|e| e < k).collect::<Vec<bool>>(); 40]);
-    let opts = Options { max_seq, spec: spec || compare, resident: flag("--resident"), n_layers, keep };
+    let opts = Options { max_seq, spec: spec || compare, resident: flag("--resident"), graphs: flag("--graphs"), n_layers, keep };
     let mut engine = Engine::new(&model_dir, token_map, opts)?;
     eprintln!("engine up in {:.1}s", t0.elapsed().as_secs_f64());
     let stop = [1u32]; // <｜end▁of▁sentence｜>

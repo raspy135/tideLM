@@ -72,6 +72,8 @@ pub struct Options {
     /// all weights and routable experts on the device, routing through the slot LUT —
     /// the mode the step graph runs in; otherwise every step streams its weights
     pub resident: bool,
+    /// resident only: issue each backbone step as one CUDA graph, captured per StepShape
+    pub graphs: bool,
     /// run only the first n backbone layers (tests)
     pub n_layers: Option<usize>,
     /// per backbone layer, the routable experts (model.py's prune mask); None = all
@@ -80,7 +82,7 @@ pub struct Options {
 
 impl Options {
     pub fn streaming(max_seq: usize, spec: bool) -> Self {
-        Options { max_seq, spec, resident: false, n_layers: None, keep: None }
+        Options { max_seq, spec, resident: false, graphs: false, n_layers: None, keep: None }
     }
 }
 
@@ -189,9 +191,6 @@ struct Act {
     latn: DeviceBuffer<u16>,
     kidx: DeviceBuffer<u16>,
     kidxn: DeviceBuffer<u16>,
-    cpos: DeviceBuffer<i32>,
-    raw: DeviceBuffer<u8>,
-    inv: DeviceBuffer<i32>,
     erows: DeviceBuffer<u16>,
     ekv: DeviceBuffer<u16>,
     emb: DeviceBuffer<u16>,
@@ -232,11 +231,34 @@ enum Selection {
     Indexed,
 }
 
+/// Everything about a backbone step that its launches depend on besides buffer contents:
+/// the CUDA-graph key. Widths that grow with the context are bucketed to powers of two so a
+/// graph serves many steps; the padding is masked by the per-row visible counts.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct StepShape {
+    t: usize,
+    /// all-visible list widths per ratio (bucketed, <= index_topk)
+    c1: usize,
+    c2: usize,
+    /// the indexer's key range per ratio when it runs (bucketed), None while n_c <= index_topk
+    n1: Option<usize>,
+    n2: Option<usize>,
+    /// layer 20's candidate-block mask exists (n_c > 16,384)
+    cand: bool,
+    /// (first row, rows) of the head; rows == 0 for none
+    head: (usize, usize),
+}
+
+fn bucket(n: usize, lo: usize, hi: usize) -> usize {
+    n.max(1).next_power_of_two().max(lo).min(hi)
+}
+
 /// How a block's attention sees keys: the backbone's (window ring + compressed cache) or a
 /// DSpark block's (its seeded ring up to the last main position + the draft block's keys).
 #[derive(Clone, Copy)]
 enum Ctx {
     Main { l: usize, s: usize, c1: usize, c2: usize },
+    #[allow(dead_code)]
     Draft { k: usize, s: usize, win_end: usize },
 }
 
@@ -305,6 +327,18 @@ pub struct Engine {
     /// rows of the compressed-rope positions, per ratio: max(pos - (r - 1), 0)
     cpos1: DeviceBuffer<i32>,
     cpos2: DeviceBuffer<i32>,
+    /// the one-hot initial pre_mix of every row, copied in on the device each step
+    one_hot: DeviceBuffer<f32>,
+    /// per engram layer, this step's gathered table rows and their (token, col) map
+    eg_raw: Vec<DeviceBuffer<u8>>,
+    eg_inv: Vec<DeviceBuffer<i32>>,
+    /// the step being issued (select() reads its indexer ranges)
+    shape: Option<StepShape>,
+    use_graphs: bool,
+    graphs: std::collections::HashMap<StepShape, tidelm_cuda::GraphExec>,
+    /// steps served by a graph replay / by a capture
+    pub graph_replays: usize,
+    pub graph_captures: usize,
     /// (start position, rows) of the last forward: what `seed_draft` reads `main_h` for
     last_forward: (usize, usize),
     pub max_seq: usize,
@@ -485,9 +519,6 @@ impl Engine {
             latn: a(t * cfg.head_dim)?,
             kidx: a(t * cfg.index_head_dim)?,
             kidxn: a(t * cfg.index_head_dim)?,
-            cpos: i(t)?,
-            raw: DeviceBuffer::zeroed(t * eng_cols * 264)?,
-            inv: i(t * eng_cols)?,
             erows: a(t * eng_cols * cfg.engram_head_dim)?,
             ekv: a(t * (hc + 1) * d)?,
             emb: a(t * d)?,
@@ -565,6 +596,9 @@ impl Engine {
         } else {
             None
         };
+        let n_eng = cfg.engram_layer_ids.len();
+        let eg_raw = (0..n_eng).map(|_| DeviceBuffer::zeroed(t * eng_cols * 264)).collect::<std::result::Result<_, _>>()?;
+        let eg_inv = (0..n_eng).map(|_| DeviceBuffer::zeroed(t * eng_cols)).collect::<std::result::Result<_, _>>()?;
         Ok(Engine {
             arena: Arena::new(ARENA_SLOTS + 1)?,
             expert_stage: PinnedBuffer::uninit(STAGE_BYTES)?,
@@ -584,6 +618,14 @@ impl Engine {
             n_layers,
             cpos1: i(t)?,
             cpos2: i(t)?,
+            one_hot: DeviceBuffer::from_slice(&(0..t * hc).map(|j| if j % hc == 0 { 1.0f32 } else { 0.0 }).collect::<Vec<_>>())?,
+            eg_raw,
+            eg_inv,
+            shape: None,
+            use_graphs: opts.graphs && opts.resident,
+            graphs: std::collections::HashMap::new(),
+            graph_replays: 0,
+            graph_captures: 0,
             last_forward: (0, 0),
             max_seq,
             times: StepTimes::default(),
@@ -597,6 +639,11 @@ impl Engine {
 
     pub fn len(&self) -> usize {
         self.caches.len
+    }
+
+    /// Switch graph capture/replay on or off (resident only).
+    pub fn set_graphs(&mut self, on: bool) {
+        self.use_graphs = on && self.resident.is_some();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -644,16 +691,12 @@ impl Engine {
         Ok(())
     }
 
-    fn embed(&mut self, ids: &[u32]) -> Result<()> {
+    /// The host half of the embedding: resident uploads the ids, streaming reads the rows.
+    fn embed_host(&mut self, ids: &[u32]) -> Result<()> {
         let d = self.cfg.dim;
-        let t = ids.len();
-        let hc = self.cfg.hc_mult;
         if let Some(res) = &self.resident {
             let dev_ids: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
             res.ids.upload_async(0, &dev_ids, &self.stream)?;
-            ck(unsafe {
-                ds_embed_hc(self.stream.raw(), np(&res.ids), np(&res.embed), np(&self.act.h), t as i32, d as i32, hc as i32)
-            }, "embed")?;
         } else {
             let noise = self.cfg.dspark_noise_token_id;
             let mut ld = Loader::new(&self.ckpt, &self.stream)?;
@@ -663,21 +706,55 @@ impl Engine {
                     _ => ld.read_into("embed.weight", id as usize * d * 2, (id as usize + 1) * d * 2, self.act.emb.ptr_at(ti * d))?,
                 }
             }
-            ck(unsafe {
-                ds_embed_hc(self.stream.raw(), np(&self.act.row_ids), np(&self.act.emb), np(&self.act.h), t as i32, d as i32, hc as i32)
-            }, "embed")?;
         }
-        let mut pre = vec![0f32; t * hc];
-        for ti in 0..t {
-            pre[ti * hc] = 1.0;
-        }
-        self.act.pre.upload_async(0, &pre, &self.stream)?;
         Ok(())
+    }
+
+    /// The device half: expand into the hc stream, one-hot pre_mix.
+    fn embed_dev(&self, t: usize) -> Result<()> {
+        let (d, hc) = (self.cfg.dim, self.cfg.hc_mult);
+        let st = &self.stream;
+        let (ids, table) = match &self.resident {
+            Some(res) => (np(&res.ids), np(&res.embed)),
+            None => (np(&self.act.row_ids), np(&self.act.emb)),
+        };
+        ck(unsafe { ds_embed_hc(st.raw(), ids, table, np(&self.act.h), t as i32, d as i32, hc as i32) }, "embed")?;
+        self.act.pre.copy_from(0, &self.one_hot, 0, t * hc, st)?;
+        Ok(())
+    }
+
+    /// Embedding for a block whose rows are not a backbone step (the draft block).
+    fn embed(&mut self, ids: &[u32]) -> Result<()> {
+        self.embed_host(ids)?;
+        self.embed_dev(ids.len())
     }
 
     /// Run tokens `ids` at positions `len..len + ids.len()` (at most TMAX) through the
     /// backbone; returns the bf16 logits `want` asks for (the engine's head rounds them).
     pub fn forward(&mut self, ids: &[u32], want: Want) -> Result<Vec<u16>> {
+        let shape = self.prepare(ids, want)?;
+        if self.use_graphs {
+            if !self.graphs.contains_key(&shape) {
+                // capture records the step without running it; the launch below runs it once
+                self.stream.begin_capture()?;
+                let rec = self.device_step(shape);
+                let graph = self.stream.end_capture();
+                rec?;
+                self.graphs.insert(shape, graph?);
+                self.graph_captures += 1;
+            } else {
+                self.graph_replays += 1;
+            }
+            self.graphs[&shape].launch(&self.stream)?;
+        } else {
+            self.device_step(shape)?;
+        }
+        self.collect(shape)
+    }
+
+    /// Host work before a step's device work: positions, the embedding's host half, the
+    /// n-gram hashes and their engram rows (an NVMe gather), and the step's shape.
+    fn prepare(&mut self, ids: &[u32], want: Want) -> Result<StepShape> {
         let t = ids.len();
         let s = self.caches.len;
         if t == 0 || t > TMAX {
@@ -687,34 +764,84 @@ impl Engine {
             return Err(format!("context {} exceeds max_seq {}", s + t, self.max_seq).into());
         }
         let cfg = self.cfg.clone();
-        let (d, hc) = (cfg.dim, cfg.hc_mult);
         let tw = Instant::now();
-        let (c1, c2) = {
+        {
             let st = &self.stream;
-            let sr = st.raw();
             let pos: Vec<i32> = (s..s + t).map(|p| p as i32).collect();
             self.act.pos.upload_async(0, &pos, st)?;
             let cpos2: Vec<i32> = pos.iter().map(|&p| (p - 1).max(0)).collect();
             self.cpos1.upload_async(0, &pos, st)?;
             self.cpos2.upload_async(0, &cpos2, st)?;
-            // the all-visible compressed lists, built on the device from the positions; only
-            // read while n_c <= index_topk (past that the indexer's top-k replaces them), so
-            // they are never wider than index_topk
-            let c1 = ((s + t) / 1).min(cfg.index_topk);
-            let c2 = ((s + t) / 2).min(cfg.index_topk);
-            ck(unsafe { ds_visible(sr, np(&self.act.pos), t as i32, 1, c1.max(1) as i32, np(&self.act.cidx1), np(&self.act.clen1)) }, "visible r1")?;
-            ck(unsafe { ds_visible(sr, np(&self.act.pos), t as i32, 2, c2.max(1) as i32, np(&self.act.cidx2), np(&self.act.clen2)) }, "visible r2")?;
-            (c1, c2)
-        };
-        self.selection = Selection::AllVisible;
-        self.cand_live = false;
-        self.embed(ids)?;
-
+        }
+        self.embed_host(ids)?;
+        let st = &self.stream;
         let hashes = self.hash.hash(ids, s, None); // [t][n_engram_layers][cols]
         let cols = self.hash.layout.n_hash_cols();
         let n_eng = cfg.engram_layer_ids.len();
         self.times.compute_s += tw.elapsed().as_secs_f64();
+        let te = Instant::now();
+        for li in 0..n_eng {
+            let l = cfg.engram_layer_ids[li];
+            if l >= self.n_layers {
+                continue;
+            }
+            let col_ids: Vec<i64> =
+                (0..t).flat_map(|ti| hashes[(ti * n_eng + li) * cols..(ti * n_eng + li + 1) * cols].to_vec()).collect();
+            let mut uniq = col_ids.clone();
+            uniq.sort_unstable();
+            uniq.dedup();
+            let inv: Vec<i32> = col_ids.iter().map(|h| uniq.binary_search(h).unwrap() as i32).collect();
+            let mut raw = vec![0u8; uniq.len() * 264];
+            let rc = unsafe { eg::engram_gather_run(self.engram_tables[&l].ctx, uniq.as_ptr(), uniq.len(), raw.as_mut_ptr()) };
+            if rc != 0 {
+                return Err(format!("layer {l}: engram gather failed ({rc})").into());
+            }
+            self.eg_raw[li].upload_async(0, &raw, st)?;
+            self.eg_inv[li].upload_async(0, &inv, st)?;
+        }
+        self.times.engram_s += te.elapsed().as_secs_f64();
 
+        let topk = cfg.index_topk;
+        let nc = |r: usize| (s + t) / r;
+        let indexed = |r: usize| -> Option<usize> {
+            (nc(r) > topk).then(|| bucket(nc(r), 2048, self.max_seq / r + 1))
+        };
+        let cand_src = cfg.candidate_source_layer;
+        let head = match want {
+            Want::Nothing => (0, 0),
+            Want::Last => (t - 1, 1),
+            Want::All => (0, t),
+        };
+        Ok(StepShape {
+            t,
+            c1: bucket(nc(1).min(topk), 16, topk),
+            c2: bucket(nc(2).min(topk), 16, topk),
+            n1: indexed(1),
+            n2: indexed(2),
+            cand: cand_src >= 0 && (cand_src as usize) < self.n_layers && nc(cfg.compress_ratios[cand_src as usize].max(1)) > 2048 * 8,
+            head,
+        })
+    }
+
+    /// Every device operation of one backbone step, in stream order, with no host decision
+    /// that depends on buffer contents: the body the step graph captures.
+    fn device_step(&mut self, shape: StepShape) -> Result<()> {
+        let cfg = self.cfg.clone();
+        let (d, hc, t) = (cfg.dim, cfg.hc_mult, shape.t);
+        let capturing = self.use_graphs;
+        self.shape = Some(shape);
+        self.embed_dev(t)?;
+        {
+            let sr = self.stream.raw();
+            let a = &self.act;
+            // the all-visible compressed lists, built from the positions; only read while
+            // n_c <= index_topk (past that the indexer's top-k replaces them)
+            ck(unsafe { ds_visible(sr, np(&a.pos), t as i32, 1, shape.c1 as i32, np(&a.cidx1), np(&a.clen1)) }, "visible r1")?;
+            ck(unsafe { ds_visible(sr, np(&a.pos), t as i32, 2, shape.c2 as i32, np(&a.cidx2), np(&a.clen2)) }, "visible r2")?;
+        }
+        self.selection = Selection::AllVisible;
+        self.cand_live = false;
+        let cols = self.hash.layout.n_hash_cols();
         for l in 0..self.n_layers {
             let t0 = Instant::now();
             // resident: borrow the layer out of the resident set for this block (put back below)
@@ -726,49 +853,33 @@ impl Engine {
                 }
             };
             self.times.weights_s += t0.elapsed().as_secs_f64();
-
-            if let Some(e) = &w.engram {
-                let te = Instant::now();
-                let st = &self.stream;
-                let sr = st.raw();
-                let li = cfg.engram_layer_ids.iter().position(|&x| x == l).unwrap();
-                let col_ids: Vec<i64> =
-                    (0..t).flat_map(|ti| hashes[(ti * n_eng + li) * cols..(ti * n_eng + li + 1) * cols].to_vec()).collect();
-                let mut uniq = col_ids.clone();
-                uniq.sort_unstable();
-                uniq.dedup();
-                let inv: Vec<i32> = col_ids.iter().map(|h| uniq.binary_search(h).unwrap() as i32).collect();
-                let mut raw = vec![0u8; uniq.len() * 264];
-                let rc = unsafe { eg::engram_gather_run(self.engram_tables[&l].ctx, uniq.as_ptr(), uniq.len(), raw.as_mut_ptr()) };
-                if rc != 0 {
-                    return Err(format!("layer {l}: engram gather failed ({rc})").into());
-                }
-                self.act.raw.upload_async(0, &raw, st)?;
-                self.act.inv.upload_async(0, &inv, st)?;
-                self.times.engram_s += te.elapsed().as_secs_f64();
-                let a = &self.act;
-                ck(unsafe { ds_engram_dequant(sr, np(&a.raw), np(&a.inv), t as i32, cols as i32, np(&a.erows)) }, "engram dequant")?;
-                let k = cols * cfg.engram_head_dim;
-                ck(unsafe {
-                    ds_linear_fp8(sr, np(&a.erows), k as i64, np(&e.wkv.w), np(&e.wkv.s), e.wkv.lds() as i64, t as i32,
-                                  e.wkv.n as i32, k as i32, 1, np(&a.ekv), nul(), e.wkv.n as i64, nul())
-                }, "engram wkv")?;
-                ck(unsafe {
-                    ds_engram_gate(sr, np(&a.h), np(&a.ekv), np(&e.weight), t as i32, d as i32, hc as i32, cfg.norm_eps,
-                                   (d as f64).powf(-0.5) as f32)
-                }, "engram gate")?;
-            }
-            // the DSpark main hidden reads the attention INPUT of its target layers
-            if let Some(ti) = cfg.dspark_target_layer_ids.iter().position(|&x| x == l) {
-                let ld_main = cfg.dspark_target_layer_ids.len() * d;
-                ck(unsafe {
-                    ds_hc_mean(self.stream.raw(), np(&self.act.h), self.act.main_h.ptr_at(ti * d), ld_main as i64,
-                               t as i32, d as i32, hc as i32)
-                }, "main hidden")?;
-            }
-
             let tc = Instant::now();
-            let res = self.block(&w, Ctx::Main { l, s, c1, c2 }, t);
+            let res = (|| -> Result<()> {
+                if let Some(e) = &w.engram {
+                    let sr = self.stream.raw();
+                    let li = cfg.engram_layer_ids.iter().position(|&x| x == l).unwrap();
+                    let a = &self.act;
+                    ck(unsafe { ds_engram_dequant(sr, np(&self.eg_raw[li]), np(&self.eg_inv[li]), t as i32, cols as i32, np(&a.erows)) }, "engram dequant")?;
+                    let k = cols * cfg.engram_head_dim;
+                    ck(unsafe {
+                        ds_linear_fp8(sr, np(&a.erows), k as i64, np(&e.wkv.w), np(&e.wkv.s), e.wkv.lds() as i64, t as i32,
+                                      e.wkv.n as i32, k as i32, 1, np(&a.ekv), nul(), e.wkv.n as i64, nul())
+                    }, "engram wkv")?;
+                    ck(unsafe {
+                        ds_engram_gate(sr, np(&a.h), np(&a.ekv), np(&e.weight), t as i32, d as i32, hc as i32, cfg.norm_eps,
+                                       (d as f64).powf(-0.5) as f32)
+                    }, "engram gate")?;
+                }
+                // the DSpark main hidden reads the attention INPUT of its target layers
+                if let Some(ti) = cfg.dspark_target_layer_ids.iter().position(|&x| x == l) {
+                    let ld_main = cfg.dspark_target_layer_ids.len() * d;
+                    ck(unsafe {
+                        ds_hc_mean(self.stream.raw(), np(&self.act.h), self.act.main_h.ptr_at(ti * d), ld_main as i64,
+                                   t as i32, d as i32, hc as i32)
+                    }, "main hidden")?;
+                }
+                self.block(&w, Ctx::Main { l, s: 0, c1: shape.c1, c2: shape.c2 }, t)
+            })();
             match self.resident.as_mut() {
                 Some(r) => r.layers[l] = Some(w),
                 None => {
@@ -779,32 +890,51 @@ impl Engine {
             }
             res?;
             self.times.compute_s += tc.elapsed().as_secs_f64();
-            if let Some(dir) = &self.dump_dir {
+            if let (Some(dir), false) = (&self.dump_dir, capturing) {
                 let mut hb = vec![0u16; t * hc * d];
                 self.act.h.download_async(0, &mut hb, &self.stream)?;
                 self.stream.synchronize()?;
                 dump_bf16(&dir.join(format!("h{l:02}.f32")), &hb)?;
             }
         }
-        self.caches.len = s + t;
-        self.last_forward = (s, t);
+        if shape.head.1 > 0 {
+            let norm = np(&self.norm);
+            self.head_dev(shape.head.0, shape.head.1, norm)?;
+        }
+        Ok(())
+    }
 
-        let (r0, rows) = match want {
-            Want::Nothing => return Ok(Vec::new()),
-            Want::Last => (t - 1, 1),
-            Want::All => (0, t),
-        };
-        let norm = np(&self.norm);
-        let logits = self.head(r0, rows, norm)?;
-        if let Some(dir) = &self.dump_dir {
-            dump_bf16(&dir.join("logits.f32"), &logits[(rows - 1) * cfg.vocab_size..])?;
+    /// After the step's device work: read back the logits it computed, advance the length.
+    fn collect(&mut self, shape: StepShape) -> Result<Vec<u16>> {
+        let st = &self.stream;
+        let v = self.cfg.vocab_size;
+        let rows = shape.head.1;
+        let mut logits = vec![0u16; rows * v];
+        if rows > 0 {
+            self.act.logits.download_async(0, &mut logits, st)?;
+        }
+        st.synchronize()?;
+        let s = self.caches.len;
+        self.caches.len = s + shape.t;
+        self.last_forward = (s, shape.t);
+        if let (Some(dir), true) = (&self.dump_dir, rows > 0) {
+            dump_bf16(&dir.join("logits.f32"), &logits[(rows - 1) * v..])?;
         }
         Ok(logits)
     }
 
-    /// hc_pre with the final pre_mix + `norm` + the streamed head over rows r0..r0+rows of
-    /// the hc stream; bf16 logits `[rows][V]` (also left in act.logits).
+    /// The head with a read-back (the draft block's path).
     fn head(&mut self, r0: usize, rows: usize, norm: *mut c_void) -> Result<Vec<u16>> {
+        self.head_dev(r0, rows, norm)?;
+        let mut logits = vec![0u16; rows * self.cfg.vocab_size];
+        self.act.logits.download_async(0, &mut logits, &self.stream)?;
+        self.stream.synchronize()?;
+        Ok(logits)
+    }
+
+    /// hc_pre with the final pre_mix + `norm` + the head over rows r0..r0+rows of the hc
+    /// stream, into act.logits `[rows][V]` bf16 (streamed from NVMe unless resident).
+    fn head_dev(&mut self, r0: usize, rows: usize, norm: *mut c_void) -> Result<()> {
         let th = Instant::now();
         let cfg = &self.cfg;
         let (d, hc, v) = (cfg.dim, cfg.hc_mult, cfg.vocab_size);
@@ -833,11 +963,8 @@ impl Engine {
                 n0 += n;
             }
         }
-        let mut logits = vec![0u16; rows * v];
-        a.logits.download_async(0, &mut logits, st)?;
-        st.synchronize()?;
         self.times.head_s += th.elapsed().as_secs_f64();
-        Ok(logits)
+        Ok(())
     }
 
     /// model.py::dspark_seed: write the drafter's window keys for the first `rows` rows of
@@ -978,8 +1105,10 @@ impl Engine {
             let a = &self.act;
             ck(unsafe { ds_hc_post(sr, np(&a.moe_out), np(&a.h), np(&a.fpost), np(&a.fcomb), np(&a.h), t as i32, d as i32) }, "ffn hc_post")?;
         }
-        // the next layer's attention mixes the stream with this layer's ffn pre
-        std::mem::swap(&mut self.act.pre, &mut self.act.fpre);
+        // the next layer's attention mixes the stream with this layer's ffn pre. A copy, not a
+        // buffer swap: a swap would change which pointer each layer reads from step to step,
+        // and a captured graph bakes the pointers in.
+        self.act.pre.copy_from(0, &self.act.fpre, 0, t * hc, &self.stream)?;
         Ok(())
     }
 
@@ -1069,15 +1198,16 @@ impl Engine {
 
     /// model.py::_indexer at an index-source layer: which compressed positions this layer
     /// and the following ones (until the next index source) attend over.
-    fn select(&mut self, w: &Layer, l: usize, s: usize, t: usize) -> Result<()> {
+    fn select(&mut self, w: &Layer, l: usize, _s: usize, t: usize) -> Result<()> {
         let cfg = self.cfg.clone();
         let r = cfg.compress_ratios[l];
-        let n_c = (s + t) / r;
-        if n_c <= cfg.index_topk {
+        let shape = self.shape.expect("select runs inside a backbone step");
+        // the key range is the bucketed count; keys past the true count are masked by clen
+        let Some(n_c) = (if r == 1 { shape.n1 } else { shape.n2 }) else {
             // top-k of every visible position is every visible position
             self.selection = Selection::AllVisible;
             return Ok(());
-        }
+        };
         let ix = w.indexer.as_ref().expect("index-source layer has indexer weights");
         let st = &self.stream;
         let sr = st.raw();
@@ -1108,7 +1238,7 @@ impl Engine {
         }, "index scores")?;
         let block = 8usize;
         let topk_blocks = 2048usize;
-        if l as i64 == cand_src && n_c > topk_blocks * block {
+        if l as i64 == cand_src && shape.cand {
             // model.py::_select_candidates: below topk_blocks blocks every block is kept, so
             // the mask only exists where it can drop something
             let nb = n_c.div_ceil(block);
