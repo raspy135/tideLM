@@ -162,6 +162,23 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
   config check. 4-layer truncation: the pair's logits digests equal one box's, plain and
   speculative. (An expert-parallel first cut ran before this and was replaced: its per-layer
   all-reduce cost ~150 us on NCCL and its ranks waited on whichever held the hot experts.)
+
+  Full model on the pair, 10,000 demand-ranked experts resident (65%, the rest pruned),
+  greedy, graphs, bench.py's prompts, 256 tokens, after the small-kernel and split-key
+  attention work (every arm token-identical to plain greedy):
+
+  | arm | prose tok/s | code tok/s |
+  |---|---:|---:|
+  | plain | 23.2 (43.2 ms) | 19.9 (50.2 ms) |
+  | confidence 1..5 | 26.1-27.1 | 38.9-39.9 |
+  | window 3/5 (Python's default) | 25.9-26.7 | 38.2-39.2 |
+  | depth 3 | 26.7 | 39.2 |
+
+  The README rows (25.6 prose, 43.3 code) are a different protocol - sampled at 0.6 over
+  1,024 tokens with hot reads and a learned 68% set - so these are not a like-for-like win:
+  per step the pair is now a little faster than Python (~87 ms at depth 5 against ~89 implied
+  by 43.3 tok/s at 3.84 tokens/step), and on code it accepts fewer drafts (3.0-3.1 tokens/step
+  greedy against 3.84 sampled).
   Original plan: NCCL from Rust, control message over NCCL (replacing Gloo), RoCE shim,
   full boot config guard (typed struct, broadcast, any differing field aborts — the
   repo's silent-pair-divergence rule). *Gate: two-rank token parity and tok/s vs the
