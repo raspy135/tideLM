@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tidelm-core",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/raspberrypark/tidelm"
+
+[profile.release]
+lto = "thin"
+debug = 1
