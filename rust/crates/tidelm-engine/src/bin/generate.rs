@@ -16,7 +16,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use tidelm_engine::decode::{generate_plain, generate_spec, Generation};
+use tidelm_engine::decode::{generate_plain, generate_spec, generate_spec_auto, Generation};
 use tidelm_engine::forward::{Engine, Options};
 use tidelm_text::Text;
 
@@ -89,6 +89,32 @@ fn main() -> tidelm_engine::Result<()> {
         let (plain, tp) = run(&mut engine, false)?;
         eprintln!("depth 0 (plain): {} tokens, {:.1} tok/s, {:.1} ms/step", plain.tokens.len(),
                   plain.tokens.len() as f64 / tp, 1e3 * tp / plain.tokens.len() as f64);
+        // the confidence policy, twice: the first run learns this machine's step times
+        let mut policy = tidelm_core::depth::ConfidenceDepthPolicy::new(true, 0);
+        for pass in ["cold", "warm"] {
+            let t = Instant::now();
+            let g = generate_spec_auto(&mut engine, &ids, max_tokens, &stop, &mut policy, |_| {})?;
+            let dt = t.elapsed().as_secs_f64();
+            let per: Vec<usize> = (1..=5).map(|d| g.depths.iter().filter(|&&x| x == d).count()).collect();
+            eprintln!("auto ({pass}): {} tokens, {} steps, {:.3} tokens/step, {:.1} tok/s, {:.1} ms/step, steps at depth 1..5 {per:?}{}",
+                      g.tokens.len(), g.steps, g.tokens_per_step(), g.tokens.len() as f64 / dt, 1e3 * dt / g.steps.max(1) as f64,
+                      if g.tokens == plain.tokens { "" } else { "  DIVERGED from plain" });
+        }
+        // the Python engine's shipped controller on this engine: 3/5, every 8 tokens
+        let mut window = tidelm_core::depth::DepthPolicy::new((3, 5), tidelm_core::depth::DepthOptions {
+            interval: 8, ..Default::default()
+        }).map_err(|e| e.0)?;
+        for pass in ["cold", "warm"] {
+            let t = Instant::now();
+            let g = tidelm_engine::decode::generate_spec_window(&mut engine, &ids, max_tokens, &stop, &mut window)?;
+            let dt = t.elapsed().as_secs_f64();
+            let per: Vec<usize> = (1..=5).map(|d| g.depths.iter().filter(|&&x| x == d).count()).collect();
+            eprintln!("window 3/5 ({pass}): {} tokens, {} steps, {:.3} tokens/step, {:.1} tok/s, {:.1} ms/step, steps at depth 1..5 {per:?}{}",
+                      g.tokens.len(), g.steps, g.tokens_per_step(), g.tokens.len() as f64 / dt, 1e3 * dt / g.steps.max(1) as f64,
+                      if g.tokens == plain.tokens { "" } else { "  DIVERGED from plain" });
+        }
+        eprintln!("auto step-time estimates (ms): {:?}",
+                  policy.estimated_step_s().iter().map(|(d, t)| (*d, (t * 1e4).round() / 10.0)).collect::<Vec<_>>());
         for d in 1..=engine.cfg.dspark_block_size {
             let t = Instant::now();
             let g = generate_spec(&mut engine, &ids, max_tokens, d, &stop, |_| {})?;

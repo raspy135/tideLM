@@ -456,6 +456,11 @@ struct Act {
     markov_e: DeviceBuffer<u16>,
     markov_b: DeviceBuffer<u16>,
     d_idx: DeviceBuffer<i32>,
+    /// the confidence head's two halves: per draft row from hc_pre (before the norm), and
+    /// per [step][lane] from the markov embedding
+    xpre: DeviceBuffer<u16>,
+    conf_x: DeviceBuffer<f32>,
+    conf_m: DeviceBuffer<f32>,
 }
 
 /// Which compressed rows the current layer attends over (model.py's `sh.topk`, which an
@@ -645,6 +650,8 @@ pub struct Engine {
     dspark_keep: Option<DeviceBuffer<u8>>,
     /// per number of drafting lanes
     draft_graphs: HashMap<usize, GraphExec>,
+    /// the last draft_batch's confidence logits, per lane its `dspark_block_size`
+    draft_conf: Vec<Vec<f32>>,
     n_layers: usize,
     /// rows of the compressed-rope positions, per ratio: max(pos - (r - 1), 0)
     cpos1: DeviceBuffer<i32>,
@@ -885,6 +892,9 @@ impl Engine {
             markov_e: a(draft_lanes * cfg.dspark_markov_rank)?,
             markov_b: a(draft_lanes * cfg.vocab_size)?,
             d_idx: i((bsz + 1) * draft_lanes)?,
+            xpre: a(t * d)?,
+            conf_x: f(t)?,
+            conf_m: f(bsz * draft_lanes)?,
         };
         let mut caches = Caches {
             ring: Vec::new(),
@@ -981,6 +991,7 @@ impl Engine {
             keep,
             dspark_keep,
             draft_graphs: HashMap::new(),
+            draft_conf: Vec::new(),
             n_layers,
             cpos1: i(t)?,
             cpos2: i(t)?,
@@ -1640,9 +1651,19 @@ impl Engine {
             self.draft_dev(n)?;
         }
         let mut out = vec![0i32; (b + 1) * n];
+        let (mut cx, mut cm) = (vec![0f32; n * b], vec![0f32; b * n]);
         self.act.d_idx.download_async(0, &mut out, &self.stream)?;
+        self.act.conf_x.download_async(0, &mut cx, &self.stream)?;
+        self.act.conf_m.download_async(0, &mut cm, &self.stream)?;
         self.stream.synchronize()?;
+        self.draft_conf = (0..n).map(|j| (0..b).map(|i| cx[j * b + i] + cm[i * n + j]).collect()).collect();
         Ok((0..n).map(|j| (0..b).map(|i| out[(i + 1) * n + j] as u32).collect()).collect())
+    }
+
+    /// The last draft_batch's DSpark confidence logits (raw, before the sigmoid), per lane
+    /// and draft position: the conditional acceptance estimate the depth policy reads.
+    pub fn draft_conf(&self) -> &[Vec<f32>] {
+        &self.draft_conf
     }
 
     /// The draft's device work for `n` lanes: embedding, the three blocks, the head, and the
@@ -1665,14 +1686,27 @@ impl Engine {
         let norm = np(&self.dspark.as_ref().unwrap().w.norm);
         self.head_dev(rows, None, norm)?;
         let ds = self.dspark.as_ref().unwrap();
-        let (v, r) = (cfg.vocab_size, cfg.dspark_markov_rank);
+        let (v, r, d, hc) = (cfg.vocab_size, cfg.dspark_markov_rank, cfg.dim, cfg.hc_mult);
         let sr = self.stream.raw();
         let a = &self.act;
         let ni = n as i32;
+        // confidence, hc_pre half: the reference feeds the head the UN-normed hc_pre output
+        // (inference/model.py::DSparkBlock.forward_head)
+        ck(unsafe { ds_hc_pre_norm(sr, np(&a.h), np(&a.pre), nul(), np(&a.xpre), rows as i32, d as i32, hc as i32, cfg.norm_eps) }, "conf hc_pre")?;
+        for r0 in (0..rows).step_by(FMA_ROWS) {
+            let mt = FMA_ROWS.min(rows - r0) as i32;
+            ck(unsafe {
+                ds_linear_f32w(sr, a.xpre.ptr_at(r0 * d), d as i64, np(&ds.w.conf_w), mt, 1, d as i32, 1, a.conf_x.ptr_at(r0), 1, nul())
+            }, "conf x")?;
+        }
         // logits row j * b + i is lane j's draft step i
         for i in 0..b {
             ck(unsafe { ds_gather_rows_u16(sr, np(&ds.w.markov_embed), a.d_idx.ptr_at(i * n), np(&a.markov_e), ni, r as i32) }, "markov embed")?;
             gemm(sr, &a.mma_part, np(&a.markov_e), r, Wt::Bf16 { w: np(&ds.w.markov_head), n: v, k: r }, n, np(&a.markov_b), false, v)?;
+            // confidence, markov half: the embedding of step i's input token
+            ck(unsafe {
+                ds_linear_f32w(sr, np(&a.markov_e), r as i64, ds.w.conf_w.ptr_at(d), ni, 1, r as i32, 1, a.conf_m.ptr_at(i * n), 1, nul())
+            }, "conf markov")?;
             ck(unsafe {
                 ds_argmax_sum_bf16(sr, a.logits.ptr_at(i * v), (b * v) as i64, np(&a.markov_b), v as i64, ni, v as i32,
                                    a.d_idx.ptr_at((i + 1) * n))

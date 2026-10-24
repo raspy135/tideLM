@@ -3,6 +3,8 @@
 //! longest matching prefix plus the bonus token, roll back the rest) — for one sequence, and
 //! for many at once through continuous batching (`generate_batch`).
 
+use tidelm_core::depth::{ConfidenceDepthPolicy, DepthPolicy};
+
 use crate::forward::{Engine, Seg, Want, TMAX};
 use crate::Result;
 
@@ -28,6 +30,8 @@ pub struct Generation {
     /// a hash of every logits row the sequence consumed, in order: two runs with equal
     /// digests computed bit-identical logits
     pub digest: u64,
+    /// verify depth per speculative step (generate_spec_auto)
+    pub depths: Vec<usize>,
 }
 
 fn digest(h: u64, logits: &[u16]) -> u64 {
@@ -128,6 +132,96 @@ pub fn generate_spec_with(engine: &mut Engine, prompt: &[u32], max_tokens: usize
             tok = last;
         }
         on_token(&emitted);
+        g.tokens.extend_from_slice(&emitted);
+        if emitted.iter().any(|t| stop.contains(t)) {
+            break;
+        }
+    }
+    Ok(g)
+}
+
+/// DSpark speculative greedy decoding with the verify depth chosen every step from the
+/// drafter's confidence head (`ConfidenceDepthPolicy`, widths 1..=5: expected tokens over
+/// measured step time, DSV41_BLOCK_CONFIDENCE with DSV41_VERIFY_ODD). Any width is free
+/// here - graphs are keyed by row bucket, not by width - so the policy is not limited to the
+/// Python engine's 1/3/5. Steps that captured a graph are not timed.
+pub fn generate_spec_auto(engine: &mut Engine, prompt: &[u32], max_tokens: usize, stop: &[u32],
+                          policy: &mut ConfidenceDepthPolicy, mut on_token: impl FnMut(&[u32])) -> Result<Generation> {
+    engine.reset();
+    policy.reset_request();
+    let mut g = Generation::default();
+    let mut tok = prefill(engine, prompt, true, &mut g)?;
+    g.tokens.push(tok);
+    on_token(&[tok]);
+    let v = engine.cfg.vocab_size;
+    let mut pos = prompt.len();
+    while g.tokens.len() < max_tokens && !stop.contains(&tok) {
+        let t0 = std::time::Instant::now();
+        let caps = engine.graph_captures;
+        let drafts = engine.draft(tok, pos - 1)?;
+        let conf: Vec<f64> = engine.draft_conf()[0].iter().map(|&x| x as f64).collect();
+        let depth = policy.choose(&conf).map_err(|e| e.0)?;
+        let mut block = vec![tok];
+        block.extend_from_slice(&drafts[..depth.min(drafts.len())]);
+        let logits = engine.forward(&block, Want::All)?;
+        g.digest = digest(g.digest, &logits);
+        let am: Vec<u32> = (0..block.len()).map(|r| argmax_bf16(&logits[r * v..(r + 1) * v])).collect();
+        let (a, mut emitted) = accept(&block, &am, stop);
+        engine.rollback(pos + a + 1)?;
+        engine.seed_draft(a + 1)?;
+        let step_s = (engine.graph_captures == caps).then(|| t0.elapsed().as_secs_f64());
+        policy.observe(depth, a as u64, emitted.len() as u64, step_s);
+        emitted.truncate(max_tokens - g.tokens.len());
+        pos += a + 1;
+        g.steps += 1;
+        g.accepted.push(a);
+        g.depths.push(depth);
+        if let Some(&last) = emitted.last() {
+            tok = last;
+        }
+        on_token(&emitted);
+        g.tokens.extend_from_slice(&emitted);
+        if emitted.iter().any(|t| stop.contains(t)) {
+            break;
+        }
+    }
+    Ok(g)
+}
+
+/// The same loop under the Python engine's shipped controller (DSV41_BLOCK_DYNAMIC=3,5 with
+/// DSV41_BLOCK_DYNAMIC_TOKENS=8): a depth from recent acceptance, re-decided every few
+/// tokens, chosen before the draft. For A/B against `generate_spec_auto`.
+pub fn generate_spec_window(engine: &mut Engine, prompt: &[u32], max_tokens: usize, stop: &[u32],
+                            policy: &mut DepthPolicy) -> Result<Generation> {
+    engine.reset();
+    policy.reset_request();
+    let mut g = Generation::default();
+    let mut tok = prefill(engine, prompt, true, &mut g)?;
+    g.tokens.push(tok);
+    let v = engine.cfg.vocab_size;
+    let mut pos = prompt.len();
+    while g.tokens.len() < max_tokens && !stop.contains(&tok) {
+        let t0 = std::time::Instant::now();
+        let caps = engine.graph_captures;
+        let depth = policy.decide();
+        let drafts = engine.draft(tok, pos - 1)?;
+        let mut block = vec![tok];
+        block.extend_from_slice(&drafts[..depth.min(drafts.len())]);
+        let logits = engine.forward(&block, Want::All)?;
+        let am: Vec<u32> = (0..block.len()).map(|r| argmax_bf16(&logits[r * v..(r + 1) * v])).collect();
+        let (a, mut emitted) = accept(&block, &am, stop);
+        engine.rollback(pos + a + 1)?;
+        engine.seed_draft(a + 1)?;
+        let step_s = (engine.graph_captures == caps).then(|| t0.elapsed().as_secs_f64());
+        policy.observe(depth, a as u64, emitted.len() as u64, step_s);
+        emitted.truncate(max_tokens - g.tokens.len());
+        pos += a + 1;
+        g.steps += 1;
+        g.accepted.push(a);
+        g.depths.push(depth);
+        if let Some(&last) = emitted.last() {
+            tok = last;
+        }
         g.tokens.extend_from_slice(&emitted);
         if emitted.iter().any(|t| stop.contains(t)) {
             break;

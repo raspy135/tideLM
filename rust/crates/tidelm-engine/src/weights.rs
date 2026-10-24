@@ -276,6 +276,10 @@ pub struct DsparkW {
     pub norm: DeviceBuffer<u16>,
     pub markov_embed: DeviceBuffer<u16>,
     pub markov_head: DeviceBuffer<u16>,
+    /// DSparkConfidenceHead.proj [1, dim + markov rank] in f32: per draft position, the
+    /// conditional acceptance logit from [hc_pre output before the norm ; markov embedding
+    /// of the position's input token]
+    pub conf_w: DeviceBuffer<f32>,
 }
 
 impl DsparkW {
@@ -288,6 +292,14 @@ impl DsparkW {
             norm: ld.bf16(&format!("mtp.{last}.norm.weight"), &[d])?,
             markov_embed: ld.bf16(&format!("mtp.{last}.markov_head.embed.weight"), &[v, r])?,
             markov_head: ld.bf16(&format!("mtp.{last}.markov_head.head.weight"), &[v, r])?,
+            conf_w: {
+                let name = format!("mtp.{last}.confidence_head.proj.weight");
+                let (bytes, meta) = ld.host_bytes(&name)?;
+                if meta.dtype != "BF16" || meta.shape != [1, d + r] {
+                    return Err(format!("{name}: {} {:?}, expected BF16 [1, {}]", meta.dtype, meta.shape, d + r).into());
+                }
+                DeviceBuffer::from_slice(&bf16_vec(&bytes))?
+            },
         })
     }
 }
