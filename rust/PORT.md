@@ -71,7 +71,7 @@ host waits. Prefill is eager (graphs off in the profile).
 | `tidelm-kernels` | done | `fp4_moe_cuda.cu` + `engram_gather.cpp` built from their in-tree sources with the Python JIT's flags, plus **`cuda/ds41.cu`: the engine's own decode-path kernels** (skinny FP8/BF16/FP32 GEMMs, norms, HC, RoPE, router, attention, compressor, indexer, engram, graph-safe step plumbing); 18 GPU tests against CPU transcriptions of the Python |
 | `tidelm-cuda` | done | streams, events, device/pinned buffers, async copies, graph capture/replay |
 | `tidelm-model` | done | safetensors headers, O_DIRECT span reads (parallel aligned pieces), expert run grouping — byte-exact vs buffered IO on the real checkpoint |
-| `tidelm-engine` | in progress | forward pass (streaming and resident), indexer, DSpark spec decode, rollback, one-graph steps; CLIs `tidelm-generate`, `tidelm-parity` |
+| `tidelm-engine` | in progress | forward pass (streaming and resident), indexer, DSpark spec decode, rollback, one-graph steps, lanes + continuous batching; CLIs `tidelm-generate`, `tidelm-parity`, `tidelm-batch` |
 | `tidelm-server` | later | HTTP front, same API as `server/app.py` |
 
 Kernel strategy, as built: the Triton/Gluon kernels were **not** AOT-compiled. Every op
@@ -141,6 +141,24 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
   `apply_global_swaps` rule). The Lane split happens in M1's data model so this stage
   is a scheduler, not a rewrite. *Gate: aggregate tok/s at N streams vs N sequential
   runs, plus p50/p95 per-stream latency.*
+
+  Status 2026-10-24: lanes and the scheduler are in (`forward_batch`, `decode::generate_batch`).
+  Every cache is lane-major; a step stacks up to 64 rows from any lanes, padded to a row
+  bucket (1, 2, 4, 8, 16, then multiples of 8) with filler rows in a scratch lane that route
+  to no expert, so graphs are keyed by bucket, not by batch composition. Decode rows go
+  first, prompt chunks fill the rest (chunked prefill); drafts, rollbacks and seeding are
+  batched across lanes. Measured (`tidelm-batch --check`, 4-layer 16-expert truncation):
+  - batched == alone bit for bit while steps stay at <= 16 rows: 8 requests over 4 lanes
+    plain, 6 over 2 lanes speculative (eager and graphs) — identical logits digests.
+  - above 16 rows the GEMMs take the tensor-core kernel, which rounds differently: prefill
+    logits move by 7e-3..2.3e-2 rel L2 with the FP4 cache QDQ off, but by up to 1.4e-1
+    with it on (`tidelm-parity --mma`; the QDQ amplification of M1), enough to flip a 0.375
+    logit margin on a truncated model. Not batch-invariant past 16 rows, like other engines.
+  - aggregate tok/s, resident + graphs, warm: plain 67 (1 lane) -> 184 (4) -> 244 (8) ->
+    293 (16); speculative 27 -> 39 (2) -> 51 (4) -> 34 (8). The 8-lane speculative loss is
+    the bm16 MoE kernels going compute-bound (7.2 + 5.8 ms per layer at 384 pairs, ~52 GB/s
+    effective): they run each pair on CUDA cores, and the Python engine leaves them for
+    tensor-core kernels above 64 pairs. A tensor-core FP4 MoE for > 16-row steps is next.
 - **M7 — server + adaptation.** Port or front: decided by measurement, the pipeline is
   already Python-free by M2.
 

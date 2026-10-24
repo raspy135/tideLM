@@ -712,11 +712,14 @@ __global__ void moe_combine_kernel(const float* __restrict__ parts, int K, int M
 // One block per (row, group of HG heads).
 constexpr int kAttnHG = 4;
 
+// Batched rows: row m reads the caches of lane[m] (lane == nullptr: lane 0), each lane's
+// ring / compressed rows `*_lstride` elements after the previous lane's.
 __global__ void __launch_bounds__(256) attn_decode_kernel(
-    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ ring, int ring_size,
-    const int* __restrict__ pos, int W, int win_lo, const __nv_bfloat16* __restrict__ ckv,
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ ring_base, int ring_size,
+    const int* __restrict__ pos, int W, int win_lo, const __nv_bfloat16* __restrict__ ckv_base,
     const int* __restrict__ cidx, int C, const float* __restrict__ sink, float scale,
-    __nv_bfloat16* __restrict__ out, int H) {
+    __nv_bfloat16* __restrict__ out, int H, const int* __restrict__ row_lane, int64_t ring_lstride,
+    int64_t ckv_lstride) {
     constexpr int D = 512;
     extern __shared__ __align__(16) float smem[];
     float* qs = smem;                    // [HG][D]
@@ -726,6 +729,9 @@ __global__ void __launch_bounds__(256) attn_decode_kernel(
     const int h0 = blockIdx.x * kAttnHG;
     const int NK = W + C;
     const int p = pos[m];
+    const int ln = row_lane ? row_lane[m] : 0;
+    const __nv_bfloat16* ring = ring_base + (int64_t)ln * ring_lstride;
+    const __nv_bfloat16* ckv = ckv_base ? ckv_base + (int64_t)ln * ckv_lstride : nullptr;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
 
     for (int i = threadIdx.x; i < kAttnHG * D; i += blockDim.x)
@@ -942,14 +948,15 @@ __global__ void argmax_bf16_kernel(const __nv_bfloat16* __restrict__ x, int64_t 
 constexpr int kIdxH = 32, kIdxD = 128, kIdxTile = 64;
 
 __global__ void __launch_bounds__(256) index_scores_kernel(
-    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k, const float* __restrict__ w,
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_base, const float* __restrict__ w,
     const int* __restrict__ clen, const uint8_t* __restrict__ cand, int64_t ld_cand, int n,
-    __nv_bfloat16* __restrict__ out, int64_t ld_out) {
+    __nv_bfloat16* __restrict__ out, int64_t ld_out, const int* __restrict__ lane, int64_t k_lstride) {
     __shared__ float qs[kIdxH][kIdxD + 1];
     __shared__ __align__(16) __nv_bfloat16 ks[kIdxTile][kIdxD];
     const int t = blockIdx.y;
     const int j0 = blockIdx.x * kIdxTile;
     const int h = threadIdx.x & 31, jj = threadIdx.x >> 5;
+    const __nv_bfloat16* k = k_base + (int64_t)(lane ? lane[t] : 0) * k_lstride;
     for (int i = threadIdx.x; i < kIdxH * kIdxD; i += blockDim.x)
         qs[i / kIdxD][i % kIdxD] = bf(q[(int64_t)t * kIdxH * kIdxD + i]);
     for (int i = threadIdx.x; i < kIdxTile * kIdxD / 8; i += blockDim.x) {
@@ -1186,10 +1193,11 @@ __global__ void gather_rows_u16_kernel(const uint16_t* __restrict__ table, const
 
 // dst[pos[t] % ring_size] = src[t]  (the window ring write, model.py: ring[pos % RING] = kv)
 __global__ void scatter_ring_kernel(const uint16_t* __restrict__ src, uint16_t* __restrict__ ring, int ring_size,
-                                    const int* __restrict__ pos, int D) {
+                                    const int* __restrict__ pos, int D, const int* __restrict__ lane, int64_t lstride) {
     const int t = blockIdx.y;
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    if (d < D) ring[(int64_t)(pos[t] % ring_size) * D + d] = src[(int64_t)t * D + d];
+    const int64_t base = (int64_t)(lane ? lane[t] : 0) * lstride;
+    if (d < D) ring[base + (int64_t)(pos[t] % ring_size) * D + d] = src[(int64_t)t * D + d];
 }
 
 // out[t, j] = j for j < (pos[t] + 1) / r, else -1; clen[t] = (pos[t] + 1) / r.
@@ -1208,12 +1216,17 @@ __global__ void visible_kernel(const int* __restrict__ pos, int r, int C, int* _
 // device flag for the pending position.
 __global__ void compress_rows_kernel(const float* __restrict__ kv, const float* __restrict__ sc,
                                      const float* __restrict__ pkv, const float* __restrict__ psc,
-                                     const int* __restrict__ pos, __nv_bfloat16* __restrict__ out, int D) {
+                                     const int* __restrict__ pos, __nv_bfloat16* __restrict__ out, int D,
+                                     const int* __restrict__ lane) {
     const int t = blockIdx.y;
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= D || (pos[t] + 1) % 2 != 0) return;
-    const float* ka = t > 0 ? kv + (int64_t)(t - 1) * D : pkv;
-    const float* sa = t > 0 ? sc + (int64_t)(t - 1) * D : psc;
+    const int ln = lane ? lane[t] : 0;
+    // rows of one lane are contiguous and in position order; the first row of a lane's run
+    // pairs with that lane's pending position
+    const bool prev_same = t > 0 && (lane ? lane[t - 1] == ln : true);
+    const float* ka = prev_same ? kv + (int64_t)(t - 1) * D : pkv + (int64_t)ln * D;
+    const float* sa = prev_same ? sc + (int64_t)(t - 1) * D : psc + (int64_t)ln * D;
     const float a = sa[d], b = sc[(int64_t)t * D + d];
     const float mx = fmaxf(a, b);
     const float ea = expf(a - mx), eb = expf(b - mx);
@@ -1223,64 +1236,87 @@ __global__ void compress_rows_kernel(const float* __restrict__ kv, const float* 
 
 // dst[(pos[t] + 1) / r - 1] = src[t] for rows whose position completes a group of r.
 __global__ void scatter_compressed_kernel(const uint16_t* __restrict__ src, int64_t ld_src, uint16_t* __restrict__ dst,
-                                          const int* __restrict__ pos, int r, int D) {
+                                          const int* __restrict__ pos, int r, int D, const int* __restrict__ lane,
+                                          int64_t lstride) {
     const int t = blockIdx.y;
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= D || (pos[t] + 1) % r != 0) return;
-    dst[(int64_t)((pos[t] + 1) / r - 1) * D + d] = src[(int64_t)t * ld_src + d];
+    const int64_t base = (int64_t)(lane ? lane[t] : 0) * lstride;
+    dst[base + (int64_t)((pos[t] + 1) / r - 1) * D + d] = src[(int64_t)t * ld_src + d];
 }
 
-// After a ratio-2 chunk of T rows at pos[0]..: the chunk's last position is unpaired iff
-// (pos[T-1] + 1) is odd; save the chunk's inputs and the pending state before it (for
-// rollback) and set the new pending state. One block; `flag` is the device pending flag.
+// After a ratio-2 chunk, per lane segment of the step (block b: rows seg_first[b] ..
+// + seg_count[b] of lane seg_lane[b]): the segment's last position is unpaired iff
+// (pos[last] + 1) is odd; save the segment's inputs and the pending state before it (for
+// rollback) and set the new pending state. Per-lane state is `[lanes][...]`.
 __global__ void pending_update_kernel(const float* __restrict__ kv, const float* __restrict__ sc, const int* __restrict__ pos,
-                                      int T, float* pkv, float* psc, int* flag, float* mem_kv, float* mem_sc,
-                                      float* before_kv, float* before_sc, int* before_flag, int* mem_start, int D) {
-    for (int i = threadIdx.x; i < T * D; i += blockDim.x) { mem_kv[i] = kv[i]; mem_sc[i] = sc[i]; }
-    for (int d = threadIdx.x; d < D; d += blockDim.x) { before_kv[d] = pkv[d]; before_sc[d] = psc[d]; }
+                                      const int* __restrict__ seg_first, const int* __restrict__ seg_count,
+                                      const int* __restrict__ seg_lane, float* pkv, float* psc, int* flag, float* mem_kv,
+                                      float* mem_sc, float* before_kv, float* before_sc, int* before_flag, int* mem_start,
+                                      int D, int mem_rows) {
+    const int f = seg_first[blockIdx.x], T = seg_count[blockIdx.x], L = seg_lane[blockIdx.x];
+    // the step graph launches one block per lane slot; a lane absent from this step has T == 0
+    if (T == 0) return;
+    float* pk = pkv + (int64_t)L * D;
+    float* ps = psc + (int64_t)L * D;
+    for (int i = threadIdx.x; i < T * D; i += blockDim.x) {
+        mem_kv[(int64_t)L * mem_rows * D + i] = kv[(int64_t)f * D + i];
+        mem_sc[(int64_t)L * mem_rows * D + i] = sc[(int64_t)f * D + i];
+    }
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        before_kv[(int64_t)L * D + d] = pk[d];
+        before_sc[(int64_t)L * D + d] = ps[d];
+    }
     __syncthreads();
-    const bool unpaired = (pos[T - 1] + 1) % 2 != 0;
+    const bool unpaired = (pos[f + T - 1] + 1) % 2 != 0;
     for (int d = threadIdx.x; d < D; d += blockDim.x)
-        if (unpaired) { pkv[d] = kv[(int64_t)(T - 1) * D + d]; psc[d] = sc[(int64_t)(T - 1) * D + d]; }
+        if (unpaired) { pk[d] = kv[(int64_t)(f + T - 1) * D + d]; ps[d] = sc[(int64_t)(f + T - 1) * D + d]; }
     if (threadIdx.x == 0) {
-        *before_flag = *flag;
-        *flag = unpaired ? 1 : 0;
-        *mem_start = pos[0];
+        before_flag[L] = flag[L];
+        flag[L] = unpaired ? 1 : 0;
+        mem_start[L] = pos[f];
     }
 }
 
-// model.py::Caches.rollback for a ratio-2 source, n read from the device (the accepted
-// length of a verify block): pending = the input of position n-1 if n is odd.
-__global__ void rollback_pending_kernel(const int* __restrict__ n_dev, const float* __restrict__ mem_kv,
-                                        const float* __restrict__ mem_sc, const int* __restrict__ mem_start,
-                                        const float* __restrict__ before_kv, const float* __restrict__ before_sc,
-                                        const int* __restrict__ before_flag, float* pkv, float* psc, int* flag, int D,
-                                        int mem_rows) {
-    const int n = *n_dev;
+// model.py::Caches.rollback for a ratio-2 source, per lane: block b restores lane lanes[b]
+// to length n_dev[b] (read from the device: the accepted length of its verify block).
+__global__ void rollback_pending_kernel(const int* __restrict__ n_dev, const int* __restrict__ lanes,
+                                        const float* __restrict__ mem_kv, const float* __restrict__ mem_sc,
+                                        const int* __restrict__ mem_start, const float* __restrict__ before_kv,
+                                        const float* __restrict__ before_sc, const int* __restrict__ before_flag,
+                                        float* pkv, float* psc, int* flag, int D, int mem_rows) {
+    const int n = n_dev[blockIdx.x];
+    const int L = lanes ? lanes[blockIdx.x] : 0;
     if (n % 2 == 0) {
-        if (threadIdx.x == 0) *flag = 0;
+        if (threadIdx.x == 0) flag[L] = 0;
         return;
     }
-    const int p = n - 1, start = *mem_start;
+    const int p = n - 1, start = mem_start[L];
     // a rollback reaches at most into the last chunk; anything else is a caller bug and
     // must not read past the chunk memory
     if (p - start >= mem_rows || p + 1 < start) return;
+    float* pk = pkv + (int64_t)L * D;
+    float* ps = psc + (int64_t)L * D;
     if (p >= start) {
-        for (int d = threadIdx.x; d < D; d += blockDim.x) {
-            pkv[d] = mem_kv[(int64_t)(p - start) * D + d];
-            psc[d] = mem_sc[(int64_t)(p - start) * D + d];
-        }
-        if (threadIdx.x == 0) *flag = 1;
+        const int64_t row = (int64_t)L * mem_rows * D + (int64_t)(p - start) * D;
+        for (int d = threadIdx.x; d < D; d += blockDim.x) { pk[d] = mem_kv[row + d]; ps[d] = mem_sc[row + d]; }
+        if (threadIdx.x == 0) flag[L] = 1;
     } else {
-        for (int d = threadIdx.x; d < D; d += blockDim.x) { pkv[d] = before_kv[d]; psc[d] = before_sc[d]; }
-        if (threadIdx.x == 0) *flag = *before_flag;
+        for (int d = threadIdx.x; d < D; d += blockDim.x) {
+            pk[d] = before_kv[(int64_t)L * D + d];
+            ps[d] = before_sc[(int64_t)L * D + d];
+        }
+        if (threadIdx.x == 0) flag[L] = before_flag[L];
     }
 }
 
 // Routed expert ids -> arena slots through the device LUT (model.py: lut[L][indices]).
-__global__ void lut_slots_kernel(const int* __restrict__ idx, const int* __restrict__ lut, int P, int* __restrict__ slots) {
+// Pairs at or past *live (null: none) belong to a padded step's filler rows and get slot -1,
+// which the MoE kernels skip: filler rows must not pull experts through the bandwidth.
+__global__ void lut_slots_kernel(const int* __restrict__ idx, const int* __restrict__ lut, int P,
+                                 int* __restrict__ slots, const int* __restrict__ live) {
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p < P) slots[p] = lut[idx[p]];
+    if (p < P) slots[p] = (live && p >= *live) ? -1 : lut[idx[p]];
 }
 
 // v41_engine.py lean greedy verify: am[t] is row t's argmax, block the verified tokens.
@@ -1428,7 +1464,7 @@ int ds_moe_combine(void* stream, const void* parts, int K, int M, const void* sh
 
 int ds_attn_decode(void* stream, const void* q, const void* ring, int ring_size, const void* pos, int W,
                    int win_lo, const void* ckv, const void* cidx, int C, const void* sink, float scale, void* out,
-                   int M, int H) {
+                   int M, int H, const void* lane, int64_t ring_lstride, int64_t ckv_lstride) {
     if (H % kAttnHG) return cudaErrorInvalidValue;
     const size_t smem = (size_t)kAttnHG * (512 + W + C) * sizeof(float);
     static size_t configured = 0;
@@ -1443,7 +1479,7 @@ int ds_attn_decode(void* stream, const void* q, const void* ring, int ring_size,
         static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(ring), ring_size,
         static_cast<const int*>(pos), W, win_lo, static_cast<const __nv_bfloat16*>(ckv),
         static_cast<const int*>(cidx), C, static_cast<const float*>(sink), scale,
-        static_cast<__nv_bfloat16*>(out), H);
+        static_cast<__nv_bfloat16*>(out), H, static_cast<const int*>(lane), ring_lstride, ckv_lstride);
     return static_cast<int>(cudaGetLastError());
 }
 
@@ -1492,13 +1528,13 @@ int ds_argmax_bf16(void* stream, const void* x, int64_t ldx, int M, int N, void*
 }
 
 int ds_index_scores(void* stream, const void* q, const void* k, const void* w, const void* clen, const void* cand,
-                    int64_t ld_cand, int n, void* out, int64_t ld_out, int T) {
+                    int64_t ld_cand, int n, void* out, int64_t ld_out, int T, const void* lane, int64_t k_lstride) {
     if (n < 1) return cudaErrorInvalidValue;
     dim3 grid((n + kIdxTile - 1) / kIdxTile, T);
     index_scores_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
         static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(k), static_cast<const float*>(w),
         static_cast<const int*>(clen), static_cast<const uint8_t*>(cand), ld_cand, n,
-        static_cast<__nv_bfloat16*>(out), ld_out);
+        static_cast<__nv_bfloat16*>(out), ld_out, static_cast<const int*>(lane), k_lstride);
     return static_cast<int>(cudaGetLastError());
 }
 
@@ -1555,9 +1591,10 @@ int ds_gather_rows_u16(void* stream, const void* table, const void* idx, void* o
 #define DS_RET return static_cast<int>(cudaGetLastError())
 #define DS_ST static_cast<cudaStream_t>(stream)
 
-int ds_scatter_ring(void* stream, const void* src, void* ring, int ring_size, const void* pos, int T, int D) {
+int ds_scatter_ring(void* stream, const void* src, void* ring, int ring_size, const void* pos, int T, int D,
+                    const void* lane, int64_t lstride) {
     scatter_ring_kernel<<<dim3((D + 255) / 256, T), 256, 0, DS_ST>>>(static_cast<const uint16_t*>(src),
-        static_cast<uint16_t*>(ring), ring_size, static_cast<const int*>(pos), D);
+        static_cast<uint16_t*>(ring), ring_size, static_cast<const int*>(pos), D, static_cast<const int*>(lane), lstride);
     DS_RET;
 }
 
@@ -1568,41 +1605,45 @@ int ds_visible(void* stream, const void* pos, int T, int r, int C, void* cidx, v
 }
 
 int ds_compress_rows(void* stream, const void* kv, const void* sc, const void* pkv, const void* psc, const void* pos,
-                     void* out, int T, int D) {
+                     void* out, int T, int D, const void* lane) {
     compress_rows_kernel<<<dim3((D + 255) / 256, T), 256, 0, DS_ST>>>(static_cast<const float*>(kv),
         static_cast<const float*>(sc), static_cast<const float*>(pkv), static_cast<const float*>(psc),
-        static_cast<const int*>(pos), static_cast<__nv_bfloat16*>(out), D);
+        static_cast<const int*>(pos), static_cast<__nv_bfloat16*>(out), D, static_cast<const int*>(lane));
     DS_RET;
 }
 
-int ds_scatter_compressed(void* stream, const void* src, int64_t ld_src, void* dst, const void* pos, int r, int T, int D) {
+int ds_scatter_compressed(void* stream, const void* src, int64_t ld_src, void* dst, const void* pos, int r, int T, int D,
+                          const void* lane, int64_t lstride) {
     scatter_compressed_kernel<<<dim3((D + 255) / 256, T), 256, 0, DS_ST>>>(static_cast<const uint16_t*>(src), ld_src,
-        static_cast<uint16_t*>(dst), static_cast<const int*>(pos), r, D);
+        static_cast<uint16_t*>(dst), static_cast<const int*>(pos), r, D, static_cast<const int*>(lane), lstride);
     DS_RET;
 }
 
-int ds_pending_update(void* stream, const void* kv, const void* sc, const void* pos, int T, void* pkv, void* psc, void* flag,
-                      void* mem_kv, void* mem_sc, void* before_kv, void* before_sc, void* before_flag, void* mem_start, int D) {
-    pending_update_kernel<<<1, 256, 0, DS_ST>>>(static_cast<const float*>(kv), static_cast<const float*>(sc),
-        static_cast<const int*>(pos), T, static_cast<float*>(pkv), static_cast<float*>(psc), static_cast<int*>(flag),
+int ds_pending_update(void* stream, const void* kv, const void* sc, const void* pos, const void* seg_first,
+                      const void* seg_count, const void* seg_lane, int segments, void* pkv, void* psc, void* flag,
+                      void* mem_kv, void* mem_sc, void* before_kv, void* before_sc, void* before_flag, void* mem_start,
+                      int D, int mem_rows) {
+    pending_update_kernel<<<segments, 256, 0, DS_ST>>>(static_cast<const float*>(kv), static_cast<const float*>(sc),
+        static_cast<const int*>(pos), static_cast<const int*>(seg_first), static_cast<const int*>(seg_count),
+        static_cast<const int*>(seg_lane), static_cast<float*>(pkv), static_cast<float*>(psc), static_cast<int*>(flag),
         static_cast<float*>(mem_kv), static_cast<float*>(mem_sc), static_cast<float*>(before_kv),
-        static_cast<float*>(before_sc), static_cast<int*>(before_flag), static_cast<int*>(mem_start), D);
+        static_cast<float*>(before_sc), static_cast<int*>(before_flag), static_cast<int*>(mem_start), D, mem_rows);
     DS_RET;
 }
 
-int ds_rollback_pending(void* stream, const void* n_dev, const void* mem_kv, const void* mem_sc, const void* mem_start,
-                        const void* before_kv, const void* before_sc, const void* before_flag, void* pkv, void* psc,
-                        void* flag, int D, int mem_rows) {
-    rollback_pending_kernel<<<1, 256, 0, DS_ST>>>(static_cast<const int*>(n_dev), static_cast<const float*>(mem_kv),
-        static_cast<const float*>(mem_sc), static_cast<const int*>(mem_start), static_cast<const float*>(before_kv),
-        static_cast<const float*>(before_sc), static_cast<const int*>(before_flag), static_cast<float*>(pkv),
-        static_cast<float*>(psc), static_cast<int*>(flag), D, mem_rows);
+int ds_rollback_pending(void* stream, const void* n_dev, const void* lanes, int entries, const void* mem_kv,
+                        const void* mem_sc, const void* mem_start, const void* before_kv, const void* before_sc,
+                        const void* before_flag, void* pkv, void* psc, void* flag, int D, int mem_rows) {
+    rollback_pending_kernel<<<entries, 256, 0, DS_ST>>>(static_cast<const int*>(n_dev), static_cast<const int*>(lanes),
+        static_cast<const float*>(mem_kv), static_cast<const float*>(mem_sc), static_cast<const int*>(mem_start),
+        static_cast<const float*>(before_kv), static_cast<const float*>(before_sc), static_cast<const int*>(before_flag),
+        static_cast<float*>(pkv), static_cast<float*>(psc), static_cast<int*>(flag), D, mem_rows);
     DS_RET;
 }
 
-int ds_lut_slots(void* stream, const void* idx, const void* lut, int P, void* slots) {
+int ds_lut_slots(void* stream, const void* idx, const void* lut, int P, void* slots, const void* live) {
     lut_slots_kernel<<<(P + 127) / 128, 128, 0, DS_ST>>>(static_cast<const int*>(idx), static_cast<const int*>(lut), P,
-        static_cast<int*>(slots));
+        static_cast<int*>(slots), static_cast<const int*>(live));
     DS_RET;
 }
 

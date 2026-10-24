@@ -561,7 +561,7 @@ fn attention_decode_matches_the_sinked_softmax_reference() {
     let dout = DeviceBuffer::<u16>::zeroed(m * h * d).unwrap();
     ok(unsafe {
         ds_attn_decode(st.raw(), p(&dq), p(&dring), ring_size as i32, p(&dpos), w as i32, 0, p(&dckv), p(&dcidx),
-                       c as i32, p(&dsink), scale, p(&dout), m as i32, h as i32)
+                       c as i32, p(&dsink), scale, p(&dout), m as i32, h as i32, null(), 0, 0)
     });
     st.synchronize().unwrap();
     let got = dout.download().unwrap();
@@ -746,7 +746,7 @@ fn index_scores_match_the_bf16_einsum_reference() {
         let dout = DeviceBuffer::<u16>::zeroed(t * n).unwrap();
         ok(unsafe {
             ds_index_scores(st.raw(), p(&dq), p(&dk), p(&dw), p(&dc), if masked { p(&dcand) } else { null() },
-                            n as i64, n as i32, p(&dout), n as i64, t as i32)
+                            n as i64, n as i32, p(&dout), n as i64, t as i32, null(), 0)
         });
         st.synchronize().unwrap();
         let got = dout.download().unwrap();
@@ -845,15 +845,18 @@ fn ring_scatter_visible_lists_and_lut() {
     let src = rng.bf16_vec(t * d, 1.0);
     let pos = [6i32, 7, 8];
     let (dsrc, dpos, dring) = (dev(&src), dev(&pos), DeviceBuffer::<u16>::zeroed(ring * d).unwrap());
-    ok(unsafe { ds_scatter_ring(st.raw(), p(&dsrc), p(&dring), ring as i32, p(&dpos), t as i32, d as i32) });
+    ok(unsafe { ds_scatter_ring(st.raw(), p(&dsrc), p(&dring), ring as i32, p(&dpos), t as i32, d as i32, null(), 0) });
     let c = 6usize;
     let (dc, dl) = (DeviceBuffer::<i32>::zeroed(t * c).unwrap(), DeviceBuffer::<i32>::zeroed(t).unwrap());
     ok(unsafe { ds_visible(st.raw(), p(&dpos), t as i32, 2, c as i32, p(&dc), p(&dl)) });
     let lut: Vec<i32> = (0..10).map(|e| if e % 3 == 0 { -1 } else { 100 + e }).collect();
     let idx = [1i32, 2, 4, 8];
     let (dlut, didx, dslots) = (dev(&lut), dev(&idx), DeviceBuffer::<i32>::zeroed(4).unwrap());
-    ok(unsafe { ds_lut_slots(st.raw(), p(&didx), p(&dlut), 4, p(&dslots)) });
+    ok(unsafe { ds_lut_slots(st.raw(), p(&didx), p(&dlut), 4, p(&dslots), null()) });
+    let (dlive, dslots2) = (dev(&[2i32]), DeviceBuffer::<i32>::zeroed(4).unwrap());
+    ok(unsafe { ds_lut_slots(st.raw(), p(&didx), p(&dlut), 4, p(&dslots2), p(&dlive)) });
     st.synchronize().unwrap();
+    assert_eq!(dslots2.download().unwrap(), vec![101, 102, -1, -1], "pairs past `live` are filler");
     let r = dring.download().unwrap();
     for (i, &ps) in pos.iter().enumerate() {
         let slot = ps as usize % ring;
@@ -896,10 +899,11 @@ fn device_compressor_pairs_pending_and_rollback_match_the_host_logic() {
         let pos: Vec<i32> = (s..s + t).map(|x| x as i32).collect();
         let (dkv, dsc, dpos) = (dev(&kv.concat()), dev(&sc.concat()), dev(&pos));
         let out = DeviceBuffer::<u16>::zeroed(t * d).unwrap();
-        ok(unsafe { ds_compress_rows(st.raw(), p(&dkv), p(&dsc), p(&pkv), p(&psc), p(&dpos), p(&out), t as i32, d as i32) });
+        ok(unsafe { ds_compress_rows(st.raw(), p(&dkv), p(&dsc), p(&pkv), p(&psc), p(&dpos), p(&out), t as i32, d as i32, null()) });
+        let (sf, sn, sl) = (dev(&[0i32]), dev(&[t as i32]), dev(&[0i32]));
         ok(unsafe {
-            ds_pending_update(st.raw(), p(&dkv), p(&dsc), p(&dpos), t as i32, p(&pkv), p(&psc), p(&flag), p(&mkv), p(&msc),
-                              p(&bkv), p(&bsc), p(&bflag), p(&mstart), d as i32)
+            ds_pending_update(st.raw(), p(&dkv), p(&dsc), p(&dpos), p(&sf), p(&sn), p(&sl), 1, p(&pkv), p(&psc), p(&flag),
+                              p(&mkv), p(&msc), p(&bkv), p(&bsc), p(&bflag), p(&mstart), d as i32, tmax as i32)
         });
         st.synchronize().unwrap();
         let got = out.download().unwrap();
@@ -925,8 +929,8 @@ fn device_compressor_pairs_pending_and_rollback_match_the_host_logic() {
     for (n, want_valid, src_pos) in [(5usize, 1, Some(4usize)), (4, 0, None), (3, 1, Some(2))] {
         let dn = dev(&[n as i32]);
         ok(unsafe {
-            ds_rollback_pending(st.raw(), p(&dn), p(&mkv), p(&msc), p(&mstart), p(&bkv), p(&bsc), p(&bflag), p(&pkv), p(&psc),
-                                p(&flag), d as i32, tmax as i32)
+            ds_rollback_pending(st.raw(), p(&dn), null(), 1, p(&mkv), p(&msc), p(&mstart), p(&bkv), p(&bsc), p(&bflag),
+                                p(&pkv), p(&psc), p(&flag), d as i32, tmax as i32)
         });
         st.synchronize().unwrap();
         assert_eq!(flag.download().unwrap()[0], want_valid, "rollback({n}) flag");
@@ -1043,3 +1047,137 @@ fn mma_grouped_reads_each_groups_slice() {
     assert_bf16_accum(&dy.download().unwrap(), &want, &mag, "mma grouped");
 }
 
+
+// ------------------------------------------------------------------ lanes
+/// Two lanes' rows in one call must compute exactly what each lane computes alone, and
+/// write only its own lane's caches.
+#[test]
+fn lane_rows_read_and_write_only_their_own_caches() {
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(83);
+    let (h, d, ring, w, n_ckv) = (8usize, 512usize, 256usize, 128usize, 32usize);
+    let lanes = 2usize;
+    let rings = rng.bf16_vec(lanes * ring * d, 1.0);
+    let ckvs = rng.bf16_vec(lanes * n_ckv * d, 1.0);
+    let sink: Vec<f32> = (0..h).map(|_| rng.normal()).collect();
+    let scale = (d as f64).powf(-0.5) as f32;
+    // rows: lane 1 at position 40, lane 0 at 7 and 8 (lane order need not follow row order)
+    let row_lane = [1i32, 0, 0];
+    let pos = [40i32, 7, 8];
+    let c = 4usize;
+    let cidx: Vec<i32> = vec![0, 1, 2, 3, 0, 1, -1, -1, 0, 1, 2, -1];
+    let q = rng.bf16_vec(3 * h * d, 0.2);
+    let (dq, drings, dckvs, dsink, dl, dp, dc) = (dev(&q), dev(&rings), dev(&ckvs), dev(&sink), dev(&row_lane), dev(&pos), dev(&cidx));
+    let both = DeviceBuffer::<u16>::zeroed(3 * h * d).unwrap();
+    ok(unsafe {
+        ds_attn_decode(st.raw(), p(&dq), p(&drings), ring as i32, p(&dp), w as i32, 0, p(&dckvs), p(&dc), c as i32, p(&dsink),
+                       scale, p(&both), 3, h as i32, p(&dl), (ring * d) as i64, (n_ckv * d) as i64)
+    });
+    st.synchronize().unwrap();
+    let both = both.download().unwrap();
+    for (row, &ln) in row_lane.iter().enumerate() {
+        let ln = ln as usize;
+        let (dq1, dr1, dk1, dp1, dc1) = (dev(&q[row * h * d..(row + 1) * h * d]), dev(&rings[ln * ring * d..(ln + 1) * ring * d]),
+            dev(&ckvs[ln * n_ckv * d..(ln + 1) * n_ckv * d]), dev(&pos[row..row + 1]), dev(&cidx[row * c..(row + 1) * c]));
+        let one = DeviceBuffer::<u16>::zeroed(h * d).unwrap();
+        ok(unsafe {
+            ds_attn_decode(st.raw(), p(&dq1), p(&dr1), ring as i32, p(&dp1), w as i32, 0, p(&dk1), p(&dc1), c as i32, p(&dsink),
+                           scale, p(&one), 1, h as i32, null(), 0, 0)
+        });
+        st.synchronize().unwrap();
+        assert_eq!(&both[row * h * d..(row + 1) * h * d], &one.download().unwrap()[..], "attention row {row} (lane {ln})");
+    }
+
+    // ring scatter: each row lands in its own lane's ring only
+    let src = rng.bf16_vec(3 * d, 1.0);
+    let (dsrc, dring2) = (dev(&src), DeviceBuffer::<u16>::zeroed(lanes * ring * d).unwrap());
+    ok(unsafe { ds_scatter_ring(st.raw(), p(&dsrc), p(&dring2), ring as i32, p(&dp), 3, d as i32, p(&dl), (ring * d) as i64) });
+    st.synchronize().unwrap();
+    let r2 = dring2.download().unwrap();
+    for (row, (&ln, &ps)) in row_lane.iter().zip(&pos).enumerate() {
+        let at = ln as usize * ring * d + (ps as usize % ring) * d;
+        assert_eq!(&r2[at..at + d], &src[row * d..(row + 1) * d]);
+    }
+    let written: usize = r2.chunks(d).filter(|r| r.iter().any(|&x| x != 0)).count();
+    assert_eq!(written, 3, "nothing else in either ring is touched");
+
+    // compressor: a lane's first row pairs with that lane's pending, never the other lane's
+    let dd = 32usize;
+    let kv: Vec<f32> = (0..3 * dd).map(|_| rng.normal()).collect();
+    let sc: Vec<f32> = (0..3 * dd).map(|_| rng.normal()).collect();
+    let pkv: Vec<f32> = (0..lanes * dd).map(|_| rng.normal()).collect();
+    let psc: Vec<f32> = (0..lanes * dd).map(|_| rng.normal()).collect();
+    // lane 1 at position 41 (odd: pairs with its pending), lane 0 at 7 (odd: pending) and 8
+    let pos_c = [41i32, 7, 8];
+    let (dkv, dsc, dpkv, dpsc, dpc) = (dev(&kv), dev(&sc), dev(&pkv), dev(&psc), dev(&pos_c));
+    let out = DeviceBuffer::<u16>::zeroed(3 * dd).unwrap();
+    ok(unsafe { ds_compress_rows(st.raw(), p(&dkv), p(&dsc), p(&dpkv), p(&dpsc), p(&dpc), p(&out), 3, dd as i32, p(&dl)) });
+    st.synchronize().unwrap();
+    let got = out.download().unwrap();
+    let pair = |ka: &[f32], sa: &[f32], kb: &[f32], sb: &[f32]| -> Vec<u16> {
+        (0..dd).map(|i| {
+            let mx = sa[i].max(sb[i]);
+            let (ea, eb) = ((sa[i] - mx).exp(), (sb[i] - mx).exp());
+            bf16_from_f32(ka[i] * (ea / (ea + eb)) + kb[i] * (eb / (ea + eb)))
+        }).collect()
+    };
+    let close = |a: &[u16], b: &[u16]| a.iter().zip(b).all(|(&x, &y)| (f32_from_bf16(x) - f32_from_bf16(y)).abs() <= f32_from_bf16(y).abs() * 2f32.powi(-7) + 1e-30);
+    assert!(close(&got[..dd], &pair(&pkv[dd..], &psc[dd..], &kv[..dd], &sc[..dd])), "lane 1 pairs with its own pending");
+    assert!(close(&got[dd..2 * dd], &pair(&pkv[..dd], &psc[..dd], &kv[dd..2 * dd], &sc[dd..2 * dd])), "lane 0 pairs with its own pending");
+}
+
+/// Per-lane compressor state: segments of two lanes in one launch (plus an empty slot) leave
+/// each lane's pending, rollback memory and flag exactly as two separate launches would, and a
+/// per-entry rollback restores each lane from its own memory.
+#[test]
+fn pending_update_and_rollback_per_lane_segment() {
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(89);
+    let (d, lanes, mem_rows) = (32usize, 3usize, 8usize);
+    let z = |n: usize| DeviceBuffer::<f32>::zeroed(n).unwrap();
+    let zi = |n: usize| DeviceBuffer::<i32>::zeroed(n).unwrap();
+    struct St { pkv: DeviceBuffer<f32>, psc: DeviceBuffer<f32>, flag: DeviceBuffer<i32>, mkv: DeviceBuffer<f32>,
+                msc: DeviceBuffer<f32>, bkv: DeviceBuffer<f32>, bsc: DeviceBuffer<f32>, bflag: DeviceBuffer<i32>,
+                mstart: DeviceBuffer<i32> }
+    let mk = || St { pkv: z(lanes * d), psc: z(lanes * d), flag: zi(lanes), mkv: z(lanes * mem_rows * d),
+                     msc: z(lanes * mem_rows * d), bkv: z(lanes * d), bsc: z(lanes * d), bflag: zi(lanes), mstart: zi(lanes) };
+    let (both, apart) = (mk(), mk());
+    // rows 0..3: lane 2 at positions 10..13 (ends unpaired); rows 3..5: lane 0 at 4..6 (paired)
+    let kv: Vec<f32> = (0..5 * d).map(|_| rng.normal()).collect();
+    let sc: Vec<f32> = (0..5 * d).map(|_| rng.normal()).collect();
+    let pos = [10i32, 11, 12, 4, 5];
+    let (dkv, dsc, dpos) = (dev(&kv), dev(&sc), dev(&pos));
+    let update = |s: &St, first: &[i32], count: &[i32], lane: &[i32]| {
+        let (f, c, l) = (dev(first), dev(count), dev(lane));
+        ok(unsafe {
+            ds_pending_update(st.raw(), p(&dkv), p(&dsc), p(&dpos), p(&f), p(&c), p(&l), first.len() as i32, p(&s.pkv),
+                              p(&s.psc), p(&s.flag), p(&s.mkv), p(&s.msc), p(&s.bkv), p(&s.bsc), p(&s.bflag), p(&s.mstart),
+                              d as i32, mem_rows as i32)
+        });
+        st.synchronize().unwrap();
+    };
+    update(&both, &[0, 3, 0], &[3, 2, 0], &[2, 0, 1]);
+    update(&apart, &[0], &[3], &[2]);
+    update(&apart, &[3], &[2], &[0]);
+    let dl = |b: &DeviceBuffer<f32>| b.download().unwrap();
+    let dli = |b: &DeviceBuffer<i32>| b.download().unwrap();
+    assert_eq!(dli(&both.flag), vec![0, 0, 1], "lane 2 ends unpaired, lane 0 paired, lane 1 untouched");
+    assert_eq!(dli(&both.mstart), vec![4, 0, 10]);
+    assert_eq!(&dl(&both.pkv)[2 * d..], &kv[2 * d..3 * d], "lane 2's pending is its last row");
+    for (a, b) in [(&both.pkv, &apart.pkv), (&both.psc, &apart.psc), (&both.mkv, &apart.mkv), (&both.msc, &apart.msc),
+                   (&both.bkv, &apart.bkv), (&both.bsc, &apart.bsc)] {
+        assert_eq!(dl(a), dl(b));
+    }
+    assert_eq!(dli(&both.flag), dli(&apart.flag));
+    assert_eq!(dli(&both.bflag), dli(&apart.bflag));
+    // roll lane 2 back to 12 (even: no pending) and lane 0 back to 5 (odd: position 4 = its row 0)
+    let (dn, dlanes) = (dev(&[12i32, 5]), dev(&[2i32, 0]));
+    ok(unsafe {
+        ds_rollback_pending(st.raw(), p(&dn), p(&dlanes), 2, p(&both.mkv), p(&both.msc), p(&both.mstart), p(&both.bkv),
+                            p(&both.bsc), p(&both.bflag), p(&both.pkv), p(&both.psc), p(&both.flag), d as i32, mem_rows as i32)
+    });
+    st.synchronize().unwrap();
+    assert_eq!(dli(&both.flag), vec![1, 0, 0]);
+    assert_eq!(&dl(&both.pkv)[..d], &kv[3 * d..4 * d], "lane 0's pending restored from its own memory");
+    assert_eq!(&dl(&both.psc)[..d], &sc[3 * d..4 * d]);
+}

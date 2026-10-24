@@ -144,7 +144,8 @@ impl EngramLayout {
 #[derive(Debug, Clone)]
 pub struct NgramHashState {
     pub layout: EngramLayout,
-    token_map: Vec<i64>,
+    /// shared by every sequence's state (`fresh`)
+    token_map: std::sync::Arc<Vec<i64>>,
     pad_id: i64,
     /// compressed ids by absolute position (DEAD for image positions)
     cache: Vec<i64>,
@@ -155,7 +156,12 @@ impl NgramHashState {
     /// vocabulary id (2 for this checkpoint) whose compressed id pads blocked lookbacks.
     pub fn new(layout: EngramLayout, token_map: Vec<i64>, engram_pad_id: usize) -> Self {
         let pad_id = token_map[engram_pad_id];
-        NgramHashState { layout, token_map, pad_id, cache: Vec::new() }
+        NgramHashState { layout, token_map: std::sync::Arc::new(token_map), pad_id, cache: Vec::new() }
+    }
+
+    /// A state for another sequence: same layout and token map, empty cache.
+    pub fn fresh(&self) -> Self {
+        NgramHashState { layout: self.layout.clone(), token_map: self.token_map.clone(), pad_id: self.pad_id, cache: Vec::new() }
     }
 
     /// Hash ids for tokens at absolute positions `start_pos..start_pos + ids.len()`,

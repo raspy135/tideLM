@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use tidelm_engine::decode::{argmax_bf16, generate_plain, generate_spec, generate_spec_with};
-use tidelm_engine::forward::{Engine, Options, Want};
+use tidelm_engine::forward::{Engine, Options, Seg, Want};
 use tidelm_text::Text;
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -57,10 +57,13 @@ fn main() -> tidelm_engine::Result<()> {
     ids.extend(text.encode(&prompt)?);
     tidelm_cuda::set_device(0)?;
     let keep = Some(vec![(0..384).map(|e| e < keep_first).collect::<Vec<bool>>(); 40]);
+    if args.iter().any(|a| a == "--mma") {
+        return mma_rounding(&model_dir, token_map, &text, layers, keep);
+    }
     if args.iter().any(|a| a == "--spec") {
         return spec_parity(&model_dir, token_map, &ids, layers, keep, steps);
     }
-    let base = Options { max_seq: 1024, spec: false, resident: false, graphs: false, n_layers: Some(layers), keep, dspark_keep: None };
+    let base = Options { max_seq: 1024, max_lanes: 1, spec: false, resident: false, graphs: false, n_layers: Some(layers), keep, dspark_keep: None };
 
     let (sl, st, _) = {
         let mut e = Engine::new(&model_dir, token_map.clone(), base.clone())?;
@@ -96,7 +99,7 @@ fn main() -> tidelm_engine::Result<()> {
 fn spec_parity(model_dir: &std::path::Path, token_map: Vec<i64>, ids: &[u32], layers: usize,
                keep: Option<Vec<Vec<bool>>>, steps: usize) -> tidelm_engine::Result<()> {
     let dkeep = Some(vec![(0..128).map(|e| e < 8).collect::<Vec<bool>>(); 3]);
-    let base = Options { max_seq: 1024, spec: true, resident: false, graphs: false, n_layers: Some(layers), keep,
+    let base = Options { max_seq: 1024, max_lanes: 1, spec: true, resident: false, graphs: false, n_layers: Some(layers), keep,
                          dspark_keep: dkeep };
     let n = steps + 1;
     let mut results = Vec::new();
@@ -149,4 +152,35 @@ fn oracle_spec(e: &mut Engine, ids: &[u32], n: usize, truth: &[u32]) -> tidelm_e
         }
         Ok(d)
     })
+}
+
+/// How far a prompt's logits move when its prefill shares a step of more than 16 rows (the
+/// tensor-core GEMM) instead of running alone (the FMA GEMM): relative L2, top-1 agreement,
+/// and the top-1/top-2 margin alone — a kernel bug moves logits by O(1), rounding by ~1e-2.
+fn mma_rounding(model_dir: &std::path::Path, token_map: Vec<i64>, text: &Text, layers: usize,
+                keep: Option<Vec<Vec<bool>>>) -> tidelm_engine::Result<()> {
+    let opts = Options { max_seq: 1024, max_lanes: 2, spec: false, resident: true, graphs: false, n_layers: Some(layers), keep,
+                         dspark_keep: None };
+    let mut e = Engine::new(model_dir, token_map, opts)?;
+    let f = |h: u16| f32::from_bits((h as u32) << 16) as f64;
+    let filler: Vec<u32> = (0..24).map(|i| 1000 + i).collect();
+    for p in ["The capital of France is", "def fibonacci(n):", "1, 2, 3, 5, 8, 13,", "A haiku about autumn:"] {
+        let mut ids = vec![0u32];
+        ids.extend(text.encode(p)?);
+        e.reset();
+        let a = e.forward(&ids, Want::Last)?;
+        e.reset();
+        let b = e.forward_batch(&[Seg { lane: 0, ids: &ids, want: Want::Last }, Seg { lane: 1, ids: &filler, want: Want::Nothing }])?.remove(0);
+        let (mut num, mut den) = (0.0, 0.0);
+        for (x, y) in a.iter().zip(&b) {
+            num += (f(*x) - f(*y)).powi(2);
+            den += f(*x).powi(2);
+        }
+        let (ta, tb) = (argmax_bf16(&a), argmax_bf16(&b));
+        let mut sorted: Vec<f64> = a.iter().map(|&x| f(x)).collect();
+        sorted.sort_by(|x, y| y.partial_cmp(x).unwrap());
+        eprintln!("{p:32} rows {:2}+24: rel L2 {:.2e}, top-1 alone {ta} batched {tb}, alone margin {:.4} (top-1 {:.3})",
+                  ids.len(), (num / den).sqrt(), sorted[0] - sorted[1], sorted[0]);
+    }
+    Ok(())
 }

@@ -59,7 +59,7 @@ fn main() -> tidelm_engine::Result<()> {
 
     tidelm_cuda::set_device(0)?;
     let keep = keep_first.map(|k| vec![(0..384).map(|e| e < k).collect::<Vec<bool>>(); 40]);
-    let opts = Options { max_seq, spec: spec || compare, resident: flag("--resident"), graphs: flag("--graphs"), n_layers, keep, dspark_keep: None };
+    let opts = Options { max_seq, max_lanes: 1, spec: spec || compare, resident: flag("--resident"), graphs: flag("--graphs"), n_layers, keep, dspark_keep: None };
     let mut engine = Engine::new(&model_dir, token_map, opts)?;
     eprintln!("engine up in {:.1}s", t0.elapsed().as_secs_f64());
     let stop = [1u32]; // <｜end▁of▁sentence｜>

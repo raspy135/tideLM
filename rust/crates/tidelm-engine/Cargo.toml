@@ -21,3 +21,7 @@ path = "src/bin/generate.rs"
 [[bin]]
 name = "tidelm-parity"
 path = "src/bin/parity.rs"
+
+[[bin]]
+name = "tidelm-batch"
+path = "src/bin/batch.rs"
