@@ -58,8 +58,12 @@ fn main() -> tidelm_engine::Result<()> {
     eprintln!("prompt: {} tokens", ids.len());
 
     tidelm_cuda::set_device(0)?;
-    let keep = keep_first.map(|k| vec![(0..384).map(|e| e < k).collect::<Vec<bool>>(); 40]);
-    let opts = Options { max_seq, max_lanes: 1, spec: spec || compare, resident: flag("--resident"), graphs: flag("--graphs"), n_layers, keep, dspark_keep: None };
+    // --keep-db FILE --budget N: the demand-ranked resident set (tidelm_engine::keep)
+    let keep = match (arg(&args, "--keep-db"), arg(&args, "--budget")) {
+        (Some(db), Some(b)) => Some(tidelm_engine::keep::keep_from_demand(std::path::Path::new(&db), 40, 384, 6, b.parse().unwrap())?),
+        _ => keep_first.map(|k| vec![(0..384).map(|e| e < k).collect::<Vec<bool>>(); 40]),
+    };
+    let opts = Options { max_seq, max_lanes: 1, spec: spec || compare || flag("--sweep-depth"), resident: flag("--resident"), graphs: flag("--graphs"), n_layers, keep, dspark_keep: None };
     let mut engine = Engine::new(&model_dir, token_map, opts)?;
     eprintln!("engine up in {:.1}s", t0.elapsed().as_secs_f64());
     let stop = [1u32]; // <｜end▁of▁sentence｜>
@@ -80,6 +84,21 @@ fn main() -> tidelm_engine::Result<()> {
         Ok((g, t.elapsed().as_secs_f64()))
     };
 
+    if flag("--sweep-depth") {
+        // the same greedy continuation at every depth (lossless), so only the cost differs
+        let (plain, tp) = run(&mut engine, false)?;
+        eprintln!("depth 0 (plain): {} tokens, {:.1} tok/s, {:.1} ms/step", plain.tokens.len(),
+                  plain.tokens.len() as f64 / tp, 1e3 * tp / plain.tokens.len() as f64);
+        for d in 1..=engine.cfg.dspark_block_size {
+            let t = Instant::now();
+            let g = generate_spec(&mut engine, &ids, max_tokens, d, &stop, |_| {})?;
+            let dt = t.elapsed().as_secs_f64();
+            eprintln!("depth {d}: {} tokens, {} steps, {:.3} tokens/step, {:.1} tok/s, {:.1} ms/step{}", g.tokens.len(), g.steps,
+                      g.tokens_per_step(), g.tokens.len() as f64 / dt, 1e3 * dt / g.steps.max(1) as f64,
+                      if g.tokens == plain.tokens { "" } else { "  DIVERGED from plain" });
+        }
+        return Ok(());
+    }
     if compare {
         let (plain, tp) = run(&mut engine, false)?;
         eprintln!("plain: {} tokens, {} steps, {:.1}s", plain.tokens.len(), plain.steps, tp);

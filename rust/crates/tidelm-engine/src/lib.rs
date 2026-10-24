@@ -8,6 +8,7 @@
 pub mod config;
 pub mod decode;
 pub mod forward;
+pub mod keep;
 pub mod rope;
 pub mod weights;
 

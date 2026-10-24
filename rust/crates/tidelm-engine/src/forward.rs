@@ -244,15 +244,99 @@ pub struct StepTimes {
     pub device_s: f64,
 }
 
+/// Gathers at or below this many unique rows read through the page cache (the memmap),
+/// above it with O_DIRECT sector reads: the Python serving setting DSV41_ENGRAM_DIRECT=prefill
+/// (engine/engram.py: a page-cache hit beats an O_DIRECT round trip at decode sizes, while
+/// prefill-sized gathers would flood the page cache and stall the MoE kernels in reclaim).
+const ENGRAM_MAPPED_MAX: usize = 384;
+/// Native gather workers per table (DSV41_ENGRAM_NATIVE_THREADS)
+const ENGRAM_THREADS: i32 = 64;
+const ENGRAM_ROW: usize = 264;
+
+/// One engram layer's table on NVMe: a page-cache gather over a read-only mapping of its
+/// shard, an O_DIRECT gather, and a packed row cache in front of both.
 struct EngramTable {
-    ctx: *mut c_void,
+    mapped: *mut c_void,
+    direct: *mut c_void,
+    map: *mut c_void,
+    map_len: usize,
+    cache: RowCache,
+}
+
+// the gather contexts are internally synchronised native objects; a table is used by one
+// thread at a time (moved into the step's gather thread and back)
+unsafe impl Send for EngramTable {}
+
+impl EngramTable {
+    /// The rows for unique ids `ids` into `out` ([ids][264] bytes): cache hits copied, misses
+    /// gathered and cached.
+    fn gather(&mut self, ids: &[i64], out: &mut [u8]) -> i32 {
+        let (mapped, direct) = (self.mapped, self.direct);
+        self.cache.gather(ids, out, &mut |miss: &[i64], buf: &mut [u8]| {
+            let ctx = if miss.len() <= ENGRAM_MAPPED_MAX { mapped } else { direct };
+            unsafe { eg::engram_gather_run(ctx, miss.as_ptr(), miss.len(), buf.as_mut_ptr()) }
+        })
+    }
 }
 
 impl Drop for EngramTable {
     fn drop(&mut self) {
-        unsafe { eg::engram_gather_destroy(self.ctx) };
+        unsafe {
+            eg::engram_gather_destroy(self.mapped);
+            eg::engram_gather_destroy(self.direct);
+            libc::munmap(self.map, self.map_len);
+        }
     }
 }
+
+/// engine/engram_cache.py::PackedRowCache: direct-mapped by id % capacity, one tag and one
+/// 264-byte row a slot (272 bytes of budget). The tables are immutable, so it never needs
+/// clearing; a collision only costs an extra read.
+struct RowCache {
+    keys: Vec<i64>,
+    data: Vec<u8>,
+}
+
+impl RowCache {
+    fn new(budget: usize) -> Self {
+        let cap = (budget / 272).max(1);
+        RowCache { keys: vec![-1; cap], data: vec![0; cap * ENGRAM_ROW] }
+    }
+
+    fn gather(&mut self, ids: &[i64], out: &mut [u8], read: &mut dyn FnMut(&[i64], &mut [u8]) -> i32) -> i32 {
+        let cap = self.keys.len() as i64;
+        let (mut miss, mut at) = (Vec::new(), Vec::new());
+        for (i, &id) in ids.iter().enumerate() {
+            let slot = id.rem_euclid(cap) as usize;
+            if self.keys[slot] == id {
+                out[i * ENGRAM_ROW..(i + 1) * ENGRAM_ROW].copy_from_slice(&self.data[slot * ENGRAM_ROW..(slot + 1) * ENGRAM_ROW]);
+            } else {
+                miss.push(id);
+                at.push(i);
+            }
+        }
+        if miss.is_empty() {
+            return 0;
+        }
+        let mut buf = vec![0u8; miss.len() * ENGRAM_ROW];
+        let rc = read(&miss, &mut buf);
+        if rc != 0 {
+            return rc;
+        }
+        for (j, (&id, &i)) in miss.iter().zip(&at).enumerate() {
+            let row = &buf[j * ENGRAM_ROW..(j + 1) * ENGRAM_ROW];
+            out[i * ENGRAM_ROW..(i + 1) * ENGRAM_ROW].copy_from_slice(row);
+            let slot = id.rem_euclid(cap) as usize;
+            self.keys[slot] = id;
+            self.data[slot * ENGRAM_ROW..(slot + 1) * ENGRAM_ROW].copy_from_slice(row);
+        }
+        0
+    }
+}
+
+/// A raw pointer handed to a step's gather thread (see run_step).
+struct SendPtr(*mut u8);
+unsafe impl Send for SendPtr {}
 
 const W13: usize = 2304 * 2560;
 const S13: usize = 2304 * 160;
@@ -570,12 +654,17 @@ pub struct Engine {
     /// per engram layer, this step's gathered table rows and their (row, col) map
     eg_raw: Vec<DeviceBuffer<u8>>,
     eg_inv: Vec<DeviceBuffer<i32>>,
+    /// the gather threads' pinned output, uploaded before the layer's graph segment
+    eg_host: Vec<PinnedBuffer<u8>>,
+    /// this step's pending gathers: (engram layer index, unique row ids)
+    eg_jobs: Vec<(usize, Vec<i64>)>,
     /// the step being issued (select() reads its indexer ranges)
     shape: Option<StepShape>,
     /// live rows of the step being issued (the rest are filler)
     live_rows: usize,
     use_graphs: bool,
-    graphs: HashMap<StepShape, GraphExec>,
+    /// per (shape, segment): segments split the step at the engram layers (run_step)
+    graphs: HashMap<(StepShape, usize), GraphExec>,
     /// steps served by a graph replay / by a capture
     pub graph_replays: usize,
     pub graph_captures: usize,
@@ -662,6 +751,8 @@ impl Engine {
         );
         let hash = NgramHashState::new(layout, token_map, cfg.engram_pad_id);
 
+        // DSV41_ENGRAM_CACHE_MB: the shipped profile gives each table 256 MB
+        let engram_cache = std::env::var("TIDELM_ENGRAM_CACHE_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256) << 20;
         let mut engram_tables = BTreeMap::new();
         for &l in &cfg.engram_layer_ids {
             let wname = format!("layers.{l}.engram.embed.weight");
@@ -671,13 +762,35 @@ impl Engine {
             if !std::ptr::eq(shard, ckpt.shard(&sname)?) {
                 return Err(format!("layer {l}: engram weight and scale planes live in different shards").into());
             }
-            let ctx = unsafe {
-                eg::engram_gather_create_direct(shard.file.direct_fd(), wm.lo as i64, sm.lo as i64, wm.shape[0] as i64, 16)
+            let direct = unsafe {
+                eg::engram_gather_create_direct(shard.file.direct_fd(), wm.lo as i64, sm.lo as i64, wm.shape[0] as i64,
+                                                ENGRAM_THREADS)
             };
-            if ctx.is_null() {
+            // the whole shard, read-only; MADV_RANDOM: every row lands on its own page, so
+            // readahead would only evict
+            let cpath = std::ffi::CString::new(shard.path.as_os_str().as_encoded_bytes())?;
+            let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY) };
+            let map_len = std::fs::metadata(&shard.path)?.len() as usize;
+            let map = if fd >= 0 {
+                unsafe { libc::mmap(std::ptr::null_mut(), map_len, libc::PROT_READ, libc::MAP_SHARED, fd, 0) }
+            } else {
+                libc::MAP_FAILED
+            };
+            if fd >= 0 {
+                unsafe { libc::close(fd) };
+            }
+            if direct.is_null() || map == libc::MAP_FAILED {
                 return Err(format!("layer {l}: engram gather setup failed").into());
             }
-            engram_tables.insert(l, EngramTable { ctx });
+            unsafe { libc::madvise(map, map_len, libc::MADV_RANDOM) };
+            let base = map as *const u8;
+            let mapped = unsafe {
+                eg::engram_gather_create(base.add(wm.lo as usize), base.add(sm.lo as usize), wm.shape[0] as i64, ENGRAM_THREADS)
+            };
+            if mapped.is_null() {
+                return Err(format!("layer {l}: engram mapped gather setup failed").into());
+            }
+            engram_tables.insert(l, EngramTable { mapped, direct, map, map_len, cache: RowCache::new(engram_cache) });
         }
 
         let t = TMAX;
@@ -843,6 +956,7 @@ impl Engine {
         let n_eng = cfg.engram_layer_ids.len();
         let eg_raw = (0..n_eng).map(|_| DeviceBuffer::zeroed(t * eng_cols * 264)).collect::<std::result::Result<_, _>>()?;
         let eg_inv = (0..n_eng).map(|_| DeviceBuffer::zeroed(t * eng_cols)).collect::<std::result::Result<_, _>>()?;
+        let eg_host = (0..n_eng).map(|_| PinnedBuffer::zeroed(t * eng_cols * ENGRAM_ROW)).collect::<std::result::Result<_, _>>()?;
         let lanes_v = (0..max_lanes).map(|_| Lane { len: 0, hash: hash.fresh(), last: (0, 0, 0), step: u64::MAX }).collect();
         Ok(Engine {
             arena: Arena::new(ARENA_SLOTS + 1)?,
@@ -873,6 +987,8 @@ impl Engine {
             one_hot: DeviceBuffer::from_slice(&(0..t * hc).map(|j| if j % hc == 0 { 1.0f32 } else { 0.0 }).collect::<Vec<_>>())?,
             eg_raw,
             eg_inv,
+            eg_host,
+            eg_jobs: Vec::new(),
             shape: None,
             live_rows: 0,
             use_graphs: opts.graphs && opts.resident,
@@ -1036,31 +1152,97 @@ impl Engine {
         Ok(plan.heads.iter().map(|&(h0, n)| self.am_host[h0..h0 + n].iter().map(|&x| x as u32).collect()).collect())
     }
 
+    /// The step's layer ranges, cut at each engram layer: a segment that starts at one needs
+    /// that layer's gathered rows on the device before it runs (engine/fastdecode.py's three
+    /// replays, [L0] [L1-13] [L14-39 + head]).
+    fn segments(&self) -> Vec<(usize, usize)> {
+        let mut cuts: Vec<usize> = self.cfg.engram_layer_ids.iter().copied().filter(|&l| l > 0 && l < self.n_layers).collect();
+        cuts.sort_unstable();
+        let mut out = Vec::new();
+        let mut l0 = 0;
+        for c in cuts.into_iter().chain(std::iter::once(self.n_layers)) {
+            if c > l0 {
+                out.push((l0, c));
+                l0 = c;
+            }
+        }
+        out
+    }
+
+    /// One backbone step: host preparation, then the graph segments, each started once the
+    /// engram rows it needs have been gathered. The gathers run on their own threads from the
+    /// start of the step, so a layer's NVMe reads overlap every segment before it.
     fn run_step(&mut self, segs: &[Seg], logits: bool) -> Result<Plan> {
         let tp = Instant::now();
         let plan = self.prepare(segs)?;
         let shape = plan.shape;
         let td = Instant::now();
         self.times.prepare_s += (td - tp).as_secs_f64();
-        if self.use_graphs {
-            if !self.graphs.contains_key(&shape) {
-                // capture records the step without running it; the launch below runs it once
-                self.stream.begin_capture()?;
-                let rec = self.device_step(shape);
-                let graph = self.stream.end_capture();
-                rec?;
-                self.graphs.insert(shape, graph?);
-                self.graph_captures += 1;
-            } else {
-                self.graph_replays += 1;
+        let mut tables = std::mem::take(&mut self.engram_tables);
+        let jobs = std::mem::take(&mut self.eg_jobs);
+        let cfg_layers = self.cfg.engram_layer_ids.clone();
+        let res = std::thread::scope(|sc| -> Result<()> {
+            let mut pending = HashMap::new();
+            for (l, table) in tables.iter_mut() {
+                let Some(li) = cfg_layers.iter().position(|x| x == l) else { continue };
+                let Some((_, ids)) = jobs.iter().find(|j| j.0 == li) else { continue };
+                // the gather thread is the only user of eg_host[li] until it is joined below
+                let out = SendPtr(self.eg_host[li].as_mut_ptr());
+                let n = ids.len();
+                pending.insert(*l, (li, n, sc.spawn(move || {
+                    let out = out;
+                    let buf = unsafe { std::slice::from_raw_parts_mut(out.0, n * ENGRAM_ROW) };
+                    table.gather(ids, buf)
+                })));
             }
-            self.graphs[&shape].launch(&self.stream)?;
-        } else {
-            self.device_step(shape)?;
-        }
+            let mut first_err = None;
+            for (k, (l0, l1)) in self.segments().into_iter().enumerate() {
+                if let Some((li, n, h)) = pending.remove(&l0) {
+                    let te = Instant::now();
+                    let rc = h.join().unwrap_or(-1);
+                    self.times.engram_s += te.elapsed().as_secs_f64();
+                    if rc != 0 {
+                        first_err.get_or_insert(format!("layer {l0}: engram gather failed ({rc})"));
+                        break;
+                    }
+                    self.eg_raw[li].upload_async(0, &self.eg_host[li][..n * ENGRAM_ROW], &self.stream)?;
+                }
+                self.run_segment(shape, k, l0, l1)?;
+            }
+            // a gather whose segment never ran (an error above) must still be joined
+            for (_, (_, _, h)) in pending.drain() {
+                let _ = h.join();
+            }
+            match first_err {
+                Some(e) => Err(e.into()),
+                None => Ok(()),
+            }
+        });
+        self.engram_tables = tables;
+        res?;
         self.collect(segs, &plan, logits)?;
         self.times.device_s += td.elapsed().as_secs_f64();
         Ok(plan)
+    }
+
+    fn run_segment(&mut self, shape: StepShape, k: usize, l0: usize, l1: usize) -> Result<()> {
+        if !self.use_graphs {
+            return self.device_step(shape, l0, l1);
+        }
+        let key = (shape, k);
+        if !self.graphs.contains_key(&key) {
+            // capture records the segment without running it; the launch below runs it once
+            self.stream.begin_capture()?;
+            let rec = self.device_step(shape, l0, l1);
+            let graph = self.stream.end_capture();
+            rec?;
+            self.graphs.insert(key, graph?);
+            self.graph_captures += 1;
+        } else {
+            self.graph_replays += 1;
+        }
+        self.graphs[&key].launch(&self.stream)?;
+        Ok(())
     }
 
     /// Host work before a step's device work: the rows' positions and lanes, the segments,
@@ -1146,8 +1328,8 @@ impl Engine {
             hashes.extend(l.hash.hash(sg.ids, l.len, None));
         }
         self.times.compute_s += tw.elapsed().as_secs_f64();
-        let te = Instant::now();
         let st = &self.stream;
+        self.eg_jobs.clear();
         for li in 0..n_eng {
             let l = cfg.engram_layer_ids[li];
             if l >= self.n_layers {
@@ -1161,15 +1343,9 @@ impl Engine {
             // filler rows read the first gathered row
             let mut inv: Vec<i32> = col_ids.iter().map(|h| uniq.binary_search(h).unwrap() as i32).collect();
             inv.resize(tb * cols, 0);
-            let mut raw = vec![0u8; uniq.len() * 264];
-            let rc = unsafe { eg::engram_gather_run(self.engram_tables[&l].ctx, uniq.as_ptr(), uniq.len(), raw.as_mut_ptr()) };
-            if rc != 0 {
-                return Err(format!("layer {l}: engram gather failed ({rc})").into());
-            }
-            self.eg_raw[li].upload_async(0, &raw, st)?;
             self.eg_inv[li].upload_async(0, &inv, st)?;
+            self.eg_jobs.push((li, uniq));
         }
-        self.times.engram_s += te.elapsed().as_secs_f64();
 
         let topk = cfg.index_topk;
         let indexed = |nc: usize, r: usize| -> Option<usize> { (nc > topk).then(|| bucket(nc, 2048, self.max_seq / r + 1)) };
@@ -1190,26 +1366,19 @@ impl Engine {
         Ok(Plan { shape, firsts, heads })
     }
 
-    /// Every device operation of one backbone step, in stream order, with no host decision
-    /// that depends on buffer contents: the body the step graph captures.
-    fn device_step(&mut self, shape: StepShape) -> Result<()> {
+    /// Every device operation of layers l0..l1 of a backbone step (the embedding first, the
+    /// head last), in stream order, with no host decision that depends on buffer contents:
+    /// the body a step graph segment captures.
+    fn device_step(&mut self, shape: StepShape, l0: usize, l1: usize) -> Result<()> {
         let cfg = self.cfg.clone();
         let (d, hc, t) = (cfg.dim, cfg.hc_mult, shape.t);
         let capturing = self.use_graphs;
         self.shape = Some(shape);
-        self.embed_dev(t)?;
-        {
-            let sr = self.stream.raw();
-            let a = &self.act;
-            // the all-visible compressed lists, built from the positions; only read while
-            // n_c <= index_topk (past that the indexer's top-k replaces them)
-            ck(unsafe { ds_visible(sr, np(&a.pos), t as i32, 1, shape.c1 as i32, np(&a.cidx1), np(&a.clen1)) }, "visible r1")?;
-            ck(unsafe { ds_visible(sr, np(&a.pos), t as i32, 2, shape.c2 as i32, np(&a.cidx2), np(&a.clen2)) }, "visible r2")?;
+        if l0 == 0 {
+            self.begin_step(shape)?;
         }
-        self.selection = Selection::AllVisible;
-        self.cand_live = false;
         let cols = self.hash.layout.n_hash_cols();
-        for l in 0..self.n_layers {
+        for l in l0..l1 {
             let t0 = Instant::now();
             // resident: borrow the layer out of the resident set for this block (put back below)
             let w = match self.resident.as_mut() {
@@ -1261,12 +1430,27 @@ impl Engine {
                 dump_bf16(&dir.join(format!("h{l:02}.f32")), &hb)?;
             }
         }
-        if shape.head > 0 {
+        if l1 == self.n_layers && shape.head > 0 {
             let norm = np(&self.norm);
             self.head_dev(t, Some(shape.head), norm)?;
             let v = cfg.vocab_size;
             ck(unsafe { ds_argmax_bf16(self.stream.raw(), np(&self.act.logits), v as i64, shape.head as i32, v as i32, np(&self.act.am)) }, "head argmax")?;
         }
+        Ok(())
+    }
+
+    /// The step's first device work: the embedding, and the all-visible compressed lists
+    /// built from the positions (only read while n_c <= index_topk; past that the indexer's
+    /// top-k replaces them).
+    fn begin_step(&mut self, shape: StepShape) -> Result<()> {
+        let t = shape.t;
+        self.embed_dev(t)?;
+        let sr = self.stream.raw();
+        let a = &self.act;
+        ck(unsafe { ds_visible(sr, np(&a.pos), t as i32, 1, shape.c1 as i32, np(&a.cidx1), np(&a.clen1)) }, "visible r1")?;
+        ck(unsafe { ds_visible(sr, np(&a.pos), t as i32, 2, shape.c2 as i32, np(&a.cidx2), np(&a.clen2)) }, "visible r2")?;
+        self.selection = Selection::AllVisible;
+        self.cand_live = false;
         Ok(())
     }
 

@@ -11,6 +11,7 @@ tidelm-cuda = { path = "../tidelm-cuda" }
 tidelm-kernels = { path = "../tidelm-kernels" }
 tidelm-model = { path = "../tidelm-model" }
 tidelm-text = { path = "../tidelm-text" }
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

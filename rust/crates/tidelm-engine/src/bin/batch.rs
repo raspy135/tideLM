@@ -58,7 +58,11 @@ fn main() -> tidelm_engine::Result<()> {
         })
         .collect::<tidelm_engine::Result<_>>()?;
     tidelm_cuda::set_device(0)?;
-    let keep = keep_first.map(|k| vec![(0..384).map(|e| e < k).collect::<Vec<bool>>(); 40]);
+    // --keep-db FILE --budget N: the demand-ranked resident set (tidelm_engine::keep)
+    let keep = match (arg(&args, "--keep-db"), arg(&args, "--budget")) {
+        (Some(db), Some(b)) => Some(tidelm_engine::keep::keep_from_demand(std::path::Path::new(&db), 40, 384, 6, b.parse().unwrap())?),
+        _ => keep_first.map(|k| vec![(0..384).map(|e| e < k).collect::<Vec<bool>>(); 40]),
+    };
     let dspark_keep = keep_first.map(|k| vec![(0..128).map(|e| e < k.min(128)).collect::<Vec<bool>>(); 3]);
     let opts = Options {
         max_seq: num("--max-seq", 1024),
