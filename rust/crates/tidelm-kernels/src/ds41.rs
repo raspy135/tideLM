@@ -174,4 +174,26 @@ extern "C" {
     pub fn ds_lut_slots(stream: CudaStream, idx: *const c_void, lut: *const c_void, p: c_int, slots: *mut c_void) -> c_int;
     pub fn ds_greedy_accept(stream: CudaStream, am: *const c_void, block: *const c_void, t: c_int, pos: *const c_void, out: *mut c_void) -> c_int;
     pub fn ds_wait_flag(stream: CudaStream, flag: *const c_void, expect: c_int, timeout_ns: i64, err: *mut c_void) -> c_int;
+
+    /// Tensor-core skinny GEMM over fp8 block-scaled weights, M <= 64 (rows_per_group > 0
+    /// for the grouped wo_a form, as ds_linear_fp8_grouped). K % 64 == 0.
+    pub fn ds_mma_fp8(
+        stream: CudaStream, x: *const c_void, ldx: i64, x_group_stride: i64, rows_per_group: c_int, w: *const c_void,
+        s: *const c_void, lds: i64, m: c_int, n: c_int, k: c_int, splits: c_int, y_bf16: *mut c_void, y_f32: *mut c_void,
+        ldy: i64, partial: *mut c_void,
+    ) -> c_int;
+
+    pub fn ds_mma_bf16(
+        stream: CudaStream, x: *const c_void, ldx: i64, w: *const c_void, m: c_int, n: c_int, k: c_int, splits: c_int,
+        y_bf16: *mut c_void, y_f32: *mut c_void, ldy: i64, partial: *mut c_void,
+    ) -> c_int;
+
+    /// Output rows per block of the tensor-core GEMM at m rows (for choosing split-K).
+    pub fn ds_mma_rows_per_block(m: c_int) -> c_int;
+
+    /// Benchmark-only: the tensor-core fp8 GEMM at an explicit (ng, depth).
+    pub fn ds_mma_fp8_cfg(
+        stream: CudaStream, x: *const c_void, ldx: i64, w: *const c_void, s: *const c_void, lds: i64, m: c_int, n: c_int,
+        k: c_int, splits: c_int, y_bf16: *mut c_void, partial: *mut c_void, ng: c_int, depth: c_int,
+    ) -> c_int;
 }

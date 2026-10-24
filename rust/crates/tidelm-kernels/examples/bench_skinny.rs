@@ -11,7 +11,7 @@ use std::os::raw::c_void;
 use std::time::Instant;
 
 use tidelm_cuda::{check, ffi, set_device, DeviceBuffer, Stream};
-use tidelm_kernels::ds41::{ds_linear_bf16, ds_linear_fp8};
+use tidelm_kernels::ds41::{ds_linear_bf16, ds_linear_fp8, ds_mma_fp8, ds_mma_rows_per_block, ds_splits_reduce};
 
 const REPS: usize = 64;
 const L2_BYTES: usize = 64 << 20; // comfortably above GB10's L2
@@ -64,7 +64,9 @@ fn main() {
         ("sh_w2  [5120, 2304]", 5120, 2304),
         ("e.wkv  [25600, 6144]", 25600, 6144),
     ];
-    println!("{:24} {:>10} {:>10} {:>10} {:>10}", "fp8 weight", "M=1 us", "M=1 GB/s", "M=6 us", "M=6 GB/s");
+    let ms = [1usize, 6, 16, 32, 64];
+    println!("GB/s of weight bytes; FMA kernel (M <= 16) | tensor-core kernel");
+    println!("{:22} {}", "fp8 weight", ms.iter().map(|m| format!("{:>13}", format!("M={m}"))).collect::<String>());
     for (name, nn, k) in shapes {
         let wbytes = nn * k + nn.div_ceil(32) * k.div_ceil(32);
         let copies = (L2_BYTES / wbytes).max(1) + 1;
@@ -76,19 +78,41 @@ fn main() {
                 )
             })
             .collect();
-        let x = DeviceBuffer::<u16>::zeroed(16 * k).unwrap();
-        let y = DeviceBuffer::<u16>::zeroed(16 * nn).unwrap();
-        let mut row = format!("{name:24}");
-        for m in [1usize, 6] {
+        let x = DeviceBuffer::<u16>::zeroed(64 * k).unwrap();
+        let y = DeviceBuffer::<u16>::zeroed(64 * nn).unwrap();
+        let mut row = format!("{name:22}");
+        for m in ms {
+            let fma = if m <= 16 {
+                let dt = time_graph(&stream, |s, i| {
+                    let (w, sc) = &ws[i % copies];
+                    unsafe {
+                        ds_linear_fp8(s.raw(), x.raw(), k as i64, w.raw(), sc.raw(), k.div_ceil(32) as i64, m as i32,
+                                      nn as i32, k as i32, 1, y.raw(), std::ptr::null_mut::<c_void>(), nn as i64,
+                                      std::ptr::null_mut())
+                    }
+                });
+                format!("{:5.0}", wbytes as f64 / dt / 1e9)
+            } else {
+                "    -".to_string()
+            };
+            // split-K to at least two blocks per SM (48 on GB10), K slices of >= 512
+            let blocks = nn.div_ceil(unsafe { ds_mma_rows_per_block(m as i32) } as usize);
+            let splits = (96usize.div_ceil(blocks)).min(k / 512).max(1);
+            let part = DeviceBuffer::<f32>::zeroed(splits * m * nn).unwrap();
             let dt = time_graph(&stream, |s, i| {
                 let (w, sc) = &ws[i % copies];
                 unsafe {
-                    ds_linear_fp8(s.raw(), x.raw(), k as i64, w.raw(), sc.raw(), k.div_ceil(32) as i64, m as i32,
-                                  nn as i32, k as i32, 1, y.raw(), std::ptr::null_mut::<c_void>(), nn as i64,
-                                  std::ptr::null_mut())
+                    let rc = ds_mma_fp8(s.raw(), x.raw(), k as i64, 0, 0, w.raw(), sc.raw(), k.div_ceil(32) as i64, m as i32,
+                                        nn as i32, k as i32, splits as i32, y.raw(), std::ptr::null_mut::<c_void>(), nn as i64,
+                                        part.raw());
+                    if rc != 0 || splits == 1 {
+                        return rc;
+                    }
+                    ds_splits_reduce(s.raw(), part.raw(), splits as i32, m as i32, nn as i32, y.raw(),
+                                     std::ptr::null_mut(), nn as i64)
                 }
             });
-            row += &format!(" {:10.1} {:10.1}", dt * 1e6, wbytes as f64 / dt / 1e9);
+            row += &format!("  {fma} |{:5.0}", wbytes as f64 / dt / 1e9);
         }
         println!("{row}");
     }

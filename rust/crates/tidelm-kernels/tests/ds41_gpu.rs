@@ -129,6 +129,32 @@ fn assert_f32_close(got: &[f32], want: &[f64], rel: f64, what: &str) {
 }
 
 // ------------------------------------------------------------------ GEMMs
+/// (sum, sum of |terms|) per output: the second bounds fp32 accumulation error, which with
+/// cancelling random terms can exceed one bf16 ulp of a small result.
+fn ref_linear_mag(x: &[u16], w: impl Fn(usize, usize) -> f64, m: usize, n: usize, k: usize) -> (Vec<f64>, Vec<f64>) {
+    let (mut out, mut mag) = (vec![0f64; m * n], vec![0f64; m * n]);
+    for i in 0..m {
+        for j in 0..n {
+            for kk in 0..k {
+                let t = f32_from_bf16(x[i * k + kk]) as f64 * w(j, kk);
+                out[i * n + j] += t;
+                mag[i * n + j] += t.abs();
+            }
+        }
+    }
+    (out, mag)
+}
+
+/// Half a bf16 ulp of rounding plus fp32 accumulation error (a few 2^-24 x sum|terms|).
+fn assert_bf16_accum(got: &[u16], want: &[f64], mag: &[f64], what: &str) {
+    for (i, ((&g, &w), &a)) in got.iter().zip(want).zip(mag).enumerate() {
+        let g = f32_from_bf16(g) as f64;
+        let ulp = 2f64.powf((w.abs().max(1e-30)).log2().floor() - 7.0);
+        let tol = 0.51 * ulp + 2f64.powi(-24) * 8.0 * a + 1e-30;
+        assert!((g - w).abs() <= tol, "{what}[{i}]: got {g}, want {w} (tol {tol})");
+    }
+}
+
 fn ref_linear(x: &[u16], w: impl Fn(usize, usize) -> f64, m: usize, n: usize, k: usize) -> Vec<f64> {
     let mut out = vec![0f64; m * n];
     for i in 0..m {
@@ -933,3 +959,87 @@ fn greedy_accept_and_flag_wait() {
     st.synchronize().unwrap();
     assert_eq!(err.download().unwrap()[0], 1, "an unset flag times out and says so");
 }
+
+// ------------------------------------------------------------------ tensor-core skinny GEMM
+#[test]
+fn mma_gemm_matches_reference_and_is_row_invariant_across_m() {
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(73);
+    let (n, k) = (200usize, 1280usize); // N not a multiple of 64 rows per block
+    let w = rng.fp8_vec(n * k);
+    let lds = k / 32;
+    let s: Vec<u8> = (0..n.div_ceil(32) * lds).map(|_| 118 + (rng.next() % 12) as u8).collect();
+    let wb = rng.bf16_vec(n * k, 0.05);
+    let (dw, ds, dwb) = (dev(&w), dev(&s), dev(&wb));
+    let x = rng.bf16_vec(64 * k, 1.0);
+    let dx = dev(&x);
+    let mut first_rows: Option<(Vec<u16>, Vec<u16>)> = None;
+    for m in [1usize, 6, 17, 24, 33, 64] {
+        let wf8 = |j: usize, kk: usize| e4m3(w[j * k + kk]) as f64 * e8m0_lin(s[(j / 32) * lds + kk / 32]) as f64;
+        let wf16 = |j: usize, kk: usize| f32_from_bf16(wb[j * k + kk]) as f64;
+        let (want8, mag8) = ref_linear_mag(&x[..m * k], wf8, m, n, k);
+        let (want16, mag16) = ref_linear_mag(&x[..m * k], wf16, m, n, k);
+        let (y8, y16) = (DeviceBuffer::<u16>::zeroed(m * n).unwrap(), DeviceBuffer::<u16>::zeroed(m * n).unwrap());
+        ok(unsafe {
+            ds_mma_fp8(st.raw(), p(&dx), k as i64, 0, 0, p(&dw), p(&ds), lds as i64, m as i32, n as i32, k as i32, 1,
+                       p(&y8), null(), n as i64, null())
+        });
+        ok(unsafe { ds_mma_bf16(st.raw(), p(&dx), k as i64, p(&dwb), m as i32, n as i32, k as i32, 1, p(&y16), null(), n as i64, null()) });
+        st.synchronize().unwrap();
+        let (g8, g16) = (y8.download().unwrap(), y16.download().unwrap());
+        assert_bf16_accum(&g8, &want8, &mag8, &format!("mma fp8 M={m}"));
+        assert_bf16_accum(&g16, &want16, &mag16, &format!("mma bf16 M={m}"));
+        // row 0 must not depend on how many rows share the call
+        match &first_rows {
+            None => first_rows = Some((g8[..n].to_vec(), g16[..n].to_vec())),
+            Some((a, b)) => {
+                assert_eq!(&g8[..n], &a[..], "fp8 row 0 differs at M={m}");
+                assert_eq!(&g16[..n], &b[..], "bf16 row 0 differs at M={m}");
+            }
+        }
+    }
+    // split-K into fp32 partials
+    let (m, splits) = (24usize, 4usize);
+    let want = ref_linear(&x[..m * k], |j, kk| e4m3(w[j * k + kk]) as f64 * e8m0_lin(s[(j / 32) * lds + kk / 32]) as f64, m, n, k);
+    let (dpart, dy) = (DeviceBuffer::<f32>::zeroed(splits * m * n).unwrap(), DeviceBuffer::<f32>::zeroed(m * n).unwrap());
+    ok(unsafe {
+        ds_mma_fp8(st.raw(), p(&dx), k as i64, 0, 0, p(&dw), p(&ds), lds as i64, m as i32, n as i32, k as i32, splits as i32,
+                   null(), null(), n as i64, p(&dpart))
+    });
+    ok(unsafe { ds_splits_reduce(st.raw(), p(&dpart), splits as i32, m as i32, n as i32, null(), p(&dy), n as i64) });
+    st.synchronize().unwrap();
+    assert_f32_close(&dy.download().unwrap(), &want, 1e-5, "mma split-K");
+}
+
+#[test]
+fn mma_grouped_reads_each_groups_slice() {
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(79);
+    // rows per group must be a multiple of the block's rows (the model's wo_a groups are 1024)
+    let (g, r, k, m) = (4usize, 256usize, 512usize, 20usize);
+    let n = g * r;
+    let w = rng.fp8_vec(n * k);
+    let lds = k / 32;
+    let s: Vec<u8> = (0..(n / 32) * lds).map(|_| 120 + (rng.next() % 8) as u8).collect();
+    let x = rng.bf16_vec(m * g * k, 1.0);
+    let (mut want, mut mag) = (vec![0f64; m * n], vec![0f64; m * n]);
+    for i in 0..m {
+        for j in 0..n {
+            let grp = j / r;
+            for kk in 0..k {
+                let t = f32_from_bf16(x[(i * g + grp) * k + kk]) as f64 * e4m3(w[j * k + kk]) as f64
+                    * e8m0_lin(s[(j / 32) * lds + kk / 32]) as f64;
+                want[i * n + j] += t;
+                mag[i * n + j] += t.abs();
+            }
+        }
+    }
+    let (dx, dw, ds, dy) = (dev(&x), dev(&w), dev(&s), DeviceBuffer::<u16>::zeroed(m * n).unwrap());
+    ok(unsafe {
+        ds_mma_fp8(st.raw(), p(&dx), (g * k) as i64, k as i64, r as i32, p(&dw), p(&ds), lds as i64, m as i32, n as i32,
+                   k as i32, 1, p(&dy), null(), n as i64, null())
+    });
+    st.synchronize().unwrap();
+    assert_bf16_accum(&dy.download().unwrap(), &want, &mag, "mma grouped");
+}
+

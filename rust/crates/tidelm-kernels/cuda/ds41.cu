@@ -259,6 +259,208 @@ __global__ void splits_reduce_kernel(const float* __restrict__ partial, int spli
     else yf[(int64_t)m * ldy + n] = acc;
 }
 
+// ------------------------------------------------------------------ tensor-core skinny GEMM
+// The same products as skinny_kernel on mma.sync.m16n8k16 (bf16 in, fp32 accumulate), for M
+// up to 64 rows per launch: the batched-decode shape (lanes x verify rows) that the FMA kernel
+// cannot hold in registers. One warp owns 8 output rows; per 64-wide K block each lane loads 16
+// contiguous weight values of one row, and the K order inside the block is permuted so those
+// land exactly in the lane's B-fragment positions:
+//   logical k L of mma step s  <->  physical k = (L % 8 / 2) * 16 + s * 4 + (L / 8) * 2 + L % 2
+// The activation fragments are read with the same permutation, so it is the same dot product
+// in a fixed order per row — row-invariant across M like skinny_kernel (not bit-identical to it).
+// FP8 weights take their power-of-two block scale before the bf16 conversion: exact, as in
+// tools/fp8_linear.py's dequant-then-dot.
+
+__device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
+    const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast<const uint32_t*>(&v);
+}
+
+__device__ __forceinline__ void mma_bf16(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
+                                         uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// 16 weights of one row at (n, k..k+16) as 8 packed bf16 pairs (scale folded in for fp8).
+template <int KIND>
+__device__ __forceinline__ void load_w16(const uint8_t* w, const uint8_t* s, int64_t lds, int n, int K, int k,
+                                         bool valid, uint32_t* out) {
+    float v[16];
+    if (!valid) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) out[i] = 0;
+        return;
+    }
+    if (KIND == 0) {
+        const uint4 raw = *reinterpret_cast<const uint4*>(w + (int64_t)n * K + k);
+        decode_w<0>(raw, v);
+        const float sc = e8m0_lin(s[(int64_t)(n >> 5) * lds + (k >> 5)]);
+#pragma unroll
+        for (int i = 0; i < 16; ++i) v[i] *= sc;
+    } else {
+        const uint4* p = reinterpret_cast<const uint4*>(w + ((int64_t)n * K + k) * 2);
+        bf16x8_to_f32(p[0], v);
+        bf16x8_to_f32(p[1], v + 8);
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) out[i] = pack_bf16(v[2 * i], v[2 * i + 1]);
+}
+
+// KC: K values of x staged per pass; MT * (KC + 2) bf16 must stay under the 48 KB static limit.
+// NG: 8-row groups per warp. A block re-stages x for every pass, so x traffic per weight byte
+// is 2 * M / rows_per_block: NG grows with M to keep that below ~0.5 (NG = 1 at M=64 measured
+// x staging at 2x the weight bytes). DEPTH: K blocks whose weight loads are issued together.
+template <int KIND, int MT, int KC, int NG, int DEPTH>
+__global__ void __launch_bounds__(256) mma_skinny_kernel(
+    const __nv_bfloat16* __restrict__ x, int64_t ldx, int64_t x_group_stride, int rows_per_group,
+    const uint8_t* __restrict__ w, const uint8_t* __restrict__ s, int64_t lds,
+    int M, int N, int K, int ksplit,
+    __nv_bfloat16* __restrict__ ybf, float* __restrict__ yf, int64_t ldy, float* __restrict__ partial) {
+    constexpr int MTILES = MT / 16;
+    constexpr int XS = KC + 2;  // row stride in bf16: an odd number of words, so the 8 rows x 4
+                                // lanes of a fragment read hit 32 distinct banks
+    __shared__ __align__(16) __nv_bfloat16 xs[MT * XS];
+
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r = lane >> 2, q = lane & 3;
+    const int n_block = blockIdx.x * (kWarps * 8 * NG);
+    const int n0 = n_block + warp * 8 * NG;
+    const int k_begin = blockIdx.y * ksplit;
+    const int k_end = min(K, k_begin + ksplit);
+    const __nv_bfloat16* xg =
+        x + (rows_per_group > 0 ? (int64_t)(n_block / rows_per_group) * x_group_stride : 0);
+
+    float acc[NG][MTILES][4];
+#pragma unroll
+    for (int g = 0; g < NG; ++g)
+#pragma unroll
+        for (int mt = 0; mt < MTILES; ++mt)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) acc[g][mt][i] = 0.f;
+
+    for (int k0 = k_begin; k0 < k_end; k0 += KC) {
+        const int kc = min(KC, k_end - k0);
+        __syncthreads();
+        for (int i = threadIdx.x; i < MT * (KC / 2); i += blockDim.x) {
+            const int m = i / (KC / 2), j = (i % (KC / 2)) * 2;
+            uint32_t v = 0;
+            if (m < M && j < kc) v = *reinterpret_cast<const uint32_t*>(xg + (int64_t)m * ldx + k0 + j);
+            *reinterpret_cast<uint32_t*>(&xs[m * XS + j]) = v;
+        }
+        __syncthreads();
+        for (int kb0 = 0; kb0 < kc; kb0 += 64 * DEPTH) {
+            uint32_t b[DEPTH][NG][8];
+#pragma unroll
+            for (int u = 0; u < DEPTH; ++u)
+#pragma unroll
+                for (int g = 0; g < NG; ++g) {
+                    const int kb = kb0 + u * 64, n = n0 + g * 8 + r;
+                    load_w16<KIND>(w, s, lds, n, K, k0 + kb + q * 16, n < N && kb < kc, b[u][g]);
+                }
+#pragma unroll
+            for (int u = 0; u < DEPTH; ++u) {
+                const int kb = kb0 + u * 64;
+                if (kb >= kc) break;
+#pragma unroll
+                for (int st = 0; st < 4; ++st) {
+                    const int kx = kb + q * 16 + st * 4;
+#pragma unroll
+                    for (int mt = 0; mt < MTILES; ++mt) {
+                        const __nv_bfloat16* r0 = &xs[(mt * 16 + r) * XS + kx];
+                        const __nv_bfloat16* r1 = &xs[(mt * 16 + r + 8) * XS + kx];
+                        const uint32_t a0 = *reinterpret_cast<const uint32_t*>(r0);
+                        const uint32_t a1 = *reinterpret_cast<const uint32_t*>(r1);
+                        const uint32_t a2 = *reinterpret_cast<const uint32_t*>(r0 + 2);
+                        const uint32_t a3 = *reinterpret_cast<const uint32_t*>(r1 + 2);
+#pragma unroll
+                        for (int g = 0; g < NG; ++g)
+                            mma_bf16(acc[g][mt], a0, a1, a2, a3, b[u][g][2 * st], b[u][g][2 * st + 1]);
+                    }
+                }
+            }
+        }
+    }
+    // D fragment: rows (mt*16 + r, +8), columns n0 + g*8 + q*2 + {0, 1}
+#pragma unroll
+    for (int g = 0; g < NG; ++g)
+#pragma unroll
+        for (int mt = 0; mt < MTILES; ++mt)
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const int m = mt * 16 + r + half * 8;
+                if (m >= M) continue;
+#pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    const int n = n0 + g * 8 + q * 2 + j;
+                    if (n >= N) continue;
+                    const float v = acc[g][mt][half * 2 + j];
+                    if (gridDim.y > 1) partial[((int64_t)blockIdx.y * M + m) * N + n] = v;
+                    else if (ybf) ybf[(int64_t)m * ldy + n] = to_bf(v);
+                    else yf[(int64_t)m * ldy + n] = v;
+                }
+            }
+}
+
+template <int KIND>
+int launch_mma(cudaStream_t st, const void* x, int64_t ldx, int64_t gstride, int rpg, const void* w, const void* s,
+               int64_t lds, int M, int N, int K, int splits, void* ybf, void* yf, int64_t ldy, void* partial) {
+    if (M < 1 || M > 64 || splits < 1 || K % 64 || (splits > 1 && !partial)) return cudaErrorInvalidValue;
+    const int ksplit = ((K + splits - 1) / splits + 63) / 64 * 64;
+    auto xb = static_cast<const __nv_bfloat16*>(x);
+    auto wb = static_cast<const uint8_t*>(w);
+    auto sb = static_cast<const uint8_t*>(s);
+    auto yb = static_cast<__nv_bfloat16*>(ybf);
+    auto yff = static_cast<float*>(yf);
+    auto pp = static_cast<float*>(partial);
+#define DS_MMA(MT, KC, NG, DEPTH)                                                                          \
+    {                                                                                                      \
+        if (rpg > 0 && rpg % (kWarps * 8 * NG)) return cudaErrorInvalidValue;                             \
+        dim3 grid((N + kWarps * 8 * NG - 1) / (kWarps * 8 * NG), splits);                                 \
+        mma_skinny_kernel<KIND, MT, KC, NG, DEPTH><<<grid, kThreads, 0, st>>>(xb, ldx, gstride, rpg, wb, sb, lds, M, N, \
+                                                                              K, ksplit, yb, yff, ldy, pp); \
+    }
+    // (NG, DEPTH) per tile, from examples/tune_mma.rs on the decode shapes (2026-10-24, GB/s
+    // of weight bytes, split-K to >= 2 blocks/SM): M=32 2x2 avg ~165 (1x4 157, 4x1 154);
+    // M=64 1x4 avg ~133 (2x4 126, 4x1 121, 4x2 106). Neither reaches the ~230 GB/s the FMA
+    // kernel streams at M <= 16 - this kernel exists for M > 16, where the FMA one cannot
+    // hold its accumulators, and a deeper pipeline (cp.async, ldmatrix) is the next step.
+    if (M <= 16) DS_MMA(16, 512, 1, 4)
+    else if (M <= 32) DS_MMA(32, 512, 2, 2)
+    else DS_MMA(64, 256, 1, 4)
+#undef DS_MMA
+    return static_cast<int>(cudaGetLastError());
+}
+
+/// Rows per block of the tensor-core GEMM at M rows (callers size split-K with it).
+extern "C" int ds_mma_rows_per_block(int M) { return kWarps * 8 * (M <= 16 ? 1 : M <= 32 ? 2 : 1); }
+
+/// Tuning entry: fp8 weights at an explicit (NG, DEPTH) for the tile M needs (benchmarks only).
+extern "C" int ds_mma_fp8_cfg(void* stream, const void* x, int64_t ldx, const void* w, const void* s, int64_t lds, int M,
+                              int N, int K, int splits, void* y_bf16, void* partial, int ng, int depth) {
+    if (M < 1 || M > 64 || K % 64) return cudaErrorInvalidValue;
+    cudaStream_t st = static_cast<cudaStream_t>(stream);
+    const int ksplit = ((K + splits - 1) / splits + 63) / 64 * 64;
+    auto xb = static_cast<const __nv_bfloat16*>(x);
+    auto wb = static_cast<const uint8_t*>(w);
+    auto sb = static_cast<const uint8_t*>(s);
+    auto yb = static_cast<__nv_bfloat16*>(y_bf16);
+    auto pp = static_cast<float*>(partial);
+#define DS_CFG(MT, KC, NG, DEPTH)                                                                                    \
+    if (ng == NG && depth == DEPTH && (M <= MT) && (MT == 16 || M > MT / 2)) {                                        \
+        dim3 grid((N + kWarps * 8 * NG - 1) / (kWarps * 8 * NG), splits);                                            \
+        mma_skinny_kernel<0, MT, KC, NG, DEPTH><<<grid, kThreads, 0, st>>>(xb, ldx, 0, 0, wb, sb, lds, M, N, K, ksplit, \
+                                                                           yb, nullptr, N, pp);                       \
+        return static_cast<int>(cudaGetLastError());                                                                  \
+    }
+    DS_CFG(32, 512, 1, 4) DS_CFG(32, 512, 2, 2) DS_CFG(32, 512, 2, 4) DS_CFG(32, 512, 4, 1)
+    DS_CFG(64, 256, 1, 4) DS_CFG(64, 256, 2, 2) DS_CFG(64, 256, 2, 4) DS_CFG(64, 256, 4, 1) DS_CFG(64, 256, 4, 2)
+#undef DS_CFG
+    return cudaErrorInvalidValue;
+}
+
 // ------------------------------------------------------------------ norms
 // v41_ref.rmsnorm: y = bf16(w * (x * rsqrt(mean(x^2) + eps))), fp32 math. One block per row.
 __global__ void rmsnorm_kernel(const __nv_bfloat16* __restrict__ x, int64_t ldx,
@@ -1413,6 +1615,19 @@ int ds_greedy_accept(void* stream, const void* am, const void* block, int T, con
 int ds_wait_flag(void* stream, const void* flag, int expect, long long timeout_ns, void* err) {
     wait_flag_kernel<<<1, 32, 0, DS_ST>>>(static_cast<const volatile int*>(flag), expect, timeout_ns, static_cast<int*>(err));
     DS_RET;
+}
+
+int ds_mma_fp8(void* stream, const void* x, int64_t ldx, int64_t x_group_stride, int rows_per_group, const void* w,
+               const void* s, int64_t lds, int M, int N, int K, int splits, void* y_bf16, void* y_f32, int64_t ldy,
+               void* partial) {
+    return launch_mma<0>(static_cast<cudaStream_t>(stream), x, ldx, x_group_stride, rows_per_group, w, s, lds, M, N, K,
+                         splits, y_bf16, y_f32, ldy, partial);
+}
+
+int ds_mma_bf16(void* stream, const void* x, int64_t ldx, const void* w, int M, int N, int K, int splits, void* y_bf16,
+                void* y_f32, int64_t ldy, void* partial) {
+    return launch_mma<1>(static_cast<cudaStream_t>(stream), x, ldx, 0, 0, w, nullptr, 0, M, N, K, splits, y_bf16, y_f32,
+                         ldy, partial);
 }
 
 }  // extern "C"
