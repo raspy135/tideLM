@@ -6,6 +6,7 @@
 //! - `forward`: the forward pass on the ds41 and native FP4 kernels
 
 pub mod config;
+pub mod decode;
 pub mod forward;
 pub mod rope;
 pub mod weights;

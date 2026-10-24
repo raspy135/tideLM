@@ -917,6 +917,195 @@ __global__ void candidate_set_kernel(const int* __restrict__ blocks, int kb, int
     if (j < n) cand[(int64_t)t * ld_cand + j] = 1;
 }
 
+// bf16 -> f32 times a scale (model.py::_indexer's `mm(x, weights_proj).float() * c`).
+__global__ void bf16_to_f32_scale_kernel(const __nv_bfloat16* __restrict__ x, int64_t n, float scale,
+                                         float* __restrict__ out) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = bf(x[i]) * scale;
+}
+
+// model.py: `h.float().mean(dim=1)` over the hc copies (the DSpark main hidden of a target
+// layer), rounded to bf16 where the seed hands it to main_proj.
+__global__ void hc_mean_kernel(const __nv_bfloat16* __restrict__ h, __nv_bfloat16* __restrict__ out,
+                               int64_t ld_out, int D, int hc) {
+    const int m = blockIdx.y;
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= D) return;
+    float acc = bf(h[((int64_t)m * hc) * D + d]);
+    for (int c = 1; c < hc; ++c) acc += bf(h[((int64_t)m * hc + c) * D + d]);
+    out[(int64_t)m * ld_out + d] = to_bf(acc * (1.f / (float)hc));
+}
+
+// First index of the maximum of a + b over bf16 rows, in fp32 (the DSpark markov step:
+// logits[i] + bias, both bf16-valued). `b` may be null.
+__global__ void argmax_sum_bf16_kernel(const __nv_bfloat16* __restrict__ a, int64_t lda,
+                                       const __nv_bfloat16* __restrict__ b, int64_t ldb, int N,
+                                       int* __restrict__ out) {
+    __shared__ float bv[32];
+    __shared__ int bi[32];
+    const __nv_bfloat16* ar = a + (int64_t)blockIdx.x * lda;
+    const __nv_bfloat16* br = b ? b + (int64_t)blockIdx.x * ldb : nullptr;
+    float best = -INFINITY;
+    int besti = 0x7fffffff;
+    for (int n = threadIdx.x; n < N; n += blockDim.x) {
+        const float v = bf(ar[n]) + (br ? bf(br[n]) : 0.f);
+        if (v > best || (v == best && n < besti)) { best = v; besti = n; }
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, besti, o);
+        if (ov > best || (ov == best && oi < besti)) { best = ov; besti = oi; }
+    }
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (lane == 0) { bv[warp] = best; bi[warp] = besti; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        best = bv[0];
+        besti = bi[0];
+        for (int i = 1; i < (int)(blockDim.x >> 5); ++i)
+            if (bv[i] > best || (bv[i] == best && bi[i] < besti)) { best = bv[i]; besti = bi[i]; }
+        out[blockIdx.x] = besti;
+    }
+}
+
+// out[m] = table[idx[m]] for 16-bit rows of D values; idx lives on the device (graph-safe).
+__global__ void gather_rows_u16_kernel(const uint16_t* __restrict__ table, const int* __restrict__ idx,
+                                       uint16_t* __restrict__ out, int D) {
+    const int m = blockIdx.y;
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d < D) out[(int64_t)m * D + d] = table[(int64_t)idx[m] * D + d];
+}
+
+// ------------------------------------------------------------------ graph-safe step plumbing
+// The resident step is one CUDA graph, so every decision the streaming engine takes on the
+// host from positions (ring slots, compressor pairing, visible lists, rollback) is taken here
+// on the device from position buffers instead. Each kernel works on every row and masks, so
+// a graph's shape depends only on (rows, position parity, index bucket), never on a value.
+
+// dst[pos[t] % ring_size] = src[t]  (the window ring write, model.py: ring[pos % RING] = kv)
+__global__ void scatter_ring_kernel(const uint16_t* __restrict__ src, uint16_t* __restrict__ ring, int ring_size,
+                                    const int* __restrict__ pos, int D) {
+    const int t = blockIdx.y;
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d < D) ring[(int64_t)(pos[t] % ring_size) * D + d] = src[(int64_t)t * D + d];
+}
+
+// out[t, j] = j for j < (pos[t] + 1) / r, else -1; clen[t] = (pos[t] + 1) / r.
+__global__ void visible_kernel(const int* __restrict__ pos, int r, int C, int* __restrict__ cidx,
+                               int* __restrict__ clen) {
+    const int t = blockIdx.y;
+    const int vis = (pos[t] + 1) / r;
+    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < C; j += gridDim.x * blockDim.x)
+        cidx[(int64_t)t * C + j] = j < vis ? j : -1;
+    if (blockIdx.x == 0 && threadIdx.x == 0 && clen) clen[t] = vis;
+}
+
+// model.py::_compressed for ratio 2, every row: row t whose position completes a group
+// ((pos+1) % 2 == 0) gets the gated pair of (row t-1 or the pending position, row t) in
+// `out`; other rows are left as they are (they are never scattered). `pending_valid` is the
+// device flag for the pending position.
+__global__ void compress_rows_kernel(const float* __restrict__ kv, const float* __restrict__ sc,
+                                     const float* __restrict__ pkv, const float* __restrict__ psc,
+                                     const int* __restrict__ pos, __nv_bfloat16* __restrict__ out, int D) {
+    const int t = blockIdx.y;
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= D || (pos[t] + 1) % 2 != 0) return;
+    const float* ka = t > 0 ? kv + (int64_t)(t - 1) * D : pkv;
+    const float* sa = t > 0 ? sc + (int64_t)(t - 1) * D : psc;
+    const float a = sa[d], b = sc[(int64_t)t * D + d];
+    const float mx = fmaxf(a, b);
+    const float ea = expf(a - mx), eb = expf(b - mx);
+    const float den = ea + eb;
+    out[(int64_t)t * D + d] = to_bf(ka[d] * (ea / den) + kv[(int64_t)t * D + d] * (eb / den));
+}
+
+// dst[(pos[t] + 1) / r - 1] = src[t] for rows whose position completes a group of r.
+__global__ void scatter_compressed_kernel(const uint16_t* __restrict__ src, int64_t ld_src, uint16_t* __restrict__ dst,
+                                          const int* __restrict__ pos, int r, int D) {
+    const int t = blockIdx.y;
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= D || (pos[t] + 1) % r != 0) return;
+    dst[(int64_t)((pos[t] + 1) / r - 1) * D + d] = src[(int64_t)t * ld_src + d];
+}
+
+// After a ratio-2 chunk of T rows at pos[0]..: the chunk's last position is unpaired iff
+// (pos[T-1] + 1) is odd; save the chunk's inputs and the pending state before it (for
+// rollback) and set the new pending state. One block; `flag` is the device pending flag.
+__global__ void pending_update_kernel(const float* __restrict__ kv, const float* __restrict__ sc, const int* __restrict__ pos,
+                                      int T, float* pkv, float* psc, int* flag, float* mem_kv, float* mem_sc,
+                                      float* before_kv, float* before_sc, int* before_flag, int* mem_start, int D) {
+    for (int i = threadIdx.x; i < T * D; i += blockDim.x) { mem_kv[i] = kv[i]; mem_sc[i] = sc[i]; }
+    for (int d = threadIdx.x; d < D; d += blockDim.x) { before_kv[d] = pkv[d]; before_sc[d] = psc[d]; }
+    __syncthreads();
+    const bool unpaired = (pos[T - 1] + 1) % 2 != 0;
+    for (int d = threadIdx.x; d < D; d += blockDim.x)
+        if (unpaired) { pkv[d] = kv[(int64_t)(T - 1) * D + d]; psc[d] = sc[(int64_t)(T - 1) * D + d]; }
+    if (threadIdx.x == 0) {
+        *before_flag = *flag;
+        *flag = unpaired ? 1 : 0;
+        *mem_start = pos[0];
+    }
+}
+
+// model.py::Caches.rollback for a ratio-2 source, n read from the device (the accepted
+// length of a verify block): pending = the input of position n-1 if n is odd.
+__global__ void rollback_pending_kernel(const int* __restrict__ n_dev, const float* __restrict__ mem_kv,
+                                        const float* __restrict__ mem_sc, const int* __restrict__ mem_start,
+                                        const float* __restrict__ before_kv, const float* __restrict__ before_sc,
+                                        const int* __restrict__ before_flag, float* pkv, float* psc, int* flag, int D) {
+    const int n = *n_dev;
+    if (n % 2 == 0) {
+        if (threadIdx.x == 0) *flag = 0;
+        return;
+    }
+    const int p = n - 1, start = *mem_start;
+    if (p >= start) {
+        for (int d = threadIdx.x; d < D; d += blockDim.x) {
+            pkv[d] = mem_kv[(int64_t)(p - start) * D + d];
+            psc[d] = mem_sc[(int64_t)(p - start) * D + d];
+        }
+        if (threadIdx.x == 0) *flag = 1;
+    } else {
+        for (int d = threadIdx.x; d < D; d += blockDim.x) { pkv[d] = before_kv[d]; psc[d] = before_sc[d]; }
+        if (threadIdx.x == 0) *flag = *before_flag;
+    }
+}
+
+// Routed expert ids -> arena slots through the device LUT (model.py: lut[L][indices]).
+__global__ void lut_slots_kernel(const int* __restrict__ idx, const int* __restrict__ lut, int P, int* __restrict__ slots) {
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p < P) slots[p] = lut[idx[p]];
+}
+
+// v41_engine.py lean greedy verify: am[t] is row t's argmax, block the verified tokens.
+// out = [accepted a, bonus am[a], n = pos0 + a + 1, next draft position pos0 + a].
+// Stop tokens are the host's business (it truncates on the copy it reads).
+__global__ void greedy_accept_kernel(const int* __restrict__ am, const int* __restrict__ block, int T,
+                                     const int* __restrict__ pos, int* __restrict__ out) {
+    if (threadIdx.x != 0) return;
+    int a = 0;
+    while (a + 1 < T && am[a] == block[a + 1]) ++a;
+    out[0] = a;
+    out[1] = am[a];
+    out[2] = pos[0] + a + 1;
+    out[3] = pos[0] + a;
+}
+
+// Spin until *flag == expect (a host thread writes it in mapped pinned memory once the
+// engram rows of this step have landed). Gives up after `timeout_ns` and records the miss
+// in *err, so a lost signal stalls one step instead of the GPU forever.
+__global__ void wait_flag_kernel(const volatile int* flag, int expect, long long timeout_ns, int* err) {
+    if (threadIdx.x != 0) return;
+    const unsigned long long t0 = clock64();
+    long long spins = 0;
+    while (*flag != expect) {
+        __nanosleep(200);
+        if (++spins * 200 > timeout_ns) { *err = 1; break; }
+    }
+    __threadfence_system();
+    (void)t0;
+}
+
 }  // namespace
 
 // ================================================================== C ABI
@@ -1129,6 +1318,97 @@ int ds_candidate_set(void* stream, const void* blocks, int kb, int block, int n,
     candidate_set_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
         static_cast<const int*>(blocks), kb, block, n, static_cast<uint8_t*>(cand), ld_cand);
     return static_cast<int>(cudaGetLastError());
+}
+
+int ds_bf16_to_f32_scale(void* stream, const void* x, int64_t n, float scale, void* out) {
+    bf16_to_f32_scale_kernel<<<(unsigned)((n + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16*>(x), n, scale, static_cast<float*>(out));
+    return static_cast<int>(cudaGetLastError());
+}
+
+int ds_hc_mean(void* stream, const void* h, void* out, int64_t ld_out, int M, int D, int hc) {
+    dim3 grid((D + 255) / 256, M);
+    hc_mean_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16*>(h), static_cast<__nv_bfloat16*>(out), ld_out, D, hc);
+    return static_cast<int>(cudaGetLastError());
+}
+
+int ds_argmax_sum_bf16(void* stream, const void* a, int64_t lda, const void* b, int64_t ldb, int M, int N, void* out) {
+    argmax_sum_bf16_kernel<<<M, 1024, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16*>(a), lda, static_cast<const __nv_bfloat16*>(b), ldb, N, static_cast<int*>(out));
+    return static_cast<int>(cudaGetLastError());
+}
+
+int ds_gather_rows_u16(void* stream, const void* table, const void* idx, void* out, int M, int D) {
+    dim3 grid((D + 255) / 256, M);
+    gather_rows_u16_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const uint16_t*>(table), static_cast<const int*>(idx), static_cast<uint16_t*>(out), D);
+    return static_cast<int>(cudaGetLastError());
+}
+
+#define DS_RET return static_cast<int>(cudaGetLastError())
+#define DS_ST static_cast<cudaStream_t>(stream)
+
+int ds_scatter_ring(void* stream, const void* src, void* ring, int ring_size, const void* pos, int T, int D) {
+    scatter_ring_kernel<<<dim3((D + 255) / 256, T), 256, 0, DS_ST>>>(static_cast<const uint16_t*>(src),
+        static_cast<uint16_t*>(ring), ring_size, static_cast<const int*>(pos), D);
+    DS_RET;
+}
+
+int ds_visible(void* stream, const void* pos, int T, int r, int C, void* cidx, void* clen) {
+    visible_kernel<<<dim3((C + 255) / 256 > 0 ? (C + 255) / 256 : 1, T), 256, 0, DS_ST>>>(static_cast<const int*>(pos), r,
+        C, static_cast<int*>(cidx), static_cast<int*>(clen));
+    DS_RET;
+}
+
+int ds_compress_rows(void* stream, const void* kv, const void* sc, const void* pkv, const void* psc, const void* pos,
+                     void* out, int T, int D) {
+    compress_rows_kernel<<<dim3((D + 255) / 256, T), 256, 0, DS_ST>>>(static_cast<const float*>(kv),
+        static_cast<const float*>(sc), static_cast<const float*>(pkv), static_cast<const float*>(psc),
+        static_cast<const int*>(pos), static_cast<__nv_bfloat16*>(out), D);
+    DS_RET;
+}
+
+int ds_scatter_compressed(void* stream, const void* src, int64_t ld_src, void* dst, const void* pos, int r, int T, int D) {
+    scatter_compressed_kernel<<<dim3((D + 255) / 256, T), 256, 0, DS_ST>>>(static_cast<const uint16_t*>(src), ld_src,
+        static_cast<uint16_t*>(dst), static_cast<const int*>(pos), r, D);
+    DS_RET;
+}
+
+int ds_pending_update(void* stream, const void* kv, const void* sc, const void* pos, int T, void* pkv, void* psc, void* flag,
+                      void* mem_kv, void* mem_sc, void* before_kv, void* before_sc, void* before_flag, void* mem_start, int D) {
+    pending_update_kernel<<<1, 256, 0, DS_ST>>>(static_cast<const float*>(kv), static_cast<const float*>(sc),
+        static_cast<const int*>(pos), T, static_cast<float*>(pkv), static_cast<float*>(psc), static_cast<int*>(flag),
+        static_cast<float*>(mem_kv), static_cast<float*>(mem_sc), static_cast<float*>(before_kv),
+        static_cast<float*>(before_sc), static_cast<int*>(before_flag), static_cast<int*>(mem_start), D);
+    DS_RET;
+}
+
+int ds_rollback_pending(void* stream, const void* n_dev, const void* mem_kv, const void* mem_sc, const void* mem_start,
+                        const void* before_kv, const void* before_sc, const void* before_flag, void* pkv, void* psc,
+                        void* flag, int D) {
+    rollback_pending_kernel<<<1, 256, 0, DS_ST>>>(static_cast<const int*>(n_dev), static_cast<const float*>(mem_kv),
+        static_cast<const float*>(mem_sc), static_cast<const int*>(mem_start), static_cast<const float*>(before_kv),
+        static_cast<const float*>(before_sc), static_cast<const int*>(before_flag), static_cast<float*>(pkv),
+        static_cast<float*>(psc), static_cast<int*>(flag), D);
+    DS_RET;
+}
+
+int ds_lut_slots(void* stream, const void* idx, const void* lut, int P, void* slots) {
+    lut_slots_kernel<<<(P + 127) / 128, 128, 0, DS_ST>>>(static_cast<const int*>(idx), static_cast<const int*>(lut), P,
+        static_cast<int*>(slots));
+    DS_RET;
+}
+
+int ds_greedy_accept(void* stream, const void* am, const void* block, int T, const void* pos, void* out) {
+    greedy_accept_kernel<<<1, 32, 0, DS_ST>>>(static_cast<const int*>(am), static_cast<const int*>(block), T,
+        static_cast<const int*>(pos), static_cast<int*>(out));
+    DS_RET;
+}
+
+int ds_wait_flag(void* stream, const void* flag, int expect, long long timeout_ns, void* err) {
+    wait_flag_kernel<<<1, 32, 0, DS_ST>>>(static_cast<const volatile int*>(flag), expect, timeout_ns, static_cast<int*>(err));
+    DS_RET;
 }
 
 }  // extern "C"

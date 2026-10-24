@@ -809,3 +809,127 @@ fn candidate_blocks_force_the_last_block_and_set_whole_blocks() {
         }
     }
 }
+
+// ------------------------------------------------------------------ graph-safe step plumbing
+#[test]
+fn ring_scatter_visible_lists_and_lut() {
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(67);
+    let (t, d, ring) = (3usize, 64usize, 8usize);
+    let src = rng.bf16_vec(t * d, 1.0);
+    let pos = [6i32, 7, 8];
+    let (dsrc, dpos, dring) = (dev(&src), dev(&pos), DeviceBuffer::<u16>::zeroed(ring * d).unwrap());
+    ok(unsafe { ds_scatter_ring(st.raw(), p(&dsrc), p(&dring), ring as i32, p(&dpos), t as i32, d as i32) });
+    let c = 6usize;
+    let (dc, dl) = (DeviceBuffer::<i32>::zeroed(t * c).unwrap(), DeviceBuffer::<i32>::zeroed(t).unwrap());
+    ok(unsafe { ds_visible(st.raw(), p(&dpos), t as i32, 2, c as i32, p(&dc), p(&dl)) });
+    let lut: Vec<i32> = (0..10).map(|e| if e % 3 == 0 { -1 } else { 100 + e }).collect();
+    let idx = [1i32, 2, 4, 8];
+    let (dlut, didx, dslots) = (dev(&lut), dev(&idx), DeviceBuffer::<i32>::zeroed(4).unwrap());
+    ok(unsafe { ds_lut_slots(st.raw(), p(&didx), p(&dlut), 4, p(&dslots)) });
+    st.synchronize().unwrap();
+    let r = dring.download().unwrap();
+    for (i, &ps) in pos.iter().enumerate() {
+        let slot = ps as usize % ring;
+        assert_eq!(&r[slot * d..(slot + 1) * d], &src[i * d..(i + 1) * d]);
+    }
+    assert_eq!(dl.download().unwrap(), vec![3, 4, 4]);
+    let cidx = dc.download().unwrap();
+    assert_eq!(&cidx[..c], &[0, 1, 2, -1, -1, -1]);
+    assert_eq!(&cidx[2 * c..], &[0, 1, 2, 3, -1, -1]);
+    assert_eq!(dslots.download().unwrap(), vec![101, 102, 104, 108]);
+}
+
+#[test]
+fn device_compressor_pairs_pending_and_rollback_match_the_host_logic() {
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(71);
+    let d = 32usize;
+    let row = |rng: &mut Rng| -> Vec<f32> { (0..d).map(|_| rng.normal()).collect() };
+    // device state: pending (kv, sc, flag) and the rollback memory
+    let (pkv, psc, flag) = (DeviceBuffer::<f32>::zeroed(d).unwrap(), DeviceBuffer::<f32>::zeroed(d).unwrap(), DeviceBuffer::<i32>::zeroed(1).unwrap());
+    let tmax = 6;
+    let (mkv, msc) = (DeviceBuffer::<f32>::zeroed(tmax * d).unwrap(), DeviceBuffer::<f32>::zeroed(tmax * d).unwrap());
+    let (bkv, bsc, bflag, mstart) = (DeviceBuffer::<f32>::zeroed(d).unwrap(), DeviceBuffer::<f32>::zeroed(d).unwrap(),
+                                     DeviceBuffer::<i32>::zeroed(1).unwrap(), DeviceBuffer::<i32>::zeroed(1).unwrap());
+    let pair = |ka: &[f32], sa: &[f32], kb: &[f32], sb: &[f32]| -> Vec<f32> {
+        (0..d).map(|i| {
+            let mx = sa[i].max(sb[i]);
+            let (ea, eb) = ((sa[i] - mx).exp(), (sb[i] - mx).exp());
+            bf(ka[i] * (ea / (ea + eb)) + kb[i] * (eb / (ea + eb)))
+        }).collect()
+    };
+    // host mirror
+    let mut h_pending: Option<(Vec<f32>, Vec<f32>)> = None;
+    let mut all_kv: Vec<Vec<f32>> = Vec::new();
+    let mut all_sc: Vec<Vec<f32>> = Vec::new();
+    let mut s = 0usize;
+    for t in [3usize, 4] {
+        let kv: Vec<Vec<f32>> = (0..t).map(|_| row(&mut rng)).collect();
+        let sc: Vec<Vec<f32>> = (0..t).map(|_| row(&mut rng)).collect();
+        let pos: Vec<i32> = (s..s + t).map(|x| x as i32).collect();
+        let (dkv, dsc, dpos) = (dev(&kv.concat()), dev(&sc.concat()), dev(&pos));
+        let out = DeviceBuffer::<u16>::zeroed(t * d).unwrap();
+        ok(unsafe { ds_compress_rows(st.raw(), p(&dkv), p(&dsc), p(&pkv), p(&psc), p(&dpos), p(&out), t as i32, d as i32) });
+        ok(unsafe {
+            ds_pending_update(st.raw(), p(&dkv), p(&dsc), p(&dpos), t as i32, p(&pkv), p(&psc), p(&flag), p(&mkv), p(&msc),
+                              p(&bkv), p(&bsc), p(&bflag), p(&mstart), d as i32)
+        });
+        st.synchronize().unwrap();
+        let got = out.download().unwrap();
+        for ti in 0..t {
+            let ps = s + ti;
+            if ps % 2 == 1 {
+                let (ka, sa) = if ti > 0 { (kv[ti - 1].clone(), sc[ti - 1].clone()) } else { h_pending.clone().unwrap() };
+                let want = pair(&ka, &sa, &kv[ti], &sc[ti]);
+                let g: Vec<f32> = got[ti * d..(ti + 1) * d].iter().map(|&b| f32_from_bf16(b)).collect();
+                for (x, y) in g.iter().zip(&want) {
+                    assert!((x - y).abs() <= y.abs() * 2f32.powi(-7) + 1e-30, "pair at position {ps}: {x} vs {y}");
+                }
+            }
+        }
+        h_pending = if (s + t) % 2 == 1 { Some((kv[t - 1].clone(), sc[t - 1].clone())) } else { None };
+        assert_eq!(flag.download().unwrap()[0], h_pending.is_some() as i32);
+        all_kv.extend(kv);
+        all_sc.extend(sc);
+        s += t;
+    }
+    // positions 0..7 done; the last chunk was 3..7 (start 3). Roll back to n = 5: position 4
+    // is unpaired, and its inputs are row 1 of the last chunk.
+    for (n, want_valid, src_pos) in [(5usize, 1, Some(4usize)), (4, 0, None), (3, 1, Some(2))] {
+        let dn = dev(&[n as i32]);
+        ok(unsafe {
+            ds_rollback_pending(st.raw(), p(&dn), p(&mkv), p(&msc), p(&mstart), p(&bkv), p(&bsc), p(&bflag), p(&pkv), p(&psc),
+                                p(&flag), d as i32)
+        });
+        st.synchronize().unwrap();
+        assert_eq!(flag.download().unwrap()[0], want_valid, "rollback({n}) flag");
+        if let Some(ps) = src_pos {
+            assert_eq!(pkv.download().unwrap(), all_kv[ps], "rollback({n}) pending kv");
+            assert_eq!(psc.download().unwrap(), all_sc[ps], "rollback({n}) pending sc");
+        }
+    }
+}
+
+#[test]
+fn greedy_accept_and_flag_wait() {
+    let Some(st) = setup() else { return };
+    let am = [5i32, 7, 9, 4, 4, 4];
+    let block = [1i32, 5, 7, 8, 9, 9];
+    let pos = [100i32, 101, 102, 103, 104, 105];
+    let (dam, db, dp, dout) = (dev(&am), dev(&block), dev(&pos), DeviceBuffer::<i32>::zeroed(4).unwrap());
+    ok(unsafe { ds_greedy_accept(st.raw(), p(&dam), p(&db), 6, p(&dp), p(&dout)) });
+    st.synchronize().unwrap();
+    // drafts 5, 7 accepted (rows 0, 1 predicted them), row 2 predicts 9 != 8 -> bonus 9
+    assert_eq!(dout.download().unwrap(), vec![2, 9, 103, 102]);
+
+    let mut flag = tidelm_cuda::PinnedBuffer::<i32>::zeroed(1).unwrap();
+    let err = DeviceBuffer::<i32>::zeroed(1).unwrap();
+    flag[0] = 7;
+    ok(unsafe { ds_wait_flag(st.raw(), flag.raw(), 7, 1_000_000_000, p(&err)) });
+    st.synchronize().unwrap();
+    assert_eq!(err.download().unwrap()[0], 0, "a set flag passes at once");
+    ok(unsafe { ds_wait_flag(st.raw(), flag.raw(), 8, 2_000_000, p(&err)) });
+    st.synchronize().unwrap();
+    assert_eq!(err.download().unwrap()[0], 1, "an unset flag times out and says so");
+}

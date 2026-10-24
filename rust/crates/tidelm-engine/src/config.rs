@@ -44,6 +44,13 @@ pub struct Config {
     pub engram_compressed_vocab_size: i64,
     pub engram_n_heads: usize,
     pub engram_head_dim: usize,
+    pub n_mtp_layers: usize,
+    pub dspark_block_size: usize,
+    pub dspark_noise_token_id: u32,
+    pub dspark_target_layer_ids: Vec<usize>,
+    pub dspark_markov_rank: usize,
+    pub dspark_n_routed_experts: usize,
+    pub dspark_n_activated_experts: usize,
 }
 
 impl Config {

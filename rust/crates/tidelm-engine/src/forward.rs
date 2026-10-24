@@ -1,22 +1,25 @@
 //! The DS v4.1 forward pass (engine/model.py::Model.forward + block + attention + moe,
-//! tools/v41_ref.py), on the ds41.cu kernels and the native FP4 MoE kernels.
+//! tools/v41_ref.py), the DSpark drafter (Model.dspark_seed / dspark_draft) and cache
+//! rollback (Caches.rollback), on the ds41.cu kernels and the native FP4 MoE kernels.
 //!
-//! This first engine runs in *streaming* mode: each step reads every layer's weights from
-//! NVMe, routes, loads only the experts the step's tokens chose (through a 16-slot arena),
-//! and frees the layer again. It needs ~1 GB of device memory, so it runs next to a live
-//! server; it is the correctness vehicle for the resident engine, which keeps the same
-//! step code and swaps the weight source.
+//! This engine runs in *streaming* mode: each step reads every layer's weights from NVMe,
+//! routes, loads only the experts the step's tokens chose (through a 16-slot arena), and
+//! frees the layer again. It needs ~2 GB of device memory, so it runs next to a live
+//! server; it is the correctness vehicle for the resident engine, which keeps this step
+//! code and swaps the weight source.
 //!
 //! Semantics follow the checkpoint's reference forward (inference/model.py), which runs
 //! every layer over every token. The Python engine's decoder replay (layers past the
 //! candidate source over only the last 128 prompt tokens) is an approximation from the
 //! tech report; it agrees exactly for prompts up to 128 tokens and is not used here.
 //!
-//! Limits of this stage, each refused with an error rather than approximated:
-//! - at most `TMAX` = 16 tokens per call (the decode GEMM and MoE router bound; prefill
+//! - at most `TMAX` = 16 rows per call (the decode GEMM and MoE router bound; prefill
 //!   loops over 16-token chunks);
-//! - total context <= index_topk (1024): below that the indexer selects every visible
-//!   compressed position, so skipping it is exact. The indexer itself lands next.
+//! - the indexer runs only where it can change something: an index-source layer whose
+//!   compressed count exceeds index_topk (1024). Below that, model.py's top-k selects every
+//!   visible position, so the all-visible selection is the same set at no cost.
+//! - every kernel is row-invariant, so a verify block of T rows computes each row exactly
+//!   as T one-row steps would: speculation cannot change greedy output.
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -30,7 +33,7 @@ use tidelm_model::{Checkpoint, ExpertReader, STAGE_BYTES};
 
 use crate::config::Config;
 use crate::rope;
-use crate::weights::{Layer, Loader};
+use crate::weights::{DsparkW, Fp8, Layer, Loader};
 use crate::Result;
 
 pub const TMAX: usize = 16;
@@ -53,7 +56,23 @@ fn nul() -> *mut c_void {
     std::ptr::null_mut()
 }
 
-/// Per-step wall-clock split, printed by the CLI: where a streaming step's time goes.
+fn dump_bf16(path: &std::path::Path, v: &[u16]) -> Result<()> {
+    let bytes: Vec<u8> = v.iter().flat_map(|&h| f32::from_bits((h as u32) << 16).to_le_bytes()).collect();
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+/// Which logits a forward call returns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Want {
+    Nothing,
+    /// the last row's `[V]`
+    Last,
+    /// every row's, `[rows][V]` flattened (speculative verification)
+    All,
+}
+
+/// Per-call wall-clock split, printed by the CLI: where a streaming step's time goes.
 #[derive(Default, Debug, Clone)]
 pub struct StepTimes {
     pub weights_s: f64,
@@ -74,6 +93,11 @@ impl Drop for EngramTable {
     }
 }
 
+const W13: usize = 2304 * 2560;
+const S13: usize = 2304 * 160;
+const W2: usize = 5120 * 1152;
+const S2: usize = 5120 * 72;
+
 /// The routed-expert arena for streaming: ARENA_SLOTS slots in the native FP4 layout
 /// (tools/fp4_moe.py::ExpertArena at world 1).
 struct Arena {
@@ -84,11 +108,6 @@ struct Arena {
     w3: DeviceBuffer<u8>,
     s3: DeviceBuffer<u8>,
 }
-
-const W13: usize = 2304 * 2560;
-const S13: usize = 2304 * 160;
-const W2: usize = 5120 * 1152;
-const S2: usize = 5120 * 72;
 
 impl Arena {
     fn new(slots: usize) -> Result<Self> {
@@ -158,6 +177,55 @@ struct Act {
     head_x: DeviceBuffer<u16>,
     head_w: DeviceBuffer<u16>,
     logits: DeviceBuffer<u16>,
+    // indexer (model.py::_indexer): per-row scores over every compressed position
+    iq: DeviceBuffer<u16>,
+    iwb: DeviceBuffer<u16>,
+    iwf: DeviceBuffer<f32>,
+    scores: DeviceBuffer<u16>,
+    cand: DeviceBuffer<u8>,
+    bmax: DeviceBuffer<u16>,
+    blocks: DeviceBuffer<i32>,
+    topk: DeviceBuffer<i32>,
+    clen1: DeviceBuffer<i32>,
+    clen2: DeviceBuffer<i32>,
+    // DSpark: the target layers' hc means of the last forward, the projected main hidden,
+    // and the draft block's own keys / positions
+    main_h: DeviceBuffer<u16>,
+    main_x: DeviceBuffer<u16>,
+    dkv: DeviceBuffer<u16>,
+    dwin: DeviceBuffer<i32>,
+    dcidx: DeviceBuffer<i32>,
+    markov_e: DeviceBuffer<u16>,
+    markov_b: DeviceBuffer<u16>,
+    d_idx: DeviceBuffer<i32>,
+}
+
+/// Which compressed rows the current layer attends over (model.py's `sh.topk`, which an
+/// index-source layer sets for itself and the layers after it).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Selection {
+    /// every visible position (exactly the indexer's result while n_c <= index_topk)
+    AllVisible,
+    /// the indexer's top-k in `act.topk`
+    Indexed,
+}
+
+/// How a block's attention sees keys: the backbone's (window ring + compressed cache) or a
+/// DSpark block's (its seeded ring up to the last main position + the draft block's keys).
+#[derive(Clone, Copy)]
+enum Ctx {
+    Main { l: usize, s: usize, c1: usize, c2: usize },
+    Draft { k: usize, s: usize, win_end: usize },
+}
+
+/// Per ratio-2 source: what rollback needs (model.py::Caches._chunk_inputs).
+struct ChunkMemory {
+    start: usize,
+    kv: DeviceBuffer<f32>,
+    sc: DeviceBuffer<f32>,
+    before_kv: DeviceBuffer<f32>,
+    before_sc: DeviceBuffer<f32>,
+    before_valid: bool,
 }
 
 struct Caches {
@@ -167,7 +235,15 @@ struct Caches {
     pending_kv: BTreeMap<usize, DeviceBuffer<f32>>,
     pending_sc: BTreeMap<usize, DeviceBuffer<f32>>,
     pending: BTreeMap<usize, bool>,
+    chunk: BTreeMap<usize, ChunkMemory>,
+    mtp_ring: Vec<DeviceBuffer<u16>>,
     len: usize,
+}
+
+struct Dspark {
+    blocks: Vec<Layer>,
+    w: DsparkW,
+    noise_row: DeviceBuffer<u16>,
 }
 
 pub struct Engine {
@@ -183,31 +259,26 @@ pub struct Engine {
     expert_stage: PinnedBuffer<u8>,
     act: Act,
     caches: Caches,
+    dspark: Option<Dspark>,
+    /// (start position, rows) of the last forward: what `seed_draft` reads `main_h` for
+    last_forward: (usize, usize),
     pub max_seq: usize,
     pub times: StepTimes,
     /// TIDELM_DUMP_DIR: write the hc stream after every layer and the last logits as raw
     /// little-endian f32 (the layout rust/tools/ref_forward.py writes), for parity checks.
     pub dump_dir: Option<std::path::PathBuf>,
     no_qdq: bool,
-}
-
-fn dump_bf16(path: &std::path::Path, v: &[u16]) -> Result<()> {
-    let bytes: Vec<u8> = v.iter().flat_map(|&h| f32::from_bits((h as u32) << 16).to_le_bytes()).collect();
-    std::fs::write(path, bytes)?;
-    Ok(())
+    selection: Selection,
+    /// the candidate-source layer's block mask is live for this forward's later layers
+    cand_live: bool,
+    /// index-source layer passes in which the indexer actually ran
+    pub indexed_layers: usize,
 }
 
 impl Engine {
-    pub fn new(model_dir: &std::path::Path, token_map: Vec<i64>, max_seq: usize) -> Result<Self> {
+    /// `spec` loads the DSpark drafter (three blocks + its heads, ~0.8 GB resident).
+    pub fn new(model_dir: &std::path::Path, token_map: Vec<i64>, max_seq: usize, spec: bool) -> Result<Self> {
         let cfg = Config::load(model_dir)?;
-        if max_seq > cfg.index_topk {
-            return Err(format!(
-                "max_seq {max_seq} > index_topk {}: the indexer is not ported yet, and below that bound \
-                 skipping it is exact",
-                cfg.index_topk
-            )
-            .into());
-        }
         let ckpt = Checkpoint::open(model_dir)?;
         let stream = Stream::new()?;
         let (d, hc, rd) = (cfg.dim, cfg.hc_mult, cfg.rope_head_dim);
@@ -219,9 +290,23 @@ impl Engine {
             rd, max_seq + 8, cfg.original_seq_len, cfg.compress_rope_theta, cfg.rope_factor, cfg.beta_fast,
             cfg.beta_slow,
         )))?;
-        let norm = {
+        let (norm, dspark) = {
             let mut ld = Loader::new(&ckpt, &stream)?;
-            ld.bf16("norm.weight", &[d])?
+            let norm = ld.bf16("norm.weight", &[d])?;
+            let dspark = if spec {
+                let mut blocks = Vec::new();
+                for k in 0..cfg.n_mtp_layers {
+                    blocks.push(Layer::load_mtp(&mut ld, &cfg, k)?);
+                }
+                let w = DsparkW::load(&mut ld, &cfg)?;
+                let noise_row = DeviceBuffer::<u16>::new(d)?;
+                let id = cfg.dspark_noise_token_id as usize;
+                ld.read_into("embed.weight", id * d * 2, (id + 1) * d * 2, noise_row.raw())?;
+                Some(Dspark { blocks, w, noise_row })
+            } else {
+                None
+            };
+            (norm, dspark)
         };
         let layout = EngramLayout::new(
             &cfg.engram_layer_ids, cfg.engram_max_ngram_size, cfg.engram_n_heads, cfg.engram_vocab_size,
@@ -239,9 +324,7 @@ impl Engine {
                 return Err(format!("layer {l}: engram weight and scale planes live in different shards").into());
             }
             let ctx = unsafe {
-                eg::engram_gather_create_direct(
-                    shard.file.direct_fd(), wm.lo as i64, sm.lo as i64, wm.shape[0] as i64, 16,
-                )
+                eg::engram_gather_create_direct(shard.file.direct_fd(), wm.lo as i64, sm.lo as i64, wm.shape[0] as i64, 16)
             };
             if ctx.is_null() {
                 return Err(format!("layer {l}: engram gather setup failed").into());
@@ -250,9 +333,11 @@ impl Engine {
         }
 
         let t = TMAX;
-        let p = t * cfg.n_activated_experts;
+        let p = t * cfg.n_activated_experts.max(cfg.dspark_n_activated_experts);
         let hdq = cfg.n_heads * cfg.head_dim;
         let eng_cols = (cfg.engram_max_ngram_size - 1) * cfg.engram_n_heads;
+        let n_target = cfg.dspark_target_layer_ids.len();
+        let bsz = cfg.dspark_block_size;
         let a = |n: usize| -> Result<DeviceBuffer<u16>> { Ok(DeviceBuffer::zeroed(n)?) };
         let f = |n: usize| -> Result<DeviceBuffer<f32>> { Ok(DeviceBuffer::zeroed(n)?) };
         let i = |n: usize| -> Result<DeviceBuffer<i32>> { Ok(DeviceBuffer::zeroed(n)?) };
@@ -307,9 +392,27 @@ impl Engine {
             ekv: a(t * (hc + 1) * d)?,
             emb: a(t * d)?,
             row_ids: DeviceBuffer::from_slice(&(0..t as i32).collect::<Vec<_>>())?,
-            head_x: a(d)?,
+            head_x: a(t * d)?,
             head_w: a(HEAD_ROWS * d)?,
-            logits: a(cfg.vocab_size)?,
+            logits: a(t * cfg.vocab_size)?,
+            iq: a(t * cfg.index_n_heads * cfg.index_head_dim)?,
+            iwb: a(t * cfg.index_n_heads)?,
+            iwf: f(t * cfg.index_n_heads)?,
+            scores: a(t * (max_seq + 1))?,
+            cand: DeviceBuffer::zeroed(t * (max_seq + 1))?,
+            bmax: a(t * ((max_seq + 1).div_ceil(8) + 1))?,
+            blocks: i(t * 2048)?,
+            topk: i(t * cfg.index_topk)?,
+            clen1: i(t)?,
+            clen2: i(t)?,
+            main_h: a(t * n_target * d)?,
+            main_x: a(t * d)?,
+            dkv: a(bsz * cfg.head_dim)?,
+            dwin: i(bsz)?,
+            dcidx: DeviceBuffer::from_slice(&(0..bsz * bsz).map(|j| (j % bsz) as i32).collect::<Vec<_>>())?,
+            markov_e: a(cfg.dspark_markov_rank)?,
+            markov_b: a(cfg.vocab_size)?,
+            d_idx: i(1)?,
         };
         let mut caches = Caches {
             ring: Vec::new(),
@@ -318,10 +421,17 @@ impl Engine {
             pending_kv: BTreeMap::new(),
             pending_sc: BTreeMap::new(),
             pending: BTreeMap::new(),
+            chunk: BTreeMap::new(),
+            mtp_ring: Vec::new(),
             len: 0,
         };
         for _ in 0..cfg.n_layers {
             caches.ring.push(a(RING * cfg.head_dim)?);
+        }
+        if spec {
+            for _ in 0..cfg.n_mtp_layers {
+                caches.mtp_ring.push(a(RING * cfg.head_dim)?);
+            }
         }
         for &l in &cfg.kv_source_layers {
             let r = cfg.compress_ratios[l];
@@ -331,6 +441,14 @@ impl Engine {
                 caches.pending_kv.insert(l, f(cfg.head_dim)?);
                 caches.pending_sc.insert(l, f(cfg.head_dim)?);
                 caches.pending.insert(l, false);
+                caches.chunk.insert(l, ChunkMemory {
+                    start: 0,
+                    kv: f(t * cfg.head_dim)?,
+                    sc: f(t * cfg.head_dim)?,
+                    before_kv: f(cfg.head_dim)?,
+                    before_sc: f(cfg.head_dim)?,
+                    before_valid: false,
+                });
             }
         }
         Ok(Engine {
@@ -346,10 +464,15 @@ impl Engine {
             engram_tables,
             act,
             caches,
+            dspark,
+            last_forward: (0, 0),
             max_seq,
             times: StepTimes::default(),
             dump_dir: std::env::var_os("TIDELM_DUMP_DIR").map(std::path::PathBuf::from),
             no_qdq: std::env::var("TIDELM_NO_QDQ").as_deref() == Ok("1"),
+            selection: Selection::AllVisible,
+            cand_live: false,
+            indexed_layers: 0,
         })
     }
 
@@ -361,9 +484,79 @@ impl Engine {
         self.caches.len == 0
     }
 
-    /// Run tokens `ids` at positions `len..len + ids.len()` (at most TMAX); with
-    /// `want_logits`, return the last row's bf16 logits (the engine's head rounds them).
-    pub fn forward(&mut self, ids: &[u32], want_logits: bool) -> Result<Option<Vec<u16>>> {
+    /// Start a new sequence. Nothing needs clearing: every cache entry a position reads is
+    /// written by this sequence before it is read (rings and compressed rows by position,
+    /// the hash cache from position 0), so only the lengths and the pending flags reset.
+    pub fn reset(&mut self) {
+        self.caches.len = 0;
+        for v in self.caches.pending.values_mut() {
+            *v = false;
+        }
+        self.last_forward = (0, 0);
+    }
+
+    /// Discard positions `>= n` (model.py::Caches.rollback). Only the ratio-2 compressors
+    /// carry state across positions; rings and compressed rows are append-only and every
+    /// slot at or after n is rewritten before anything reads it.
+    pub fn rollback(&mut self, n: usize) -> Result<()> {
+        if n > self.caches.len {
+            return Err(format!("rollback({n}) past the cached length {}", self.caches.len).into());
+        }
+        let st = &self.stream;
+        let hd = self.cfg.head_dim;
+        for (&l, mem) in &self.caches.chunk {
+            let r = self.cfg.compress_ratios[l];
+            if n % r == 0 {
+                self.caches.pending.insert(l, false);
+                continue;
+            }
+            let p = n - 1; // the position left unpaired at n
+            if p >= mem.start {
+                self.caches.pending_kv[&l].copy_from(0, &mem.kv, (p - mem.start) * hd, hd, st)?;
+                self.caches.pending_sc[&l].copy_from(0, &mem.sc, (p - mem.start) * hd, hd, st)?;
+                self.caches.pending.insert(l, true);
+            } else if p + 1 == mem.start {
+                self.caches.pending_kv[&l].copy_from(0, &mem.before_kv, 0, hd, st)?;
+                self.caches.pending_sc[&l].copy_from(0, &mem.before_sc, 0, hd, st)?;
+                self.caches.pending.insert(l, mem.before_valid);
+            } else {
+                return Err(format!(
+                    "rollback({n}) reaches before layer {l}'s last chunk (start {}); its compressor input is gone",
+                    mem.start
+                )
+                .into());
+            }
+        }
+        self.caches.len = n;
+        Ok(())
+    }
+
+    fn embed(&mut self, ids: &[u32]) -> Result<()> {
+        let d = self.cfg.dim;
+        let noise = self.cfg.dspark_noise_token_id;
+        let mut ld = Loader::new(&self.ckpt, &self.stream)?;
+        for (ti, &id) in ids.iter().enumerate() {
+            match &self.dspark {
+                Some(ds) if id == noise => self.act.emb.copy_from(ti * d, &ds.noise_row, 0, d, &self.stream)?,
+                _ => ld.read_into("embed.weight", id as usize * d * 2, (id as usize + 1) * d * 2, self.act.emb.ptr_at(ti * d))?,
+            }
+        }
+        let t = ids.len();
+        let hc = self.cfg.hc_mult;
+        ck(unsafe {
+            ds_embed_hc(self.stream.raw(), np(&self.act.row_ids), np(&self.act.emb), np(&self.act.h), t as i32, d as i32, hc as i32)
+        }, "embed")?;
+        let mut pre = vec![0f32; t * hc];
+        for ti in 0..t {
+            pre[ti * hc] = 1.0;
+        }
+        self.act.pre.upload_async(0, &pre, &self.stream)?;
+        Ok(())
+    }
+
+    /// Run tokens `ids` at positions `len..len + ids.len()` (at most TMAX) through the
+    /// backbone; returns the bf16 logits `want` asks for (the engine's head rounds them).
+    pub fn forward(&mut self, ids: &[u32], want: Want) -> Result<Vec<u16>> {
         let t = ids.len();
         let s = self.caches.len;
         if t == 0 || t > TMAX {
@@ -375,42 +568,37 @@ impl Engine {
         let cfg = self.cfg.clone();
         let (d, hc) = (cfg.dim, cfg.hc_mult);
         let tw = Instant::now();
-        let st = &self.stream;
-        let sr = st.raw();
-
-        // positions and the visible compressed rows per ratio (all of them: see module doc)
-        let pos: Vec<i32> = (s..s + t).map(|p| p as i32).collect();
-        self.act.pos.upload_async(0, &pos, st)?;
-        let cidx = |r: usize| -> (Vec<i32>, usize) {
-            let c = (s + t) / r;
-            let mut v = vec![-1i32; t * c.max(1)];
-            for (ti, &p) in pos.iter().enumerate() {
-                let vis = (p as usize + 1) / r;
-                for j in 0..vis {
-                    v[ti * c.max(1) + j] = j as i32;
+        let (c1, c2) = {
+            let st = &self.stream;
+            let pos: Vec<i32> = (s..s + t).map(|p| p as i32).collect();
+            self.act.pos.upload_async(0, &pos, st)?;
+            // the all-visible compressed lists; only read while n_c <= index_topk (past that the
+            // indexer's top-k replaces them), so they are never wider than index_topk
+            let topk_w = cfg.index_topk;
+            let cidx = |r: usize| -> (Vec<i32>, usize) {
+                let c = ((s + t) / r).min(topk_w);
+                let w = c.max(1);
+                let mut v = vec![-1i32; t * w];
+                for (ti, &p) in pos.iter().enumerate() {
+                    let vis = ((p as usize + 1) / r).min(c);
+                    for j in 0..vis {
+                        v[ti * w + j] = j as i32;
+                    }
                 }
-            }
-            (v, c)
+                (v, c)
+            };
+            let (c1v, c1) = cidx(1);
+            let (c2v, c2) = cidx(2);
+            self.act.cidx1.upload_async(0, &c1v, st)?;
+            self.act.cidx2.upload_async(0, &c2v, st)?;
+            let clen = |r: usize| -> Vec<i32> { pos.iter().map(|&p| (p + 1) / r as i32).collect() };
+            self.act.clen1.upload_async(0, &clen(1), st)?;
+            self.act.clen2.upload_async(0, &clen(2), st)?;
+            (c1, c2)
         };
-        let (c1v, c1) = cidx(1);
-        let (c2v, c2) = cidx(2);
-        self.act.cidx1.upload_async(0, &c1v, st)?;
-        self.act.cidx2.upload_async(0, &c2v, st)?;
-
-        // embedding rows straight from the checkpoint (a 10 KB read each)
-        {
-            let mut ld = Loader::new(&self.ckpt, st)?;
-            let row = d * 2;
-            for (ti, &id) in ids.iter().enumerate() {
-                ld.read_into("embed.weight", id as usize * row, (id as usize + 1) * row, self.act.emb.ptr_at(ti * d))?;
-            }
-        }
-        ck(unsafe { ds_embed_hc(sr, np(&self.act.row_ids), np(&self.act.emb), np(&self.act.h), t as i32, d as i32, hc as i32) }, "embed")?;
-        let mut pre = vec![0f32; t * hc];
-        for ti in 0..t {
-            pre[ti * hc] = 1.0;
-        }
-        self.act.pre.upload_async(0, &pre, st)?;
+        self.selection = Selection::AllVisible;
+        self.cand_live = false;
+        self.embed(ids)?;
 
         let hashes = self.hash.hash(ids, s, None); // [t][n_engram_layers][cols]
         let cols = self.hash.layout.n_hash_cols();
@@ -423,12 +611,12 @@ impl Engine {
                 let mut ld = Loader::new(&self.ckpt, &self.stream)?;
                 Layer::load(&mut ld, &cfg, l)?
             };
-            let st = &self.stream;
-            let sr = st.raw();
             self.times.weights_s += t0.elapsed().as_secs_f64();
 
             if let Some(e) = &w.engram {
                 let te = Instant::now();
+                let st = &self.stream;
+                let sr = st.raw();
                 let li = cfg.engram_layer_ids.iter().position(|&x| x == l).unwrap();
                 let col_ids: Vec<i64> =
                     (0..t).flat_map(|ti| hashes[(ti * n_eng + li) * cols..(ti * n_eng + li + 1) * cols].to_vec()).collect();
@@ -456,9 +644,17 @@ impl Engine {
                                    (d as f64).powf(-0.5) as f32)
                 }, "engram gate")?;
             }
+            // the DSpark main hidden reads the attention INPUT of its target layers
+            if let Some(ti) = cfg.dspark_target_layer_ids.iter().position(|&x| x == l) {
+                let ld_main = cfg.dspark_target_layer_ids.len() * d;
+                ck(unsafe {
+                    ds_hc_mean(self.stream.raw(), np(&self.act.h), self.act.main_h.ptr_at(ti * d), ld_main as i64,
+                               t as i32, d as i32, hc as i32)
+                }, "main hidden")?;
+            }
 
             let tc = Instant::now();
-            self.block(&w, l, s, t, c1, c2)?;
+            self.block(&w, Ctx::Main { l, s, c1, c2 }, t)?;
             self.stream.synchronize()?;
             self.times.compute_s += tc.elapsed().as_secs_f64();
             drop(w);
@@ -470,38 +666,143 @@ impl Engine {
             }
         }
         self.caches.len = s + t;
+        self.last_forward = (s, t);
 
-        if !want_logits {
-            return Ok(None);
+        let (r0, rows) = match want {
+            Want::Nothing => return Ok(Vec::new()),
+            Want::Last => (t - 1, 1),
+            Want::All => (0, t),
+        };
+        let norm = np(&self.norm);
+        let logits = self.head(r0, rows, norm)?;
+        if let Some(dir) = &self.dump_dir {
+            dump_bf16(&dir.join("logits.f32"), &logits[(rows - 1) * cfg.vocab_size..])?;
         }
+        Ok(logits)
+    }
+
+    /// hc_pre with the final pre_mix + `norm` + the streamed head over rows r0..r0+rows of
+    /// the hc stream; bf16 logits `[rows][V]` (also left in act.logits).
+    fn head(&mut self, r0: usize, rows: usize, norm: *mut c_void) -> Result<Vec<u16>> {
         let th = Instant::now();
+        let cfg = &self.cfg;
+        let (d, hc, v) = (cfg.dim, cfg.hc_mult, cfg.vocab_size);
         let st = &self.stream;
         let sr = st.raw();
         let a = &self.act;
-        // the last row only: hc_pre with the final pre_mix, the final norm, then the head
-        let last_h = a.h.ptr_at((t - 1) * hc * d);
-        let last_pre = a.pre.ptr_at((t - 1) * hc);
-        ck(unsafe { ds_hc_pre_norm(sr, last_h, last_pre, np(&self.norm), np(&a.head_x), 1, d as i32, hc as i32, cfg.norm_eps) }, "final norm")?;
+        ck(unsafe {
+            ds_hc_pre_norm(sr, a.h.ptr_at(r0 * hc * d), a.pre.ptr_at(r0 * hc), norm, np(&a.head_x), rows as i32, d as i32,
+                           hc as i32, cfg.norm_eps)
+        }, "final norm")?;
         let mut ld = Loader::new(&self.ckpt, st)?;
-        let v = cfg.vocab_size;
-        let mut r0 = 0;
-        while r0 < v {
-            let rows = HEAD_ROWS.min(v - r0);
-            ld.read_into("head.weight", r0 * d * 2, (r0 + rows) * d * 2, a.head_w.raw())?;
+        let mut n0 = 0;
+        while n0 < v {
+            let n = HEAD_ROWS.min(v - n0);
+            ld.read_into("head.weight", n0 * d * 2, (n0 + n) * d * 2, a.head_w.raw())?;
             ck(unsafe {
-                ds_linear_bf16(sr, np(&a.head_x), d as i64, np(&a.head_w), 1, rows as i32, d as i32, 1,
-                               a.logits.ptr_at(r0), nul(), v as i64, nul())
+                ds_linear_bf16(sr, np(&a.head_x), d as i64, np(&a.head_w), rows as i32, n as i32, d as i32, 1,
+                               a.logits.ptr_at(n0), nul(), v as i64, nul())
             }, "head")?;
-            r0 += rows;
+            n0 += n;
         }
-        let mut logits = vec![0u16; v];
+        let mut logits = vec![0u16; rows * v];
         a.logits.download_async(0, &mut logits, st)?;
         st.synchronize()?;
-        if let Some(dir) = &self.dump_dir {
-            dump_bf16(&dir.join("logits.f32"), &logits)?;
-        }
         self.times.head_s += th.elapsed().as_secs_f64();
-        Ok(Some(logits))
+        Ok(logits)
+    }
+
+    /// model.py::dspark_seed: write the drafter's window keys for the first `rows` rows of
+    /// the last forward, from their main hiddens (the target layers' hc means).
+    pub fn seed_draft(&mut self, rows: usize) -> Result<()> {
+        let Some(ds) = &self.dspark else { return Err("seed_draft needs the drafter (spec)".into()) };
+        let (s, t) = self.last_forward;
+        if rows > t {
+            return Err(format!("seed_draft({rows}) past the last forward's {t} rows").into());
+        }
+        if rows == 0 {
+            return Ok(());
+        }
+        let cfg = &self.cfg;
+        let (d, hd, rd) = (cfg.dim, cfg.head_dim, cfg.rope_head_dim);
+        let st = &self.stream;
+        let sr = st.raw();
+        let a = &self.act;
+        let ri = rows as i32;
+        let pos: Vec<i32> = (s..s + rows).map(|p| p as i32).collect();
+        a.pos.upload_async(0, &pos, st)?;
+        let lin = |x: *mut c_void, ldx: usize, w: &Fp8, y: *mut c_void, ldy: usize, what: &str| {
+            ck(unsafe {
+                ds_linear_fp8(sr, x, ldx as i64, np(&w.w), np(&w.s), w.lds() as i64, ri, w.n as i32, w.k as i32, 1, y,
+                              nul(), ldy as i64, nul())
+            }, what)
+        };
+        let k_main = cfg.dspark_target_layer_ids.len() * d;
+        lin(np(&a.main_h), k_main, &ds.w.main_proj, np(&a.y), d, "main_proj")?;
+        ck(unsafe { ds_rmsnorm(sr, np(&a.y), d as i64, np(&ds.w.main_norm), np(&a.main_x), d as i64, ri, d as i32, cfg.norm_eps) }, "main_norm")?;
+        for (k, blk) in ds.blocks.iter().enumerate() {
+            lin(np(&a.main_x), d, &blk.wkv, np(&a.kv0), hd, "draft seed wkv")?;
+            ck(unsafe { ds_rmsnorm(sr, np(&a.kv0), hd as i64, np(&blk.kv_norm), np(&a.kv), hd as i64, ri, hd as i32, cfg.norm_eps) }, "draft seed kv_norm")?;
+            ck(unsafe { ds_rope(sr, np(&a.kv), hd as i64, ri, 1, hd as i64, (hd - rd) as i32, rd as i32, np(&a.pos), np(&self.rope_w), 0) }, "draft seed rope")?;
+            for i in 0..rows {
+                self.caches.mtp_ring[k].copy_from(((s + i) % RING) * hd, &a.kv, i * hd, hd, st)?;
+            }
+        }
+        st.synchronize()?;
+        Ok(())
+    }
+
+    /// model.py::dspark_draft, greedy: the block [tok, noise x 4] at positions
+    /// last_main_pos+1.., through the three DSpark blocks, then the markov-biased argmax
+    /// chain. Returns the `dspark_block_size` drafted tokens.
+    pub fn draft(&mut self, tok: u32, last_main_pos: usize) -> Result<Vec<u32>> {
+        if self.dspark.is_none() {
+            return Err("draft needs the drafter (spec)".into());
+        }
+        let cfg = self.cfg.clone();
+        let b = cfg.dspark_block_size;
+        let s = last_main_pos + 1;
+        let mut ids = vec![cfg.dspark_noise_token_id; b];
+        ids[0] = tok;
+        {
+            let st = &self.stream;
+            let pos: Vec<i32> = (s..s + b).map(|p| p as i32).collect();
+            self.act.pos.upload_async(0, &pos, st)?;
+            self.act.dwin.upload_async(0, &vec![last_main_pos as i32; b], st)?;
+        }
+        self.embed(&ids)?;
+        let blocks = std::mem::take(&mut self.dspark.as_mut().unwrap().blocks);
+        let res = (|| -> Result<()> {
+            for (k, w) in blocks.iter().enumerate() {
+                self.block(w, Ctx::Draft { k, s, win_end: last_main_pos }, b)?;
+            }
+            Ok(())
+        })();
+        self.dspark.as_mut().unwrap().blocks = blocks;
+        res?;
+        let norm = np(&self.dspark.as_ref().unwrap().w.norm);
+        self.head(0, b, norm)?;
+        // the markov chain: each draft's bias comes from the embedding of the token before it
+        let ds = self.dspark.as_ref().unwrap();
+        let (v, r) = (cfg.vocab_size, cfg.dspark_markov_rank);
+        let st = &self.stream;
+        let sr = st.raw();
+        let a = &self.act;
+        let mut out = vec![tok];
+        for i in 0..b {
+            a.d_idx.upload_async(0, &[out[i] as i32], st)?;
+            ck(unsafe { ds_gather_rows_u16(sr, np(&ds.w.markov_embed), np(&a.d_idx), np(&a.markov_e), 1, r as i32) }, "markov embed")?;
+            ck(unsafe {
+                ds_linear_bf16(sr, np(&a.markov_e), r as i64, np(&ds.w.markov_head), 1, v as i32, r as i32, 1, np(&a.markov_b),
+                               nul(), v as i64, nul())
+            }, "markov head")?;
+            ck(unsafe { ds_argmax_sum_bf16(sr, a.logits.ptr_at(i * v), v as i64, np(&a.markov_b), v as i64, 1, v as i32, np(&a.d_idx)) }, "markov argmax")?;
+            let mut nxt = [0i32];
+            a.d_idx.download_async(0, &mut nxt, st)?;
+            st.synchronize()?;
+            out.push(nxt[0] as u32);
+        }
+        Ok(out[1..].to_vec())
     }
 
     fn hc_mixes(&self, fn_w: &DeviceBuffer<f32>, base: &DeviceBuffer<f32>, scale: &DeviceBuffer<f32>, t: usize,
@@ -523,7 +824,7 @@ impl Engine {
         }, "hc sinkhorn")
     }
 
-    fn block(&mut self, w: &Layer, l: usize, s: usize, t: usize, c1: usize, c2: usize) -> Result<()> {
+    fn block(&mut self, w: &Layer, ctx: Ctx, t: usize) -> Result<()> {
         let (d, hc) = (self.cfg.dim, self.cfg.hc_mult);
         let sr = self.stream.raw();
         let eps = self.cfg.norm_eps;
@@ -533,7 +834,7 @@ impl Engine {
             let a = &self.act;
             ck(unsafe { ds_hc_pre_norm(sr, np(&a.h), np(&a.pre), np(&w.attn_norm), np(&a.y), t as i32, d as i32, hc as i32, eps) }, "attn hc_pre")?;
         }
-        self.attention(w, l, s, t, c1, c2)?;
+        self.attention(w, ctx, t)?;
         {
             let a = &self.act;
             ck(unsafe { ds_hc_post(sr, np(&a.attn_out), np(&a.h), np(&a.apost), np(&a.acomb), np(&a.h), t as i32, d as i32) }, "attn hc_post")?;
@@ -544,7 +845,7 @@ impl Engine {
             let a = &self.act;
             ck(unsafe { ds_hc_pre_norm(sr, np(&a.h), np(&a.apre), np(&w.ffn_norm), np(&a.y), t as i32, d as i32, hc as i32, eps) }, "ffn hc_pre")?;
         }
-        self.moe(w, l, t)?;
+        self.moe(w, t)?;
         {
             let a = &self.act;
             ck(unsafe { ds_hc_post(sr, np(&a.moe_out), np(&a.h), np(&a.fpost), np(&a.fcomb), np(&a.h), t as i32, d as i32) }, "ffn hc_post")?;
@@ -554,49 +855,76 @@ impl Engine {
         Ok(())
     }
 
-    fn attention(&mut self, w: &Layer, l: usize, s: usize, t: usize, c1: usize, c2: usize) -> Result<()> {
+    fn attention(&mut self, w: &Layer, ctx: Ctx, t: usize) -> Result<()> {
         let cfg = self.cfg.clone();
-        let ratio = cfg.compress_ratios[l];
+        let (ratio, l, s) = match ctx {
+            Ctx::Main { l, s, .. } => (cfg.compress_ratios[l], l, s),
+            Ctx::Draft { s, .. } => (0, usize::MAX, s),
+        };
         // independent of q and the window: the chunk's new compressed positions, which this
         // layer's own attention already reads (engine/model.py::_compressed)
-        if ratio > 0 {
-            if let Some(comp) = &w.compressor {
-                self.compress(w, comp, l, s, t)?;
+        if let (Ctx::Main { .. }, Some(comp)) = (ctx, &w.compressor) {
+            self.compress(w, comp, l, s, t)?;
+        }
+        let (d, hd, rd, h) = (cfg.dim, cfg.head_dim, cfg.rope_head_dim, cfg.n_heads);
+        let ti = t as i32;
+        {
+            let st = &self.stream;
+            let sr = st.raw();
+            let table = if ratio > 0 { &self.rope_c } else { &self.rope_w };
+            let a = &self.act;
+            let fp8 = |x: *mut c_void, ldx: usize, wt: &Fp8, y: *mut c_void, ldy: usize, what: &str| {
+                ck(unsafe {
+                    ds_linear_fp8(sr, x, ldx as i64, np(&wt.w), np(&wt.s), wt.lds() as i64, ti, wt.n as i32, wt.k as i32, 1,
+                                  y, nul(), ldy as i64, nul())
+                }, what)
+            };
+            fp8(np(&a.y), d, &w.wq_a, np(&a.qa), cfg.q_lora_rank, "wq_a")?;
+            ck(unsafe { ds_rmsnorm(sr, np(&a.qa), cfg.q_lora_rank as i64, np(&w.q_norm), np(&a.qr), cfg.q_lora_rank as i64, ti, cfg.q_lora_rank as i32, cfg.norm_eps) }, "q_norm")?;
+            fp8(np(&a.qr), cfg.q_lora_rank, &w.wq_b, np(&a.q), h * hd, "wq_b")?;
+            ck(unsafe { ds_rope(sr, np(&a.q), (h * hd) as i64, ti, h as i32, hd as i64, (hd - rd) as i32, rd as i32, np(&a.pos), np(table), 0) }, "q rope")?;
+            fp8(np(&a.y), d, &w.wkv, np(&a.kv0), hd, "wkv")?;
+            // the draft block's own keys live in dkv and are never written to its ring
+            let kv_out = if matches!(ctx, Ctx::Draft { .. }) { &a.dkv } else { &a.kv };
+            ck(unsafe { ds_rmsnorm(sr, np(&a.kv0), hd as i64, np(&w.kv_norm), np(kv_out), hd as i64, ti, hd as i32, cfg.norm_eps) }, "kv_norm")?;
+            ck(unsafe { ds_rope(sr, np(kv_out), hd as i64, ti, 1, hd as i64, (hd - rd) as i32, rd as i32, np(&a.pos), np(table), 0) }, "kv rope")?;
+            if let Ctx::Main { .. } = ctx {
+                let ring = &self.caches.ring[l];
+                for i in 0..t {
+                    ring.copy_from(((s + i) % RING) * hd, &a.kv, i * hd, hd, st)?;
+                }
             }
+        }
+        if ratio > 0 && cfg.index_source_layers.contains(&l) {
+            self.select(w, l, s, t)?;
         }
         let st = &self.stream;
         let sr = st.raw();
-        let (d, hd, rd, h) = (cfg.dim, cfg.head_dim, cfg.rope_head_dim, cfg.n_heads);
         let table = if ratio > 0 { &self.rope_c } else { &self.rope_w };
         let a = &self.act;
-        let ti = t as i32;
-        let fp8 = |x: *mut c_void, ldx: usize, wt: &crate::weights::Fp8, y: *mut c_void, ldy: usize, what: &str| {
-            ck(unsafe {
-                ds_linear_fp8(sr, x, ldx as i64, np(&wt.w), np(&wt.s), wt.lds() as i64, ti, wt.n as i32, wt.k as i32, 1,
-                              y, nul(), ldy as i64, nul())
-            }, what)
-        };
-        fp8(np(&a.y), d, &w.wq_a, np(&a.qa), cfg.q_lora_rank, "wq_a")?;
-        ck(unsafe { ds_rmsnorm(sr, np(&a.qa), cfg.q_lora_rank as i64, np(&w.q_norm), np(&a.qr), cfg.q_lora_rank as i64, ti, cfg.q_lora_rank as i32, cfg.norm_eps) }, "q_norm")?;
-        fp8(np(&a.qr), cfg.q_lora_rank, &w.wq_b, np(&a.q), h * hd, "wq_b")?;
-        ck(unsafe { ds_rope(sr, np(&a.q), (h * hd) as i64, ti, h as i32, hd as i64, (hd - rd) as i32, rd as i32, np(&a.pos), np(table), 0) }, "q rope")?;
-        fp8(np(&a.y), d, &w.wkv, np(&a.kv0), hd, "wkv")?;
-        ck(unsafe { ds_rmsnorm(sr, np(&a.kv0), hd as i64, np(&w.kv_norm), np(&a.kv), hd as i64, ti, hd as i32, cfg.norm_eps) }, "kv_norm")?;
-        ck(unsafe { ds_rope(sr, np(&a.kv), hd as i64, ti, 1, hd as i64, (hd - rd) as i32, rd as i32, np(&a.pos), np(table), 0) }, "kv rope")?;
-        let ring = &self.caches.ring[l];
-        for i in 0..t {
-            ring.copy_from(((s + i) % RING) * hd, &a.kv, i * hd, hd, st)?;
-        }
-
-        let (ckv_ptr, cidx_ptr, c) = if ratio > 0 {
-            let src = cfg.kv_source_of(l).expect("compressed layer has a kv source");
-            let (cidx, c) = if ratio == 1 { (&a.cidx1, c1) } else { (&a.cidx2, c2) };
-            (np(&self.caches.ckv[&src]), np(cidx), c)
-        } else {
-            (nul(), nul(), 0)
+        // (ring, per-row window end, extra keys, their per-row indices, width)
+        let (ring, win_pos, ckv_ptr, cidx_ptr, c) = match ctx {
+            Ctx::Main { l, c1, c2, .. } => {
+                let ring = &self.caches.ring[l];
+                if ratio > 0 {
+                    let src = cfg.kv_source_of(l).expect("compressed layer has a kv source");
+                    let (cidx, c) = match self.selection {
+                        Selection::Indexed => (&a.topk, cfg.index_topk),
+                        Selection::AllVisible if ratio == 1 => (&a.cidx1, c1),
+                        Selection::AllVisible => (&a.cidx2, c2),
+                    };
+                    (ring, &a.pos, np(&self.caches.ckv[&src]), np(cidx), c)
+                } else {
+                    (ring, &a.pos, nul(), nul(), 0)
+                }
+            }
+            // model.py::attention with mtp_extra: the window is the main stream's last 128
+            // positions in this block's seeded ring, for every draft query alike, plus every
+            // draft key of the block (no causal mask among them)
+            Ctx::Draft { k, .. } => (&self.caches.mtp_ring[k], &a.dwin, np(&a.dkv), np(&a.dcidx), t),
         };
         ck(unsafe {
-            ds_attn_decode(sr, np(&a.q), np(ring), RING as i32, np(&a.pos), cfg.window_size as i32, 0, ckv_ptr, cidx_ptr,
+            ds_attn_decode(sr, np(&a.q), np(ring), RING as i32, np(win_pos), cfg.window_size as i32, 0, ckv_ptr, cidx_ptr,
                            c as i32, np(&w.attn_sink), (hd as f64).powf(-0.5) as f32, np(&a.o), ti, h as i32)
         }, "attention")?;
         ck(unsafe { ds_rope(sr, np(&a.o), (h * hd) as i64, ti, h as i32, hd as i64, (hd - rd) as i32, rd as i32, np(&a.pos), np(table), 1) }, "o rope")?;
@@ -607,7 +935,69 @@ impl Engine {
                                   np(&w.wo_a.s), w.wo_a.lds() as i64, ti, w.wo_a.n as i32, gk as i32, np(&a.oa),
                                   w.wo_a.n as i64)
         }, "wo_a")?;
-        fp8(np(&a.oa), og * cfg.o_lora_rank, &w.wo_b, np(&a.attn_out), d, "wo_b")
+        ck(unsafe {
+            ds_linear_fp8(sr, np(&a.oa), (og * cfg.o_lora_rank) as i64, np(&w.wo_b.w), np(&w.wo_b.s), w.wo_b.lds() as i64,
+                          ti, w.wo_b.n as i32, w.wo_b.k as i32, 1, np(&a.attn_out), nul(), d as i64, nul())
+        }, "wo_b")
+    }
+
+    /// model.py::_indexer at an index-source layer: which compressed positions this layer
+    /// and the following ones (until the next index source) attend over.
+    fn select(&mut self, w: &Layer, l: usize, s: usize, t: usize) -> Result<()> {
+        let cfg = self.cfg.clone();
+        let r = cfg.compress_ratios[l];
+        let n_c = (s + t) / r;
+        if n_c <= cfg.index_topk {
+            // top-k of every visible position is every visible position
+            self.selection = Selection::AllVisible;
+            return Ok(());
+        }
+        let ix = w.indexer.as_ref().expect("index-source layer has indexer weights");
+        let st = &self.stream;
+        let sr = st.raw();
+        let a = &self.act;
+        let ti = t as i32;
+        let (ih, ihd, rd) = (cfg.index_n_heads, cfg.index_head_dim, cfg.rope_head_dim);
+        let nmax = self.max_seq + 1;
+        ck(unsafe {
+            ds_linear_fp8(sr, np(&a.qr), cfg.q_lora_rank as i64, np(&ix.wq_b.w), np(&ix.wq_b.s), ix.wq_b.lds() as i64,
+                          ti, ix.wq_b.n as i32, ix.wq_b.k as i32, 1, np(&a.iq), nul(), (ih * ihd) as i64, nul())
+        }, "index wq_b")?;
+        // the indexer's queries always take the compressed-rope table (model.py: freqs_c[pos])
+        ck(unsafe { ds_rope(sr, np(&a.iq), (ih * ihd) as i64, ti, ih as i32, ihd as i64, (ihd - rd) as i32, rd as i32, np(&a.pos), np(&self.rope_c), 0) }, "index q rope")?;
+        ck(unsafe {
+            ds_linear_bf16(sr, np(&a.y), cfg.dim as i64, np(&ix.weights_proj), ti, ih as i32, cfg.dim as i32, 1,
+                           np(&a.iwb), nul(), ih as i64, nul())
+        }, "index weights_proj")?;
+        let scale = ((ihd as f64).powf(-0.5) * (ih as f64).powf(-0.5)) as f32;
+        ck(unsafe { ds_bf16_to_f32_scale(sr, np(&a.iwb), (t * ih) as i64, scale, np(&a.iwf)) }, "index weights")?;
+        let src = cfg.kv_source_of(l).expect("compressed layer has a kv source");
+        let clen = if r == 1 { &a.clen1 } else { &a.clen2 };
+        let cand_src = cfg.candidate_source_layer;
+        let use_cand = self.cand_live && cand_src >= 0 && (l as i64) > cand_src;
+        ck(unsafe {
+            ds_index_scores(sr, np(&a.iq), np(&self.caches.ik[&src]), np(&a.iwf), np(clen),
+                            if use_cand { np(&a.cand) } else { nul() }, nmax as i64, n_c as i32, np(&a.scores),
+                            n_c as i64, ti)
+        }, "index scores")?;
+        let block = 8usize;
+        let topk_blocks = 2048usize;
+        if l as i64 == cand_src && n_c > topk_blocks * block {
+            // model.py::_select_candidates: below topk_blocks blocks every block is kept, so
+            // the mask only exists where it can drop something
+            let nb = n_c.div_ceil(block);
+            let kb = topk_blocks.min(nb);
+            ck(unsafe { ds_candidate_blocks(sr, np(&a.scores), n_c as i64, n_c as i32, block as i32, np(clen), np(&a.bmax), nb as i64, ti) }, "candidate blocks")?;
+            ck(unsafe { ds_topk_select(sr, np(&a.bmax), nb as i64, nb as i32, kb as i32, np(&a.blocks), kb as i32, ti) }, "candidate select")?;
+            a.cand.zero_async(st)?;
+            ck(unsafe { ds_candidate_set(sr, np(&a.blocks), kb as i32, block as i32, n_c as i32, np(&a.cand), nmax as i64, ti) }, "candidate set")?;
+            self.cand_live = true;
+        }
+        let k = cfg.index_topk.min(n_c);
+        ck(unsafe { ds_topk_select(sr, np(&a.scores), n_c as i64, n_c as i32, k as i32, np(&a.topk), cfg.index_topk as i32, ti) }, "index topk")?;
+        self.selection = Selection::Indexed;
+        self.indexed_layers += 1;
+        Ok(())
     }
 
     /// engine/model.py::_compressed for a kv-source layer: new compressed positions of this
@@ -620,13 +1010,24 @@ impl Engine {
         let r = cfg.compress_ratios[l];
         let a = &self.act;
         let ti = t as i32;
-        // (compressed index j, absolute position of its rope) per completed group
+        // compressed index j per completed group, in order
         let mut groups: Vec<usize> = Vec::new();
         if r > 1 {
             let wgate = comp.wgate.as_ref().expect("ratio-2 compressor has a gate");
             ck(unsafe { ds_linear_bf16(sr, np(&a.y), d as i64, np(&comp.wkv), ti, hd as i32, d as i32, 1, nul(), np(&a.kvl), hd as i64, nul()) }, "comp wkv")?;
             ck(unsafe { ds_linear_bf16(sr, np(&a.y), d as i64, np(wgate), ti, hd as i32, d as i32, 1, nul(), np(&a.sc), hd as i64, nul()) }, "comp wgate")?;
             let (pkv, psc) = (&self.caches.pending_kv[&l], &self.caches.pending_sc[&l]);
+            let pending_before = self.caches.pending[&l];
+            // keep this chunk's inputs and the pending state before it, for rollback
+            {
+                let mem = self.caches.chunk.get_mut(&l).unwrap();
+                mem.start = s;
+                mem.kv.copy_from(0, &a.kvl, 0, t * hd, st)?;
+                mem.sc.copy_from(0, &a.sc, 0, t * hd, st)?;
+                mem.before_kv.copy_from(0, pkv, 0, hd, st)?;
+                mem.before_sc.copy_from(0, psc, 0, hd, st)?;
+                mem.before_valid = pending_before;
+            }
             for p in s..s + t {
                 if p % r != r - 1 {
                     continue;
@@ -635,7 +1036,7 @@ impl Engine {
                 let (ka, sa) = if p > s {
                     (a.kvl.ptr_at((p - 1 - s) * hd), a.sc.ptr_at((p - 1 - s) * hd))
                 } else {
-                    if !self.caches.pending[&l] {
+                    if !pending_before {
                         return Err(format!("layer {l}: position {p} pairs with a pending position that is not there").into());
                     }
                     (np(pkv), np(psc))
@@ -702,11 +1103,11 @@ impl Engine {
     }
 
     /// engine/model.py::moe on one box, with the routed experts streamed through the arena.
-    fn moe(&mut self, w: &Layer, l: usize, t: usize) -> Result<()> {
+    fn moe(&mut self, w: &Layer, t: usize) -> Result<()> {
         let cfg = self.cfg.clone();
         let st = &self.stream;
         let sr = st.raw();
-        let (d, inter, e, k) = (cfg.dim, cfg.moe_inter_dim, cfg.n_routed_experts, cfg.n_activated_experts);
+        let (d, inter, e, k) = (cfg.dim, cfg.moe_inter_dim, w.n_experts, w.topk);
         let ti = t as i32;
         let p = t * k;
         {
@@ -718,8 +1119,10 @@ impl Engine {
         self.act.idx.download_async(0, &mut idx, st)?;
         st.synchronize()?;
         if let Some(dir) = &self.dump_dir {
-            let bytes: Vec<u8> = idx.iter().flat_map(|v| v.to_le_bytes()).collect();
-            std::fs::write(dir.join(format!("idx{l:02}.i32")), bytes)?;
+            if let Some(l) = w.prefix.strip_prefix("layers.").and_then(|r| r.trim_end_matches('.').parse::<usize>().ok()) {
+                let bytes: Vec<u8> = idx.iter().flat_map(|v| v.to_le_bytes()).collect();
+                std::fs::write(dir.join(format!("idx{l:02}.i32")), bytes)?;
+            }
         }
         let mut experts: Vec<i32> = idx.clone();
         experts.sort_unstable();
@@ -729,7 +1132,7 @@ impl Engine {
         for group in experts.chunks(ARENA_SLOTS) {
             let tl = Instant::now();
             for (slot, &ex) in group.iter().enumerate() {
-                let views = reader.read_expert_into(&mut self.expert_stage, &ExpertReader::expert_prefix(l, ex as usize))?;
+                let views = reader.read_expert_into(&mut self.expert_stage, &format!("{}ffn.experts.{ex}.", w.prefix))?;
                 let ar = &self.arena;
                 let dsts: [(*mut c_void, usize); 6] = [
                     (ar.w1.ptr_at(slot * W13), W13), (ar.s1.ptr_at(slot * S13), S13),
@@ -738,7 +1141,7 @@ impl Engine {
                 ];
                 for (&(off, len), &(dst, want)) in views.iter().zip(dsts.iter()) {
                     if len != want {
-                        return Err(format!("layer {l} expert {ex}: tensor of {len} bytes, arena expects {want}").into());
+                        return Err(format!("{}expert {ex}: tensor of {len} bytes, arena expects {want}", w.prefix).into());
                     }
                     let src = unsafe { self.expert_stage.as_ptr().add(off) } as *const c_void;
                     unsafe { memcpy_async(dst, src, len, MEMCPY_HOST_TO_DEVICE, st)? };
@@ -767,7 +1170,7 @@ impl Engine {
             }, "moe down")?;
         }
         let a = &self.act;
-        let fp8 = |x: *mut c_void, ldx: usize, wt: &crate::weights::Fp8, y: *mut c_void, ldy: usize, what: &str| {
+        let fp8 = |x: *mut c_void, ldx: usize, wt: &Fp8, y: *mut c_void, ldy: usize, what: &str| {
             ck(unsafe {
                 ds_linear_fp8(sr, x, ldx as i64, np(&wt.w), np(&wt.s), wt.lds() as i64, ti, wt.n as i32, wt.k as i32, 1,
                               y, nul(), ldy as i64, nul())

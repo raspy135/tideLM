@@ -144,6 +144,10 @@ pub struct EngramW {
 }
 
 pub struct Layer {
+    /// `layers.{l}.` or `mtp.{k}.` — also the routed experts' tensor prefix
+    pub prefix: String,
+    pub n_experts: usize,
+    pub topk: usize,
     pub attn_norm: DeviceBuffer<u16>,
     pub ffn_norm: DeviceBuffer<u16>,
     pub q_norm: DeviceBuffer<u16>,
@@ -171,12 +175,25 @@ pub struct Layer {
 }
 
 impl Layer {
-    /// A backbone layer (`layers.{l}.`); DSpark blocks reuse this with `mtp.{k}.` later.
+    /// A backbone layer (`layers.{l}.`).
     pub fn load(ld: &mut Loader, cfg: &Config, l: usize) -> Result<Self> {
-        let p = format!("layers.{l}.");
+        Self::load_block(ld, cfg, &format!("layers.{l}."), Some(l), cfg.n_routed_experts, cfg.n_activated_experts)
+    }
+
+    /// A DSpark block (`mtp.{k}.`, model.py::MTPWeights): a window-only block with its own
+    /// 128-expert, top-3 MoE.
+    pub fn load_mtp(ld: &mut Loader, cfg: &Config, k: usize) -> Result<Self> {
+        Self::load_block(ld, cfg, &format!("mtp.{k}."), None, cfg.dspark_n_routed_experts,
+                         cfg.dspark_n_activated_experts)
+    }
+
+    fn load_block(ld: &mut Loader, cfg: &Config, p: &str, backbone: Option<usize>, n_experts: usize,
+                  topk: usize) -> Result<Self> {
+        let p = p.to_string();
+        let l = backbone.unwrap_or(usize::MAX);
         let (d, hcw) = (cfg.dim, cfg.hc_mix_width());
         let attn = |n: &str| format!("{p}attn.{n}");
-        let compressor = if cfg.kv_source_layers.contains(&l) {
+        let compressor = if backbone.is_some() && cfg.kv_source_layers.contains(&l) {
             let ratio = cfg.compress_ratios[l];
             Some(Compressor {
                 norm: ld.bf16(&attn("compressor.norm.weight"), &[cfg.head_dim])?,
@@ -190,7 +207,7 @@ impl Layer {
         } else {
             None
         };
-        let indexer = if cfg.index_source_layers.contains(&l) {
+        let indexer = if backbone.is_some() && cfg.index_source_layers.contains(&l) {
             let key = if cfg.kv_source_layers.contains(&l) {
                 Some(IndexKey {
                     wk: ld.bf16(&attn("indexer.wk.weight"), &[cfg.index_head_dim, cfg.head_dim])?,
@@ -207,7 +224,7 @@ impl Layer {
         } else {
             None
         };
-        let engram = if cfg.engram_layer_ids.contains(&l) {
+        let engram = if backbone.is_some() && cfg.engram_layer_ids.contains(&l) {
             let width = (cfg.hc_mult + 1) * d;
             let rows = (cfg.engram_max_ngram_size - 1) * cfg.engram_n_heads * cfg.engram_head_dim;
             let q = bf16_vec(&ld.host_bytes(&format!("{p}engram.q_weight"))?.0);
@@ -221,6 +238,8 @@ impl Layer {
             None
         };
         Ok(Layer {
+            n_experts,
+            topk,
             attn_norm: ld.bf16(&format!("{p}attn_norm.weight"), &[d])?,
             ffn_norm: ld.bf16(&format!("{p}ffn_norm.weight"), &[d])?,
             q_norm: ld.bf16(&attn("q_norm.weight"), &[cfg.q_lora_rank])?,
@@ -237,14 +256,38 @@ impl Layer {
             hc_ffn_fn: ld.f32(&format!("{p}hc_ffn_fn"), &[hcw, cfg.hc_mult * d])?,
             hc_ffn_base: ld.f32(&format!("{p}hc_ffn_base"), &[hcw])?,
             hc_ffn_scale: ld.f32(&format!("{p}hc_ffn_scale"), &[3])?,
-            gate_w: ld.bf16(&format!("{p}ffn.gate.weight"), &[cfg.n_routed_experts, d])?,
-            gate_bias: ld.f32(&format!("{p}ffn.gate.bias"), &[cfg.n_routed_experts])?,
+            gate_w: ld.bf16(&format!("{p}ffn.gate.weight"), &[n_experts, d])?,
+            gate_bias: ld.f32(&format!("{p}ffn.gate.bias"), &[n_experts])?,
             sh_w1: ld.fp8(&format!("{p}ffn.shared_experts.w1"), cfg.moe_inter_dim, d)?,
             sh_w2: ld.fp8(&format!("{p}ffn.shared_experts.w2"), d, cfg.moe_inter_dim)?,
             sh_w3: ld.fp8(&format!("{p}ffn.shared_experts.w3"), cfg.moe_inter_dim, d)?,
             compressor,
             indexer,
             engram,
+            prefix: p,
+        })
+    }
+}
+
+/// The DSpark drafter's own weights besides its three blocks (model.py::MTPWeights k = 0, 2).
+pub struct DsparkW {
+    pub main_proj: Fp8,
+    pub main_norm: DeviceBuffer<u16>,
+    pub norm: DeviceBuffer<u16>,
+    pub markov_embed: DeviceBuffer<u16>,
+    pub markov_head: DeviceBuffer<u16>,
+}
+
+impl DsparkW {
+    pub fn load(ld: &mut Loader, cfg: &Config) -> Result<Self> {
+        let (d, v, r) = (cfg.dim, cfg.vocab_size, cfg.dspark_markov_rank);
+        let last = cfg.n_mtp_layers - 1;
+        Ok(DsparkW {
+            main_proj: ld.fp8("mtp.0.main_proj", d, d * cfg.dspark_target_layer_ids.len())?,
+            main_norm: ld.bf16("mtp.0.main_norm.weight", &[d])?,
+            norm: ld.bf16(&format!("mtp.{last}.norm.weight"), &[d])?,
+            markov_embed: ld.bf16(&format!("mtp.{last}.markov_head.embed.weight"), &[v, r])?,
+            markov_head: ld.bf16(&format!("mtp.{last}.markov_head.head.weight"), &[v, r])?,
         })
     }
 }

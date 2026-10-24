@@ -150,4 +150,28 @@ extern "C" {
         stream: CudaStream, blocks: *const c_void, kb: c_int, block: c_int, n: c_int,
         cand: *mut c_void, ld_cand: i64, t: c_int,
     ) -> c_int;
+
+    pub fn ds_bf16_to_f32_scale(stream: CudaStream, x: *const c_void, n: i64, scale: f32, out: *mut c_void) -> c_int;
+
+    /// bf16 mean over the hc copies: h [M, hc, D] -> out [M, ld_out].
+    pub fn ds_hc_mean(stream: CudaStream, h: *const c_void, out: *mut c_void, ld_out: i64, m: c_int, d: c_int, hc: c_int) -> c_int;
+
+    /// argmax over float(a) + float(b) per row (b may be null), first index on ties.
+    pub fn ds_argmax_sum_bf16(
+        stream: CudaStream, a: *const c_void, lda: i64, b: *const c_void, ldb: i64, m: c_int, n: c_int,
+        out: *mut c_void,
+    ) -> c_int;
+
+    pub fn ds_gather_rows_u16(stream: CudaStream, table: *const c_void, idx: *const c_void, out: *mut c_void, m: c_int, d: c_int) -> c_int;
+
+    // graph-safe step plumbing (see the kernels' comments)
+    pub fn ds_scatter_ring(stream: CudaStream, src: *const c_void, ring: *mut c_void, ring_size: c_int, pos: *const c_void, t: c_int, d: c_int) -> c_int;
+    pub fn ds_visible(stream: CudaStream, pos: *const c_void, t: c_int, r: c_int, c: c_int, cidx: *mut c_void, clen: *mut c_void) -> c_int;
+    pub fn ds_compress_rows(stream: CudaStream, kv: *const c_void, sc: *const c_void, pkv: *const c_void, psc: *const c_void, pos: *const c_void, out: *mut c_void, t: c_int, d: c_int) -> c_int;
+    pub fn ds_scatter_compressed(stream: CudaStream, src: *const c_void, ld_src: i64, dst: *mut c_void, pos: *const c_void, r: c_int, t: c_int, d: c_int) -> c_int;
+    pub fn ds_pending_update(stream: CudaStream, kv: *const c_void, sc: *const c_void, pos: *const c_void, t: c_int, pkv: *mut c_void, psc: *mut c_void, flag: *mut c_void, mem_kv: *mut c_void, mem_sc: *mut c_void, before_kv: *mut c_void, before_sc: *mut c_void, before_flag: *mut c_void, mem_start: *mut c_void, d: c_int) -> c_int;
+    pub fn ds_rollback_pending(stream: CudaStream, n_dev: *const c_void, mem_kv: *const c_void, mem_sc: *const c_void, mem_start: *const c_void, before_kv: *const c_void, before_sc: *const c_void, before_flag: *const c_void, pkv: *mut c_void, psc: *mut c_void, flag: *mut c_void, d: c_int) -> c_int;
+    pub fn ds_lut_slots(stream: CudaStream, idx: *const c_void, lut: *const c_void, p: c_int, slots: *mut c_void) -> c_int;
+    pub fn ds_greedy_accept(stream: CudaStream, am: *const c_void, block: *const c_void, t: c_int, pos: *const c_void, out: *mut c_void) -> c_int;
+    pub fn ds_wait_flag(stream: CudaStream, flag: *const c_void, expect: c_int, timeout_ns: i64, err: *mut c_void) -> c_int;
 }
