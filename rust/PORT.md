@@ -76,9 +76,20 @@ host waits. Prefill is eager (graphs off in the profile).
 ## Milestones and gates
 
 - **M1 — single-rank greedy decode, eager.** Weights + arena warm start, engram, all
-  step math in Rust, no graphs yet. *Gate: token-for-token parity with the Python
-  engine (greedy, fixed prompts, `verify_replay`-style) — a correctness gate, tok/s
-  recorded but expected to lose to the graphed Python engine.*
+  step math in Rust, no graphs yet. *Gate: layer parity against tools/v41_ref.py with the
+  compressed-KV QDQ off on both sides (bf16-level per row), plus teacher-forced NLL with it
+  on — a correctness gate, tok/s recorded but expected to lose to the graphed Python
+  engine.* Token-for-token parity across implementations is NOT the gate: see below.
+
+  Status 2026-10-24: the streaming engine (weights from NVMe each step, ~1 GB) passes
+  layer parity — QDQ off, all 6 rows x 40 layers at 5e-3..3e-2 rel L2, logits corr
+  0.99994, top-10 10/10 (rust/tools/ref_forward.py + compare_dumps.py). With QDQ on, the
+  compressed latents that agree to 5e-3 come out of the FP4/E4M3 quantizer 5-13% apart:
+  a 0.5% change in a group's amax flips its E4M3 scale (3-bit mantissa, 12.5% steps) and
+  requantizes all 16 values, which cascades into router flips (50 vs 8). That is a property
+  of the model's FP4 cache, not of either implementation — it applies to the Python engine
+  against its own reference too — so cross-implementation token identity is unattainable
+  at near-ties and must not be used as a gate.
 - **M2 — graphed decode + speculation.** Graph capture of the step, DSpark draft +
   verify, depth policy live. *Gate: ≥ Python decode tok/s on the README workloads
   (code and prose separately — the depth policy history says they diverge), identical

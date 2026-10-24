@@ -185,6 +185,16 @@ pub struct Engine {
     caches: Caches,
     pub max_seq: usize,
     pub times: StepTimes,
+    /// TIDELM_DUMP_DIR: write the hc stream after every layer and the last logits as raw
+    /// little-endian f32 (the layout rust/tools/ref_forward.py writes), for parity checks.
+    pub dump_dir: Option<std::path::PathBuf>,
+    no_qdq: bool,
+}
+
+fn dump_bf16(path: &std::path::Path, v: &[u16]) -> Result<()> {
+    let bytes: Vec<u8> = v.iter().flat_map(|&h| f32::from_bits((h as u32) << 16).to_le_bytes()).collect();
+    std::fs::write(path, bytes)?;
+    Ok(())
 }
 
 impl Engine {
@@ -338,6 +348,8 @@ impl Engine {
             caches,
             max_seq,
             times: StepTimes::default(),
+            dump_dir: std::env::var_os("TIDELM_DUMP_DIR").map(std::path::PathBuf::from),
+            no_qdq: std::env::var("TIDELM_NO_QDQ").as_deref() == Ok("1"),
         })
     }
 
@@ -450,6 +462,12 @@ impl Engine {
             self.stream.synchronize()?;
             self.times.compute_s += tc.elapsed().as_secs_f64();
             drop(w);
+            if let Some(dir) = &self.dump_dir {
+                let mut hb = vec![0u16; t * hc * d];
+                self.act.h.download_async(0, &mut hb, &self.stream)?;
+                self.stream.synchronize()?;
+                dump_bf16(&dir.join(format!("h{l:02}.f32")), &hb)?;
+            }
         }
         self.caches.len = s + t;
 
@@ -479,6 +497,9 @@ impl Engine {
         let mut logits = vec![0u16; v];
         a.logits.download_async(0, &mut logits, st)?;
         st.synchronize()?;
+        if let Some(dir) = &self.dump_dir {
+            dump_bf16(&dir.join("logits.f32"), &logits)?;
+        }
         self.times.head_s += th.elapsed().as_secs_f64();
         Ok(Some(logits))
     }
@@ -655,10 +676,27 @@ impl Engine {
             }
         }
         ck(unsafe { ds_rope(sr, np(&a.latn), hd as i64, gi, 1, hd as i64, (hd - rd) as i32, rd as i32, np(&a.cpos), np(&self.rope_c), 0) }, "comp rope")?;
-        ck(unsafe { ds_fp4_qdq_e4m3(sr, np(&a.latn), (g * hd) as i64) }, "comp qdq")?;
+        // TIDELM_NO_QDQ=1 is a diagnostic only; serving always quantizes, as the checkpoint's
+        // model does. Measured 2026-10-24 against tools/v41_ref.py (rust/tools/ref_forward.py,
+        // 6-token prompt, all 40 layers): with QDQ off on both sides every row tracks the
+        // reference at bf16 level (5e-3..3e-2 rel L2, logits corr 0.99994, top-10 10/10); with
+        // it on, latents that agree to 5e-3 come out 5-13% apart, because a 0.5% wobble in a
+        // group's amax flips its E4M3 scale (12.5% steps) and requantizes all 16 values — 50
+        // router flips instead of 8. Two correct implementations cannot be token-identical
+        // through this cache; judge parity with QDQ off, and quality by NLL.
+        if !self.no_qdq {
+            ck(unsafe { ds_fp4_qdq_e4m3(sr, np(&a.latn), (g * hd) as i64) }, "comp qdq")?;
+        }
         let ckv = &self.caches.ckv[&l];
         for (i, &j) in groups.iter().enumerate() {
             ckv.copy_from(j * hd, &a.latn, i * hd, hd, st)?;
+        }
+        if let Some(dir) = &self.dump_dir {
+            let n = groups.last().map(|&j| j + 1).unwrap_or(0);
+            let mut v = vec![0u16; n * hd];
+            ckv.download_async(0, &mut v, st)?;
+            st.synchronize()?;
+            dump_bf16(&dir.join(format!("ckv{l:02}.f32")), &v)?;
         }
         Ok(())
     }
@@ -679,6 +717,10 @@ impl Engine {
         let mut idx = vec![0i32; p];
         self.act.idx.download_async(0, &mut idx, st)?;
         st.synchronize()?;
+        if let Some(dir) = &self.dump_dir {
+            let bytes: Vec<u8> = idx.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(dir.join(format!("idx{l:02}.i32")), bytes)?;
+        }
         let mut experts: Vec<i32> = idx.clone();
         experts.sort_unstable();
         experts.dedup();

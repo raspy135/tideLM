@@ -125,4 +125,29 @@ extern "C" {
     pub fn ds_argmax_bf16(
         stream: CudaStream, x: *const c_void, ldx: i64, m: c_int, n: c_int, out: *mut c_void,
     ) -> c_int;
+
+    /// Indexer scores [T, n] bf16 (ld_out): q [T, 32, 128], k [n, 128], w [T, 32] f32,
+    /// clen [T] visible counts, cand [T, ld_cand] u8 or null.
+    pub fn ds_index_scores(
+        stream: CudaStream, q: *const c_void, k: *const c_void, w: *const c_void, clen: *const c_void,
+        cand: *const c_void, ld_cand: i64, n: c_int, out: *mut c_void, ld_out: i64, t: c_int,
+    ) -> c_int;
+
+    /// Per row: the K largest selectable bf16 values' indices, ascending, -1 padded to
+    /// `width`.
+    pub fn ds_topk_select(
+        stream: CudaStream, s: *const c_void, ld_s: i64, n: c_int, k: c_int, out: *mut c_void,
+        width: c_int, t: c_int,
+    ) -> c_int;
+
+    pub fn ds_candidate_blocks(
+        stream: CudaStream, s: *const c_void, ld_s: i64, n: c_int, block: c_int, clen: *const c_void,
+        bmax: *mut c_void, ld_b: i64, t: c_int,
+    ) -> c_int;
+
+    /// Sets cand[t, j] = 1 for the positions of the selected blocks; zero `cand` first.
+    pub fn ds_candidate_set(
+        stream: CudaStream, blocks: *const c_void, kb: c_int, block: c_int, n: c_int,
+        cand: *mut c_void, ld_cand: i64, t: c_int,
+    ) -> c_int;
 }

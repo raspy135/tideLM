@@ -731,6 +731,192 @@ __global__ void argmax_bf16_kernel(const __nv_bfloat16* __restrict__ x, int64_t 
     }
 }
 
+// ------------------------------------------------------------------ indexer
+// model.py::_indexer for decode rows. The score buffer is a RANKING quantity there (masked,
+// block-max'd, top-k'd, never fed to arithmetic), stored bf16, with each per-head dot product
+// rounded to bf16 by the bf16 einsum before the relu:
+//   s[t, j] = bf16( sum_h relu(bf16(q[t, h] . k[j])) * w[t, h] ),   -inf where j >= clen[t]
+//   (or where the candidate mask `cand` [T, ld_cand] is 0).
+constexpr int kIdxH = 32, kIdxD = 128, kIdxTile = 64;
+
+__global__ void __launch_bounds__(256) index_scores_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k, const float* __restrict__ w,
+    const int* __restrict__ clen, const uint8_t* __restrict__ cand, int64_t ld_cand, int n,
+    __nv_bfloat16* __restrict__ out, int64_t ld_out) {
+    __shared__ float qs[kIdxH][kIdxD + 1];
+    __shared__ __align__(16) __nv_bfloat16 ks[kIdxTile][kIdxD];
+    const int t = blockIdx.y;
+    const int j0 = blockIdx.x * kIdxTile;
+    const int h = threadIdx.x & 31, jj = threadIdx.x >> 5;
+    for (int i = threadIdx.x; i < kIdxH * kIdxD; i += blockDim.x)
+        qs[i / kIdxD][i % kIdxD] = bf(q[(int64_t)t * kIdxH * kIdxD + i]);
+    for (int i = threadIdx.x; i < kIdxTile * kIdxD / 8; i += blockDim.x) {
+        const int r = i / (kIdxD / 8), c = (i % (kIdxD / 8)) * 8;
+        uint4 v = make_uint4(0, 0, 0, 0);
+        if (j0 + r < n) v = *reinterpret_cast<const uint4*>(k + (int64_t)(j0 + r) * kIdxD + c);
+        *reinterpret_cast<uint4*>(&ks[r][c]) = v;
+    }
+    __syncthreads();
+    const float wh = w[t * kIdxH + h];
+    const int lim = clen[t];
+    for (int i = 0; i < kIdxTile / 8; ++i) {
+        const int jl = jj + 8 * i, j = j0 + jl;
+        float dot = 0.f;
+#pragma unroll 16
+        for (int d = 0; d < kIdxD; ++d) dot = fmaf(qs[h][d], bf(ks[jl][d]), dot);
+        float v = fmaxf(bf(to_bf(dot)), 0.f) * wh;
+        v = warp_sum(v);
+        if (h == 0 && j < n) {
+            const bool live = j < lim && (!cand || cand[(int64_t)t * ld_cand + j]);
+            out[(int64_t)t * ld_out + j] = live ? to_bf(v) : to_bf(-INFINITY);
+        }
+    }
+}
+
+// Orderable key of a bf16 value: larger value -> larger key. -inf and NaN are not selectable.
+__device__ __forceinline__ bool bf16_key(uint16_t b, uint32_t& key) {
+    if (b == 0xff80u || (b & 0x7f80u) == 0x7f80u && (b & 0x7fu)) return false;  // -inf, NaN
+    key = (b & 0x8000u) ? (~b & 0xffffu) : (b | 0x8000u);
+    return true;
+}
+
+// Per row: the indices of the K largest selectable bf16 values, ascending, then -1 up to
+// `width` columns (model.py: topk(k).indices.sort(), positions past clen -> -1, _pad_topk).
+// Ties at the threshold keep the lowest indices (torch.topk leaves tie order unspecified).
+// One block of 1024 threads per row: an 8+8-bit radix select for the threshold, then a stable
+// compaction that emits the selected indices already in ascending order.
+constexpr int kSelThreads = 1024;
+
+__global__ void __launch_bounds__(kSelThreads) topk_select_kernel(
+    const __nv_bfloat16* __restrict__ s, int64_t ld_s, int n, int K, int* __restrict__ out, int width) {
+    __shared__ int hist[256];
+    __shared__ int scan[kSelThreads];
+    __shared__ uint32_t sh_thresh;
+    __shared__ int sh_gt, sh_need, sh_all;
+    const uint16_t* row = reinterpret_cast<const uint16_t*>(s + (int64_t)blockIdx.x * ld_s);
+    int* orow = out + (int64_t)blockIdx.x * width;
+    const int tid = threadIdx.x;
+    const int chunk = (n + kSelThreads - 1) / kSelThreads;
+    const int lo = min(n, tid * chunk), hi = min(n, lo + chunk);
+
+    // pass 0: selectable count; pass 1/2: the K-th largest key, one byte at a time
+    int finite = 0;
+    for (int i = lo; i < hi; ++i) { uint32_t key; finite += bf16_key(row[i], key); }
+    scan[tid] = finite;
+    __syncthreads();
+    for (int o = kSelThreads / 2; o > 0; o >>= 1) {
+        if (tid < o) scan[tid] += scan[tid + o];
+        __syncthreads();
+    }
+    if (tid == 0) { sh_all = scan[0] <= K; sh_thresh = 0; sh_gt = 0; sh_need = 0; }
+    __syncthreads();
+    const bool take_all = sh_all;
+    if (!take_all) {
+        uint32_t prefix = 0;
+        int remaining = K, above = 0;
+        for (int pass = 0; pass < 2; ++pass) {
+            const int shift = pass == 0 ? 8 : 0;
+            for (int b = tid; b < 256; b += kSelThreads) hist[b] = 0;
+            __syncthreads();
+            for (int i = lo; i < hi; ++i) {
+                uint32_t key;
+                if (!bf16_key(row[i], key)) continue;
+                if (pass == 1 && (key >> 8) != (prefix >> 8)) continue;
+                atomicAdd(&hist[(key >> shift) & 0xff], 1);
+            }
+            __syncthreads();
+            if (tid == 0) {
+                int acc = 0, b = 255;
+                for (; b > 0; --b) {
+                    if (acc + hist[b] >= remaining) break;
+                    acc += hist[b];
+                }
+                prefix |= (uint32_t)b << shift;
+                above += acc;
+                remaining -= acc;
+                sh_thresh = prefix;
+                sh_gt = above;
+                sh_need = remaining;
+            }
+            __syncthreads();
+            prefix = sh_thresh;
+            above = sh_gt;
+            remaining = sh_need;
+        }
+    }
+    const uint32_t thresh = sh_thresh;
+    const int need_eq = sh_need;
+
+    // equal-to-threshold ranks in index order, then the selected count per thread
+    int eq = 0;
+    if (!take_all)
+        for (int i = lo; i < hi; ++i) { uint32_t key; if (bf16_key(row[i], key) && key == thresh) ++eq; }
+    __syncthreads();
+    scan[tid] = eq;
+    __syncthreads();
+    for (int o = 1; o < kSelThreads; o <<= 1) {  // inclusive Hillis-Steele scan
+        const int v = tid >= o ? scan[tid - o] : 0;
+        __syncthreads();
+        scan[tid] += v;
+        __syncthreads();
+    }
+    int eq_rank = scan[tid] - eq;
+    int sel = 0;
+    for (int i = lo, r = eq_rank; i < hi; ++i) {
+        uint32_t key;
+        if (!bf16_key(row[i], key)) continue;
+        if (take_all || key > thresh) ++sel;
+        else if (key == thresh && r++ < need_eq) ++sel;
+    }
+    __syncthreads();
+    scan[tid] = sel;
+    __syncthreads();
+    for (int o = 1; o < kSelThreads; o <<= 1) {
+        const int v = tid >= o ? scan[tid - o] : 0;
+        __syncthreads();
+        scan[tid] += v;
+        __syncthreads();
+    }
+    const int total = scan[kSelThreads - 1];
+    int at = scan[tid] - sel;
+    for (int i = lo, r = eq_rank; i < hi; ++i) {
+        uint32_t key;
+        if (!bf16_key(row[i], key)) continue;
+        bool take = take_all || key > thresh;
+        if (!take && key == thresh && r++ < need_eq) take = true;
+        if (take && at < width) orow[at++] = i;
+    }
+    for (int i = total + tid; i < width; i += kSelThreads) orow[i] = -1;
+}
+
+// model.py::_select_candidates, the scoring half: per row, the max of each `block` scores,
+// with the block holding position clen-1 forced to +inf (it is always kept).
+__global__ void candidate_blocks_kernel(const __nv_bfloat16* __restrict__ s, int64_t ld_s, int n, int block,
+                                        const int* __restrict__ clen, __nv_bfloat16* __restrict__ bmax,
+                                        int64_t ld_b) {
+    const int t = blockIdx.y;
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    const int nb = (n + block - 1) / block;
+    if (b >= nb) return;
+    float m = -INFINITY;
+    for (int i = b * block; i < min(n, (b + 1) * block); ++i) m = fmaxf(m, bf(s[(int64_t)t * ld_s + i]));
+    if (clen[t] > 0 && b == (clen[t] - 1) / block) m = INFINITY;
+    bmax[(int64_t)t * ld_b + b] = to_bf(m);
+}
+
+// The mask half: cand[t, j] = 1 iff j's block was selected (block ids from topk_select,
+// -1 padded). The caller zeroes `cand` first; this kernel only sets.
+__global__ void candidate_set_kernel(const int* __restrict__ blocks, int kb, int block, int n,
+                                     uint8_t* __restrict__ cand, int64_t ld_cand) {
+    const int t = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;  // over kb * block
+    if (i >= kb * block) return;
+    const int b = blocks[(int64_t)t * kb + i / block];
+    if (b < 0) return;
+    const int j = b * block + i % block;
+    if (j < n) cand[(int64_t)t * ld_cand + j] = 1;
+}
+
 }  // namespace
 
 // ================================================================== C ABI
@@ -907,6 +1093,41 @@ int ds_embed_hc(void* stream, const void* ids, const void* table, void* h, int M
 int ds_argmax_bf16(void* stream, const void* x, int64_t ldx, int M, int N, void* out) {
     argmax_bf16_kernel<<<M, 1024, 0, static_cast<cudaStream_t>(stream)>>>(
         static_cast<const __nv_bfloat16*>(x), ldx, N, static_cast<int*>(out));
+    return static_cast<int>(cudaGetLastError());
+}
+
+int ds_index_scores(void* stream, const void* q, const void* k, const void* w, const void* clen, const void* cand,
+                    int64_t ld_cand, int n, void* out, int64_t ld_out, int T) {
+    if (n < 1) return cudaErrorInvalidValue;
+    dim3 grid((n + kIdxTile - 1) / kIdxTile, T);
+    index_scores_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(k), static_cast<const float*>(w),
+        static_cast<const int*>(clen), static_cast<const uint8_t*>(cand), ld_cand, n,
+        static_cast<__nv_bfloat16*>(out), ld_out);
+    return static_cast<int>(cudaGetLastError());
+}
+
+int ds_topk_select(void* stream, const void* s, int64_t ld_s, int n, int K, void* out, int width, int T) {
+    if (K > width || n < 1) return cudaErrorInvalidValue;
+    topk_select_kernel<<<T, kSelThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16*>(s), ld_s, n, K, static_cast<int*>(out), width);
+    return static_cast<int>(cudaGetLastError());
+}
+
+int ds_candidate_blocks(void* stream, const void* s, int64_t ld_s, int n, int block, const void* clen, void* bmax,
+                        int64_t ld_b, int T) {
+    const int nb = (n + block - 1) / block;
+    dim3 grid((nb + 255) / 256, T);
+    candidate_blocks_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16*>(s), ld_s, n, block, static_cast<const int*>(clen),
+        static_cast<__nv_bfloat16*>(bmax), ld_b);
+    return static_cast<int>(cudaGetLastError());
+}
+
+int ds_candidate_set(void* stream, const void* blocks, int kb, int block, int n, void* cand, int64_t ld_cand, int T) {
+    dim3 grid((kb * block + 255) / 256, T);
+    candidate_set_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const int*>(blocks), kb, block, n, static_cast<uint8_t*>(cand), ld_cand);
     return static_cast<int>(cudaGetLastError());
 }
 

@@ -703,3 +703,109 @@ fn engram_dequant_gate_embed_argmax() {
     st.synchronize().unwrap();
     assert_eq!(da.download().unwrap(), vec![777, 128_000]);
 }
+
+// ------------------------------------------------------------------ indexer
+#[test]
+fn index_scores_match_the_bf16_einsum_reference() {
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(53);
+    let (t, n, h, dd) = (3usize, 300usize, 32usize, 128usize);
+    let q = rng.bf16_vec(t * h * dd, 0.3);
+    let k = rng.bf16_vec(n * dd, 0.3);
+    let w: Vec<f32> = (0..t * h).map(|_| rng.unif()).collect();
+    let clen = [100i32, 250, 300];
+    let cand: Vec<u8> = (0..t * n).map(|i| ((i / 8) % 3 != 1) as u8).collect();
+    let (dq, dk, dw, dc, dcand) = (dev(&q), dev(&k), dev(&w), dev(&clen), dev(&cand));
+    for masked in [false, true] {
+        let dout = DeviceBuffer::<u16>::zeroed(t * n).unwrap();
+        ok(unsafe {
+            ds_index_scores(st.raw(), p(&dq), p(&dk), p(&dw), p(&dc), if masked { p(&dcand) } else { null() },
+                            n as i64, n as i32, p(&dout), n as i64, t as i32)
+        });
+        st.synchronize().unwrap();
+        let got = dout.download().unwrap();
+        for r in 0..t {
+            for j in 0..n {
+                let g = f32_from_bf16(got[r * n + j]);
+                if j as i32 >= clen[r] || (masked && cand[r * n + j] == 0) {
+                    assert!(g.is_infinite() && g < 0.0, "row {r} key {j} should be masked, got {g}");
+                    continue;
+                }
+                let (mut sum, mut mag) = (0f64, 0f64);
+                for hh in 0..h {
+                    let dot: f64 = (0..dd)
+                        .map(|c| f32_from_bf16(q[(r * h + hh) * dd + c]) as f64 * f32_from_bf16(k[j * dd + c]) as f64)
+                        .sum();
+                    let term = (bf(dot as f32).max(0.0) * w[r * h + hh]) as f64;
+                    sum += term;
+                    mag += term.abs() + 2f64.powi(-8) * (dot.abs() * w[r * h + hh] as f64);
+                }
+                assert!((g as f64 - sum).abs() <= mag * 2f64.powi(-7) + 1e-6, "score[{r}][{j}] {g} vs {sum}");
+            }
+        }
+    }
+}
+
+#[test]
+fn topk_select_keeps_the_largest_lowest_index_ties_ascending() {
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(59);
+    let (t, n, width) = (4usize, 5000usize, 1100usize);
+    // coarse values force many exact ties at the threshold; some entries masked to -inf
+    let s: Vec<u16> = (0..t * n)
+        .map(|i| {
+            if i % 7 == 3 {
+                0xff80
+            } else {
+                bf16_from_f32(((rng.next() % 64) as f32 - 32.0) / 4.0)
+            }
+        })
+        .collect();
+    for (k, rows_n) in [(1024usize, n), (1024, 900), (37, n)] {
+        let (ds, dout) = (dev(&s), DeviceBuffer::<i32>::zeroed(t * width).unwrap());
+        ok(unsafe { ds_topk_select(st.raw(), p(&ds), n as i64, rows_n as i32, k as i32, p(&dout), width as i32, t as i32) });
+        st.synchronize().unwrap();
+        let got = dout.download().unwrap();
+        for r in 0..t {
+            let row = &s[r * n..r * n + rows_n];
+            let mut order: Vec<usize> = (0..rows_n).filter(|&i| row[i] != 0xff80).collect();
+            order.sort_by(|&a, &b| f32_from_bf16(row[b]).partial_cmp(&f32_from_bf16(row[a])).unwrap().then(a.cmp(&b)));
+            let mut want: Vec<i32> = order.iter().take(k).map(|&i| i as i32).collect();
+            want.sort_unstable();
+            want.resize(width, -1);
+            assert_eq!(&got[r * width..(r + 1) * width], &want[..], "row {r} k {k} n {rows_n}");
+        }
+    }
+}
+
+#[test]
+fn candidate_blocks_force_the_last_block_and_set_whole_blocks() {
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(61);
+    let (t, n, block, kb) = (2usize, 400usize, 8usize, 10usize);
+    let s: Vec<u16> = (0..t * n).map(|_| bf16_from_f32(rng.normal())).collect();
+    let clen = [400i32, 123];
+    let nb = n / block;
+    let (ds, dc) = (dev(&s), dev(&clen));
+    let dbmax = DeviceBuffer::<u16>::zeroed(t * nb).unwrap();
+    ok(unsafe { ds_candidate_blocks(st.raw(), p(&ds), n as i64, n as i32, block as i32, p(&dc), p(&dbmax), nb as i64, t as i32) });
+    let dblocks = DeviceBuffer::<i32>::zeroed(t * kb).unwrap();
+    ok(unsafe { ds_topk_select(st.raw(), p(&dbmax), nb as i64, nb as i32, kb as i32, p(&dblocks), kb as i32, t as i32) });
+    let dcand = DeviceBuffer::<u8>::zeroed(t * n).unwrap();
+    ok(unsafe { ds_candidate_set(st.raw(), p(&dblocks), kb as i32, block as i32, n as i32, p(&dcand), n as i64, t as i32) });
+    st.synchronize().unwrap();
+    let (bmax, blocks, cand) = (dbmax.download().unwrap(), dblocks.download().unwrap(), dcand.download().unwrap());
+    for r in 0..t {
+        let last = (clen[r] as usize - 1) / block;
+        for b in 0..nb {
+            let m = (b * block..(b + 1) * block).map(|i| f32_from_bf16(s[r * n + i])).fold(f32::NEG_INFINITY, f32::max);
+            let want = if b == last { f32::INFINITY } else { m };
+            assert_eq!(f32_from_bf16(bmax[r * nb + b]), bf(want), "bmax[{r}][{b}]");
+        }
+        let chosen = &blocks[r * kb..(r + 1) * kb];
+        assert!(chosen.contains(&(last as i32)), "the block holding clen-1 is always kept");
+        for j in 0..n {
+            assert_eq!(cand[r * n + j] == 1, chosen.contains(&((j / block) as i32)), "cand[{r}][{j}]");
+        }
+    }
+}
