@@ -1,9 +1,9 @@
-//! Bringing up a two-box pair from a CLI: `--world 2 --rank R --addr HOST:PORT`.
+//! Bringing up a two-box tensor-parallel pair from a CLI: `--world 2 --rank R --addr HOST:PORT`.
 
 use std::time::Duration;
 
-use crate::forward::{Options, Pair};
-use crate::keep::owned_split;
+use crate::forward::{Options, Pair, TP_MAX_GATHER};
+use crate::weights::Tp;
 use crate::Result;
 
 pub struct PairArgs {
@@ -24,12 +24,13 @@ pub fn pair_args(args: &[String]) -> Result<Option<PairArgs>> {
     }
 }
 
-/// Agree on the boot config with the peer, then take this rank's share of the routable
-/// experts (`scores`: the demand ranking that alternates them between the ranks).
-pub fn join(opts: &mut Options, scores: Option<&[Vec<f64>]>, model_dir: &std::path::Path, pa: &PairArgs) -> Result<Pair> {
-    let keep = opts.keep.as_ref().ok_or("expert parallel needs a keep set (--keep-db/--budget or --keep-first)")?;
+/// Agree on the boot config with the peer, bring up RoCE (on the HCAs NCCL_IB_HCA names, all
+/// active ones otherwise), and make `opts` this rank's tensor-parallel shard.
+pub fn join(opts: &mut Options, model_dir: &std::path::Path, pa: &PairArgs) -> Result<Pair> {
     let boot = opts.boot_config(model_dir)?;
-    let (comm, ctl) = tidelm_comm::join(pa.rank, &pa.addr, &boot, Duration::from_secs(300))?;
-    opts.owned = Some(owned_split(keep, scores, 2, pa.rank));
-    Ok(Pair { comm, ctl })
+    let (comm, mut ctl) = tidelm_comm::join(pa.rank, &pa.addr, &boot, Duration::from_secs(300))?;
+    let hcas: Option<Vec<String>> = std::env::var("NCCL_IB_HCA").ok().map(|v| v.split(',').map(|s| s.to_string()).collect());
+    let roce = tidelm_comm::roce::Roce::setup(pa.rank, &mut ctl, TP_MAX_GATHER, hcas.as_deref())?;
+    opts.tp = Some(Tp { rank: pa.rank, world: 2 });
+    Ok(Pair { comm, ctl, roce })
 }

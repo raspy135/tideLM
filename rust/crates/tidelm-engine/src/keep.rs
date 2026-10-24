@@ -40,23 +40,3 @@ pub fn keep_from_demand(path: &std::path::Path, layers: usize, experts: usize, f
                         -> Result<Vec<Vec<bool>>> {
     keep_from_scores(&load_demand(path, layers, experts)?, floor, budget)
 }
-
-/// The kept experts this rank holds: per layer, alternate ranks down the demand ranking
-/// (ties by expert id; without scores, by id), so both ranks get a like share of the hot
-/// experts. Both ranks compute it from the same inputs.
-pub fn owned_split(keep: &[Vec<bool>], scores: Option<&[Vec<f64>]>, world: usize, rank: usize) -> Vec<Vec<bool>> {
-    keep.iter()
-        .enumerate()
-        .map(|(l, k)| {
-            let mut kept: Vec<usize> = (0..k.len()).filter(|&e| k[e]).collect();
-            if let Some(s) = scores {
-                kept.sort_by(|&a, &b| s[l][b].partial_cmp(&s[l][a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
-            }
-            let mut owned = vec![false; k.len()];
-            for (i, &e) in kept.iter().enumerate() {
-                owned[e] = i % world == rank;
-            }
-            owned
-        })
-        .collect()
-}

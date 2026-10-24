@@ -1238,8 +1238,10 @@ __global__ void embed_hc_kernel(const int* __restrict__ ids, const __nv_bfloat16
 }
 
 // First index of the maximum (torch.argmax), over bf16 logits.
+// `pair`: also the maximum, the index written as offset + n, as (index, value bits) pairs -
+// a vocab-sharded head's per-rank candidate for argmax_combine_kernel.
 __global__ void argmax_bf16_kernel(const __nv_bfloat16* __restrict__ x, int64_t ldx, int N,
-                                   int* __restrict__ out) {
+                                   int* __restrict__ out, int pair, int offset) {
     __shared__ float bv[32];
     __shared__ int bi[32];
     const __nv_bfloat16* xr = x + (int64_t)blockIdx.x * ldx;
@@ -1262,8 +1264,38 @@ __global__ void argmax_bf16_kernel(const __nv_bfloat16* __restrict__ x, int64_t 
         besti = bi[0];
         for (int i = 1; i < (int)(blockDim.x >> 5); ++i)
             if (bv[i] > best || (bv[i] == best && bi[i] < besti)) { best = bv[i]; besti = bi[i]; }
-        out[blockIdx.x] = besti;
+        if (pair) {
+            out[2 * blockIdx.x] = besti + offset;
+            out[2 * blockIdx.x + 1] = __float_as_int(best);
+        } else {
+            out[blockIdx.x] = besti;
+        }
     }
+}
+
+// The vocab-sharded head's argmax: per row the larger of the ranks' (index, value) pairs
+// [world][M][2], the earlier rank on a tie - its indices are the lower ones, so this is the
+// one-box first-index argmax.
+__global__ void argmax_combine_kernel(const int* __restrict__ pairs, int world, int M, int* __restrict__ out) {
+    const int m = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= M) return;
+    int best = pairs[2 * m];
+    float bv = __int_as_float(pairs[2 * m + 1]);
+    for (int r = 1; r < world; ++r) {
+        const float v = __int_as_float(pairs[2 * ((int64_t)r * M + m) + 1]);
+        if (v > bv) { bv = v; best = pairs[2 * ((int64_t)r * M + m)]; }
+    }
+    out[m] = best;
+}
+
+// A tensor-parallel gather's rank-major result [world][M][n] as full rows [M][world * n].
+__global__ void unshard_u16_kernel(const uint16_t* __restrict__ src, uint16_t* __restrict__ dst, int M, int n, int world) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t total = (int64_t)world * M * n;
+    if (i >= total) return;
+    const int64_t r = i / ((int64_t)M * n), rem = i % ((int64_t)M * n);
+    const int64_t m = rem / n, j = rem % n;
+    dst[m * (int64_t)world * n + r * n + j] = src[i];
 }
 
 // ------------------------------------------------------------------ indexer
@@ -1850,7 +1882,7 @@ int ds_embed_hc(void* stream, const void* ids, const void* table, void* h, int M
 
 int ds_argmax_bf16(void* stream, const void* x, int64_t ldx, int M, int N, void* out) {
     argmax_bf16_kernel<<<M, 1024, 0, static_cast<cudaStream_t>(stream)>>>(
-        static_cast<const __nv_bfloat16*>(x), ldx, N, static_cast<int*>(out));
+        static_cast<const __nv_bfloat16*>(x), ldx, N, static_cast<int*>(out), 0, 0);
     return static_cast<int>(cudaGetLastError());
 }
 
@@ -1982,6 +2014,25 @@ int ds_greedy_accept(void* stream, const void* am, const void* block, int T, con
 
 int ds_wait_flag(void* stream, const void* flag, int expect, long long timeout_ns, void* err) {
     wait_flag_kernel<<<1, 32, 0, DS_ST>>>(static_cast<const volatile int*>(flag), expect, timeout_ns, static_cast<int*>(err));
+    DS_RET;
+}
+
+int ds_argmax_bf16_pairs(void* stream, const void* x, int64_t ldx, int M, int N, int offset, void* out) {
+    argmax_bf16_kernel<<<M, 1024, 0, DS_ST>>>(static_cast<const __nv_bfloat16*>(x), ldx, N, static_cast<int*>(out), 1,
+                                             offset);
+    DS_RET;
+}
+
+int ds_argmax_combine(void* stream, const void* pairs, int world, int M, void* out) {
+    argmax_combine_kernel<<<(M + 127) / 128, 128, 0, DS_ST>>>(static_cast<const int*>(pairs), world, M,
+                                                              static_cast<int*>(out));
+    DS_RET;
+}
+
+int ds_unshard_u16(void* stream, const void* src, void* dst, int M, int n, int world) {
+    const int64_t total = (int64_t)world * M * n;
+    unshard_u16_kernel<<<(unsigned)((total + 255) / 256), 256, 0, DS_ST>>>(static_cast<const uint16_t*>(src),
+        static_cast<uint16_t*>(dst), M, n, world);
     DS_RET;
 }
 

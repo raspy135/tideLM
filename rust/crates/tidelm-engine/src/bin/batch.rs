@@ -78,13 +78,13 @@ fn main() -> tidelm_engine::Result<()> {
         n_layers,
         keep,
         dspark_keep,
-        owned: None,
+        tp: None,
     };
     let t0 = Instant::now();
     let pair_args = tidelm_engine::pair::pair_args(&args)?;
     let mut opts = opts;
     let pair = match &pair_args {
-        Some(pa) => Some(tidelm_engine::pair::join(&mut opts, scores.as_deref(), &model_dir, pa)?),
+        Some(pa) => Some(tidelm_engine::pair::join(&mut opts, &model_dir, pa)?),
         None => None,
     };
     let mut engine = Engine::new(&model_dir, token_map, opts)?;

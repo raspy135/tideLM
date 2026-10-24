@@ -197,6 +197,14 @@ extern "C" {
     /// Output rows per block of the tensor-core GEMM at m rows (for choosing split-K).
     pub fn ds_mma_rows_per_block(m: c_int) -> c_int;
 
+    /// Per row of x [M][N]: the first-index argmax as (offset + index, value bits) pairs [M][2].
+    pub fn ds_argmax_bf16_pairs(stream: CudaStream, x: *const c_void, ldx: i64, m: c_int, n: c_int, offset: c_int,
+                                out: *mut c_void) -> c_int;
+    /// The larger of the ranks' pairs [world][M][2] per row, the earlier rank on a tie.
+    pub fn ds_argmax_combine(stream: CudaStream, pairs: *const c_void, world: c_int, m: c_int, out: *mut c_void) -> c_int;
+    /// [world][M][n] -> [M][world * n].
+    pub fn ds_unshard_u16(stream: CudaStream, src: *const c_void, dst: *mut c_void, m: c_int, n: c_int, world: c_int) -> c_int;
+
     /// bf16 [N][K] -> e4m3 codes [N][K] + UE8M0 scales [ceil(N/32)][ceil(K/32)]
     /// (tools/fp8_linear.py::quantize_to_fp8).
     pub fn ds_quant_fp8_block32(stream: CudaStream, w: *const c_void, n: c_int, k: c_int, codes: *mut c_void,

@@ -41,7 +41,7 @@ use tidelm_model::{Checkpoint, ExpertReader, STAGE_BYTES};
 
 use crate::config::Config;
 use crate::rope;
-use crate::weights::{DsparkW, Fp8, Layer, Loader};
+use crate::weights::{DsparkW, Fp8, Layer, Loader, Tp};
 use crate::Result;
 
 /// Rows per step, all lanes together (64 rows x top-6 = 384 routed pairs; the router's
@@ -204,15 +204,15 @@ pub struct Options {
     pub keep: Option<Vec<Vec<bool>>>,
     /// per DSpark block, the routable experts (tests; serving keeps all 3 x 128)
     pub dspark_keep: Option<Vec<Vec<bool>>>,
-    /// expert parallel over the pair: this rank's share of the routable backbone experts
-    /// (keep::owned_split). None: one box, every routable expert local.
-    pub owned: Option<Vec<Vec<bool>>>,
+    /// tensor parallel over the pair (weights::Tp): this rank's shard of every backbone
+    /// layer, routed expert and the head. None: one box.
+    pub tp: Option<Tp>,
 }
 
 impl Options {
     pub fn streaming(max_seq: usize, spec: bool) -> Self {
         Options { max_seq, max_lanes: 1, spec, resident: false, graphs: false, n_layers: None, keep: None, dspark_keep: None,
-                  owned: None }
+                  tp: None }
     }
 
     /// The bytes both ranks of a pair must agree on before they start (tidelm_comm::join):
@@ -222,12 +222,11 @@ impl Options {
         let mask = |m: &Option<Vec<Vec<bool>>>| m.as_ref().map(|m| fnv(&m.iter().flatten().map(|&b| b as u8).collect::<Vec<_>>())).unwrap_or(0);
         let exe = std::fs::read("/proc/self/exe")?;
         let cfg = std::fs::read(model_dir.join("config.json")).or_else(|_| std::fs::read(model_dir.join("inference/config.json")))?;
-        Ok(format!("tidelm-pair v1 | max_seq {} lanes {} spec {} resident {} graphs {} layers {:?} | keep {:x} dspark_keep {:x} \
-                    | exe {:x} | config {:x} | env NO_QDQ={:?} ENGRAM_CACHE_MB={:?} PAIR_OVERLAP={:?} DRAFT_HEAD_FMT={:?}",
+        Ok(format!("tidelm-pair v2 tp | max_seq {} lanes {} spec {} resident {} graphs {} layers {:?} | keep {:x} \
+                    dspark_keep {:x} | exe {:x} | config {:x} | env NO_QDQ={:?} ENGRAM_CACHE_MB={:?} DRAFT_HEAD_FMT={:?}",
                    self.max_seq, self.max_lanes, self.spec, self.resident, self.graphs, self.n_layers, mask(&self.keep),
                    mask(&self.dspark_keep), fnv(&exe), fnv(&cfg), std::env::var("TIDELM_NO_QDQ").ok(),
-                   std::env::var("TIDELM_ENGRAM_CACHE_MB").ok(), std::env::var("TIDELM_PAIR_OVERLAP").ok(),
-                   std::env::var("TIDELM_DRAFT_HEAD_FMT").ok()).into_bytes())
+                   std::env::var("TIDELM_ENGRAM_CACHE_MB").ok(), std::env::var("TIDELM_DRAFT_HEAD_FMT").ok()).into_bytes())
     }
 }
 
@@ -239,21 +238,18 @@ const OP_RESET_LANE: u32 = 5;
 const OP_GRAPHS: u32 = 6;
 const OP_SHUTDOWN: u32 = 7;
 
-/// This engine's half of a pair (expert parallel over two boxes): the NCCL communicator its
-/// MoE combines all-reduce over, and the control channel. Rank 0 (the leader) sends every
-/// engine call to rank 1 before running it; rank 1 runs `follow` and decides nothing.
+/// This engine's half of a tensor-parallel pair: the RoCE one-shot gather every sharded
+/// output goes through, the NCCL communicator, and the control channel. Rank 0 (the
+/// leader) sends every engine call to rank 1 before running it; rank 1 runs `follow` and
+/// decides nothing.
 pub struct Pair {
     pub comm: tidelm_comm::Comm,
     pub ctl: tidelm_comm::Control,
+    pub roce: tidelm_comm::roce::Roce,
 }
 
-/// The side stream a layer's combine all-reduce runs on while the shared expert computes
-/// (forked and joined by events, so a captured step graph keeps both branches).
-struct Overlap {
-    side: Stream,
-    fork: tidelm_cuda::Event,
-    join: tidelm_cuda::Event,
-}
+/// The largest shard a step gathers: the head's logits, 64 rows x half the vocabulary.
+pub const TP_MAX_GATHER: usize = TMAX * 129_280 / 2 * 2;
 
 /// Which logits a segment of a step returns.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -381,10 +377,14 @@ impl RowCache {
 struct SendPtr(*mut u8);
 unsafe impl Send for SendPtr {}
 
-const W13: usize = 2304 * 2560;
-const S13: usize = 2304 * 160;
-const W2: usize = 5120 * 1152;
-const S2: usize = 5120 * 72;
+/// One routed expert's FP4 tensors (w1/w3 [inter][dim], w2 [dim][inter], packed 2 a byte,
+/// UE8M0 per 32): bytes of a weight and its scales per output row.
+const INTER: usize = 2304;
+const DIM: usize = 5120;
+const W13_ROW: usize = DIM / 2;
+const S13_ROW: usize = DIM / 32;
+const W2_ROW: usize = INTER / 2;
+const S2_ROW: usize = INTER / 32;
 
 /// The routed-expert arena for streaming: ARENA_SLOTS slots in the native FP4 layout
 /// (tools/fp4_moe.py::ExpertArena at world 1).
@@ -395,18 +395,40 @@ struct Arena {
     s2: DeviceBuffer<u8>,
     w3: DeviceBuffer<u8>,
     s3: DeviceBuffer<u8>,
+    /// rows a slot holds: the intermediate rows of w1/w3 and the output rows of w2 (all of
+    /// them on one box, this rank's half under tensor parallel)
+    inter: usize,
+    dim: usize,
 }
 
 impl Arena {
-    fn new(slots: usize) -> Result<Self> {
+    fn new(slots: usize, tp: Option<Tp>) -> Result<Self> {
+        let w = tp.map(|t| t.world).unwrap_or(1);
+        let (inter, dim) = (INTER / w, DIM / w);
         Ok(Arena {
-            w1: DeviceBuffer::new(slots * W13)?,
-            s1: DeviceBuffer::new(slots * S13)?,
-            w2: DeviceBuffer::new(slots * W2)?,
-            s2: DeviceBuffer::new(slots * S2)?,
-            w3: DeviceBuffer::new(slots * W13)?,
-            s3: DeviceBuffer::new(slots * S13)?,
+            w1: DeviceBuffer::new(slots * inter * W13_ROW)?,
+            s1: DeviceBuffer::new(slots * inter * S13_ROW)?,
+            w2: DeviceBuffer::new(slots * dim * W2_ROW)?,
+            s2: DeviceBuffer::new(slots * dim * S2_ROW)?,
+            w3: DeviceBuffer::new(slots * inter * W13_ROW)?,
+            s3: DeviceBuffer::new(slots * inter * S13_ROW)?,
+            inter,
+            dim,
         })
+    }
+
+    /// (destination, source offset in the full tensor, bytes) of slot `slot`'s six tensors,
+    /// in read_expert_into's order (w1, s1, w2, s2, w3, s3), for rank `rank`'s rows.
+    fn slot_dsts(&self, slot: usize, rank: usize) -> [(*mut c_void, usize, usize); 6] {
+        let (i, d) = (self.inter, self.dim);
+        [
+            (self.w1.ptr_at(slot * i * W13_ROW), rank * i * W13_ROW, i * W13_ROW),
+            (self.s1.ptr_at(slot * i * S13_ROW), rank * i * S13_ROW, i * S13_ROW),
+            (self.w2.ptr_at(slot * d * W2_ROW), rank * d * W2_ROW, d * W2_ROW),
+            (self.s2.ptr_at(slot * d * S2_ROW), rank * d * S2_ROW, d * S2_ROW),
+            (self.w3.ptr_at(slot * i * W13_ROW), rank * i * W13_ROW, i * W13_ROW),
+            (self.s3.ptr_at(slot * i * S13_ROW), rank * i * S13_ROW, i * S13_ROW),
+        ]
     }
 }
 
@@ -457,8 +479,15 @@ struct Act {
     hs: DeviceBuffer<u16>,
     sh: DeviceBuffer<u16>,
     moe_out: DeviceBuffer<u16>,
-    /// expert parallel: this rank's routed k-sum, all-reduced in place
-    moe_partial: DeviceBuffer<f32>,
+    // tensor parallel: shards and their gathered whole rows (unused on one box)
+    oa_full: DeviceBuffer<u16>,
+    attn_local: DeviceBuffer<u16>,
+    hcat: DeviceBuffer<u16>,
+    hcat_full: DeviceBuffer<u16>,
+    moe_local: DeviceBuffer<u16>,
+    ekv_local: DeviceBuffer<u16>,
+    tp_logits: DeviceBuffer<u16>,
+    tp_scratch: DeviceBuffer<u8>,
     kvl: DeviceBuffer<f32>,
     sc: DeviceBuffer<f32>,
     lat: DeviceBuffer<u16>,
@@ -610,53 +639,43 @@ struct Lane {
 struct ExpertSet {
     arena: Arena,
     lut: DeviceBuffer<i32>,
-    /// the slot the peer's experts route to under expert parallel: the up kernels skip its
-    /// pairs and the down kernels write them as exact zeros (-1 on one box)
-    null_slot: i32,
 }
 
 impl ExpertSet {
-    /// `owned`: under expert parallel, the routable experts this rank holds; the rest of the
-    /// routable set routes to the null slot.
+    /// `tp`: hold this rank's half of every routable expert (w1/w3 intermediate rows, w2
+    /// output rows), so the pair's memory holds twice the experts and each rank does half of
+    /// every routed pair.
     #[allow(clippy::too_many_arguments)]
     fn load(ckpt: &Checkpoint, stream: &Stream, prefix: &dyn Fn(usize) -> String, blocks: usize, n_experts: usize,
-            keep: Option<&[Vec<bool>]>, owned: Option<&[Vec<bool>]>) -> Result<Self> {
+            keep: Option<&[Vec<bool>]>, tp: Option<Tp>) -> Result<Self> {
         let routable = |b: usize, x: usize| keep.map(|k| k[b][x]).unwrap_or(true);
-        let local = |b: usize, x: usize| routable(b, x) && owned.map(|o| o[b][x]).unwrap_or(true);
-        let n_slots: usize = (0..blocks).map(|b| (0..n_experts).filter(|&x| local(b, x)).count()).sum();
-        let null_slot = if owned.is_some() { n_slots as i32 } else { -1 };
-        let arena = Arena::new(n_slots.max(1))?;
+        let n_slots: usize = (0..blocks).map(|b| (0..n_experts).filter(|&x| routable(b, x)).count()).sum();
+        let arena = Arena::new(n_slots.max(1), tp)?;
+        let rank = tp.map(|t| t.rank).unwrap_or(0);
+        let world = tp.map(|t| t.world).unwrap_or(1);
         let mut lut = vec![-1i32; blocks * n_experts];
         let mut stage = PinnedBuffer::uninit(STAGE_BYTES)?;
         let reader = ExpertReader::new(ckpt);
         let mut slot = 0usize;
         for b in 0..blocks {
             for x in 0..n_experts {
-                if !local(b, x) {
-                    if routable(b, x) {
-                        lut[b * n_experts + x] = null_slot;
-                    }
+                if !routable(b, x) {
                     continue;
                 }
                 let views = reader.read_expert_into(&mut stage, &format!("{}ffn.experts.{x}.", prefix(b)))?;
-                let dsts: [(*mut c_void, usize); 6] = [
-                    (arena.w1.ptr_at(slot * W13), W13), (arena.s1.ptr_at(slot * S13), S13),
-                    (arena.w2.ptr_at(slot * W2), W2), (arena.s2.ptr_at(slot * S2), S2),
-                    (arena.w3.ptr_at(slot * W13), W13), (arena.s3.ptr_at(slot * S13), S13),
-                ];
-                for (&(off, len), &(dst, want)) in views.iter().zip(dsts.iter()) {
-                    if len != want {
-                        return Err(format!("{}expert {x}: tensor of {len} bytes, arena expects {want}", prefix(b)).into());
+                for (&(off, len), &(dst, src_off, n)) in views.iter().zip(arena.slot_dsts(slot, rank).iter()) {
+                    if len != n * world {
+                        return Err(format!("{}expert {x}: tensor of {len} bytes, arena expects {}", prefix(b), n * world).into());
                     }
-                    let src = unsafe { stage.as_ptr().add(off) } as *const c_void;
-                    unsafe { memcpy_async(dst, src, len, MEMCPY_HOST_TO_DEVICE, stream)? };
+                    let src = unsafe { stage.as_ptr().add(off + src_off) } as *const c_void;
+                    unsafe { memcpy_async(dst, src, n, MEMCPY_HOST_TO_DEVICE, stream)? };
                 }
                 stream.synchronize()?;
                 lut[b * n_experts + x] = slot as i32;
                 slot += 1;
             }
         }
-        Ok(ExpertSet { arena, lut: DeviceBuffer::from_slice(&lut)?, null_slot })
+        Ok(ExpertSet { arena, lut: DeviceBuffer::from_slice(&lut)? })
     }
 }
 
@@ -699,7 +718,7 @@ pub struct Engine {
     caches: Caches,
     /// expert parallel over two boxes (attach_pair); None on one box
     pair: Option<Pair>,
-    overlap: Option<Overlap>,
+    tp: Option<Tp>,
     /// rank 0 of a pair mirrors its calls to rank 1; rank 1 does not
     leader: bool,
     lanes: Vec<Lane>,
@@ -761,13 +780,13 @@ impl Resident {
         let mut ld = Loader::new(ckpt, stream)?;
         let mut layers = Vec::with_capacity(n_layers);
         for l in 0..n_layers {
-            layers.push(Some(Layer::load(&mut ld, cfg, l)?));
+            layers.push(Some(Layer::load(&mut ld, cfg, l, opts.tp)?));
         }
         let embed = ld.bf16("embed.weight", &[v, d])?;
-        let head = ld.bf16("head.weight", &[v, d])?;
+        let full_head = ld.bf16("head.weight", &[v, d])?;
         let draft_head = if opts.spec && std::env::var("TIDELM_DRAFT_HEAD_FMT").as_deref() != Ok("bf16") {
             let (w, s) = (DeviceBuffer::<u8>::new(v * d)?, DeviceBuffer::<u8>::new(v.div_ceil(32) * d.div_ceil(32))?);
-            let rc = unsafe { ds_quant_fp8_block32(stream.raw(), np(&head), v as i32, d as i32, np(&w), np(&s)) };
+            let rc = unsafe { ds_quant_fp8_block32(stream.raw(), np(&full_head), v as i32, d as i32, np(&w), np(&s)) };
             if rc != 0 {
                 return Err(format!("draft head quantization: CUDA error {rc}").into());
             }
@@ -776,8 +795,20 @@ impl Resident {
         } else {
             None
         };
+        // tensor parallel: the verifier's head is vocab-sharded (DSV41_TP_HEAD); the drafter's
+        // FP8 copy above was made from the whole head, as the drafter runs whole on each rank
+        let head = match opts.tp {
+            Some(tp) => {
+                let (r0, n) = tp.rows(v);
+                let local = DeviceBuffer::<u16>::new(n * d)?;
+                local.copy_from(0, &full_head, r0 * d, n * d, stream)?;
+                stream.synchronize()?;
+                local
+            }
+            None => full_head,
+        };
         let experts = ExpertSet::load(ckpt, stream, &|l| format!("layers.{l}."), n_layers, cfg.n_routed_experts,
-                                      opts.keep.as_deref(), opts.owned.as_deref())?;
+                                      opts.keep.as_deref(), opts.tp)?;
         // the drafter stays whole on each rank: no collective inside the draft
         let dspark_experts = if opts.spec {
             Some(ExpertSet::load(ckpt, stream, &|k| format!("mtp.{k}."), cfg.n_mtp_layers, cfg.dspark_n_routed_experts,
@@ -932,7 +963,14 @@ impl Engine {
             hs: a(t * cfg.moe_inter_dim)?,
             sh: a(t * d)?,
             moe_out: a(t * d)?,
-            moe_partial: f(t * d)?,
+            oa_full: a(if opts.tp.is_some() { t * cfg.o_groups * cfg.o_lora_rank } else { 1 })?,
+            attn_local: a(if opts.tp.is_some() { t * d } else { 1 })?,
+            hcat: a(if opts.tp.is_some() { (t + p) * cfg.moe_inter_dim } else { 1 })?,
+            hcat_full: a(if opts.tp.is_some() { (t + p) * cfg.moe_inter_dim } else { 1 })?,
+            moe_local: a(if opts.tp.is_some() { t * d } else { 1 })?,
+            ekv_local: a(if opts.tp.is_some() { t * (hc + 1) * d } else { 1 })?,
+            tp_logits: a(if opts.tp.is_some() { t * cfg.vocab_size } else { 1 })?,
+            tp_scratch: DeviceBuffer::zeroed(if opts.tp.is_some() { 2 * TP_MAX_GATHER } else { 1 })?,
             kvl: f(t * hd)?,
             sc: f(t * hd)?,
             lat: a(t * hd)?,
@@ -1025,8 +1063,8 @@ impl Engine {
             }
             None => None,
         };
-        if opts.owned.is_some() && !opts.resident {
-            return Err("expert parallel needs resident mode".into());
+        if opts.tp.is_some() && !opts.resident {
+            return Err("tensor parallel needs resident mode".into());
         }
         let resident = if opts.resident {
             Some(Resident::load(&ckpt, &stream, &cfg, n_layers, &opts)?)
@@ -1049,7 +1087,7 @@ impl Engine {
         let eg_host = (0..n_eng).map(|_| PinnedBuffer::zeroed(t * eng_cols * ENGRAM_ROW)).collect::<std::result::Result<_, _>>()?;
         let lanes_v = (0..max_lanes).map(|_| Lane { len: 0, hash: hash.fresh(), last: (0, 0, 0), step: u64::MAX }).collect();
         Ok(Engine {
-            arena: Arena::new(ARENA_SLOTS + 1)?,
+            arena: Arena::new(ARENA_SLOTS + 1, None)?,
             expert_stage: PinnedBuffer::uninit(STAGE_BYTES)?,
             logits_host: PinnedBuffer::zeroed(t * cfg.vocab_size)?,
             am_host: PinnedBuffer::zeroed(t)?,
@@ -1064,7 +1102,7 @@ impl Engine {
             act,
             caches,
             pair: None,
-            overlap: None,
+            tp: opts.tp,
             leader: false,
             lanes: lanes_v,
             max_lanes,
@@ -1101,15 +1139,11 @@ impl Engine {
 
     /// Join a pair before the first step (its MoE combines all-reduce over `pair.comm`).
     pub fn attach_pair(&mut self, pair: Pair) -> Result<()> {
+        if self.tp.map(|t| t.rank) != Some(pair.comm.rank) {
+            return Err("attach_pair: the engine was not built for this rank's tensor-parallel shard".into());
+        }
         self.leader = pair.comm.rank == 0;
         self.pair = Some(pair);
-        // TIDELM_PAIR_OVERLAP=1 (part of the boot config): the combine's all-reduce on a side
-        // stream beside the shared expert. Measured slower, so off: 40 layers, 1,000 experts,
-        // plain greedy, 127 steps 8.0 s serial vs 8.6 s overlapped (2026-10-24) - the NCCL
-        // kernel spins on the network on SMs the shared-expert GEMMs then lack.
-        if std::env::var("TIDELM_PAIR_OVERLAP").as_deref() == Ok("1") {
-            self.overlap = Some(Overlap { side: Stream::new()?, fork: tidelm_cuda::Event::new()?, join: tidelm_cuda::Event::new()? });
-        }
         Ok(())
     }
 
@@ -1590,7 +1624,7 @@ impl Engine {
                 Some(res) => res.layers[l].take().expect("resident layer present"),
                 None => {
                     let mut ld = Loader::new(&self.ckpt, &self.stream)?;
-                    Layer::load(&mut ld, &cfg, l)?
+                    Layer::load(&mut ld, &cfg, l, None)?
                 }
             };
             self.times.weights_s += t0.elapsed().as_secs_f64();
@@ -1602,7 +1636,13 @@ impl Engine {
                     let a = &self.act;
                     ck(unsafe { ds_engram_dequant(sr, np(&self.eg_raw[li]), np(&self.eg_inv[li]), t as i32, cols as i32, np(&a.erows)) }, "engram dequant")?;
                     let k = cols * cfg.engram_head_dim;
-                    gemm(sr, &a.mma_part, np(&a.erows), k, Wt::Fp8(&e.wkv), t, np(&a.ekv), false, e.wkv.n)?;
+                    let width = (hc + 1) * d;
+                    if e.wkv.n == width {
+                        gemm(sr, &a.mma_part, np(&a.erows), k, Wt::Fp8(&e.wkv), t, np(&a.ekv), false, width)?;
+                    } else {
+                        gemm(sr, &a.mma_part, np(&a.erows), k, Wt::Fp8(&e.wkv), t, np(&a.ekv_local), false, e.wkv.n)?;
+                        self.tp_gather(np(&a.ekv_local), t, e.wkv.n, np(&a.ekv))?;
+                    }
                     ck(unsafe {
                         ds_engram_gate(sr, np(&a.h), np(&a.ekv), np(&e.weight), t as i32, d as i32, hc as i32, cfg.norm_eps,
                                        (d as f64).powf(-0.5) as f32)
@@ -1703,11 +1743,16 @@ impl Engine {
             None => (np(&a.head_all), t),
         };
         if let Some(res) = &self.resident {
-            let w = match (&res.draft_head, draft) {
-                (Some(f), true) => Wt::Fp8(f),
-                _ => Wt::Bf16 { w: np(&res.head), n: v, k: d },
-            };
-            gemm(sr, &a.mma_part, x, d, w, rows, np(&a.logits), false, v)?;
+            let vl = res.head.len() / d;
+            match (&res.draft_head, draft) {
+                (Some(f), true) => gemm(sr, &a.mma_part, x, d, Wt::Fp8(f), rows, np(&a.logits), false, v)?,
+                _ if vl == v => gemm(sr, &a.mma_part, x, d, Wt::Bf16 { w: np(&res.head), n: v, k: d }, rows, np(&a.logits), false, v)?,
+                // tensor parallel: this rank's vocabulary rows, gathered into whole rows
+                _ => {
+                    gemm(sr, &a.mma_part, x, d, Wt::Bf16 { w: np(&res.head), n: vl, k: d }, rows, np(&a.tp_logits), false, vl)?;
+                    self.tp_gather(np(&a.tp_logits), rows, vl, np(&a.logits))?;
+                }
+            }
         } else {
             let mut ld = Loader::new(&self.ckpt, st)?;
             let mut n0 = 0;
@@ -1994,7 +2039,9 @@ impl Engine {
         if let (Ctx::Main { .. }, Some(comp)) = (ctx, &w.compressor) {
             self.compress(w, comp, l, t)?;
         }
-        let (d, hd, rd, h) = (cfg.dim, cfg.head_dim, cfg.rope_head_dim, cfg.n_heads);
+        let (d, hd, rd) = (cfg.dim, cfg.head_dim, cfg.rope_head_dim);
+        // this rank's heads (all of them on one box and in the drafter's blocks)
+        let h = w.wq_b.n / hd;
         let bsz = cfg.dspark_block_size;
         let ti = t as i32;
         {
@@ -2058,9 +2105,16 @@ impl Engine {
         }, "attention")?;
         ck(unsafe { ds_rope(sr, np(&a.o), (h * hd) as i64, ti, h as i32, hd as i64, (hd - rd) as i32, rd as i32, np(&a.pos), np(table), 1) }, "o rope")?;
         let og = cfg.o_groups;
-        let gk = h * hd / og;
+        let gk = cfg.n_heads * hd / og;
         gemm_grouped(sr, &a.mma_part, np(&a.o), h * hd, gk, cfg.o_lora_rank, &w.wo_a, t, np(&a.oa), w.wo_a.n)?;
-        gemm(sr, &a.mma_part, np(&a.oa), og * cfg.o_lora_rank, Wt::Fp8(&w.wo_b), t, np(&a.attn_out), false, d)
+        if w.wo_b.n == d {
+            return gemm(sr, &a.mma_part, np(&a.oa), og * cfg.o_lora_rank, Wt::Fp8(&w.wo_b), t, np(&a.attn_out), false, d);
+        }
+        // tensor parallel: this rank's heads made its wo_a groups; gather them whole, then
+        // this rank's rows of wo_b, then gather those
+        self.tp_gather(np(&a.oa), t, w.wo_a.n, np(&a.oa_full))?;
+        gemm(sr, &a.mma_part, np(&a.oa_full), og * cfg.o_lora_rank, Wt::Fp8(&w.wo_b), t, np(&a.attn_local), false, w.wo_b.n)?;
+        self.tp_gather(np(&a.attn_local), t, w.wo_b.n, np(&a.attn_out))
     }
 
     /// model.py::_indexer at an index-source layer: which compressed positions this layer
@@ -2223,8 +2277,11 @@ impl Engine {
             let live = if layer.is_some() { np(&a.live_pairs) } else { nul() };
             ck(unsafe { ds_lut_slots(sr, np(&a.idx), set.lut.ptr_at(bi * e), p as i32, np(&a.keys), live) }, "lut slots")?;
             ck(unsafe { fp4::fp4_moe_cuda_route_small(sr, np(&a.keys), np(&a.block_slot), np(&a.block_pair), np(&a.block_route), p as i32, k as i32) }, "route")?;
-            self.routed_experts(ar, t, k, set.null_slot)?;
-            return self.shared_and_combine(w, t, layer.is_some());
+            if ar.inter < cfg.moe_inter_dim {
+                return self.moe_tp(w, ar, t, k);
+            }
+            self.routed_experts(ar, t, k)?;
+            return self.shared_and_combine(w, t);
         }
         let mut idx = vec![0i32; p];
         self.act.idx.download_async(0, &mut idx, st)?;
@@ -2245,13 +2302,7 @@ impl Engine {
             let tl = Instant::now();
             for (slot, &ex) in group.iter().enumerate() {
                 let views = reader.read_expert_into(&mut self.expert_stage, &format!("{}ffn.experts.{ex}.", w.prefix))?;
-                let ar = &self.arena;
-                let dsts: [(*mut c_void, usize); 6] = [
-                    (ar.w1.ptr_at(slot * W13), W13), (ar.s1.ptr_at(slot * S13), S13),
-                    (ar.w2.ptr_at(slot * W2), W2), (ar.s2.ptr_at(slot * S2), S2),
-                    (ar.w3.ptr_at(slot * W13), W13), (ar.s3.ptr_at(slot * S13), S13),
-                ];
-                for (&(off, len), &(dst, want)) in views.iter().zip(dsts.iter()) {
+                for (&(off, len), &(dst, _, want)) in views.iter().zip(self.arena.slot_dsts(slot, 0).iter()) {
                     if len != want {
                         return Err(format!("{}expert {ex}: tensor of {len} bytes, arena expects {want}", w.prefix).into());
                     }
@@ -2274,15 +2325,16 @@ impl Engine {
             a.keys.upload_async(0, &keys, st)?;
             let ar = &self.arena;
             ck(unsafe { fp4::fp4_moe_cuda_route_small(sr, np(&a.keys), np(&a.block_slot), np(&a.block_pair), np(&a.block_route), p as i32, k as i32) }, "route")?;
-            self.routed_experts(ar, t, k, -1)?;
+            self.routed_experts(ar, t, k)?;
         }
-        self.shared_and_combine(w, t, false)
+        self.shared_and_combine(w, t)
     }
 
     /// The routed experts' up + down over the routing blocks in act (route_small's output),
     /// with arena `ar`: the bm16 kernels up to FMA_ROWS rows (one-row bits), the tensor-core
     /// kernels above, where bm16 goes compute-bound as pairs concentrate on experts.
-    fn routed_experts(&self, ar: &Arena, t: usize, k: usize, null_slot: i32) -> Result<()> {
+    fn routed_experts(&self, ar: &Arena, t: usize, k: usize) -> Result<()> {
+        let null_slot = -1;
         let cfg = &self.cfg;
         let sr = self.stream.raw();
         let a = &self.act;
@@ -2311,44 +2363,75 @@ impl Engine {
         }, "moe down")
     }
 
-    /// The shared expert and the combine (model.py::moe's tail); `backbone` layers of a pair
-    /// all-reduce the routed k-sum first (the drafter is whole on each rank).
-    fn shared_and_combine(&self, w: &Layer, t: usize, backbone: bool) -> Result<()> {
+    /// The shared expert and the one-box combine (model.py::moe's tail).
+    fn shared_and_combine(&self, w: &Layer, t: usize) -> Result<()> {
         let cfg = &self.cfg;
         let sr = self.stream.raw();
         let (d, inter, k) = (cfg.dim, cfg.moe_inter_dim, w.topk);
         let ti = t as i32;
         let a = &self.act;
         let part = &a.mma_part;
-        // a pair's routed k-sum is all-reduced, on the side stream beside the shared expert when
-        // TIDELM_PAIR_OVERLAP=1 (attach_pair). In a step graph the collective sits between two
-        // layers' work, ~150 us each (examples/pair_step.rs: 40 of them, 34.0 -> 39.9 ms/step)
-        let ep = match (&self.pair, &self.overlap, backbone) {
-            (Some(pair), Some(ov), true) => {
-                ck(unsafe { ds_moe_partial(sr, np(&a.parts), k as i32, ti, np(&a.moe_partial), d as i32) }, "moe partial")?;
-                ov.fork.record(&self.stream)?;
-                ov.side.wait_event(&ov.fork)?;
-                pair.comm.allreduce_f32(np(&a.moe_partial), t * d, &ov.side)?;
-                ov.join.record(&ov.side)?;
-                Some(ov)
-            }
-            _ => None,
-        };
         gemm(sr, part, np(&a.y), d, Wt::Fp8(&w.sh_w1), t, np(&a.g), false, inter)?;
         gemm(sr, part, np(&a.y), d, Wt::Fp8(&w.sh_w3), t, np(&a.u), false, inter)?;
         ck(unsafe { ds_swiglu(sr, np(&a.g), inter as i64, np(&a.u), inter as i64, np(&a.hs), inter as i64, ti, inter as i32, cfg.swiglu_limit) }, "shared swiglu")?;
         gemm(sr, part, np(&a.hs), inter, Wt::Fp8(&w.sh_w2), t, np(&a.sh), false, d)?;
-        match (ep, &self.pair, backbone) {
-            (Some(ov), _, _) => {
-                self.stream.wait_event(&ov.join)?;
-                ck(unsafe { ds_moe_finish(sr, np(&a.moe_partial), np(&a.sh), np(&a.moe_out), ti, d as i32) }, "moe finish")
-            }
-            (None, Some(pair), true) => {
-                ck(unsafe { ds_moe_partial(sr, np(&a.parts), k as i32, ti, np(&a.moe_partial), d as i32) }, "moe partial")?;
-                pair.comm.allreduce_f32(np(&a.moe_partial), t * d, &self.stream)?;
-                ck(unsafe { ds_moe_finish(sr, np(&a.moe_partial), np(&a.sh), np(&a.moe_out), ti, d as i32) }, "moe finish")
-            }
-            _ => ck(unsafe { ds_moe_combine(sr, np(&a.parts), k as i32, ti, np(&a.sh), np(&a.moe_out), d as i32) }, "moe combine"),
+        ck(unsafe { ds_moe_combine(sr, np(&a.parts), k as i32, ti, np(&a.sh), np(&a.moe_out), d as i32) }, "moe combine")
+    }
+
+    /// The tensor-parallel MoE (DSV41_TP_EXPERTS with the output layout): this rank computes
+    /// its half of every routed pair's and the shared expert's intermediate rows (written
+    /// behind each other: shared rows, then the pairs), one gather makes them whole, then its
+    /// half of every output row, and a second gather the layer's output. Each element is the
+    /// one-box dot product: no partial sums cross the pair.
+    fn moe_tp(&self, w: &Layer, ar: &Arena, t: usize, k: usize) -> Result<()> {
+        let cfg = &self.cfg;
+        let sr = self.stream.raw();
+        let a = &self.act;
+        let part = &a.mma_part;
+        let (d, inter) = (cfg.dim, cfg.moe_inter_dim);
+        let (il, dl) = (ar.inter, ar.dim);
+        let (ti, p) = (t as i32, t * k);
+        let pi = p as i32;
+        let hl = a.hcat.ptr_at(t * il);
+        if t > FMA_ROWS {
+            ck(unsafe {
+                ds_moe_up_mma(sr, np(&a.y), d as i64, np(&ar.w1), np(&ar.s1), np(&ar.w3), np(&ar.s3), hl, il as i64, np(&a.rw),
+                              np(&a.block_slot), np(&a.block_route), pi, il as i32, d as i32, cfg.swiglu_limit, -1)
+            }, "moe up (mma, tp)")?;
+        } else {
+            ck(unsafe {
+                fp4::fp4_moe_cuda_up_v2(sr, np(&a.y), np(&ar.w1), np(&ar.s1), np(&ar.w3), np(&ar.s3), hl, np(&a.rw),
+                                        np(&a.block_slot), np(&a.block_route), d as i64, il as i64, cfg.swiglu_limit,
+                                        k as i32, il as i32, d as i32, pi, -1)
+            }, "moe up (tp)")?;
         }
+        gemm(sr, part, np(&a.y), d, Wt::Fp8(&w.sh_w1), t, np(&a.g), false, il)?;
+        gemm(sr, part, np(&a.y), d, Wt::Fp8(&w.sh_w3), t, np(&a.u), false, il)?;
+        ck(unsafe { ds_swiglu(sr, np(&a.g), il as i64, np(&a.u), il as i64, np(&a.hcat), il as i64, ti, il as i32, cfg.swiglu_limit) }, "shared swiglu (tp)")?;
+        self.tp_gather(np(&a.hcat), t + p, il, np(&a.hcat_full))?;
+        let hf = a.hcat_full.ptr_at(t * inter);
+        if t > FMA_ROWS {
+            ck(unsafe {
+                ds_moe_down_mma(sr, hf, inter as i64, np(&ar.w2), np(&ar.s2), np(&a.parts), dl as i64, np(&a.block_slot),
+                                np(&a.block_pair), pi, dl as i32, inter as i32, k as i32, ti, -1, 0, 1)
+            }, "moe down (mma, tp)")?;
+        } else {
+            ck(unsafe {
+                fp4::fp4_moe_cuda_down_v2(sr, hf, np(&ar.w2), np(&ar.s2), np(&a.parts), np(&a.block_slot), np(&a.block_pair),
+                                          inter as i64, dl as i64, k as i32, dl as i32, inter as i32, ti, pi, -1, 0, 1)
+            }, "moe down (tp)")?;
+        }
+        gemm(sr, part, np(&a.hcat_full), inter, Wt::Fp8(&w.sh_w2), t, np(&a.sh), false, dl)?;
+        ck(unsafe { ds_moe_combine(sr, np(&a.parts), k as i32, ti, np(&a.sh), np(&a.moe_local), dl as i32) }, "moe combine (tp)")?;
+        self.tp_gather(np(&a.moe_local), t, dl, np(&a.moe_out))
+    }
+
+    /// All-gather this rank's `[m][n]` bf16 shard of a tensor-parallel output over RoCE and
+    /// lay it out as full rows `[m][world * n]` at `full` (stream-ordered, graph-capturable).
+    fn tp_gather(&self, local: *mut c_void, m: usize, n: usize, full: *mut c_void) -> Result<()> {
+        let pair = self.pair.as_ref().ok_or("tensor parallel needs the pair")?;
+        let world = self.tp.map(|t| t.world).unwrap_or(1);
+        pair.roce.gather(local, np(&self.act.tp_scratch), m * n * 2, &self.stream)?;
+        ck(unsafe { ds_unshard_u16(self.stream.raw(), np(&self.act.tp_scratch), full, m as i32, n as i32, world as i32) }, "unshard")
     }
 }

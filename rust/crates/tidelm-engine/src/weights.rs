@@ -94,6 +94,39 @@ impl<'a> Loader<'a> {
         Ok(Fp8 { w, s, n, k })
     }
 
+    /// Output rows `[r0, r0 + rows)` of an FP8 weight and their scale rows (tensor parallel's
+    /// output layout: a rank's share of a linear's outputs). r0 and rows multiples of 32.
+    pub fn fp8_rows(&mut self, prefix: &str, n: usize, k: usize, r0: usize, rows: usize) -> Result<Fp8> {
+        if r0 % 32 != 0 || rows % 32 != 0 || r0 + rows > n {
+            return Err(format!("{prefix}: rows {r0}..{} of {n} do not split on 32-row scale blocks", r0 + rows).into());
+        }
+        let (wn, sn) = (format!("{prefix}.weight"), format!("{prefix}.scale"));
+        self.checked(&wn, "F8_E4M3", Some(&[n, k]))?;
+        let lds = k.div_ceil(32);
+        self.checked(&sn, "F8_E8M0", Some(&[n.div_ceil(32), lds]))?;
+        let w = DeviceBuffer::<u8>::new(rows * k)?;
+        self.read_into(&wn, r0 * k, (r0 + rows) * k, w.raw())?;
+        let s = DeviceBuffer::<u8>::new(rows / 32 * lds)?;
+        self.read_into(&sn, r0 / 32 * lds, (r0 + rows) / 32 * lds, s.raw())?;
+        Ok(Fp8 { w, s, n: rows, k })
+    }
+
+    /// Elements `[e0, e0 + n)` of a 1-D F32 tensor.
+    pub fn f32_range(&mut self, name: &str, len: usize, e0: usize, n: usize) -> Result<DeviceBuffer<f32>> {
+        self.checked(name, "F32", Some(&[len]))?;
+        let buf = DeviceBuffer::<f32>::new(n)?;
+        self.read_into(name, e0 * 4, (e0 + n) * 4, buf.raw())?;
+        Ok(buf)
+    }
+
+    /// Rows `[r0, r0 + rows)` of a BF16 `[n, k]` tensor.
+    pub fn bf16_rows(&mut self, name: &str, n: usize, k: usize, r0: usize, rows: usize) -> Result<DeviceBuffer<u16>> {
+        self.checked(name, "BF16", Some(&[n, k]))?;
+        let buf = DeviceBuffer::<u16>::new(rows * k)?;
+        self.read_into(name, r0 * k * 2, (r0 + rows) * k * 2, buf.raw())?;
+        Ok(buf)
+    }
+
     /// Bytes of pinned staging an arbitrary range read needs (for the head/embed streams).
     pub fn stage_capacity(&self) -> usize {
         self.stage.len()
@@ -174,22 +207,43 @@ pub struct Layer {
     pub engram: Option<EngramW>,
 }
 
+/// Tensor parallel over the pair, the Python profile's output layout (DSV41_TP_LINEAR_LAYOUT=
+/// output): a sharded linear holds rank `rank`'s contiguous block of output rows, and its
+/// results are all-gathered, so every output element is the one-box dot product.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tp {
+    pub rank: usize,
+    pub world: usize,
+}
+
+impl Tp {
+    /// (first row, rows) of this rank's share of `n` outputs.
+    pub fn rows(&self, n: usize) -> (usize, usize) {
+        (self.rank * n / self.world, n / self.world)
+    }
+}
+
 impl Layer {
-    /// A backbone layer (`layers.{l}.`).
-    pub fn load(ld: &mut Loader, cfg: &Config, l: usize) -> Result<Self> {
-        Self::load_block(ld, cfg, &format!("layers.{l}."), Some(l), cfg.n_routed_experts, cfg.n_activated_experts)
+    /// A backbone layer (`layers.{l}.`), with `tp` this rank's shard of it: attention heads
+    /// (wq_b rows, sinks, wo_a groups), wo_b, the shared expert and the engram projection by
+    /// output rows; the small projections stay whole and run on both ranks.
+    pub fn load(ld: &mut Loader, cfg: &Config, l: usize, tp: Option<Tp>) -> Result<Self> {
+        Self::load_block(ld, cfg, &format!("layers.{l}."), Some(l), cfg.n_routed_experts, cfg.n_activated_experts, tp)
     }
 
     /// A DSpark block (`mtp.{k}.`, model.py::MTPWeights): a window-only block with its own
-    /// 128-expert, top-3 MoE.
+    /// 128-expert, top-3 MoE. Whole on every rank.
     pub fn load_mtp(ld: &mut Loader, cfg: &Config, k: usize) -> Result<Self> {
         Self::load_block(ld, cfg, &format!("mtp.{k}."), None, cfg.dspark_n_routed_experts,
-                         cfg.dspark_n_activated_experts)
+                         cfg.dspark_n_activated_experts, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn load_block(ld: &mut Loader, cfg: &Config, p: &str, backbone: Option<usize>, n_experts: usize,
-                  topk: usize) -> Result<Self> {
+                  topk: usize, tp: Option<Tp>) -> Result<Self> {
         let p = p.to_string();
+        let whole = Tp { rank: 0, world: 1 };
+        let t = tp.unwrap_or(whole);
         let l = backbone.unwrap_or(usize::MAX);
         let (d, hcw) = (cfg.dim, cfg.hc_mix_width());
         let attn = |n: &str| format!("{p}attn.{n}");
@@ -230,8 +284,9 @@ impl Layer {
             let q = bf16_vec(&ld.host_bytes(&format!("{p}engram.q_weight"))?.0);
             let k = bf16_vec(&ld.host_bytes(&format!("{p}engram.k_weight"))?.0);
             let weight: Vec<f32> = q.iter().zip(&k).map(|(a, b)| a * b).collect();
+            let (r0, n) = t.rows(width);
             Some(EngramW {
-                wkv: ld.fp8(&format!("{p}engram.wkv"), width, rows)?,
+                wkv: ld.fp8_rows(&format!("{p}engram.wkv"), width, rows, r0, n)?,
                 weight: DeviceBuffer::from_slice(&weight)?,
             })
         } else {
@@ -244,12 +299,18 @@ impl Layer {
             ffn_norm: ld.bf16(&format!("{p}ffn_norm.weight"), &[d])?,
             q_norm: ld.bf16(&attn("q_norm.weight"), &[cfg.q_lora_rank])?,
             kv_norm: ld.bf16(&attn("kv_norm.weight"), &[cfg.head_dim])?,
-            attn_sink: ld.f32(&attn("attn_sink"), &[cfg.n_heads])?,
+            attn_sink: ld.f32_range(&attn("attn_sink"), cfg.n_heads, t.rows(cfg.n_heads).0, t.rows(cfg.n_heads).1)?,
             wq_a: ld.fp8(&attn("wq_a"), cfg.q_lora_rank, d)?,
-            wq_b: ld.fp8(&attn("wq_b"), cfg.n_heads * cfg.head_dim, cfg.q_lora_rank)?,
+            wq_b: {
+                let n = cfg.n_heads * cfg.head_dim;
+                ld.fp8_rows(&attn("wq_b"), n, cfg.q_lora_rank, t.rows(n).0, t.rows(n).1)?
+            },
             wkv: ld.fp8(&attn("wkv"), cfg.head_dim, d)?,
-            wo_a: ld.fp8(&attn("wo_a"), cfg.o_groups * cfg.o_lora_rank, cfg.n_heads * cfg.head_dim / cfg.o_groups)?,
-            wo_b: ld.fp8(&attn("wo_b"), d, cfg.o_groups * cfg.o_lora_rank)?,
+            wo_a: {
+                let n = cfg.o_groups * cfg.o_lora_rank;
+                ld.fp8_rows(&attn("wo_a"), n, cfg.n_heads * cfg.head_dim / cfg.o_groups, t.rows(n).0, t.rows(n).1)?
+            },
+            wo_b: ld.fp8_rows(&attn("wo_b"), d, cfg.o_groups * cfg.o_lora_rank, t.rows(d).0, t.rows(d).1)?,
             hc_attn_fn: ld.f32(&format!("{p}hc_attn_fn"), &[hcw, cfg.hc_mult * d])?,
             hc_attn_base: ld.f32(&format!("{p}hc_attn_base"), &[hcw])?,
             hc_attn_scale: ld.f32(&format!("{p}hc_attn_scale"), &[3])?,
@@ -258,9 +319,15 @@ impl Layer {
             hc_ffn_scale: ld.f32(&format!("{p}hc_ffn_scale"), &[3])?,
             gate_w: ld.bf16(&format!("{p}ffn.gate.weight"), &[n_experts, d])?,
             gate_bias: ld.f32(&format!("{p}ffn.gate.bias"), &[n_experts])?,
-            sh_w1: ld.fp8(&format!("{p}ffn.shared_experts.w1"), cfg.moe_inter_dim, d)?,
-            sh_w2: ld.fp8(&format!("{p}ffn.shared_experts.w2"), d, cfg.moe_inter_dim)?,
-            sh_w3: ld.fp8(&format!("{p}ffn.shared_experts.w3"), cfg.moe_inter_dim, d)?,
+            sh_w1: {
+                let n = cfg.moe_inter_dim;
+                ld.fp8_rows(&format!("{p}ffn.shared_experts.w1"), n, d, t.rows(n).0, t.rows(n).1)?
+            },
+            sh_w2: ld.fp8_rows(&format!("{p}ffn.shared_experts.w2"), d, cfg.moe_inter_dim, t.rows(d).0, t.rows(d).1)?,
+            sh_w3: {
+                let n = cfg.moe_inter_dim;
+                ld.fp8_rows(&format!("{p}ffn.shared_experts.w3"), n, d, t.rows(n).0, t.rows(n).1)?
+            },
             compressor,
             indexer,
             engram,

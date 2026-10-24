@@ -146,17 +146,22 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
      capture count and warm-up.
   The L1/L14 engram boundaries stay: they wait on NVMe, and a graph cannot hide a
   host wait — the win there is prefetch depth, not capture width.
-- **M4 — TP2.** Status 2026-10-24: EP2 runs. `tidelm-comm` links the engine image's NCCL
-  2.28.3 (copied to ~/.local/nccl on both boxes) and carries the pair's TCP control channel:
-  a byte-for-byte boot config check (options, expert-set digests, the executable's hash),
-  then rank 0 sends rank 1 every engine call before running it. Experts are split by
-  alternating demand rank per layer; the peer's experts route to a null slot (up skips it,
-  down writes zeros), and each layer's routed k-sum is all-reduced in fp32 before the
-  shared expert joins at the single-box rounding point. The drafter, dense layers and head
-  are replicated. NCCL over RoCE from host processes: `NCCL_PROTO=Simple` (46 us for a
-  6-row combine against 171 for NCCL's default choice; 22 vs 57 at 1 row). On the 4-layer
-  truncation the pair emits the same 24 tokens as one box. Next: dense TP (each box reads
-  half the dense weights - ~55% of a token's bytes), then the RoCE one-shot path.
+- **M4 — TP2.** Status 2026-10-24: tensor parallel runs, bit-identical to one box. The Python
+  profile's output layout (DSV41_TP_LINEAR_LAYOUT=output): attention heads split (wq_b rows,
+  sinks, wo_a groups), wo_b, the shared expert, every routed expert (w1/w3 intermediate rows,
+  w2 output rows - each box holds half of every resident expert), the engram projection and
+  the vocab head by output rows; every sharded output is all-gathered whole, so each element is
+  the one-box dot product and nothing is summed across the pair. Four gathers a layer (wo_a's
+  groups, the attention output, the shared + routed intermediates in one, the MoE output),
+  about 163 a step, on the RoCE one-shot gather (`tidelm_comm::roce`: tools/roce/roce.cu as is,
+  its proxy torch-free behind a C ABI; 12-25 us a gather inside a step graph against ~150 us
+  for an NCCL all-reduce there, examples/pair_step.rs). The small projections, routing and
+  caches are computed identically on both ranks; the drafter runs whole on each. `tidelm-comm`
+  also links the engine image's NCCL 2.28.3 (~/.local/nccl) for the bring-up handshake. Rank 0
+  mirrors every engine call to rank 1 over the control channel after a byte-for-byte boot
+  config check. 4-layer truncation: the pair's logits digests equal one box's, plain and
+  speculative. (An expert-parallel first cut ran before this and was replaced: its per-layer
+  all-reduce cost ~150 us on NCCL and its ranks waited on whichever held the hot experts.)
   Original plan: NCCL from Rust, control message over NCCL (replacing Gloo), RoCE shim,
   full boot config guard (typed struct, broadcast, any differing field aborts — the
   repo's silent-pair-divergence rule). *Gate: two-rank token parity and tok/s vs the
@@ -189,6 +194,20 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
     tensor-core kernels above 64 pairs. A tensor-core FP4 MoE for > 16-row steps is next.
 - **M7 — server + adaptation.** Port or front: decided by measurement, the pipeline is
   already Python-free by M2.
+
+  Still missing for the README protocol, in order of what blocks an apples-to-apples row:
+  1. Sampling (bench.py runs temperature 0.6, top_p 0.95): temperature + nucleus target
+     probabilities, the drafter's nucleus-truncated q with Gumbel-max draws on the device
+     (fastdecode.py's DRAFT_NUCLEUS path), `tidelm_core::spec::verify_probabilities` (ported,
+     host) or its device form, and the confidence policy's sampled prefix rule
+     (`choose_sampled`, ported). Greedy only today.
+  2. The HTTP front (server/app.py's OpenAI + Anthropic routes) over `generate_batch`.
+  3. Hot reads and adaptation (the resident set re-planned from demand, misses read from
+     NVMe): today the resident set is fixed at boot and the rest is pruned, which changes
+     routing where Python's substitutes or reads.
+  4. The drafter under TP (DSV41_TP_DRAFT_*: -1.7 to -2.1 ms/step each in Python), the
+     sharded head's argmax without gathering logits (`ds_argmax_bf16_pairs` / `_combine`
+     are in, unused), prefill at 2,048-row chunks.
 
 ## Rules carried over from the Python engine
 

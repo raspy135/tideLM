@@ -68,11 +68,11 @@ fn main() -> tidelm_engine::Result<()> {
         (Some(s), Some(b)) => Some(tidelm_engine::keep::keep_from_scores(s, 6, b.parse().unwrap())?),
         _ => keep_first.map(|k| vec![(0..384).map(|e| e < k).collect::<Vec<bool>>(); 40]),
     };
-    let opts = Options { max_seq, max_lanes: 1, spec: spec || compare || flag("--sweep-depth"), resident: flag("--resident"), graphs: flag("--graphs"), n_layers, keep, dspark_keep: None, owned: None };
+    let opts = Options { max_seq, max_lanes: 1, spec: spec || compare || flag("--sweep-depth"), resident: flag("--resident"), graphs: flag("--graphs"), n_layers, keep, dspark_keep: None, tp: None };
     let pair_args = tidelm_engine::pair::pair_args(&args)?;
     let mut opts = opts;
     let pair = match &pair_args {
-        Some(pa) => Some(tidelm_engine::pair::join(&mut opts, scores.as_deref(), &model_dir, pa)?),
+        Some(pa) => Some(tidelm_engine::pair::join(&mut opts, &model_dir, pa)?),
         None => None,
     };
     let mut engine = Engine::new(&model_dir, token_map, opts)?;
@@ -136,7 +136,9 @@ fn main() -> tidelm_engine::Result<()> {
         }
         eprintln!("auto step-time estimates (ms): {:?}",
                   policy.estimated_step_s().iter().map(|(d, t)| (*d, (t * 1e4).round() / 10.0)).collect::<Vec<_>>());
-        for d in 1..=engine.cfg.dspark_block_size {
+        // --quick: depth 3 only (the shipped controller's usual depth) besides the policies
+        let depths: Vec<usize> = if flag("--quick") { vec![3] } else { (1..=engine.cfg.dspark_block_size).collect() };
+        for d in depths {
             let t = Instant::now();
             let g = generate_spec(&mut engine, &ids, max_tokens, d, &stop, |_| {})?;
             let dt = t.elapsed().as_secs_f64();
@@ -171,6 +173,7 @@ fn main() -> tidelm_engine::Result<()> {
         eprintln!("{} tokens in {} steps ({:.2} tokens/step), {:.1}s; times {:?}; indexed layer passes {}",
                   g.tokens.len(), g.steps, g.tokens_per_step(), dt, engine.times, engine.indexed_layers);
         eprintln!("generated ids: {:?}", g.tokens);
+        eprintln!("logits digest: {:016x}", g.digest);
     }
     engine.release_follower()?;
     if pair_args.is_some() {
