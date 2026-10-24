@@ -223,10 +223,11 @@ impl Options {
         let exe = std::fs::read("/proc/self/exe")?;
         let cfg = std::fs::read(model_dir.join("config.json")).or_else(|_| std::fs::read(model_dir.join("inference/config.json")))?;
         Ok(format!("tidelm-pair v1 | max_seq {} lanes {} spec {} resident {} graphs {} layers {:?} | keep {:x} dspark_keep {:x} \
-                    | exe {:x} | config {:x} | env NO_QDQ={:?} ENGRAM_CACHE_MB={:?}",
+                    | exe {:x} | config {:x} | env NO_QDQ={:?} ENGRAM_CACHE_MB={:?} PAIR_OVERLAP={:?} DRAFT_HEAD_FMT={:?}",
                    self.max_seq, self.max_lanes, self.spec, self.resident, self.graphs, self.n_layers, mask(&self.keep),
                    mask(&self.dspark_keep), fnv(&exe), fnv(&cfg), std::env::var("TIDELM_NO_QDQ").ok(),
-                   std::env::var("TIDELM_ENGRAM_CACHE_MB").ok()).into_bytes())
+                   std::env::var("TIDELM_ENGRAM_CACHE_MB").ok(), std::env::var("TIDELM_PAIR_OVERLAP").ok(),
+                   std::env::var("TIDELM_DRAFT_HEAD_FMT").ok()).into_bytes())
     }
 }
 
@@ -244,6 +245,14 @@ const OP_SHUTDOWN: u32 = 7;
 pub struct Pair {
     pub comm: tidelm_comm::Comm,
     pub ctl: tidelm_comm::Control,
+}
+
+/// The side stream a layer's combine all-reduce runs on while the shared expert computes
+/// (forked and joined by events, so a captured step graph keeps both branches).
+struct Overlap {
+    side: Stream,
+    fork: tidelm_cuda::Event,
+    join: tidelm_cuda::Event,
 }
 
 /// Which logits a segment of a step returns.
@@ -690,6 +699,7 @@ pub struct Engine {
     caches: Caches,
     /// expert parallel over two boxes (attach_pair); None on one box
     pair: Option<Pair>,
+    overlap: Option<Overlap>,
     /// rank 0 of a pair mirrors its calls to rank 1; rank 1 does not
     leader: bool,
     lanes: Vec<Lane>,
@@ -1054,6 +1064,7 @@ impl Engine {
             act,
             caches,
             pair: None,
+            overlap: None,
             leader: false,
             lanes: lanes_v,
             max_lanes,
@@ -1089,9 +1100,17 @@ impl Engine {
     }
 
     /// Join a pair before the first step (its MoE combines all-reduce over `pair.comm`).
-    pub fn attach_pair(&mut self, pair: Pair) {
+    pub fn attach_pair(&mut self, pair: Pair) -> Result<()> {
         self.leader = pair.comm.rank == 0;
         self.pair = Some(pair);
+        // TIDELM_PAIR_OVERLAP=1 (part of the boot config): the combine's all-reduce on a side
+        // stream beside the shared expert. Measured slower, so off: 40 layers, 1,000 experts,
+        // plain greedy, 127 steps 8.0 s serial vs 8.6 s overlapped (2026-10-24) - the NCCL
+        // kernel spins on the network on SMs the shared-expert GEMMs then lack.
+        if std::env::var("TIDELM_PAIR_OVERLAP").as_deref() == Ok("1") {
+            self.overlap = Some(Overlap { side: Stream::new()?, fork: tidelm_cuda::Event::new()?, join: tidelm_cuda::Event::new()? });
+        }
+        Ok(())
     }
 
     pub fn rank(&self) -> usize {
@@ -2301,12 +2320,30 @@ impl Engine {
         let ti = t as i32;
         let a = &self.act;
         let part = &a.mma_part;
+        // a pair's routed k-sum is all-reduced, on the side stream beside the shared expert when
+        // TIDELM_PAIR_OVERLAP=1 (attach_pair). In a step graph the collective sits between two
+        // layers' work, ~150 us each (examples/pair_step.rs: 40 of them, 34.0 -> 39.9 ms/step)
+        let ep = match (&self.pair, &self.overlap, backbone) {
+            (Some(pair), Some(ov), true) => {
+                ck(unsafe { ds_moe_partial(sr, np(&a.parts), k as i32, ti, np(&a.moe_partial), d as i32) }, "moe partial")?;
+                ov.fork.record(&self.stream)?;
+                ov.side.wait_event(&ov.fork)?;
+                pair.comm.allreduce_f32(np(&a.moe_partial), t * d, &ov.side)?;
+                ov.join.record(&ov.side)?;
+                Some(ov)
+            }
+            _ => None,
+        };
         gemm(sr, part, np(&a.y), d, Wt::Fp8(&w.sh_w1), t, np(&a.g), false, inter)?;
         gemm(sr, part, np(&a.y), d, Wt::Fp8(&w.sh_w3), t, np(&a.u), false, inter)?;
         ck(unsafe { ds_swiglu(sr, np(&a.g), inter as i64, np(&a.u), inter as i64, np(&a.hs), inter as i64, ti, inter as i32, cfg.swiglu_limit) }, "shared swiglu")?;
         gemm(sr, part, np(&a.hs), inter, Wt::Fp8(&w.sh_w2), t, np(&a.sh), false, d)?;
-        match (&self.pair, backbone) {
-            (Some(pair), true) => {
+        match (ep, &self.pair, backbone) {
+            (Some(ov), _, _) => {
+                self.stream.wait_event(&ov.join)?;
+                ck(unsafe { ds_moe_finish(sr, np(&a.moe_partial), np(&a.sh), np(&a.moe_out), ti, d as i32) }, "moe finish")
+            }
+            (None, Some(pair), true) => {
                 ck(unsafe { ds_moe_partial(sr, np(&a.parts), k as i32, ti, np(&a.moe_partial), d as i32) }, "moe partial")?;
                 pair.comm.allreduce_f32(np(&a.moe_partial), t * d, &self.stream)?;
                 ck(unsafe { ds_moe_finish(sr, np(&a.moe_partial), np(&a.sh), np(&a.moe_out), ti, d as i32) }, "moe finish")

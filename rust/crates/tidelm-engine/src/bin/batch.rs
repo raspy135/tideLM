@@ -89,7 +89,7 @@ fn main() -> tidelm_engine::Result<()> {
     };
     let mut engine = Engine::new(&model_dir, token_map, opts)?;
     if let Some(p) = pair {
-        engine.attach_pair(p);
+        engine.attach_pair(p)?;
         if engine.rank() == 1 {
             eprintln!("rank 1: engine up in {:.1}s, following rank 0", t0.elapsed().as_secs_f64());
             engine.follow()?;
