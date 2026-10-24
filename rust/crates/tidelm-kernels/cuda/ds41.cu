@@ -1052,13 +1052,17 @@ __global__ void pending_update_kernel(const float* __restrict__ kv, const float*
 __global__ void rollback_pending_kernel(const int* __restrict__ n_dev, const float* __restrict__ mem_kv,
                                         const float* __restrict__ mem_sc, const int* __restrict__ mem_start,
                                         const float* __restrict__ before_kv, const float* __restrict__ before_sc,
-                                        const int* __restrict__ before_flag, float* pkv, float* psc, int* flag, int D) {
+                                        const int* __restrict__ before_flag, float* pkv, float* psc, int* flag, int D,
+                                        int mem_rows) {
     const int n = *n_dev;
     if (n % 2 == 0) {
         if (threadIdx.x == 0) *flag = 0;
         return;
     }
     const int p = n - 1, start = *mem_start;
+    // a rollback reaches at most into the last chunk; anything else is a caller bug and
+    // must not read past the chunk memory
+    if (p - start >= mem_rows || p + 1 < start) return;
     if (p >= start) {
         for (int d = threadIdx.x; d < D; d += blockDim.x) {
             pkv[d] = mem_kv[(int64_t)(p - start) * D + d];
@@ -1386,11 +1390,11 @@ int ds_pending_update(void* stream, const void* kv, const void* sc, const void* 
 
 int ds_rollback_pending(void* stream, const void* n_dev, const void* mem_kv, const void* mem_sc, const void* mem_start,
                         const void* before_kv, const void* before_sc, const void* before_flag, void* pkv, void* psc,
-                        void* flag, int D) {
+                        void* flag, int D, int mem_rows) {
     rollback_pending_kernel<<<1, 256, 0, DS_ST>>>(static_cast<const int*>(n_dev), static_cast<const float*>(mem_kv),
         static_cast<const float*>(mem_sc), static_cast<const int*>(mem_start), static_cast<const float*>(before_kv),
         static_cast<const float*>(before_sc), static_cast<const int*>(before_flag), static_cast<float*>(pkv),
-        static_cast<float*>(psc), static_cast<int*>(flag), D);
+        static_cast<float*>(psc), static_cast<int*>(flag), D, mem_rows);
     DS_RET;
 }
 

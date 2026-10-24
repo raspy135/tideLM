@@ -78,11 +78,13 @@ pub struct Options {
     pub n_layers: Option<usize>,
     /// per backbone layer, the routable experts (model.py's prune mask); None = all
     pub keep: Option<Vec<Vec<bool>>>,
+    /// per DSpark block, the routable experts (tests; serving keeps all 3 x 128)
+    pub dspark_keep: Option<Vec<Vec<bool>>>,
 }
 
 impl Options {
     pub fn streaming(max_seq: usize, spec: bool) -> Self {
-        Options { max_seq, spec, resident: false, graphs: false, n_layers: None, keep: None }
+        Options { max_seq, spec, resident: false, graphs: false, n_layers: None, keep: None, dspark_keep: None }
     }
 }
 
@@ -288,15 +290,59 @@ struct Caches {
     len: usize,
 }
 
+/// The routable experts of one family of blocks (backbone layers, or DSpark blocks) on the
+/// device: an arena holding exactly those experts and the [block][expert] -> slot LUT
+/// (model.py's slot_lut; -1 for an expert that is not routable).
+struct ExpertSet {
+    arena: Arena,
+    lut: DeviceBuffer<i32>,
+}
+
+impl ExpertSet {
+    fn load(ckpt: &Checkpoint, stream: &Stream, prefix: &dyn Fn(usize) -> String, blocks: usize, n_experts: usize,
+            keep: Option<&[Vec<bool>]>) -> Result<Self> {
+        let routable = |b: usize, x: usize| keep.map(|k| k[b][x]).unwrap_or(true);
+        let n_slots: usize = (0..blocks).map(|b| (0..n_experts).filter(|&x| routable(b, x)).count()).sum();
+        let arena = Arena::new(n_slots.max(1))?;
+        let mut lut = vec![-1i32; blocks * n_experts];
+        let mut stage = PinnedBuffer::uninit(STAGE_BYTES)?;
+        let reader = ExpertReader::new(ckpt);
+        let mut slot = 0usize;
+        for b in 0..blocks {
+            for x in 0..n_experts {
+                if !routable(b, x) {
+                    continue;
+                }
+                let views = reader.read_expert_into(&mut stage, &format!("{}ffn.experts.{x}.", prefix(b)))?;
+                let dsts: [(*mut c_void, usize); 6] = [
+                    (arena.w1.ptr_at(slot * W13), W13), (arena.s1.ptr_at(slot * S13), S13),
+                    (arena.w2.ptr_at(slot * W2), W2), (arena.s2.ptr_at(slot * S2), S2),
+                    (arena.w3.ptr_at(slot * W13), W13), (arena.s3.ptr_at(slot * S13), S13),
+                ];
+                for (&(off, len), &(dst, want)) in views.iter().zip(dsts.iter()) {
+                    if len != want {
+                        return Err(format!("{}expert {x}: tensor of {len} bytes, arena expects {want}", prefix(b)).into());
+                    }
+                    let src = unsafe { stage.as_ptr().add(off) } as *const c_void;
+                    unsafe { memcpy_async(dst, src, len, MEMCPY_HOST_TO_DEVICE, stream)? };
+                }
+                stream.synchronize()?;
+                lut[b * n_experts + x] = slot as i32;
+                slot += 1;
+            }
+        }
+        Ok(ExpertSet { arena, lut: DeviceBuffer::from_slice(&lut)? })
+    }
+}
+
 /// Everything the resident mode keeps on the device besides the per-step activations.
 struct Resident {
     /// lent out (taken) for the duration of each block
     layers: Vec<Option<Layer>>,
     embed: DeviceBuffer<u16>,
     head: DeviceBuffer<u16>,
-    arena: Arena,
-    /// [layer][expert] -> arena slot, -1 for experts that are not routable
-    lut: DeviceBuffer<i32>,
+    experts: ExpertSet,
+    dspark_experts: Option<ExpertSet>,
     ids: DeviceBuffer<i32>,
 }
 
@@ -323,6 +369,9 @@ pub struct Engine {
     resident: Option<Resident>,
     /// [layer][expert] routable mask (u8) for the router, both modes; None = all
     keep: Option<DeviceBuffer<u8>>,
+    /// the same for the DSpark blocks
+    dspark_keep: Option<DeviceBuffer<u8>>,
+    draft_graph: Option<tidelm_cuda::GraphExec>,
     n_layers: usize,
     /// rows of the compressed-rope positions, per ratio: max(pos - (r - 1), 0)
     cpos1: DeviceBuffer<i32>,
@@ -355,10 +404,10 @@ pub struct Engine {
 }
 
 impl Resident {
-    /// Every backbone layer's weights, the embedding and head tables, and an arena holding
-    /// exactly the routable experts (`keep`, or all of them), with the LUT that maps them.
-    fn load(ckpt: &Checkpoint, stream: &Stream, cfg: &Config, n_layers: usize, keep: Option<&[Vec<bool>]>) -> Result<Self> {
-        let (d, v, e) = (cfg.dim, cfg.vocab_size, cfg.n_routed_experts);
+    /// Every backbone layer's weights, the embedding and head tables, and the routable
+    /// experts of the backbone (and of the drafter, with `spec`).
+    fn load(ckpt: &Checkpoint, stream: &Stream, cfg: &Config, n_layers: usize, opts: &Options) -> Result<Self> {
+        let (d, v) = (cfg.dim, cfg.vocab_size);
         let mut ld = Loader::new(ckpt, stream)?;
         let mut layers = Vec::with_capacity(n_layers);
         for l in 0..n_layers {
@@ -366,44 +415,15 @@ impl Resident {
         }
         let embed = ld.bf16("embed.weight", &[v, d])?;
         let head = ld.bf16("head.weight", &[v, d])?;
-        let routable = |l: usize, x: usize| keep.map(|k| k[l][x]).unwrap_or(true);
-        let n_slots: usize = (0..n_layers).map(|l| (0..e).filter(|&x| routable(l, x)).count()).sum();
-        let arena = Arena::new(n_slots.max(1))?;
-        let mut lut = vec![-1i32; n_layers * e];
-        let mut stage = PinnedBuffer::uninit(STAGE_BYTES)?;
-        let reader = ExpertReader::new(ckpt);
-        let mut slot = 0usize;
-        for l in 0..n_layers {
-            for x in 0..e {
-                if !routable(l, x) {
-                    continue;
-                }
-                let views = reader.read_expert_into(&mut stage, &ExpertReader::expert_prefix(l, x))?;
-                let dsts: [(*mut c_void, usize); 6] = [
-                    (arena.w1.ptr_at(slot * W13), W13), (arena.s1.ptr_at(slot * S13), S13),
-                    (arena.w2.ptr_at(slot * W2), W2), (arena.s2.ptr_at(slot * S2), S2),
-                    (arena.w3.ptr_at(slot * W13), W13), (arena.s3.ptr_at(slot * S13), S13),
-                ];
-                for (&(off, len), &(dst, want)) in views.iter().zip(dsts.iter()) {
-                    if len != want {
-                        return Err(format!("layer {l} expert {x}: tensor of {len} bytes, arena expects {want}").into());
-                    }
-                    let src = unsafe { stage.as_ptr().add(off) } as *const c_void;
-                    unsafe { memcpy_async(dst, src, len, MEMCPY_HOST_TO_DEVICE, stream)? };
-                }
-                stream.synchronize()?;
-                lut[l * e + x] = slot as i32;
-                slot += 1;
-            }
-        }
-        Ok(Resident {
-            layers,
-            embed,
-            head,
-            arena,
-            lut: DeviceBuffer::from_slice(&lut)?,
-            ids: DeviceBuffer::zeroed(TMAX)?,
-        })
+        let experts = ExpertSet::load(ckpt, stream, &|l| format!("layers.{l}."), n_layers, cfg.n_routed_experts,
+                                      opts.keep.as_deref())?;
+        let dspark_experts = if opts.spec {
+            Some(ExpertSet::load(ckpt, stream, &|k| format!("mtp.{k}."), cfg.n_mtp_layers, cfg.dspark_n_routed_experts,
+                                 opts.dspark_keep.as_deref())?)
+        } else {
+            None
+        };
+        Ok(Resident { layers, embed, head, experts, dspark_experts, ids: DeviceBuffer::zeroed(TMAX)? })
     }
 }
 
@@ -543,7 +563,7 @@ impl Engine {
             dcidx: DeviceBuffer::from_slice(&(0..bsz * bsz).map(|j| (j % bsz) as i32).collect::<Vec<_>>())?,
             markov_e: a(cfg.dspark_markov_rank)?,
             markov_b: a(cfg.vocab_size)?,
-            d_idx: i(1)?,
+            d_idx: i(bsz + 1)?,
         };
         let mut caches = Caches {
             ring: Vec::new(),
@@ -562,7 +582,9 @@ impl Engine {
                 caches.mtp_ring.push(a(RING * cfg.head_dim)?);
             }
         }
-        for &l in &cfg.kv_source_layers {
+        // only the compressors this engine runs: a state for a layer past a truncation would
+        // never see a chunk, and rollback would read its never-written chunk memory
+        for &l in cfg.kv_source_layers.iter().filter(|&&l| l < n_layers) {
             let r = cfg.compress_ratios[l];
             caches.ckv.insert(l, a((max_seq / r + 1) * cfg.head_dim)?);
             caches.ik.insert(l, a((max_seq / r + 1) * cfg.index_head_dim)?);
@@ -592,9 +614,19 @@ impl Engine {
             None => None,
         };
         let resident = if opts.resident {
-            Some(Resident::load(&ckpt, &stream, &cfg, n_layers, opts.keep.as_deref())?)
+            Some(Resident::load(&ckpt, &stream, &cfg, n_layers, &opts)?)
         } else {
             None
+        };
+        let dspark_keep = match &opts.dspark_keep {
+            Some(k) => {
+                let e = cfg.dspark_n_routed_experts;
+                if k.len() != cfg.n_mtp_layers || k.iter().any(|row| row.len() != e) {
+                    return Err(format!("dspark keep mask needs {} rows of {e} experts", cfg.n_mtp_layers).into());
+                }
+                Some(DeviceBuffer::from_slice(&k.iter().flat_map(|r| r.iter().map(|&b| b as u8)).collect::<Vec<u8>>())?)
+            }
+            None => None,
         };
         let n_eng = cfg.engram_layer_ids.len();
         let eg_raw = (0..n_eng).map(|_| DeviceBuffer::zeroed(t * eng_cols * 264)).collect::<std::result::Result<_, _>>()?;
@@ -615,6 +647,8 @@ impl Engine {
             dspark,
             resident,
             keep,
+            dspark_keep,
+            draft_graph: None,
             n_layers,
             cpos1: i(t)?,
             cpos2: i(t)?,
@@ -685,7 +719,7 @@ impl Engine {
             ck(unsafe {
                 ds_rollback_pending(sr, np(&self.caches.n_dev), np(&st.mem_kv), np(&st.mem_sc), np(&st.mem_start),
                                     np(&st.before_kv), np(&st.before_sc), np(&st.before_flag), np(&st.pkv), np(&st.psc),
-                                    np(&st.flag), hd)
+                                    np(&st.flag), hd, TMAX as i32)
             }, "rollback pending")?;
         }
         Ok(())
@@ -721,12 +755,6 @@ impl Engine {
         ck(unsafe { ds_embed_hc(st.raw(), ids, table, np(&self.act.h), t as i32, d as i32, hc as i32) }, "embed")?;
         self.act.pre.copy_from(0, &self.one_hot, 0, t * hc, st)?;
         Ok(())
-    }
-
-    /// Embedding for a block whose rows are not a backbone step (the draft block).
-    fn embed(&mut self, ids: &[u32]) -> Result<()> {
-        self.embed_host(ids)?;
-        self.embed_dev(ids.len())
     }
 
     /// Run tokens `ids` at positions `len..len + ids.len()` (at most TMAX) through the
@@ -923,15 +951,6 @@ impl Engine {
         Ok(logits)
     }
 
-    /// The head with a read-back (the draft block's path).
-    fn head(&mut self, r0: usize, rows: usize, norm: *mut c_void) -> Result<Vec<u16>> {
-        self.head_dev(r0, rows, norm)?;
-        let mut logits = vec![0u16; rows * self.cfg.vocab_size];
-        self.act.logits.download_async(0, &mut logits, &self.stream)?;
-        self.stream.synchronize()?;
-        Ok(logits)
-    }
-
     /// hc_pre with the final pre_mix + `norm` + the head over rows r0..r0+rows of the hc
     /// stream, into act.logits `[rows][V]` bf16 (streamed from NVMe unless resident).
     fn head_dev(&mut self, r0: usize, rows: usize, norm: *mut c_void) -> Result<()> {
@@ -1009,7 +1028,8 @@ impl Engine {
 
     /// model.py::dspark_draft, greedy: the block [tok, noise x 4] at positions
     /// last_main_pos+1.., through the three DSpark blocks, then the markov-biased argmax
-    /// chain. Returns the `dspark_block_size` drafted tokens.
+    /// chain. Returns the `dspark_block_size` drafted tokens. Resident with graphs, the whole
+    /// draft is one CUDA graph (its shape never changes) with a single read-back.
     pub fn draft(&mut self, tok: u32, last_main_pos: usize) -> Result<Vec<u32>> {
         if self.dspark.is_none() {
             return Err("draft needs the drafter (spec)".into());
@@ -1024,8 +1044,37 @@ impl Engine {
             let pos: Vec<i32> = (s..s + b).map(|p| p as i32).collect();
             self.act.pos.upload_async(0, &pos, st)?;
             self.act.dwin.upload_async(0, &vec![last_main_pos as i32; b], st)?;
+            self.act.d_idx.upload_async(0, &[tok as i32], st)?;
         }
-        self.embed(&ids)?;
+        self.embed_host(&ids)?;
+        if self.use_graphs {
+            if self.draft_graph.is_none() {
+                self.stream.begin_capture()?;
+                let rec = self.draft_dev(s, last_main_pos);
+                let graph = self.stream.end_capture();
+                rec?;
+                self.draft_graph = Some(graph?);
+                self.graph_captures += 1;
+            } else {
+                self.graph_replays += 1;
+            }
+            self.draft_graph.as_ref().unwrap().launch(&self.stream)?;
+        } else {
+            self.draft_dev(s, last_main_pos)?;
+        }
+        let mut out = vec![0i32; b + 1];
+        self.act.d_idx.download_async(0, &mut out, &self.stream)?;
+        self.stream.synchronize()?;
+        Ok(out[1..].iter().map(|&x| x as u32).collect())
+    }
+
+    /// The draft's device work: embedding, the three blocks, the head, and the markov
+    /// chain entirely on the device (each step's embedding row is gathered by the index
+    /// the previous argmax wrote, so the chain needs no host sync).
+    fn draft_dev(&mut self, s: usize, last_main_pos: usize) -> Result<()> {
+        let cfg = self.cfg.clone();
+        let b = cfg.dspark_block_size;
+        self.embed_dev(b)?;
         let blocks = std::mem::take(&mut self.dspark.as_mut().unwrap().blocks);
         let res = (|| -> Result<()> {
             for (k, w) in blocks.iter().enumerate() {
@@ -1036,28 +1085,22 @@ impl Engine {
         self.dspark.as_mut().unwrap().blocks = blocks;
         res?;
         let norm = np(&self.dspark.as_ref().unwrap().w.norm);
-        self.head(0, b, norm)?;
-        // the markov chain: each draft's bias comes from the embedding of the token before it
+        self.head_dev(0, b, norm)?;
         let ds = self.dspark.as_ref().unwrap();
         let (v, r) = (cfg.vocab_size, cfg.dspark_markov_rank);
-        let st = &self.stream;
-        let sr = st.raw();
+        let sr = self.stream.raw();
         let a = &self.act;
-        let mut out = vec![tok];
         for i in 0..b {
-            a.d_idx.upload_async(0, &[out[i] as i32], st)?;
-            ck(unsafe { ds_gather_rows_u16(sr, np(&ds.w.markov_embed), np(&a.d_idx), np(&a.markov_e), 1, r as i32) }, "markov embed")?;
+            ck(unsafe { ds_gather_rows_u16(sr, np(&ds.w.markov_embed), a.d_idx.ptr_at(i), np(&a.markov_e), 1, r as i32) }, "markov embed")?;
             ck(unsafe {
                 ds_linear_bf16(sr, np(&a.markov_e), r as i64, np(&ds.w.markov_head), 1, v as i32, r as i32, 1, np(&a.markov_b),
                                nul(), v as i64, nul())
             }, "markov head")?;
-            ck(unsafe { ds_argmax_sum_bf16(sr, a.logits.ptr_at(i * v), v as i64, np(&a.markov_b), v as i64, 1, v as i32, np(&a.d_idx)) }, "markov argmax")?;
-            let mut nxt = [0i32];
-            a.d_idx.download_async(0, &mut nxt, st)?;
-            st.synchronize()?;
-            out.push(nxt[0] as u32);
+            ck(unsafe {
+                ds_argmax_sum_bf16(sr, a.logits.ptr_at(i * v), v as i64, np(&a.markov_b), v as i64, 1, v as i32, a.d_idx.ptr_at(i + 1))
+            }, "markov argmax")?;
         }
-        Ok(out[1..].to_vec())
+        Ok(())
     }
 
     fn hc_mixes(&self, fn_w: &DeviceBuffer<f32>, base: &DeviceBuffer<f32>, scale: &DeviceBuffer<f32>, t: usize,
@@ -1324,21 +1367,28 @@ impl Engine {
         let (d, inter, e, k) = (cfg.dim, cfg.moe_inter_dim, w.n_experts, w.topk);
         let ti = t as i32;
         let p = t * k;
-        let layer = w.prefix.strip_prefix("layers.").and_then(|r| r.trim_end_matches('.').parse::<usize>().ok());
+        let index = |pre: &str| w.prefix.strip_prefix(pre).and_then(|r| r.trim_end_matches('.').parse::<usize>().ok());
+        let (layer, block) = (index("layers."), index("mtp."));
         {
             let a = &self.act;
-            let keep = match (&self.keep, layer) {
-                (Some(kb), Some(l)) => kb.ptr_at(l * e),
+            let keep = match (layer, block) {
+                (Some(l), _) => self.keep.as_ref().map(|kb| kb.ptr_at(l * e)).unwrap_or(nul()),
+                (_, Some(b)) => self.dspark_keep.as_ref().map(|kb| kb.ptr_at(b * e)).unwrap_or(nul()),
                 _ => nul(),
             };
             ck(unsafe { ds_linear_bf16(sr, np(&a.y), d as i64, np(&w.gate_w), ti, e as i32, d as i32, 1, nul(), np(&a.z), e as i64, nul()) }, "gate")?;
             ck(unsafe { ds_router(sr, np(&a.z), np(&w.gate_bias), keep, ti, e as i32, k as i32, cfg.route_scale, np(&a.idx), np(&a.rw)) }, "router")?;
         }
-        if let (Some(res), Some(l)) = (&self.resident, layer) {
+        let set = match (&self.resident, layer, block) {
+            (Some(res), Some(l), _) => Some((&res.experts, l)),
+            (Some(res), _, Some(b)) => res.dspark_experts.as_ref().map(|x| (x, b)),
+            _ => None,
+        };
+        if let Some((set, bi)) = set {
             // resident: experts -> slots through the device LUT, no host round trip
             let a = &self.act;
-            let ar = &res.arena;
-            ck(unsafe { ds_lut_slots(sr, np(&a.idx), res.lut.ptr_at(l * e), p as i32, np(&a.keys)) }, "lut slots")?;
+            let ar = &set.arena;
+            ck(unsafe { ds_lut_slots(sr, np(&a.idx), set.lut.ptr_at(bi * e), p as i32, np(&a.keys)) }, "lut slots")?;
             ck(unsafe { fp4::fp4_moe_cuda_route_small(sr, np(&a.keys), np(&a.block_slot), np(&a.block_pair), np(&a.block_route), p as i32, k as i32) }, "route")?;
             ck(unsafe {
                 fp4::fp4_moe_cuda_up_v2(sr, np(&a.y), np(&ar.w1), np(&ar.s1), np(&ar.w3), np(&ar.s3), np(&a.hm), np(&a.rw),

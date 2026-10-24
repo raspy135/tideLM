@@ -900,7 +900,7 @@ fn device_compressor_pairs_pending_and_rollback_match_the_host_logic() {
         let dn = dev(&[n as i32]);
         ok(unsafe {
             ds_rollback_pending(st.raw(), p(&dn), p(&mkv), p(&msc), p(&mstart), p(&bkv), p(&bsc), p(&bflag), p(&pkv), p(&psc),
-                                p(&flag), d as i32)
+                                p(&flag), d as i32, tmax as i32)
         });
         st.synchronize().unwrap();
         assert_eq!(flag.download().unwrap()[0], want_valid, "rollback({n}) flag");

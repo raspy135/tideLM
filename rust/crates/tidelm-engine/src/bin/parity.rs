@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use tidelm_engine::decode::argmax_bf16;
+use tidelm_engine::decode::{argmax_bf16, generate_plain, generate_spec, generate_spec_with};
 use tidelm_engine::forward::{Engine, Options, Want};
 use tidelm_text::Text;
 
@@ -57,7 +57,10 @@ fn main() -> tidelm_engine::Result<()> {
     ids.extend(text.encode(&prompt)?);
     tidelm_cuda::set_device(0)?;
     let keep = Some(vec![(0..384).map(|e| e < keep_first).collect::<Vec<bool>>(); 40]);
-    let base = Options { max_seq: 1024, spec: false, resident: false, graphs: false, n_layers: Some(layers), keep };
+    if args.iter().any(|a| a == "--spec") {
+        return spec_parity(&model_dir, token_map, &ids, layers, keep, steps);
+    }
+    let base = Options { max_seq: 1024, spec: false, resident: false, graphs: false, n_layers: Some(layers), keep, dspark_keep: None };
 
     let (sl, st, _) = {
         let mut e = Engine::new(&model_dir, token_map.clone(), base.clone())?;
@@ -86,4 +89,64 @@ fn main() -> tidelm_engine::Result<()> {
     eprintln!("PARITY OK: {} layers, {} experts/layer, {} steps bit-identical across streaming, resident, graphs",
               layers, keep_first, steps + 1);
     Ok(())
+}
+
+/// Speculative greedy through the three modes: each must equal plain greedy in its own mode
+/// (lossless), and all three must agree with each other.
+fn spec_parity(model_dir: &std::path::Path, token_map: Vec<i64>, ids: &[u32], layers: usize,
+               keep: Option<Vec<Vec<bool>>>, steps: usize) -> tidelm_engine::Result<()> {
+    let dkeep = Some(vec![(0..128).map(|e| e < 8).collect::<Vec<bool>>(); 3]);
+    let base = Options { max_seq: 1024, spec: true, resident: false, graphs: false, n_layers: Some(layers), keep,
+                         dspark_keep: dkeep };
+    let n = steps + 1;
+    let mut results = Vec::new();
+    {
+        let mut e = Engine::new(model_dir, token_map.clone(), base.clone())?;
+        let plain = generate_plain(&mut e, ids, n, &[], |_| {})?;
+        let spec = generate_spec(&mut e, ids, n, 5, &[], |_| {})?;
+        eprintln!("streaming:       plain {:?}\n                 spec  {:?} accepted {:?}", plain.tokens, spec.tokens, spec.accepted);
+        let oracle = oracle_spec(&mut e, ids, n, &plain.tokens)?;
+        eprintln!("                 oracle accepted {:?}", oracle.accepted);
+        results.push((plain.tokens.clone(), spec.tokens, spec.accepted));
+        results.push((plain.tokens, oracle.tokens, oracle.accepted));
+    }
+    let mut e = Engine::new(model_dir, token_map, Options { resident: true, ..base })?;
+    for graphs in [false, true] {
+        e.set_graphs(graphs);
+        let plain = generate_plain(&mut e, ids, n, &[], |_| {})?;
+        let spec = generate_spec(&mut e, ids, n, 5, &[], |_| {})?;
+        eprintln!("resident {:6}: plain {:?}\n                 spec  {:?} accepted {:?}", if graphs { "graphs" } else { "eager" },
+                  plain.tokens, spec.tokens, spec.accepted);
+        let oracle = oracle_spec(&mut e, ids, n, &plain.tokens)?;
+        eprintln!("                 oracle accepted {:?}", oracle.accepted);
+        results.push((plain.tokens.clone(), spec.tokens, spec.accepted));
+        results.push((plain.tokens, oracle.tokens, oracle.accepted));
+    }
+    eprintln!("graph captures {}, replays {}", e.graph_captures, e.graph_replays);
+    let lossless = results.iter().all(|(p, s, _)| p == s);
+    // drafter runs and oracle runs alternate; each kind must agree across the three modes
+    let agree = (0..2).all(|k| results.iter().skip(k).step_by(2).collect::<Vec<_>>().windows(2).all(|w| w[0] == w[1]));
+    eprintln!("lossless in every mode: {lossless}; modes agree (tokens and acceptance): {agree}");
+    if !(lossless && agree) {
+        eprintln!("SPEC PARITY FAILED");
+        std::process::exit(1);
+    }
+    eprintln!("SPEC PARITY OK");
+    Ok(())
+}
+
+/// Speculation with oracle drafts: the true greedy continuation with the draft at position
+/// `step % 6` replaced by a wrong token, so the verify accepts exactly that many drafts
+/// (5 = all) — every rollback depth, every pending parity.
+fn oracle_spec(e: &mut Engine, ids: &[u32], n: usize, truth: &[u32]) -> tidelm_engine::Result<tidelm_engine::decode::Generation> {
+    let mut step = 0usize;
+    generate_spec_with(e, ids, n, 5, &[], |_| {}, |_e, _tok, _last, emitted| {
+        let k = step % 6;
+        step += 1;
+        let mut d: Vec<u32> = (0..5).map(|i| truth.get(emitted + i).copied().unwrap_or(0)).collect();
+        if k < 5 {
+            d[k] = (d[k] + 1) % 129_280;
+        }
+        Ok(d)
+    })
 }

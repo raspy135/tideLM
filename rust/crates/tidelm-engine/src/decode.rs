@@ -64,7 +64,16 @@ pub fn generate_plain(engine: &mut Engine, prompt: &[u32], max_tokens: usize, st
 
 /// DSpark speculative greedy decoding at a fixed verify depth (<= dspark_block_size).
 pub fn generate_spec(engine: &mut Engine, prompt: &[u32], max_tokens: usize, depth: usize, stop: &[u32],
-                     mut on_token: impl FnMut(&[u32])) -> Result<Generation> {
+                     on_token: impl FnMut(&[u32])) -> Result<Generation> {
+    generate_spec_with(engine, prompt, max_tokens, depth, stop, on_token, |e, tok, last, _| e.draft(tok, last))
+}
+
+/// The speculative loop with the drafts supplied by `draft(engine, tok, last_main_pos,
+/// emitted_so_far)` — the DSpark drafter in serving, an oracle in tests (drafts with a known
+/// error position make every accepted length, and so every rollback depth, reachable).
+pub fn generate_spec_with(engine: &mut Engine, prompt: &[u32], max_tokens: usize, depth: usize, stop: &[u32],
+                          mut on_token: impl FnMut(&[u32]),
+                          mut draft: impl FnMut(&mut Engine, u32, usize, usize) -> Result<Vec<u32>>) -> Result<Generation> {
     engine.reset();
     let mut tok = prefill(engine, prompt, true)?;
     let mut g = Generation { tokens: vec![tok], ..Default::default() };
@@ -72,7 +81,7 @@ pub fn generate_spec(engine: &mut Engine, prompt: &[u32], max_tokens: usize, dep
     let v = engine.cfg.vocab_size;
     let mut pos = prompt.len(); // position of `tok`, not yet forwarded
     while g.tokens.len() < max_tokens && !stop.contains(&tok) {
-        let drafts = engine.draft(tok, pos - 1)?;
+        let drafts = draft(engine, tok, pos - 1, g.tokens.len())?;
         let mut block = vec![tok];
         block.extend_from_slice(&drafts[..depth.min(drafts.len())]);
         let logits = engine.forward(&block, Want::All)?;

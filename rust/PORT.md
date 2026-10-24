@@ -66,12 +66,20 @@ host waits. Prefill is eager (graphs off in the profile).
 
 | Crate | Status | Contents |
 |---|---|---|
-| `tidelm-core` | **done** | GPU-free logic, tests mirror the Python tests: sampling + penalties, batched spec verifier, residency planning (keep masks, demand blend, global plan), spec depth policies, UE8M0 scale codec |
-| `tidelm-kernels` | **done** | `build.rs` compiles `fp4_moe_cuda.cu` + `engram_gather.cpp` with the exact flags/defines the Python JIT uses; typed `extern "C"` surface; link + CPU-gather tests pass |
-| `tidelm-cuda` | next | Driver API: context, streams/events, **graph capture/replay**, pinned + device alloc, cuBLASLt, NCCL FFI, cubin module loading |
-| `tidelm-model` | planned | safetensors header parse, O_DIRECT expert/scale-pack/engram readers, FP8/BF16 weight planes, expert arena + LUT, KV caches (window ring, packed compressed KV), rollback |
-| `tidelm-engine` | planned | boot config guard, prefill, decode loop, spec decode, adaptation, **continuous-batching scheduler** |
-| `tidelm-server` | later | HTTP front (axum), same API as `server/app.py`; the Python server can sit in front over IPC during bring-up without touching the pipeline |
+| `tidelm-core` | done | GPU-free logic, tests mirror the Python tests: sampling + penalties, batched spec verifier, residency planning (keep masks, demand blend, global plan), spec depth policies, UE8M0 scale codec, NumPy's PCG64 + the engram n-gram hash |
+| `tidelm-text` | done | tokenizer (HF `tokenizers`, itself Rust) and the engram compressed token map — sha256-identical to the checkpoint's Python |
+| `tidelm-kernels` | done | `fp4_moe_cuda.cu` + `engram_gather.cpp` built from their in-tree sources with the Python JIT's flags, plus **`cuda/ds41.cu`: the engine's own decode-path kernels** (skinny FP8/BF16/FP32 GEMMs, norms, HC, RoPE, router, attention, compressor, indexer, engram, graph-safe step plumbing); 18 GPU tests against CPU transcriptions of the Python |
+| `tidelm-cuda` | done | streams, events, device/pinned buffers, async copies, graph capture/replay |
+| `tidelm-model` | done | safetensors headers, O_DIRECT span reads (parallel aligned pieces), expert run grouping — byte-exact vs buffered IO on the real checkpoint |
+| `tidelm-engine` | in progress | forward pass (streaming and resident), indexer, DSpark spec decode, rollback, one-graph steps; CLIs `tidelm-generate`, `tidelm-parity` |
+| `tidelm-server` | later | HTTP front, same API as `server/app.py` |
+
+Kernel strategy, as built: the Triton/Gluon kernels were **not** AOT-compiled. Every op
+on the step path is a hand-written CUDA kernel in `ds41.cu` (the decode MoE stays the
+repo's own `fp4_moe_cuda.cu`), so no Python is needed even at build time. Each reproduces
+its Python counterpart's rounding points and differs only in summation order; the FP8
+skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D copy
+(`bench_skinny`), at least on par with the 211-230 GB/s the repo records for Triton.
 
 ## Milestones and gates
 
@@ -94,6 +102,20 @@ host waits. Prefill is eager (graphs off in the profile).
   verify, depth policy live. *Gate: ≥ Python decode tok/s on the README workloads
   (code and prose separately — the depth policy history says they diverge), identical
   acceptance. A regression here blocks the branch.*
+
+  Status 2026-10-24, measured on what fits next to a live server:
+  - DSpark speculation is lossless in streaming mode on the full model — `def
+    fibonacci(n):`, 24 tokens identical with and without speculation, 3.43 tokens/step
+    (the Python engine records ~3.56). Exact, not approximate: every kernel is
+    row-invariant.
+  - The indexer lifts the context cap; the all-visible path is kept where it is exact.
+  - Resident mode (weights, embedding, head, routable experts on the device; routing via
+    a slot LUT) is bit-identical to streaming; with `--graphs` each backbone step is one
+    CUDA graph, bit-identical to both (`tidelm-parity`, 4-layer truncation: 9 steps x
+    129,280 logits). On that truncation graphs take 17.1 -> 15.3 ms/step.
+  - Not yet measured: anything at full scale. The resident full model needs the box
+    to itself (the GLM server holds 103 GB), and single-box residency needs a pruned keep
+    set; the real deployment is TP2 (M4).
 - **M3 — bigger graphs** (user goal). Today a step is 4 graph replays + eager
   embedding/hash + ~10 host-launched accept ops. Merge order, each step A/B'd on
   `boundary_gap_ms_per_step` and tok/s:

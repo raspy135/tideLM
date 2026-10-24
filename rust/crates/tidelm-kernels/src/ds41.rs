@@ -170,7 +170,7 @@ extern "C" {
     pub fn ds_compress_rows(stream: CudaStream, kv: *const c_void, sc: *const c_void, pkv: *const c_void, psc: *const c_void, pos: *const c_void, out: *mut c_void, t: c_int, d: c_int) -> c_int;
     pub fn ds_scatter_compressed(stream: CudaStream, src: *const c_void, ld_src: i64, dst: *mut c_void, pos: *const c_void, r: c_int, t: c_int, d: c_int) -> c_int;
     pub fn ds_pending_update(stream: CudaStream, kv: *const c_void, sc: *const c_void, pos: *const c_void, t: c_int, pkv: *mut c_void, psc: *mut c_void, flag: *mut c_void, mem_kv: *mut c_void, mem_sc: *mut c_void, before_kv: *mut c_void, before_sc: *mut c_void, before_flag: *mut c_void, mem_start: *mut c_void, d: c_int) -> c_int;
-    pub fn ds_rollback_pending(stream: CudaStream, n_dev: *const c_void, mem_kv: *const c_void, mem_sc: *const c_void, mem_start: *const c_void, before_kv: *const c_void, before_sc: *const c_void, before_flag: *const c_void, pkv: *mut c_void, psc: *mut c_void, flag: *mut c_void, d: c_int) -> c_int;
+    pub fn ds_rollback_pending(stream: CudaStream, n_dev: *const c_void, mem_kv: *const c_void, mem_sc: *const c_void, mem_start: *const c_void, before_kv: *const c_void, before_sc: *const c_void, before_flag: *const c_void, pkv: *mut c_void, psc: *mut c_void, flag: *mut c_void, d: c_int, mem_rows: c_int) -> c_int;
     pub fn ds_lut_slots(stream: CudaStream, idx: *const c_void, lut: *const c_void, p: c_int, slots: *mut c_void) -> c_int;
     pub fn ds_greedy_accept(stream: CudaStream, am: *const c_void, block: *const c_void, t: c_int, pos: *const c_void, out: *mut c_void) -> c_int;
     pub fn ds_wait_flag(stream: CudaStream, flag: *const c_void, expect: c_int, timeout_ns: i64, err: *mut c_void) -> c_int;
