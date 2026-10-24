@@ -20,28 +20,36 @@ fn main() -> tidelm_comm::Result<()> {
     let layer_mb: usize = arg("--layer-mb").map(|v| v.parse().unwrap()).unwrap_or(90);
     set_device(0)?;
     let stream = Stream::new()?;
-    let (comm, _ctl) = join(rank, &addr, format!("pair-step-v1 rows {rows} mb {layer_mb}").as_bytes(), Duration::from_secs(60))?;
+    let (comm, mut ctl) = join(rank, &addr, format!("pair-step-v2 rows {rows} mb {layer_mb}").as_bytes(), Duration::from_secs(60))?;
+    let hcas: Option<Vec<String>> = std::env::var("NCCL_IB_HCA").ok().map(|v| v.split(',').map(|s| s.to_string()).collect());
+    let roce = tidelm_comm::roce::Roce::setup(rank, &mut ctl, 64 * 5120 * 4, hcas.as_deref())?;
+    println!("rank {rank}: roce up");
     let layers = 40;
     let bytes = layer_mb << 20;
     // one source per layer so every copy reads cold memory, like the step's weights
     let src: Vec<DeviceBuffer<u8>> = (0..layers).map(|_| DeviceBuffer::<u8>::zeroed(bytes)).collect::<Result<_, _>>()?;
     let dst = DeviceBuffer::<u8>::zeroed(bytes)?;
     let red = DeviceBuffer::<f32>::zeroed(rows * 5120)?;
+    let gathered = DeviceBuffer::<f32>::zeroed(2 * rows * 5120)?;
+    let use_roce = std::cell::Cell::new(false);
     let step = |s: &Stream, comm_on: bool, extra: f64| -> tidelm_comm::Result<()> {
         for l in 0..layers {
             let n = (bytes as f64 * (1.0 + extra)) as usize;
             let n = n.min(bytes);
             let rc = unsafe { ffi::cudaMemcpyAsync(dst.raw(), src[l].raw() as *const c_void, n, ffi::MEMCPY_DEVICE_TO_DEVICE, s.raw()) };
             tidelm_cuda::check(rc, "copy")?;
-            if comm_on {
+            if comm_on && use_roce.get() {
+                roce.gather(red.raw(), gathered.raw(), rows * 5120 * 4, s)?;
+            } else if comm_on {
                 comm.allreduce_f32(red.raw(), rows * 5120, s)?;
             }
         }
         Ok(())
     };
     // (comm, extra work on rank 1 as a fraction of the layer)
-    for (name, comm_on, extra) in [("work only", false, 0.0), ("work + all-reduce", true, 0.0),
-                                   ("+ rank 1 does 1/3 less", true, -0.33), ("+ rank 1 does 1/3 more", true, 0.33)] {
+    for (name, comm_on, extra, rc) in [("work only", false, 0.0, false), ("work + NCCL all-reduce", true, 0.0, false),
+                                       ("work + RoCE gather", true, 0.0, true), ("RoCE, rank 1 1/3 less work", true, -0.33, true)] {
+        use_roce.set(rc);
         let mine = if rank == 1 { extra } else { 0.0 };
         stream.begin_capture()?;
         let rec = step(&stream, comm_on, mine);
@@ -58,7 +66,8 @@ fn main() -> tidelm_comm::Result<()> {
             g.launch(&stream)?;
         }
         stream.synchronize()?;
-        println!("rank {rank}: {name:26} {:.2} ms/step ({rows} rows, {layers} x {layer_mb} MB)", t.elapsed().as_secs_f64() / reps as f64 * 1e3);
+        println!("rank {rank}: {name:28} {:.2} ms/step ({rows} rows, {layers} x {layer_mb} MB)", t.elapsed().as_secs_f64() / reps as f64 * 1e3);
+        roce.check()?;
     }
     Ok(())
 }

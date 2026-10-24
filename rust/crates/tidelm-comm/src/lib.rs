@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 use tidelm_cuda::Stream;
 
+pub mod roce;
+
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
