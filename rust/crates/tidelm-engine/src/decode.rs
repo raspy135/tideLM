@@ -1,11 +1,19 @@
-//! Greedy decode loops over the engine (v41_engine.py::_decode_loop, greedy paths): plain
-//! one-token steps, and DSpark speculative steps (draft, verify the block, accept the
-//! longest matching prefix plus the bonus token, roll back the rest) — for one sequence, and
-//! for many at once through continuous batching (`generate_batch`).
+//! Decode loops over the engine (v41_engine.py::_decode_loop): plain one-token steps, and
+//! DSpark speculative steps (draft, verify the block, accept a prefix plus the bonus token,
+//! roll back the rest), greedy or sampled — for one sequence (`generate`), and for many at
+//! once through continuous batching (`generate_batch`).
+//!
+//! Sampled speculation is the Python engine's rejection sampling (engine/spec_sampling.py
+//! semantics, `tidelm_core::spec::verify_sparse`): the drafter samples from its own
+//! top-p nucleus (DSV41_DRAFT_NUCLEUS) and each draft stands with probability
+//! min(1, p/q), the first rejection drawing from (p - q)+ - exact for any q, so the output
+//! is distributed as sampling the target alone.
 
 use tidelm_core::depth::{ConfidenceDepthPolicy, DepthPolicy};
+use tidelm_core::numpy_rng::Pcg64;
+use tidelm_core::spec::{verify_sparse, SparseRow};
 
-use crate::forward::{Engine, Seg, Want, TMAX};
+use crate::forward::{Engine, Nucleus, Sampling, Seg, Want, TMAX};
 use crate::Result;
 
 /// First index of the maximum of a bf16 row (torch.argmax over the engine's bf16 logits).
@@ -30,8 +38,15 @@ pub struct Generation {
     /// a hash of every logits row the sequence consumed, in order: two runs with equal
     /// digests computed bit-identical logits
     pub digest: u64,
-    /// verify depth per speculative step (generate_spec_auto)
+    /// verify depth per speculative step
     pub depths: Vec<usize>,
+    /// sampled speculation's self-check: over every draft position verification reached,
+    /// the acceptance probability its rows imply (sum of min(p, q)) and the acceptances
+    /// seen. The two agree in expectation exactly when each draft was drawn from the q it
+    /// was verified against.
+    pub accept_expected: f64,
+    pub accept_seen: u64,
+    pub accept_tests: u64,
 }
 
 fn digest(h: u64, logits: &[u16]) -> u64 {
@@ -61,6 +76,213 @@ impl Generation {
     }
 }
 
+/// How a decode loop picks each step's verify depth.
+pub enum Depth<'a> {
+    /// no drafter: one token per backbone step
+    Plain,
+    /// DSpark speculation at a fixed depth (<= dspark_block_size)
+    Fixed(usize),
+    /// DSpark's confidence head every step, widths 1..=5 over measured step time
+    /// (DSV41_BLOCK_CONFIDENCE with DSV41_VERIFY_ODD); sampled steps take its proposal-prefix
+    /// rule (choose_sampled), which keeps the verification exact
+    Confidence(&'a mut ConfidenceDepthPolicy),
+    /// the Python engine's shipped controller (DSV41_BLOCK_DYNAMIC=3,5 with
+    /// DSV41_BLOCK_DYNAMIC_TOKENS=8): a depth from recent acceptance, chosen before the draft
+    Window(&'a mut DepthPolicy),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DecodeOptions {
+    pub sampling: Sampling,
+    /// the sampling stream's seed (PCG64): a sampled run is reproducible from it
+    pub seed: u64,
+    /// read back every consumed logits row and hash it into Generation::digest (greedy
+    /// checks); off, greedy reads back only the rows' device argmaxes
+    pub digest: bool,
+}
+
+impl DecodeOptions {
+    pub fn greedy(digest: bool) -> Self {
+        DecodeOptions { sampling: Sampling::GREEDY, seed: 0, digest }
+    }
+}
+
+/// A uniform in [0, 1) with 24 random bits (every value exact in f32).
+fn unif(rng: &mut Pcg64) -> f32 {
+    (rng.next_u64() >> 40) as f32 * (1.0 / (1u64 << 24) as f32)
+}
+
+/// The inverse-CDF draw from `n` at `u`, kept inside the positive mass.
+fn draw(n: &Nucleus, u: f32) -> u32 {
+    let total: f32 = n.probs.iter().sum();
+    let th = u * total;
+    let mut acc = 0.0f32;
+    for (j, &p) in n.probs.iter().enumerate() {
+        acc += p;
+        if acc > th {
+            return n.ids[j];
+        }
+    }
+    *n.ids.last().expect("a nucleus holds at least one token")
+}
+
+/// Per wanted row of one step's segment: the greedy token (with its logits hashed in when
+/// `digest`) or the row's nucleus.
+enum Rows {
+    Greedy(Vec<u32>),
+    Sampled(Vec<Nucleus>),
+}
+
+fn step_rows(engine: &mut Engine, seg: Seg, opt: &DecodeOptions, g: &mut Generation) -> Result<Rows> {
+    let v = engine.cfg.vocab_size;
+    if !opt.sampling.is_greedy() {
+        return Ok(Rows::Sampled(engine.forward_batch_sampled(&[seg], &[opt.sampling])?.remove(0)));
+    }
+    if opt.digest {
+        let lg = engine.forward_batch(&[seg])?.remove(0);
+        g.digest = digest(g.digest, &lg);
+        return Ok(Rows::Greedy(lg.chunks(v).map(argmax_bf16).collect()));
+    }
+    Ok(Rows::Greedy(engine.forward_batch_argmax(&[seg])?.remove(0)))
+}
+
+/// The next token from a one-row step.
+fn next_token(rows: Rows, rng: &mut Pcg64) -> u32 {
+    match rows {
+        Rows::Greedy(am) => am[0],
+        Rows::Sampled(nuc) => draw(&nuc[0], unif(rng)),
+    }
+}
+
+/// Prefill `prompt` into lane 0 (seeding the drafter when `seed`) and pick the first token.
+fn prefill_first(engine: &mut Engine, prompt: &[u32], seed: bool, opt: &DecodeOptions, rng: &mut Pcg64,
+                 g: &mut Generation) -> Result<u32> {
+    let chunks: Vec<&[u32]> = prompt.chunks(TMAX).collect();
+    let mut first = None;
+    for (i, chunk) in chunks.iter().enumerate() {
+        if i + 1 == chunks.len() {
+            first = Some(next_token(step_rows(engine, Seg { lane: 0, ids: chunk, want: Want::Last }, opt, g)?, rng));
+        } else {
+            engine.forward(chunk, Want::Nothing)?;
+        }
+        if seed {
+            engine.seed_draft(chunk.len())?;
+        }
+    }
+    first.ok_or_else(|| "an empty prompt".into())
+}
+
+/// One sequence on lane 0: prefill `prompt`, then up to `max_tokens` tokens (the first
+/// from the prompt's last row), ending early at a token of `stop`. Each emitted burst goes
+/// to `on_token`. Greedy speculation emits exactly plain greedy's tokens at any depth;
+/// sampled speculation emits a sample from the same distribution as plain sampling.
+pub fn generate(engine: &mut Engine, prompt: &[u32], max_tokens: usize, stop: &[u32], mut depth: Depth,
+                opt: &DecodeOptions, mut on_token: impl FnMut(&[u32])) -> Result<Generation> {
+    engine.reset();
+    match &mut depth {
+        Depth::Confidence(p) => p.reset_request(),
+        Depth::Window(p) => p.reset_request(),
+        Depth::Fixed(d) if *d == 0 || *d > engine.cfg.dspark_block_size => {
+            return Err(format!("verify depth {d} outside 1..={}", engine.cfg.dspark_block_size).into());
+        }
+        _ => {}
+    }
+    let spec = !matches!(depth, Depth::Plain);
+    let greedy = opt.sampling.is_greedy();
+    let b = engine.cfg.dspark_block_size;
+    let mut rng = Pcg64::from_seed(opt.seed as u128);
+    let mut g = Generation::default();
+    let mut tok = prefill_first(engine, prompt, spec, opt, &mut rng, &mut g)?;
+    g.tokens.push(tok);
+    on_token(&[tok]);
+    let mut pos = prompt.len(); // position of `tok`, not yet forwarded
+    while g.tokens.len() < max_tokens && !stop.contains(&tok) {
+        if !spec {
+            tok = next_token(step_rows(engine, Seg { lane: 0, ids: &[tok], want: Want::Last }, opt, &mut g)?, &mut rng);
+            pos += 1;
+            g.tokens.push(tok);
+            g.steps += 1;
+            on_token(&[tok]);
+            continue;
+        }
+        let t0 = std::time::Instant::now();
+        let caps = engine.graph_captures;
+        let window = match &mut depth {
+            Depth::Window(p) => Some(p.decide()),
+            _ => None,
+        };
+        let (drafts, q) = if greedy {
+            (engine.draft(tok, pos - 1)?, Vec::new())
+        } else {
+            let u: Vec<f32> = (0..b).map(|_| unif(&mut rng)).collect();
+            engine.draft_batch_sampled(&[(0, tok, pos - 1)], &[opt.sampling], &u)?.remove(0)
+        };
+        let d = match &mut depth {
+            Depth::Fixed(d) => *d,
+            Depth::Window(_) => window.unwrap(),
+            Depth::Confidence(p) => {
+                let conf: Vec<f64> = engine.draft_conf()[0].iter().map(|&x| x as f64).collect();
+                if greedy { p.choose(&conf) } else { p.choose_sampled(&conf) }.map_err(|e| e.0)?
+            }
+            Depth::Plain => unreachable!(),
+        }
+        .min(drafts.len());
+        let mut block = vec![tok];
+        block.extend_from_slice(&drafts[..d]);
+        let (a, mut emitted) = match step_rows(engine, Seg { lane: 0, ids: &block, want: Want::All }, opt, &mut g)? {
+            Rows::Greedy(am) => accept(&block, &am, stop),
+            Rows::Sampled(p) => {
+                let pr: Vec<SparseRow> = p.iter().map(|n| n.row()).collect();
+                let qr: Vec<SparseRow> = q[..d].iter().map(|n| n.row()).collect();
+                let u: Vec<f32> = (0..=d).map(|_| unif(&mut rng)).collect();
+                let ds: Vec<i64> = drafts[..d].iter().map(|&x| x as i64).collect();
+                let st: Vec<i64> = stop.iter().map(|&x| x as i64).collect();
+                let v = verify_sparse(&pr, &qr, &ds, &u, &st).map_err(|e| format!("verify: {e:?}"))?;
+                if v.bonus.is_some() {
+                    // positions 0..=accepted were tested (the last one failed unless all passed)
+                    for i in 0..(v.accepted + 1).min(d) {
+                        let (pi, qi) = (&p[i], &q[i]);
+                        if !qi.ids.contains(&drafts[i]) {
+                            return Err(format!("draft {i} ({}) is outside the q it was drawn from", drafts[i]).into());
+                        }
+                        g.accept_expected += qi.ids.iter().zip(&qi.probs)
+                            .map(|(id, &qx)| pi.ids.iter().position(|x| x == id).map_or(0.0, |j| pi.probs[j].min(qx)) as f64)
+                            .sum::<f64>();
+                        g.accept_seen += (i < v.accepted) as u64;
+                        g.accept_tests += 1;
+                    }
+                }
+                let mut em: Vec<u32> = v.tokens.iter().map(|&x| x as u32).collect();
+                em.extend(v.bonus.map(|x| x as u32));
+                (v.accepted, em)
+            }
+        };
+        engine.rollback(pos + a + 1)?;
+        engine.seed_draft(a + 1)?;
+        let step_s = (engine.graph_captures == caps).then(|| t0.elapsed().as_secs_f64());
+        match &mut depth {
+            Depth::Confidence(p) => p.observe(d, a as u64, emitted.len() as u64, step_s),
+            Depth::Window(p) => p.observe(d, a as u64, emitted.len() as u64, step_s),
+            _ => {}
+        }
+        // the limit is on emitted tokens, not verify steps
+        emitted.truncate(max_tokens - g.tokens.len());
+        pos += a + 1;
+        g.steps += 1;
+        g.accepted.push(a);
+        g.depths.push(d);
+        if let Some(&last) = emitted.last() {
+            tok = last;
+        }
+        on_token(&emitted);
+        g.tokens.extend_from_slice(&emitted);
+        if emitted.iter().any(|t| stop.contains(t)) {
+            break;
+        }
+    }
+    Ok(g)
+}
+
 fn prefill(engine: &mut Engine, prompt: &[u32], seed: bool, g: &mut Generation) -> Result<u32> {
     let chunks: Vec<&[u32]> = prompt.chunks(TMAX).collect();
     let mut logits = Vec::new();
@@ -75,29 +297,17 @@ fn prefill(engine: &mut Engine, prompt: &[u32], seed: bool, g: &mut Generation) 
     Ok(argmax_bf16(&logits))
 }
 
-/// One token per backbone step.
+/// One token per backbone step, greedy, every logits row hashed into the digest.
 pub fn generate_plain(engine: &mut Engine, prompt: &[u32], max_tokens: usize, stop: &[u32],
-                      mut on_token: impl FnMut(&[u32])) -> Result<Generation> {
-    engine.reset();
-    let mut g = Generation::default();
-    let mut tok = prefill(engine, prompt, false, &mut g)?;
-    g.tokens.push(tok);
-    on_token(&[tok]);
-    while g.tokens.len() < max_tokens && !stop.contains(&tok) {
-        let lg = engine.forward(&[tok], Want::Last)?;
-        g.digest = digest(g.digest, &lg);
-        tok = argmax_bf16(&lg);
-        g.tokens.push(tok);
-        g.steps += 1;
-        on_token(&[tok]);
-    }
-    Ok(g)
+                      on_token: impl FnMut(&[u32])) -> Result<Generation> {
+    generate(engine, prompt, max_tokens, stop, Depth::Plain, &DecodeOptions::greedy(true), on_token)
 }
 
-/// DSpark speculative greedy decoding at a fixed verify depth (<= dspark_block_size).
+/// DSpark speculative greedy decoding at a fixed verify depth (<= dspark_block_size), every
+/// logits row hashed into the digest.
 pub fn generate_spec(engine: &mut Engine, prompt: &[u32], max_tokens: usize, depth: usize, stop: &[u32],
                      on_token: impl FnMut(&[u32])) -> Result<Generation> {
-    generate_spec_with(engine, prompt, max_tokens, depth, stop, on_token, |e, tok, last, _| e.draft(tok, last))
+    generate(engine, prompt, max_tokens, stop, Depth::Fixed(depth), &DecodeOptions::greedy(true), on_token)
 }
 
 /// The speculative loop with the drafts supplied by `draft(engine, tok, last_main_pos,
@@ -140,101 +350,20 @@ pub fn generate_spec_with(engine: &mut Engine, prompt: &[u32], max_tokens: usize
     Ok(g)
 }
 
-/// DSpark speculative greedy decoding with the verify depth chosen every step from the
-/// drafter's confidence head (`ConfidenceDepthPolicy`, widths 1..=5: expected tokens over
-/// measured step time, DSV41_BLOCK_CONFIDENCE with DSV41_VERIFY_ODD). Any width is free
-/// here - graphs are keyed by row bucket, not by width - so the policy is not limited to the
-/// Python engine's 1/3/5. Steps that captured a graph are not timed.
-pub fn generate_spec_auto(engine: &mut Engine, prompt: &[u32], max_tokens: usize, stop: &[u32],
-                          policy: &mut ConfidenceDepthPolicy, mut on_token: impl FnMut(&[u32])) -> Result<Generation> {
-    engine.reset();
-    policy.reset_request();
-    let mut g = Generation::default();
-    let mut tok = prefill(engine, prompt, true, &mut g)?;
-    g.tokens.push(tok);
-    on_token(&[tok]);
-    let v = engine.cfg.vocab_size;
-    let mut pos = prompt.len();
-    while g.tokens.len() < max_tokens && !stop.contains(&tok) {
-        let t0 = std::time::Instant::now();
-        let caps = engine.graph_captures;
-        let drafts = engine.draft(tok, pos - 1)?;
-        let conf: Vec<f64> = engine.draft_conf()[0].iter().map(|&x| x as f64).collect();
-        let depth = policy.choose(&conf).map_err(|e| e.0)?;
-        let mut block = vec![tok];
-        block.extend_from_slice(&drafts[..depth.min(drafts.len())]);
-        let logits = engine.forward(&block, Want::All)?;
-        g.digest = digest(g.digest, &logits);
-        let am: Vec<u32> = (0..block.len()).map(|r| argmax_bf16(&logits[r * v..(r + 1) * v])).collect();
-        let (a, mut emitted) = accept(&block, &am, stop);
-        engine.rollback(pos + a + 1)?;
-        engine.seed_draft(a + 1)?;
-        let step_s = (engine.graph_captures == caps).then(|| t0.elapsed().as_secs_f64());
-        policy.observe(depth, a as u64, emitted.len() as u64, step_s);
-        emitted.truncate(max_tokens - g.tokens.len());
-        pos += a + 1;
-        g.steps += 1;
-        g.accepted.push(a);
-        g.depths.push(depth);
-        if let Some(&last) = emitted.last() {
-            tok = last;
-        }
-        on_token(&emitted);
-        g.tokens.extend_from_slice(&emitted);
-        if emitted.iter().any(|t| stop.contains(t)) {
-            break;
-        }
-    }
-    Ok(g)
-}
-
-/// The same loop under the Python engine's shipped controller (DSV41_BLOCK_DYNAMIC=3,5 with
-/// DSV41_BLOCK_DYNAMIC_TOKENS=8): a depth from recent acceptance, re-decided every few
-/// tokens, chosen before the draft. For A/B against `generate_spec_auto`.
-pub fn generate_spec_window(engine: &mut Engine, prompt: &[u32], max_tokens: usize, stop: &[u32],
-                            policy: &mut DepthPolicy) -> Result<Generation> {
-    engine.reset();
-    policy.reset_request();
-    let mut g = Generation::default();
-    let mut tok = prefill(engine, prompt, true, &mut g)?;
-    g.tokens.push(tok);
-    let v = engine.cfg.vocab_size;
-    let mut pos = prompt.len();
-    while g.tokens.len() < max_tokens && !stop.contains(&tok) {
-        let t0 = std::time::Instant::now();
-        let caps = engine.graph_captures;
-        let depth = policy.decide();
-        let drafts = engine.draft(tok, pos - 1)?;
-        let mut block = vec![tok];
-        block.extend_from_slice(&drafts[..depth.min(drafts.len())]);
-        let logits = engine.forward(&block, Want::All)?;
-        let am: Vec<u32> = (0..block.len()).map(|r| argmax_bf16(&logits[r * v..(r + 1) * v])).collect();
-        let (a, mut emitted) = accept(&block, &am, stop);
-        engine.rollback(pos + a + 1)?;
-        engine.seed_draft(a + 1)?;
-        let step_s = (engine.graph_captures == caps).then(|| t0.elapsed().as_secs_f64());
-        policy.observe(depth, a as u64, emitted.len() as u64, step_s);
-        emitted.truncate(max_tokens - g.tokens.len());
-        pos += a + 1;
-        g.steps += 1;
-        g.accepted.push(a);
-        g.depths.push(depth);
-        if let Some(&last) = emitted.last() {
-            tok = last;
-        }
-        g.tokens.extend_from_slice(&emitted);
-        if emitted.iter().any(|t| stop.contains(t)) {
-            break;
-        }
-    }
-    Ok(g)
-}
-
 /// One request of a batched run.
 #[derive(Clone, Debug)]
 pub struct Request {
     pub prompt: Vec<u32>,
     pub max_tokens: usize,
+    pub sampling: Sampling,
+    /// its sampling stream's seed: a request draws the same uniforms batched as alone
+    pub seed: u64,
+}
+
+impl Request {
+    pub fn greedy(prompt: Vec<u32>, max_tokens: usize) -> Self {
+        Request { prompt, max_tokens, sampling: Sampling::GREEDY, seed: 0 }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -244,8 +373,8 @@ pub struct BatchOptions {
     /// rows per backbone step (<= TMAX): decode rows first, prefill chunks fill the rest
     pub step_rows: usize,
     pub stop: Vec<u32>,
-    /// read back full logits and hash them into each Generation's digest (checks); off,
-    /// only the device argmaxes come back
+    /// read back full logits and hash them into each Generation's digest (greedy checks);
+    /// off, only the device argmaxes (or the sampled rows' nuclei) come back
     pub logits: bool,
 }
 
@@ -272,13 +401,17 @@ struct Slot {
     /// decoding: the last emitted token, not yet forwarded
     tok: Option<u32>,
     gen: Generation,
+    rng: Pcg64,
+    /// the draft's distributions, while its block is being verified
+    q: Vec<Nucleus>,
 }
 
 /// Continuous batching over the engine's lanes: requests are admitted into free lanes as
 /// lanes retire, and every backbone step carries every decoding lane's rows (one token, or a
 /// verify block) and fills the rest of `step_rows` with prompt chunks (chunked prefill).
 /// Drafts, rollbacks and drafter seeding are batched across lanes the same way. Each
-/// request's tokens are what `generate_plain` / `generate_spec` would emit for it alone,
+/// request's tokens are what `generate` would emit for it alone (greedy or sampled from its
+/// own seed: each lane draws its uniforms in the same order as the single-sequence loop),
 /// bit for bit while every step stays at or below FMA_ROWS rows (forward.rs, module doc).
 pub fn generate_batch(engine: &mut Engine, reqs: &[Request], opt: &BatchOptions) -> Result<(Vec<Generation>, BatchStats)> {
     let lanes = engine.max_lanes();
@@ -295,6 +428,10 @@ pub fn generate_batch(engine: &mut Engine, reqs: &[Request], opt: &BatchOptions)
     if let Some(i) = reqs.iter().position(|r| r.prompt.is_empty() || r.max_tokens == 0) {
         return Err(format!("request {i}: needs a prompt and max_tokens >= 1").into());
     }
+    if opt.logits && reqs.iter().any(|r| !r.sampling.is_greedy()) {
+        return Err("logits digests check greedy requests only".into());
+    }
+    let b = engine.cfg.dspark_block_size;
     let max_decode = if spec { engine.max_draft_lanes() } else { usize::MAX };
     let mut out: Vec<Option<Generation>> = vec![None; reqs.len()];
     let mut slots: Vec<Option<Slot>> = (0..lanes).map(|_| None).collect();
@@ -304,7 +441,8 @@ pub fn generate_batch(engine: &mut Engine, reqs: &[Request], opt: &BatchOptions)
         for (lane, slot) in slots.iter_mut().enumerate() {
             if slot.is_none() && next < reqs.len() {
                 engine.reset_lane(lane)?;
-                *slot = Some(Slot { req: next, fed: 0, tok: None, gen: Generation::default() });
+                *slot = Some(Slot { req: next, fed: 0, tok: None, gen: Generation::default(),
+                                    rng: Pcg64::from_seed(reqs[next].seed as u128), q: Vec::new() });
                 next += 1;
             }
         }
@@ -340,7 +478,25 @@ pub fn generate_batch(engine: &mut Engine, reqs: &[Request], opt: &BatchOptions)
             stats.drafts += 1;
             let dreq: Vec<(usize, u32, usize)> =
                 decode.iter().map(|&l| (l, slots[l].as_ref().unwrap().tok.unwrap(), engine.lane_len(l) - 1)).collect();
-            engine.draft_batch(&dreq)?
+            let sm: Vec<Sampling> = decode.iter().map(|&l| reqs[slots[l].as_ref().unwrap().req].sampling).collect();
+            if sm.iter().all(|s| s.is_greedy()) {
+                engine.draft_batch(&dreq)?
+            } else {
+                // a greedy lane draws nothing (its uniforms are placeholders)
+                let mut u = Vec::with_capacity(decode.len() * b);
+                for (&l, x) in decode.iter().zip(&sm) {
+                    let s = slots[l].as_mut().unwrap();
+                    u.extend((0..b).map(|_| if x.is_greedy() { 0.0 } else { unif(&mut s.rng) }));
+                }
+                let out = engine.draft_batch_sampled(&dreq, &sm, &u)?;
+                out.into_iter()
+                    .zip(&decode)
+                    .map(|((d, q), &l)| {
+                        slots[l].as_mut().unwrap().q = q;
+                        d
+                    })
+                    .collect()
+            }
         } else {
             Vec::new()
         };
@@ -370,12 +526,17 @@ pub fn generate_batch(engine: &mut Engine, reqs: &[Request], opt: &BatchOptions)
         stats.rows += segs.iter().map(|s| s.ids.len()).sum::<usize>();
         let tf = std::time::Instant::now();
         stats.draft_s += (tf - td).as_secs_f64();
-        // per segment, the argmax of each wanted row (and with opt.logits, the rows' logits)
-        let (am, logits): (Vec<Vec<u32>>, Vec<Vec<u16>>) = if opt.logits {
+        // per segment, the argmax of each wanted row (and with opt.logits, the rows' logits);
+        // with sampled lanes, every row's nucleus (a greedy row's is its argmax alone)
+        let seg_sampling: Vec<Sampling> = segs.iter().map(|sg| reqs[slots[sg.lane].as_ref().unwrap().req].sampling).collect();
+        let (am, logits, nuc): (Vec<Vec<u32>>, Vec<Vec<u16>>, Vec<Vec<Nucleus>>) = if opt.logits {
             let lg = engine.forward_batch(&segs)?;
-            (lg.iter().map(|l| l.chunks(v).map(argmax_bf16).collect()).collect(), lg)
+            (lg.iter().map(|l| l.chunks(v).map(argmax_bf16).collect()).collect(), lg, Vec::new())
+        } else if seg_sampling.iter().all(|s| s.is_greedy()) {
+            (engine.forward_batch_argmax(&segs)?, Vec::new(), Vec::new())
         } else {
-            (engine.forward_batch_argmax(&segs)?, Vec::new())
+            let nuc = engine.forward_batch_sampled(&segs, &seg_sampling)?;
+            (nuc.iter().map(|rows| rows.iter().map(|n| n.ids[0]).collect()).collect(), Vec::new(), nuc)
         };
         let tp = std::time::Instant::now();
         stats.forward_s += (tp - tf).as_secs_f64();
@@ -386,9 +547,23 @@ pub fn generate_batch(engine: &mut Engine, reqs: &[Request], opt: &BatchOptions)
                 s.gen.digest = digest(s.gen.digest, &logits[i]);
             }
             s.gen.steps += 1;
+            let sampled = !reqs[s.req].sampling.is_greedy();
             if spec {
                 let block = &blocks[i];
-                let (a, mut emitted) = accept(block, &am[i], &opt.stop);
+                let (a, mut emitted) = if sampled {
+                    let d = block.len() - 1;
+                    let pr: Vec<SparseRow> = nuc[i].iter().map(|n| n.row()).collect();
+                    let qr: Vec<SparseRow> = s.q[..d].iter().map(|n| n.row()).collect();
+                    let u: Vec<f32> = (0..=d).map(|_| unif(&mut s.rng)).collect();
+                    let ds: Vec<i64> = block[1..].iter().map(|&x| x as i64).collect();
+                    let st: Vec<i64> = opt.stop.iter().map(|&x| x as i64).collect();
+                    let vd = verify_sparse(&pr, &qr, &ds, &u, &st).map_err(|e| format!("verify: {e:?}"))?;
+                    let mut em: Vec<u32> = vd.tokens.iter().map(|&x| x as u32).collect();
+                    em.extend(vd.bonus.map(|x| x as u32));
+                    (vd.accepted, em)
+                } else {
+                    accept(block, &am[i], &opt.stop)
+                };
                 let pos = engine.lane_len(lane) - block.len(); // position of the block's first token
                 rollbacks.push((lane, pos + a + 1));
                 seeds.push((lane, a + 1));
@@ -399,7 +574,7 @@ pub fn generate_batch(engine: &mut Engine, reqs: &[Request], opt: &BatchOptions)
                 }
                 s.gen.tokens.extend_from_slice(&emitted);
             } else {
-                let t = am[i][0];
+                let t = if sampled { draw(&nuc[i][0], unif(&mut s.rng)) } else { am[i][0] };
                 s.gen.tokens.push(t);
                 s.tok = Some(t);
             }
@@ -414,7 +589,9 @@ pub fn generate_batch(engine: &mut Engine, reqs: &[Request], opt: &BatchOptions)
                 if opt.logits {
                     s.gen.digest = digest(s.gen.digest, &logits[decode.len() + j]);
                 }
-                let t = am[decode.len() + j][0];
+                let t = if reqs[s.req].sampling.is_greedy() { am[decode.len() + j][0] } else {
+                    draw(&nuc[decode.len() + j][0], unif(&mut s.rng))
+                };
                 s.gen.tokens.push(t);
                 s.tok = Some(t);
             }

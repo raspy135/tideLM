@@ -1298,3 +1298,135 @@ fn moe_mma_matches_bm16_and_is_row_invariant() {
         assert_eq!(&parts1[k * dim..(k + 1) * dim], &parts_mma[(k * t) * dim..(k * t + 1) * dim], "down row k={k}");
     }
 }
+
+/// The host reference for ds_nucleus: f64 softmax of x / T over the whole row, sorted by
+/// (value desc, id asc), kept while the mass before a token is < top_p, at most k tokens.
+/// Returns (ids, renormalized probs, whole nucleus, the cut's margin |excl - top_p|).
+fn ref_nucleus(x: &[f32], t: f32, top_p: f32, k: usize) -> (Vec<u32>, Vec<f64>, bool, f64) {
+    let m = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let e: Vec<f64> = x.iter().map(|&v| (((v - m) / t) as f64).exp()).collect();
+    let z: f64 = e.iter().sum();
+    let mut idx: Vec<usize> = (0..x.len()).collect();
+    idx.sort_by(|&a, &b| x[b].partial_cmp(&x[a]).unwrap().then(a.cmp(&b)));
+    let (mut ids, mut ps, mut cum, mut margin) = (Vec::new(), Vec::new(), 0f64, f64::INFINITY);
+    let mut whole = false;
+    for &i in &idx {
+        if cum >= top_p as f64 {
+            // the cut: the mass before this token, and before the last one kept
+            margin = (cum - top_p as f64).min(top_p as f64 - (cum - ps.last().unwrap_or(&0.0)));
+            whole = true;
+            break;
+        }
+        if ids.len() == k {
+            break;
+        }
+        ids.push(i as u32);
+        ps.push(e[i] / z);
+        cum += e[i] / z;
+    }
+    let s: f64 = ps.iter().sum();
+    (ids, ps.iter().map(|p| p / s).collect(), whole, margin)
+}
+
+#[test]
+fn nucleus_matches_the_sorted_softmax_reference() {
+    let Some(st) = setup() else { return };
+    let cap = unsafe { ds_nucleus_cap() } as usize;
+    let mut rng = Rng(0x5eed_1234);
+    // (rows of a, rows of b or none, N, K, temperatures, top_ps)
+    let v = 129_280usize;
+    struct Case {
+        a: Vec<f32>,
+        b: Option<Vec<f32>>,
+        n: usize,
+        k: usize,
+        t: Vec<f32>,
+        tp: Vec<f32>,
+        what: &'static str,
+    }
+    let normal = |rng: &mut Rng, n: usize, s: f32| (0..n).map(|_| bf(rng.normal() * s)).collect::<Vec<f32>>();
+    let mut cases = Vec::new();
+    {
+        // the target: sampled rows at several shapes, a greedy row, top_p 1
+        let mut a = Vec::new();
+        a.extend(normal(&mut rng, v, 3.0)); // ordinary
+        let mut peak = normal(&mut rng, v, 1.0);
+        peak[77_777] = 40.0;
+        a.extend(peak); // a sure token
+        a.extend(normal(&mut rng, v, 0.05)); // flat: the nucleus outgrows the cap
+        a.extend(normal(&mut rng, v, 3.0)); // greedy
+        a.extend(normal(&mut rng, v, 2.0)); // top_p 1
+        let ties: Vec<f32> = (0..v).map(|_| (rng.normal() * 2.0).round() / 2.0).collect();
+        a.extend(ties); // exact ties at every value, ordered by id
+        let crowd: Vec<f32> = (0..v).map(|_| ((rng.normal() * 2.0).round() / 2.0).min(4.0)).collect();
+        a.extend(crowd); // ~3,000 tokens tied at the top: cut short
+        cases.push(Case { a, b: None, n: v, k: cap, t: vec![0.6, 0.6, 0.6, 0.0, 0.8, 0.25, 1.0],
+                          tp: vec![0.95, 0.95, 0.95, 0.95, 1.0, 0.9, 0.9], what: "target" });
+    }
+    {
+        // the drafter: logits + a markov bias, K = 512 (DRAFT_NUCLEUS_K)
+        let a: Vec<f32> = (0..3).flat_map(|_| normal(&mut rng, v, 2.5)).collect();
+        let b: Vec<f32> = (0..3).flat_map(|_| normal(&mut rng, v, 1.5)).collect();
+        cases.push(Case { a, b: Some(b), n: v, k: 512, t: vec![0.6, 1.5, 0.0], tp: vec![0.95, 0.99, 0.95], what: "draft" });
+    }
+    {
+        // a row length off the 16-byte path
+        let a: Vec<f32> = (0..2).flat_map(|_| normal(&mut rng, 1001, 2.0)).collect();
+        cases.push(Case { a, b: None, n: 1001, k: 64, t: vec![0.7, 0.3], tp: vec![0.9, 0.5], what: "unaligned" });
+    }
+    for c in &cases {
+        let rows = c.t.len();
+        let a16: Vec<u16> = c.a.iter().map(|&x| bf16_from_f32(x)).collect();
+        let b16: Option<Vec<u16>> = c.b.as_ref().map(|b| b.iter().map(|&x| bf16_from_f32(x)).collect());
+        let (da, db) = (dev(&a16), b16.as_ref().map(|b| dev(b)));
+        let us: Vec<f32> = (0..rows).map(|_| rng.unif()).collect();
+        let (dt, dtp, du) = (dev(&c.t), dev(&c.tp), dev(&us));
+        let ids = DeviceBuffer::<i32>::zeroed(rows * c.k).unwrap();
+        let probs = DeviceBuffer::<f32>::zeroed(rows * c.k).unwrap();
+        let cnt = DeviceBuffer::<i32>::zeroed(rows).unwrap();
+        let tok = DeviceBuffer::<i32>::zeroed(rows).unwrap();
+        ok(unsafe {
+            ds_nucleus(st.raw(), p(&da), c.n as i64, db.as_ref().map_or(null(), |b| p(b)), c.n as i64, rows as i32, c.n as i32, p(&dt),
+                       p(&dtp), p(&du), c.k as i32, p(&ids), p(&probs), c.k as i64, p(&cnt), p(&tok))
+        });
+        st.synchronize().unwrap();
+        let (ids, probs, cnt, tok) = (ids.download().unwrap(), probs.download().unwrap(), cnt.download().unwrap(), tok.download().unwrap());
+        for r in 0..rows {
+            let x: Vec<f32> = (0..c.n).map(|i| c.a[r * c.n + i] + c.b.as_ref().map_or(0.0, |b| b[r * c.n + i])).collect();
+            let what = format!("{} row {r}", c.what);
+            if c.t[r] <= 0.0 {
+                let am = (0..c.n).fold(0, |b, i| if x[i] > x[b] { i } else { b });
+                assert_eq!((cnt[r], ids[r * c.k], tok[r], probs[r * c.k]), (1, am as i32, am as i32, 1.0), "{what}: greedy");
+                continue;
+            }
+            let (rid, rp, whole, margin) = ref_nucleus(&x, c.t[r], c.tp[r], c.k);
+            let n = cnt[r].unsigned_abs() as usize;
+            assert!(margin > 1e-6, "{what}: the test row's cut is too close to call ({margin})");
+            assert_eq!(cnt[r] > 0, whole, "{what}: whole-nucleus flag (cnt {}, reference {} tokens)", cnt[r], rid.len());
+            // whole: the nucleus itself; cut short: a prefix of it (all of it when K binds),
+            // renormalized - a distribution to draw from either way
+            let got: Vec<u32> = ids[r * c.k..r * c.k + n].iter().map(|&i| i as u32).collect();
+            let q: Vec<f64> = probs[r * c.k..r * c.k + n].iter().map(|&x| x as f64).collect();
+            if whole {
+                assert_eq!(got, rid, "{what}: nucleus ids");
+                for j in 0..n {
+                    assert!((q[j] - rp[j]).abs() <= 1e-5 * rp[j] + 1e-9, "{what}: prob {j}: {} vs {}", q[j], rp[j]);
+                }
+            } else {
+                assert!(n >= 1 && n <= rid.len(), "{what}: {n} tokens of a {}-token nucleus", rid.len());
+                assert_eq!(got, rid[..n], "{what}: cut-short ids are the nucleus' first {n}");
+                assert!(n == c.k || c.what != "draft" || rid.len() < c.k, "{what}: the drafter's K-cap");
+            }
+            let s: f64 = q.iter().sum();
+            assert!((s - 1.0).abs() < 1e-4, "{what}: the distribution sums to {s}");
+            // the draw: the first token whose running mass passes u
+            let mut acc = 0.0;
+            let want = (0..n).find(|&j| {
+                acc += q[j];
+                acc > us[r] as f64
+            }).unwrap_or(n - 1);
+            assert_eq!(tok[r], got[want] as i32, "{what}: draw at u = {}", us[r]);
+            eprintln!("{what}: {n} tokens{}", if cnt[r] < 0 { " (cut short)" } else { "" });
+        }
+    }
+}

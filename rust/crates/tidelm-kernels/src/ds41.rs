@@ -206,6 +206,18 @@ extern "C" {
                                 out: *mut c_void) -> c_int;
     /// The larger of the ranks' pairs [world][M][2] per row, the earlier rank on a tie.
     pub fn ds_argmax_combine(stream: CudaStream, pairs: *const c_void, world: c_int, m: c_int, out: *mut c_void) -> c_int;
+    /// Temperature + nucleus per row of a + b (bf16 [M][N], b may be null), parameters per row
+    /// from the device: temp [M] (<= 0: greedy, the first-index argmax), top_p [M], u [M] or
+    /// null. Writes the nucleus by `cum - p < top_p` over (value desc, id asc), at most K
+    /// <= ds_nucleus_cap() tokens, renormalized: ids/probs [M][ldo], cnt [M] = n, or -n when
+    /// it was cut short (by K or by the candidate window) - still exactly the distribution
+    /// written, but not the row's whole nucleus. With u, tok [M]: the inverse-CDF draw.
+    pub fn ds_nucleus(
+        stream: CudaStream, a: *const c_void, lda: i64, b: *const c_void, ldb: i64, m: c_int, n: c_int, temp: *const c_void,
+        top_p: *const c_void, u: *const c_void, k: c_int, ids: *mut c_void, probs: *mut c_void, ldo: i64, cnt: *mut c_void,
+        tok: *mut c_void,
+    ) -> c_int;
+    pub fn ds_nucleus_cap() -> c_int;
     /// [world][M][n] -> [M][world * n].
     pub fn ds_unshard_u16(stream: CudaStream, src: *const c_void, dst: *mut c_void, m: c_int, n: c_int, world: c_int) -> c_int;
 

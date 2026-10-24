@@ -3,7 +3,11 @@
 //!
 //!   tidelm-batch [--lanes 4] [--requests 8] [--max-tokens 24] [--step-rows 16]
 //!                [--spec [--depth 5]] [--resident [--graphs]] [--layers N] [--keep-first K]
-//!                [--check] [--warmup] [--max-seq 1024] [--model-dir DIR]
+//!                [--check] [--warmup] [--max-seq 1024] [--model-dir DIR] [--temperature T [--top-p P]]
+//!
+//! --temperature samples every request (request i from seed 1000 + i); --check then
+//! compares tokens only (a sampled run's draws depend on every bit of its rows, so equal
+//! tokens over a run are the same check).
 //!
 //! --check runs every request again alone (one lane busy, the same rows per step) and
 //! requires identical tokens, and identical logits digests when --step-rows <= 16 (every
@@ -15,8 +19,9 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use tidelm_engine::decode::{generate_batch, generate_plain, generate_spec, BatchOptions, Generation, Request};
-use tidelm_engine::forward::{Engine, Options, FMA_ROWS, TMAX};
+use tidelm_engine::decode::{generate, generate_batch, generate_plain, generate_spec, BatchOptions, DecodeOptions, Depth,
+                            Generation, Request};
+use tidelm_engine::forward::{Engine, Options, Sampling, FMA_ROWS, TMAX};
 use tidelm_text::Text;
 
 const PROMPTS: [&str; 8] = [
@@ -54,7 +59,13 @@ fn main() -> tidelm_engine::Result<()> {
         .map(|i| -> tidelm_engine::Result<Request> {
             let mut prompt = vec![0u32];
             prompt.extend(text.encode(PROMPTS[i % PROMPTS.len()])?);
-            Ok(Request { prompt, max_tokens })
+            let mut r = Request::greedy(prompt, max_tokens);
+            if let Some(t) = arg(&args, "--temperature") {
+                let top_p = arg(&args, "--top-p").map(|v| v.parse().unwrap()).unwrap_or(0.95);
+                r.sampling = Sampling { temperature: t.parse().unwrap(), top_p };
+                r.seed = 1000 + i as u64;
+            }
+            Ok(r)
         })
         .collect::<tidelm_engine::Result<_>>()?;
     tidelm_cuda::set_device(0)?;
@@ -114,7 +125,8 @@ fn run(engine: &mut Engine, args: &[String], reqs: &[Request], lanes: usize, n_r
     let flag = |name: &str| args.iter().any(|a| a == name);
     // --check compares logits digests; timing runs read back only the device argmaxes
     let check = flag("--check");
-    let opt = BatchOptions { spec_depth: spec.then_some(depth), step_rows, stop: vec![], logits: check };
+    let sampled = reqs.iter().any(|r| !r.sampling.is_greedy());
+    let opt = BatchOptions { spec_depth: spec.then_some(depth), step_rows, stop: vec![], logits: check && !sampled };
 
     if flag("--warmup") {
         generate_batch(engine, reqs, &opt)?;
@@ -155,25 +167,33 @@ fn run(engine: &mut Engine, args: &[String], reqs: &[Request], lanes: usize, n_r
     if !check {
         return Ok(());
     }
-    let bitwise = step_rows <= FMA_ROWS;
+    // every kernel is row-invariant on the FMA path: bits must not move while every step -
+    // the drafts' too, one block a decoding lane - stays at or below FMA_ROWS rows
+    let block = engine.cfg.dspark_block_size;
+    let bitwise = step_rows <= FMA_ROWS && (!spec || lanes.min(n_req) * block <= FMA_ROWS);
     let mut ok = true;
     // the argmax-only read-back must pick the same tokens as the host argmax of the logits
-    let (fast, _) = generate_batch(engine, reqs, &BatchOptions { logits: false, ..opt.clone() })?;
-    for (i, (b, f)) in batched.iter().zip(&fast).enumerate() {
-        if b.tokens != f.tokens {
-            ok = false;
-            eprintln!("request {i}: device argmax and host argmax DIFFER\n  host   {:?}\n  device {:?}", b.tokens, f.tokens);
+    if !sampled {
+        let (fast, _) = generate_batch(engine, reqs, &BatchOptions { logits: false, ..opt.clone() })?;
+        for (i, (b, f)) in batched.iter().zip(&fast).enumerate() {
+            if b.tokens != f.tokens {
+                ok = false;
+                eprintln!("request {i}: device argmax and host argmax DIFFER\n  host   {:?}\n  device {:?}", b.tokens, f.tokens);
+            }
         }
     }
     for (i, (b, a)) in batched.iter().zip(&alone).enumerate() {
         let same_tokens = b.tokens == a.tokens;
         let same_bits = b.digest == a.digest;
-        if !same_tokens || (bitwise && !same_bits) {
+        // greedy tokens survive rounding; a sampled draw does not, so past the FMA path a
+        // sampled request is only reported
+        if (!same_tokens && (bitwise || !sampled)) || (bitwise && !same_bits) {
             ok = false;
             eprintln!("request {i}: batched and alone DIFFER (tokens {same_tokens}, logits {same_bits})\n  batched {:?}\n  alone   {:?}",
                       b.tokens, a.tokens);
-        } else if !same_bits {
-            eprintln!("request {i}: same tokens, logits differ in rounding (steps above {FMA_ROWS} rows take the tensor-core GEMM)");
+        } else if !same_bits || !same_tokens {
+            eprintln!("request {i}: {} differ in rounding (steps above {FMA_ROWS} rows take the tensor-core GEMM)",
+                      if same_tokens { "logits" } else { "sampled tokens" });
         }
     }
     // the scheduler alone against the single-sequence loops, where their chunking agrees
@@ -181,7 +201,10 @@ fn run(engine: &mut Engine, args: &[String], reqs: &[Request], lanes: usize, n_r
         if !(r.prompt.len() <= step_rows || step_rows == TMAX) {
             continue;
         }
-        let g = if spec {
+        let g = if sampled {
+            let d = if spec { Depth::Fixed(depth) } else { Depth::Plain };
+            generate(engine, &r.prompt, max_tokens, &[], d, &DecodeOptions { sampling: r.sampling, seed: r.seed, digest: false }, |_| {})?
+        } else if spec {
             generate_spec(engine, &r.prompt, max_tokens, depth, &[], |_| {})?
         } else {
             generate_plain(engine, &r.prompt, max_tokens, &[], |_| {})?
@@ -197,6 +220,6 @@ fn run(engine: &mut Engine, args: &[String], reqs: &[Request], lanes: usize, n_r
         std::process::exit(1);
     }
     eprintln!("BATCH CHECK OK: {n_req} requests over {lanes} lanes, tokens identical to each request alone{}",
-              if bitwise { ", logits bit-identical" } else { "" });
+              if bitwise && !sampled { ", logits bit-identical" } else { "" });
     Ok(())
 }

@@ -1519,20 +1519,41 @@ __global__ void embed_hc_kernel(const int* __restrict__ ids, const __nv_bfloat16
     for (int c = 0; c < hc; ++c) h[((int64_t)m * hc + c) * D + d] = v;
 }
 
+// Row kernels: one 1024-thread block a vocabulary row.
+constexpr int kRowThreads = 1024;
+
+// f(x[n], n) over the row, 16-byte loads when `vec`
+template <class F>
+__device__ __forceinline__ void nuc_scan(const __nv_bfloat16* ar, const __nv_bfloat16* br, int N, bool vec, F&& f) {
+    if (vec) {
+        const int nc = N >> 3;
+        for (int c = threadIdx.x; c < nc; c += kRowThreads) {
+            const uint4 ra = reinterpret_cast<const uint4*>(ar)[c];
+            const uint4 rb = br ? reinterpret_cast<const uint4*>(br)[c] : make_uint4(0, 0, 0, 0);
+            const __nv_bfloat16* xa = reinterpret_cast<const __nv_bfloat16*>(&ra);
+            const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(&rb);
+#pragma unroll
+            for (int k = 0; k < 8; ++k) f(bf(xa[k]) + (br ? bf(xb[k]) : 0.f), 8 * c + k);
+        }
+    } else {
+        for (int n = threadIdx.x; n < N; n += kRowThreads) f(bf(ar[n]) + (br ? bf(br[n]) : 0.f), n);
+    }
+}
+
 // First index of the maximum (torch.argmax), over bf16 logits.
 // `pair`: also the maximum, the index written as offset + n, as (index, value bits) pairs -
 // a vocab-sharded head's per-rank candidate for argmax_combine_kernel.
-__global__ void argmax_bf16_kernel(const __nv_bfloat16* __restrict__ x, int64_t ldx, int N,
-                                   int* __restrict__ out, int pair, int offset) {
+// 16-byte loads when `vec` (26 -> 7 us a 129,280-wide row, bench_nucleus).
+__global__ void __launch_bounds__(kRowThreads) argmax_bf16_kernel(const __nv_bfloat16* __restrict__ x, int64_t ldx, int N,
+                                                                   bool vec, int* __restrict__ out, int pair, int offset) {
     __shared__ float bv[32];
     __shared__ int bi[32];
     const __nv_bfloat16* xr = x + (int64_t)blockIdx.x * ldx;
     float best = -INFINITY;
     int besti = 0x7fffffff;
-    for (int n = threadIdx.x; n < N; n += blockDim.x) {
-        const float v = bf(xr[n]);
+    nuc_scan(xr, nullptr, N, vec, [&](float v, int n) {
         if (v > best || (v == best && n < besti)) { best = v; besti = n; }
-    }
+    });
     for (int o = 16; o > 0; o >>= 1) {
         const float ov = __shfl_xor_sync(0xffffffffu, best, o);
         const int oi = __shfl_xor_sync(0xffffffffu, besti, o);
@@ -1788,19 +1809,18 @@ __global__ void hc_mean_kernel(const __nv_bfloat16* __restrict__ h, __nv_bfloat1
 
 // First index of the maximum of a + b over bf16 rows, in fp32 (the DSpark markov step:
 // logits[i] + bias, both bf16-valued). `b` may be null.
-__global__ void argmax_sum_bf16_kernel(const __nv_bfloat16* __restrict__ a, int64_t lda,
-                                       const __nv_bfloat16* __restrict__ b, int64_t ldb, int N,
-                                       int* __restrict__ out) {
+__global__ void __launch_bounds__(kRowThreads) argmax_sum_bf16_kernel(const __nv_bfloat16* __restrict__ a, int64_t lda,
+                                                                       const __nv_bfloat16* __restrict__ b, int64_t ldb,
+                                                                       int N, bool vec, int* __restrict__ out) {
     __shared__ float bv[32];
     __shared__ int bi[32];
     const __nv_bfloat16* ar = a + (int64_t)blockIdx.x * lda;
     const __nv_bfloat16* br = b ? b + (int64_t)blockIdx.x * ldb : nullptr;
     float best = -INFINITY;
     int besti = 0x7fffffff;
-    for (int n = threadIdx.x; n < N; n += blockDim.x) {
-        const float v = bf(ar[n]) + (br ? bf(br[n]) : 0.f);
+    nuc_scan(ar, br, N, vec, [&](float v, int n) {
         if (v > best || (v == best && n < besti)) { best = v; besti = n; }
-    }
+    });
     for (int o = 16; o > 0; o >>= 1) {
         const float ov = __shfl_xor_sync(0xffffffffu, best, o);
         const int oi = __shfl_xor_sync(0xffffffffu, besti, o);
@@ -1815,6 +1835,305 @@ __global__ void argmax_sum_bf16_kernel(const __nv_bfloat16* __restrict__ a, int6
         for (int i = 1; i < (int)(blockDim.x >> 5); ++i)
             if (bv[i] > best || (bv[i] == best && bi[i] < besti)) { best = bv[i]; besti = bi[i]; }
         out[blockIdx.x] = besti;
+    }
+}
+
+// ---- temperature + nucleus: v41_engine.sample_probs, and fastdecode.py's DRAFT_NUCLEUS draft ----
+//
+// One 1024-thread block per row x = a + b (bf16 rows, b may be null, summed in fp32 as
+// argmax_sum_bf16_kernel does). temp[r] <= 0: greedy, the row's first-index argmax with n = 1.
+// Otherwise p = softmax(x / T) over the whole row and its nucleus by the `cum - p < top_p` rule
+// over (value desc, id asc), at most K tokens (DRAFT_NUCLEUS_K; the target passes kNucCap),
+// renormalized: ids[r][0..n), probs[r][0..n), cnt[r] = n. cnt[r] = -n when the nucleus was cut
+// short (by K, or by the candidate window below): still a distribution to draw from - the
+// drafter does, and verification divides by exactly it - but not the target's full nucleus,
+// which the host then recomputes from the row. With u: tok[r] is the inverse-CDF draw at u[r].
+//
+// Candidates: a histogram of each token's log-probability gap below the max (kNucBinsPerNat
+// bins a nat over kNucGap nats - a token further down holds under e^-64 of the mass and is
+// never a candidate), in counts and in fixed-point mass. The window is every bin up to the one
+// that reaches K tokens or, one bin past it, the one that reaches top_p of the mass, whichever
+// comes first: whole bins, so the window is the top of the row by value, ties included. When
+// that is more than kNucCap tokens, the K-th token's bin is split once more into kNucSub
+// sub-bins (one more pass, only then), and the window ends at the sub-bin reaching K. The
+// fixed-point mass rounds down, which can only widen the window; the cut itself is taken on
+// the sorted window's float sums and checked there. Only a crowd of more than kNucCap tokens
+// within 1/256 nat of each other (exact ties, in practice) still cuts the window short.
+constexpr int kNucThreads = kRowThreads, kNucBins = 128, kNucSub = 128, kNucCap = 2048;
+constexpr float kNucBinsPerNat = 2.f, kNucGap = kNucBins / kNucBinsPerNat;
+// 2^18: a warp's at most 4,096 tokens cannot overflow a 32-bit bin
+constexpr float kNucMassScale = 262144.f;
+
+__device__ __forceinline__ uint32_t nuc_key(float f) {
+    const uint32_t b = __float_as_uint(f);
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+__device__ __forceinline__ float nuc_val(uint32_t k) {
+    return __uint_as_float((k & 0x80000000u) ? (k & 0x7fffffffu) : ~k);
+}
+
+__global__ void __launch_bounds__(kNucThreads) nucleus_kernel(
+    const __nv_bfloat16* __restrict__ a, int64_t lda, const __nv_bfloat16* __restrict__ b, int64_t ldb, int N, bool vec,
+    const float* __restrict__ temp, const float* __restrict__ top_p, const float* __restrict__ u, int K,
+    int* __restrict__ ids, float* __restrict__ probs, int64_t ldo, int* __restrict__ cnt, int* __restrict__ tok) {
+    __shared__ union {
+        struct { unsigned c[32][kNucBins]; unsigned m[32][kNucBins]; } h;
+        struct { unsigned long long e[kNucCap]; float incl[kNucCap]; } s;
+    } sm;
+    __shared__ unsigned tot_c[kNucBins], sub_c[kNucSub];
+    __shared__ unsigned long long tot_m[kNucBins];
+    __shared__ float rf[32];
+    __shared__ int ri[32];
+    __shared__ float s_max, s_z;
+    __shared__ int s_arg, s_sel, s_sub, s_lo, s_nc, s_n, s_draw;
+    const int r = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const __nv_bfloat16* ar = a + (int64_t)r * lda;
+    const __nv_bfloat16* br = b ? b + (int64_t)r * ldb : nullptr;
+    int* ir = ids + (int64_t)r * ldo;
+    float* pr = probs + (int64_t)r * ldo;
+    // 1. the max and its first index (argmax_sum_bf16_kernel's result)
+    float best = -INFINITY;
+    int besti = 0x7fffffff;
+    nuc_scan(ar, br, N, vec, [&](float v, int n) {
+        if (v > best || (v == best && n < besti)) { best = v; besti = n; }
+    });
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, besti, o);
+        if (ov > best || (ov == best && oi < besti)) { best = ov; besti = oi; }
+    }
+    if (lane == 0) { rf[warp] = best; ri[warp] = besti; }
+    __syncthreads();
+    if (tid == 0) {
+        best = rf[0];
+        besti = ri[0];
+        for (int i = 1; i < 32; ++i)
+            if (rf[i] > best || (rf[i] == best && ri[i] < besti)) { best = rf[i]; besti = ri[i]; }
+        s_max = best;
+        s_arg = besti;
+    }
+    __syncthreads();
+    const float m = s_max;
+    const float T = temp[r];
+    if (!(T > 0.f)) {
+        if (tid == 0) {
+            ir[0] = s_arg;
+            pr[0] = 1.f;
+            cnt[r] = 1;
+            if (tok) tok[r] = s_arg;
+        }
+        return;
+    }
+    const float inv_t = 1.f / T;
+    // 2. the normalizer and the per-warp gap histograms (no cross-warp atomics)
+    for (int i = tid; i < 32 * kNucBins; i += kNucThreads) {
+        (&sm.h.c[0][0])[i] = 0u;
+        (&sm.h.m[0][0])[i] = 0u;
+    }
+    __syncthreads();
+    float z = 0.f;
+    nuc_scan(ar, br, N, vec, [&](float v, int) {
+        const float g = (m - v) * inv_t;
+        const float e = expf(-g);
+        z += e;
+        if (g < kNucGap) {
+            const int bin = (int)(g * kNucBinsPerNat);
+            atomicAdd(&sm.h.c[warp][bin], 1u);
+            atomicAdd(&sm.h.m[warp][bin], (unsigned)(e * kNucMassScale));
+        }
+    });
+    for (int o = 16; o > 0; o >>= 1) z += __shfl_xor_sync(0xffffffffu, z, o);
+    if (lane == 0) rf[warp] = z;
+    __syncthreads();
+    if (tid < kNucBins) {
+        unsigned c = 0;
+        unsigned long long w = 0;
+        for (int i = 0; i < 32; ++i) { c += sm.h.c[i][tid]; w += sm.h.m[i][tid]; }
+        tot_c[tid] = c;
+        tot_m[tid] = w;
+    }
+    if (tid == 0) {
+        float zs = 0.f;
+        for (int i = 0; i < 32; ++i) zs += rf[i];
+        s_z = zs;
+    }
+    __syncthreads();
+    const float tp = top_p[r];
+    // 3. the window, from warp 0's scan over the bins (kNucBins / 32 a lane)
+    if (warp == 0) {
+        constexpr int B4 = kNucBins / 32;
+        unsigned c[B4];
+        unsigned long long w[B4];
+        unsigned cs = 0;
+        unsigned long long ws = 0;
+        for (int j = 0; j < B4; ++j) {
+            c[j] = tot_c[lane * B4 + j];
+            w[j] = tot_m[lane * B4 + j];
+            cs += c[j];
+            ws += w[j];
+        }
+        unsigned ci = cs;
+        unsigned long long wi = ws;
+        for (int o = 1; o < 32; o <<= 1) {
+            const unsigned co = __shfl_up_sync(0xffffffffu, ci, o);
+            const unsigned long long wo = __shfl_up_sync(0xffffffffu, wi, o);
+            if (lane >= o) { ci += co; wi += wo; }
+        }
+        const double thr = (double)tp * (double)s_z * (double)kNucMassScale;
+        // the first bin reaching K tokens (the last bin if none does), the first reaching top_p
+        // of the mass (kNucBins if none)
+        int bc = kNucBins - 1, bm = kNucBins;
+        const unsigned lc = __ballot_sync(0xffffffffu, ci >= (unsigned)K);
+        if (lc) {
+            const int L = __ffs(lc) - 1;
+            int x = 0;
+            if (lane == L) {
+                unsigned acc = ci - cs;
+                for (int j = 0; j < B4; ++j) {
+                    acc += c[j];
+                    if (acc >= (unsigned)K) { x = lane * B4 + j; break; }
+                }
+            }
+            bc = __shfl_sync(0xffffffffu, x, L);
+        }
+        const unsigned lm = __ballot_sync(0xffffffffu, (double)wi >= thr);
+        if (lm) {
+            const int L = __ffs(lm) - 1;
+            int x = 0;
+            if (lane == L) {
+                unsigned long long acc = wi - ws;
+                for (int j = 0; j < B4; ++j) {
+                    acc += w[j];
+                    if ((double)acc >= thr) { x = lane * B4 + j; break; }
+                }
+            }
+            bm = __shfl_sync(0xffffffffu, x, L);
+        }
+        int sel = min(bc, bm + 1);
+        const int L = sel / B4;
+        unsigned through = 0;
+        if (lane == L) {
+            through = ci - cs;
+            for (int j = 0; j <= sel % B4; ++j) through += c[j];
+        }
+        through = __shfl_sync(0xffffffffu, through, L);
+        if (lane == 0) {
+            // over the cap only when sel is bc: its earlier bins hold fewer than K <= kNucCap
+            s_sel = sel;
+            s_sub = through > (unsigned)kNucCap ? -1 : kNucSub - 1;
+            s_lo = (int)(through - tot_c[sel]);
+            s_nc = 0;
+            s_n = 0x7fffffff;
+            s_draw = 0;
+        }
+    }
+    for (int i = tid; i < kNucSub; i += kNucThreads) sub_c[i] = 0u;
+    __syncthreads();
+    const int sel = s_sel;
+    const auto sub_of = [&](float g) { return min(kNucSub - 1, (int)((g * kNucBinsPerNat - (float)sel) * (float)kNucSub)); };
+    if (s_sub < 0) {
+        // 3b. the K-th token's bin is crowded: split it
+        nuc_scan(ar, br, N, vec, [&](float v, int) {
+            const float g = (m - v) * inv_t;
+            if (g < kNucGap && (int)(g * kNucBinsPerNat) == sel) atomicAdd(&sub_c[sub_of(g)], 1u);
+        });
+        __syncthreads();
+        if (tid == 0) {
+            unsigned acc = (unsigned)s_lo;
+            int j = 0;
+            for (; j < kNucSub; ++j) {
+                if (acc + sub_c[j] > (unsigned)kNucCap) break;
+                acc += sub_c[j];
+                if (acc >= (unsigned)K) { ++j; break; }
+            }
+            s_sub = j - 1;  // the last sub-bin in the window; -1: none of this bin
+        }
+        __syncthreads();
+    }
+    // 4. the window's (value, id) keys - the histograms are spent, the union is the sort's now
+    const int ssub = s_sub;
+    nuc_scan(ar, br, N, vec, [&](float v, int n) {
+        const float g = (m - v) * inv_t;
+        if (g < kNucGap) {
+            const int bin = (int)(g * kNucBinsPerNat);
+            if (bin < sel || (bin == sel && (ssub == kNucSub - 1 || sub_of(g) <= ssub)))
+                sm.s.e[atomicAdd(&s_nc, 1)] = ((unsigned long long)nuc_key(v) << 32) | (0xffffffffu - (unsigned)n);
+        }
+    });
+    __syncthreads();
+    if (tid == 0 && s_nc == 0) {
+        // the top bin alone overflows the window: the argmax by itself
+        sm.s.e[0] = ((unsigned long long)nuc_key(m) << 32) | (0xffffffffu - (unsigned)s_arg);
+        s_nc = 1;
+    }
+    __syncthreads();
+    const int nc = s_nc;
+    int P = 1;
+    while (P < nc) P <<= 1;
+    for (int i = nc + tid; i < P; i += kNucThreads) sm.s.e[i] = 0ull;
+    __syncthreads();
+    // 5. bitonic sort, descending: value desc, then id asc
+    for (int k = 2; k <= P; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = tid; i < P; i += kNucThreads) {
+                const int ixj = i ^ j;
+                if (ixj > i) {
+                    const unsigned long long x = sm.s.e[i], y = sm.s.e[ixj];
+                    if (((i & k) == 0) ? x < y : x > y) { sm.s.e[i] = y; sm.s.e[ixj] = x; }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    // 6. probabilities over the whole row, their running sums, the cut
+    const int Kc = min(nc, K);
+    const float zt = s_z;
+    const int j0 = 2 * tid, j1 = j0 + 1;
+    const float p0 = j0 < Kc ? expf(-((m - nuc_val((uint32_t)(sm.s.e[j0] >> 32))) * inv_t)) / zt : 0.f;
+    const float p1 = j1 < Kc ? expf(-((m - nuc_val((uint32_t)(sm.s.e[j1] >> 32))) * inv_t)) / zt : 0.f;
+    float x = p0 + p1;
+    for (int o = 1; o < 32; o <<= 1) {
+        const float y = __shfl_up_sync(0xffffffffu, x, o);
+        if (lane >= o) x += y;
+    }
+    float ex = __shfl_up_sync(0xffffffffu, x, 1);
+    if (lane == 0) ex = 0.f;
+    __syncthreads();
+    if (lane == 31) rf[warp] = x;
+    __syncthreads();
+    if (warp == 0) {
+        const float t = rf[lane];
+        float y = t;
+        for (int o = 1; o < 32; o <<= 1) {
+            const float q = __shfl_up_sync(0xffffffffu, y, o);
+            if (lane >= o) y += q;
+        }
+        float e0 = __shfl_up_sync(0xffffffffu, y, 1);
+        if (lane == 0) e0 = 0.f;
+        rf[lane] = e0;
+    }
+    __syncthreads();
+    const float incl0 = rf[warp] + ex + p0;
+    const float incl1 = incl0 + p1;
+    if (j0 < Kc) sm.s.incl[j0] = incl0;
+    if (j1 < Kc) sm.s.incl[j1] = incl1;
+    __syncthreads();
+    // kept while the mass before the token is < top_p
+    if (j0 < Kc && (j0 ? sm.s.incl[j0 - 1] : 0.f) >= tp) atomicMin(&s_n, j0);
+    if (j1 < Kc && sm.s.incl[j1 - 1] >= tp) atomicMin(&s_n, j1);
+    __syncthreads();
+    const int n = max(1, min(s_n, Kc));
+    const float S = sm.s.incl[n - 1];
+    if (j0 < n) { ir[j0] = (int)(0xffffffffu - (uint32_t)sm.s.e[j0]); pr[j0] = p0 / S; }
+    if (j1 < n) { ir[j1] = (int)(0xffffffffu - (uint32_t)sm.s.e[j1]); pr[j1] = p1 / S; }
+    if (tid == 0) cnt[r] = (n < Kc || S >= tp) ? n : -n;
+    if (u) {
+        // first j whose running mass passes u * S
+        const float th = u[r] * S;
+        const int c = (j0 < n && sm.s.incl[j0] <= th) + (j1 < n && sm.s.incl[j1] <= th);
+        if (c) atomicAdd(&s_draw, c);
+        __syncthreads();
+        if (tid == 0) tok[r] = (int)(0xffffffffu - (uint32_t)sm.s.e[min(s_draw, n - 1)]);
     }
 }
 
@@ -2219,9 +2538,15 @@ int ds_embed_hc(void* stream, const void* ids, const void* table, void* h, int M
     return static_cast<int>(cudaGetLastError());
 }
 
+// Whether rows of a (and b) can be read 16 bytes at a time.
+static bool row_vec(const void* a, int64_t lda, const void* b, int64_t ldb, int N) {
+    const auto al = [](const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15) == 0; };
+    return N % 8 == 0 && lda % 8 == 0 && al(a) && (!b || (ldb % 8 == 0 && al(b)));
+}
+
 int ds_argmax_bf16(void* stream, const void* x, int64_t ldx, int M, int N, void* out) {
-    argmax_bf16_kernel<<<M, 1024, 0, static_cast<cudaStream_t>(stream)>>>(
-        static_cast<const __nv_bfloat16*>(x), ldx, N, static_cast<int*>(out), 0, 0);
+    argmax_bf16_kernel<<<M, kRowThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16*>(x), ldx, N, row_vec(x, ldx, nullptr, 0, N), static_cast<int*>(out), 0, 0);
     return static_cast<int>(cudaGetLastError());
 }
 
@@ -2274,8 +2599,9 @@ int ds_hc_mean(void* stream, const void* h, void* out, int64_t ld_out, int M, in
 }
 
 int ds_argmax_sum_bf16(void* stream, const void* a, int64_t lda, const void* b, int64_t ldb, int M, int N, void* out) {
-    argmax_sum_bf16_kernel<<<M, 1024, 0, static_cast<cudaStream_t>(stream)>>>(
-        static_cast<const __nv_bfloat16*>(a), lda, static_cast<const __nv_bfloat16*>(b), ldb, N, static_cast<int*>(out));
+    argmax_sum_bf16_kernel<<<M, kRowThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16*>(a), lda, static_cast<const __nv_bfloat16*>(b), ldb, N, row_vec(a, lda, b, ldb, N),
+        static_cast<int*>(out));
     return static_cast<int>(cudaGetLastError());
 }
 
@@ -2357,10 +2683,22 @@ int ds_wait_flag(void* stream, const void* flag, int expect, long long timeout_n
 }
 
 int ds_argmax_bf16_pairs(void* stream, const void* x, int64_t ldx, int M, int N, int offset, void* out) {
-    argmax_bf16_kernel<<<M, 1024, 0, DS_ST>>>(static_cast<const __nv_bfloat16*>(x), ldx, N, static_cast<int*>(out), 1,
-                                             offset);
+    argmax_bf16_kernel<<<M, kRowThreads, 0, DS_ST>>>(static_cast<const __nv_bfloat16*>(x), ldx, N,
+                                                    row_vec(x, ldx, nullptr, 0, N), static_cast<int*>(out), 1, offset);
     DS_RET;
 }
+
+int ds_nucleus(void* stream, const void* a, int64_t lda, const void* b, int64_t ldb, int M, int N, const void* temp,
+               const void* top_p, const void* u, int K, void* ids, void* probs, int64_t ldo, void* cnt, void* tok) {
+    if (K < 1 || K > kNucCap || ldo < K || M < 1) return cudaErrorInvalidValue;
+    nucleus_kernel<<<M, kNucThreads, 0, DS_ST>>>(
+        static_cast<const __nv_bfloat16*>(a), lda, static_cast<const __nv_bfloat16*>(b), ldb, N, row_vec(a, lda, b, ldb, N),
+        static_cast<const float*>(temp), static_cast<const float*>(top_p), static_cast<const float*>(u), K,
+        static_cast<int*>(ids), static_cast<float*>(probs), ldo, static_cast<int*>(cnt), static_cast<int*>(tok));
+    DS_RET;
+}
+
+int ds_nucleus_cap() { return kNucCap; }
 
 int ds_argmax_combine(void* stream, const void* pairs, int world, int M, void* out) {
     argmax_combine_kernel<<<(M + 127) / 128, 128, 0, DS_ST>>>(static_cast<const int*>(pairs), world, M,

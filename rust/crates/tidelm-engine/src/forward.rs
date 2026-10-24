@@ -59,6 +59,50 @@ const HC_SPLITS: usize = 16;
 /// largest request at 64 rows is ~0.66M (wo_b, main_proj: 2 x 64 x 5120); a request that
 /// does not fit runs with fewer splits.
 const MMA_PART: usize = 1 << 21;
+/// The longest nucleus ds_nucleus returns whole (its sort's capacity); a target row whose
+/// nucleus is longer is recomputed on the host from its logits.
+const NUC_CAP: usize = 2048;
+/// The drafter's nucleus is cut at this many tokens (fastdecode.py DSV41_DRAFT_NUCLEUS_K).
+pub const DRAFT_NUCLEUS_K: usize = 512;
+
+/// Temperature + nucleus parameters of a sequence (v41_engine.sample_probs); temperature
+/// <= 0 is greedy.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sampling {
+    pub temperature: f32,
+    pub top_p: f32,
+}
+
+impl Sampling {
+    pub const GREEDY: Sampling = Sampling { temperature: 0.0, top_p: 1.0 };
+
+    pub fn is_greedy(&self) -> bool {
+        !(self.temperature > 0.0)
+    }
+}
+
+/// A row's sampling distribution: its nucleus by probability (descending, ties by id),
+/// renormalized - one token at probability 1 for a greedy row.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Nucleus {
+    pub ids: Vec<u32>,
+    pub probs: Vec<f32>,
+}
+
+impl Nucleus {
+    pub fn row(&self) -> tidelm_core::spec::SparseRow<'_> {
+        tidelm_core::spec::SparseRow { ids: &self.ids, probs: &self.probs }
+    }
+}
+
+/// What a step reads back from its head rows.
+#[derive(Clone, Copy)]
+enum Readback<'a> {
+    Argmax,
+    Logits,
+    /// each segment's rows with its sampling parameters
+    Nucleus(&'a [Sampling]),
+}
 
 fn ck(rc: i32, what: &str) -> Result<()> {
     if rc != 0 {
@@ -237,6 +281,7 @@ const OP_SEED: u32 = 4;
 const OP_RESET_LANE: u32 = 5;
 const OP_GRAPHS: u32 = 6;
 const OP_SHUTDOWN: u32 = 7;
+const OP_DRAFT_SAMPLED: u32 = 8;
 
 /// This engine's half of a tensor-parallel pair: the RoCE one-shot gather every sharded
 /// output goes through, the NCCL communicator, and the control channel. Rank 0 (the
@@ -538,6 +583,20 @@ struct Act {
     xpre: DeviceBuffer<u16>,
     conf_x: DeviceBuffer<f32>,
     conf_m: DeviceBuffer<f32>,
+    /// sampling (ds_nucleus): per head row its temperature and top_p and its nucleus
+    /// [row][NUC_CAP]; per draft lane the same, the draws' uniforms per [step][lane], and the
+    /// drafter's distributions per [step][lane][DRAFT_NUCLEUS_K]
+    s_temp: DeviceBuffer<f32>,
+    s_topp: DeviceBuffer<f32>,
+    nuc_ids: DeviceBuffer<i32>,
+    nuc_p: DeviceBuffer<f32>,
+    nuc_cnt: DeviceBuffer<i32>,
+    d_temp: DeviceBuffer<f32>,
+    d_topp: DeviceBuffer<f32>,
+    d_u: DeviceBuffer<f32>,
+    dq_ids: DeviceBuffer<i32>,
+    dq_p: DeviceBuffer<f32>,
+    dq_cnt: DeviceBuffer<i32>,
 }
 
 /// Which compressed rows the current layer attends over (model.py's `sh.topk`, which an
@@ -717,6 +776,10 @@ pub struct Engine {
     /// nsys, 48-row steps), more than the step's kernels
     logits_host: PinnedBuffer<u16>,
     am_host: PinnedBuffer<i32>,
+    /// nuclei read back (the verify rows' or the drafter's): counts, ids, probabilities
+    nuc_cnt_host: PinnedBuffer<i32>,
+    nuc_ids_host: PinnedBuffer<i32>,
+    nuc_p_host: PinnedBuffer<f32>,
     act: Act,
     caches: Caches,
     /// expert parallel over two boxes (attach_pair); None on one box
@@ -734,8 +797,8 @@ pub struct Engine {
     keep: Option<DeviceBuffer<u8>>,
     /// the same for the DSpark blocks
     dspark_keep: Option<DeviceBuffer<u8>>,
-    /// per number of drafting lanes
-    draft_graphs: HashMap<usize, GraphExec>,
+    /// per (drafting lanes, sampled)
+    draft_graphs: HashMap<(usize, bool), GraphExec>,
     /// the last draft_batch's confidence logits, per lane its `dspark_block_size`
     draft_conf: Vec<Vec<f32>>,
     n_layers: usize,
@@ -773,6 +836,8 @@ pub struct Engine {
     cand_live: bool,
     /// index-source layer passes in which the indexer actually ran
     pub indexed_layers: usize,
+    /// sampled rows whose nucleus outgrew the device's window (recomputed on the host)
+    pub nucleus_fallbacks: usize,
 }
 
 impl Resident {
@@ -910,6 +975,9 @@ impl Engine {
             engram_tables.insert(l, EngramTable { mapped, direct, map, map_len, cache: RowCache::new(engram_cache) });
         }
 
+        if unsafe { ds_nucleus_cap() } as usize != NUC_CAP {
+            return Err("ds41.cu's nucleus capacity is not the engine's NUC_CAP".into());
+        }
         let t = TMAX;
         let lanes = max_lanes + 1; // + the scratch lane
         let p = t * cfg.n_activated_experts.max(cfg.dspark_n_activated_experts);
@@ -1016,6 +1084,17 @@ impl Engine {
             xpre: a(t * d)?,
             conf_x: f(t)?,
             conf_m: f(bsz * draft_lanes)?,
+            s_temp: f(t)?,
+            s_topp: f(t)?,
+            nuc_ids: i(t * NUC_CAP)?,
+            nuc_p: f(t * NUC_CAP)?,
+            nuc_cnt: i(t)?,
+            d_temp: f(draft_lanes)?,
+            d_topp: f(draft_lanes)?,
+            d_u: f(bsz * draft_lanes)?,
+            dq_ids: i(bsz * draft_lanes * DRAFT_NUCLEUS_K)?,
+            dq_p: f(bsz * draft_lanes * DRAFT_NUCLEUS_K)?,
+            dq_cnt: i(bsz * draft_lanes)?,
         };
         let mut caches = Caches {
             ring: Vec::new(),
@@ -1097,6 +1176,9 @@ impl Engine {
             expert_stage: PinnedBuffer::uninit(STAGE_BYTES)?,
             logits_host: PinnedBuffer::zeroed(t * cfg.vocab_size)?,
             am_host: PinnedBuffer::zeroed(t)?,
+            nuc_cnt_host: PinnedBuffer::zeroed(t)?,
+            nuc_ids_host: PinnedBuffer::zeroed(t * NUC_CAP)?,
+            nuc_p_host: PinnedBuffer::zeroed(t * NUC_CAP)?,
             cfg,
             ckpt,
             stream,
@@ -1140,6 +1222,7 @@ impl Engine {
             selection: Selection::AllVisible,
             cand_live: false,
             indexed_layers: 0,
+            nucleus_fallbacks: 0,
         })
     }
 
@@ -1195,13 +1278,24 @@ impl Engine {
                         owned.push((lane, want, r.u32s()?));
                     }
                     let segs: Vec<Seg> = owned.iter().map(|(lane, want, ids)| Seg { lane: *lane, ids, want: *want }).collect();
-                    self.run_step(&segs, false)?;
+                    // what comes back is rank 0's business: the cheapest read-back
+                    self.run_step(&segs, Readback::Argmax)?;
                 }
                 OP_DRAFT => {
                     let n = r.u32()? as usize;
                     let reqs: Vec<(usize, u32, usize)> =
                         (0..n).map(|_| Ok((r.u32()? as usize, r.u32()?, r.u64()? as usize))).collect::<Result<_>>()?;
                     self.draft_batch(&reqs)?;
+                }
+                OP_DRAFT_SAMPLED => {
+                    let n = r.u32()? as usize;
+                    let reqs: Vec<(usize, u32, usize)> =
+                        (0..n).map(|_| Ok((r.u32()? as usize, r.u32()?, r.u64()? as usize))).collect::<Result<_>>()?;
+                    let sm: Vec<Sampling> = (0..n)
+                        .map(|_| Ok(Sampling { temperature: f32::from_bits(r.u32()?), top_p: f32::from_bits(r.u32()?) }))
+                        .collect::<Result<_>>()?;
+                    let u: Vec<f32> = r.u32s()?.into_iter().map(f32::from_bits).collect();
+                    self.draft_inner(&reqs, Some((&sm, &u)))?;
                 }
                 OP_ROLLBACK => {
                     let n = r.u32()? as usize;
@@ -1374,7 +1468,7 @@ impl Engine {
     /// `want` asks for (the engine's head rounds them).
     pub fn forward_batch(&mut self, segs: &[Seg]) -> Result<Vec<Vec<u16>>> {
         let v = self.cfg.vocab_size;
-        let plan = self.run_step(segs, true)?;
+        let plan = self.run_step(segs, Readback::Logits)?;
         Ok(plan.heads.iter().map(|&(h0, n)| self.logits_host[h0 * v..(h0 + n) * v].to_vec()).collect())
     }
 
@@ -1382,8 +1476,42 @@ impl Engine {
     /// asks for (first index on ties, as decode::argmax_bf16), computed on the device so
     /// only the ids come back.
     pub fn forward_batch_argmax(&mut self, segs: &[Seg]) -> Result<Vec<Vec<u32>>> {
-        let plan = self.run_step(segs, false)?;
+        let plan = self.run_step(segs, Readback::Argmax)?;
         Ok(plan.heads.iter().map(|&(h0, n)| self.am_host[h0..h0 + n].iter().map(|&x| x as u32).collect()).collect())
+    }
+
+    /// `forward_batch` for sampling: per segment, the nucleus of each row its `want` asks for
+    /// at that segment's `sampling` (v41_engine.sample_probs), computed on the device; a row
+    /// whose nucleus outgrows the device's window is recomputed here from its logits.
+    pub fn forward_batch_sampled(&mut self, segs: &[Seg], sampling: &[Sampling]) -> Result<Vec<Vec<Nucleus>>> {
+        if sampling.len() != segs.len() {
+            return Err(format!("{} segments, {} samplings", segs.len(), sampling.len()).into());
+        }
+        let plan = self.run_step(segs, Readback::Nucleus(sampling))?;
+        let v = self.cfg.vocab_size;
+        let mut out = Vec::with_capacity(segs.len());
+        for (i, &(h0, n)) in plan.heads.iter().enumerate() {
+            let mut rows = Vec::with_capacity(n);
+            for h in h0..h0 + n {
+                let c = self.nuc_cnt_host[h];
+                if c > 0 {
+                    let (ids, probs) = (&self.nuc_ids_host[h * NUC_CAP..], &self.nuc_p_host[h * NUC_CAP..]);
+                    rows.push(Nucleus { ids: ids[..c as usize].iter().map(|&x| x as u32).collect(), probs: probs[..c as usize].to_vec() });
+                    continue;
+                }
+                // the whole row, on the host (tidelm_core::sampling::sample_probs)
+                self.act.logits.download_async(h * v, &mut self.logits_host[..v], &self.stream)?;
+                self.stream.synchronize()?;
+                let row: Vec<f32> = self.logits_host[..v].iter().map(|&x| f32::from_bits((x as u32) << 16)).collect();
+                let p = tidelm_core::sampling::sample_probs(&row, sampling[i].temperature, sampling[i].top_p);
+                let mut kept: Vec<u32> = (0..v as u32).filter(|&j| p[j as usize] > 0.0).collect();
+                kept.sort_by(|&a, &b| p[b as usize].total_cmp(&p[a as usize]).then(a.cmp(&b)));
+                self.nucleus_fallbacks += 1;
+                rows.push(Nucleus { probs: kept.iter().map(|&j| p[j as usize]).collect(), ids: kept });
+            }
+            out.push(rows);
+        }
+        Ok(out)
     }
 
     /// The step's layer ranges, cut at each engram layer: a segment that starts at one needs
@@ -1406,9 +1534,9 @@ impl Engine {
     /// One backbone step: host preparation, then the graph segments, each started once the
     /// engram rows it needs have been gathered. The gathers run on their own threads from the
     /// start of the step, so a layer's NVMe reads overlap every segment before it.
-    fn run_step(&mut self, segs: &[Seg], logits: bool) -> Result<Plan> {
+    fn run_step(&mut self, segs: &[Seg], readback: Readback) -> Result<Plan> {
         self.mirror(|m| {
-            m.u32(OP_FORWARD).u32(logits as u32).u32(segs.len() as u32);
+            m.u32(OP_FORWARD).u32(0).u32(segs.len() as u32);
             for sg in segs {
                 let want = match sg.want {
                     Want::Nothing => 0,
@@ -1465,7 +1593,7 @@ impl Engine {
         });
         self.engram_tables = tables;
         res?;
-        self.collect(segs, &plan, logits)?;
+        self.collect(segs, &plan, readback)?;
         self.times.device_s += td.elapsed().as_secs_f64();
         Ok(plan)
     }
@@ -1705,16 +1833,34 @@ impl Engine {
         Ok(())
     }
 
-    /// After the step's device work: read back the logits (or only their argmaxes) it
-    /// computed into the pinned buffers, advance the lanes.
-    fn collect(&mut self, segs: &[Seg], plan: &Plan, logits: bool) -> Result<()> {
+    /// After the step's device work: read back the logits, their argmaxes or their nuclei
+    /// into the pinned buffers, advance the lanes.
+    fn collect(&mut self, segs: &[Seg], plan: &Plan, readback: Readback) -> Result<()> {
         let st = &self.stream;
         let v = self.cfg.vocab_size;
         let nw: usize = plan.heads.iter().map(|h| h.1).sum();
-        if nw > 0 && logits {
-            self.act.logits.download_async(0, &mut self.logits_host[..nw * v], st)?;
-        } else if nw > 0 {
-            self.act.am.download_async(0, &mut self.am_host[..nw], st)?;
+        let logits = matches!(readback, Readback::Logits);
+        match readback {
+            _ if nw == 0 => {}
+            Readback::Logits => self.act.logits.download_async(0, &mut self.logits_host[..nw * v], st)?,
+            Readback::Argmax => self.act.am.download_async(0, &mut self.am_host[..nw], st)?,
+            Readback::Nucleus(sampling) => {
+                let a = &self.act;
+                let (mut temp, mut topp) = (Vec::with_capacity(nw), Vec::with_capacity(nw));
+                for (&(_, n), sm) in plan.heads.iter().zip(sampling) {
+                    temp.extend(std::iter::repeat_n(sm.temperature, n));
+                    topp.extend(std::iter::repeat_n(sm.top_p, n));
+                }
+                a.s_temp.upload_async(0, &temp, st)?;
+                a.s_topp.upload_async(0, &topp, st)?;
+                ck(unsafe {
+                    ds_nucleus(st.raw(), np(&a.logits), v as i64, nul(), 0, nw as i32, v as i32, np(&a.s_temp), np(&a.s_topp),
+                               nul(), NUC_CAP as i32, np(&a.nuc_ids), np(&a.nuc_p), NUC_CAP as i64, np(&a.nuc_cnt), nul())
+                }, "head nucleus")?;
+                a.nuc_cnt.download_async(0, &mut self.nuc_cnt_host[..nw], st)?;
+                a.nuc_ids.download_async(0, &mut self.nuc_ids_host[..nw * NUC_CAP], st)?;
+                a.nuc_p.download_async(0, &mut self.nuc_p_host[..nw * NUC_CAP], st)?;
+            }
         }
         st.synchronize()?;
         self.step_no += 1;
@@ -1852,6 +1998,33 @@ impl Engine {
     /// Resident with graphs, the whole draft is one CUDA graph per number of lanes, with a
     /// single read-back.
     pub fn draft_batch(&mut self, reqs: &[(usize, u32, usize)]) -> Result<Vec<Vec<u32>>> {
+        Ok(self.draft_inner(reqs, None)?.into_iter().map(|d| d.0).collect())
+    }
+
+    /// `draft_batch` with sampled drafts (fastdecode.py's DRAFT_NUCLEUS draft): per lane
+    /// its `sampling`, and per lane and draft step a uniform in [0, 1) - `u` is
+    /// `[lane][dspark_block_size]`. Each step's token is the inverse-CDF draw from the
+    /// markov-biased logits' nucleus at that lane's temperature and top_p, cut at
+    /// DRAFT_NUCLEUS_K tokens, and that distribution comes back with it: verification divides
+    /// by exactly it. Greedy lanes (temperature <= 0) get their argmax and a one-token q.
+    pub fn draft_batch_sampled(&mut self, reqs: &[(usize, u32, usize)], sampling: &[Sampling], u: &[f32])
+                               -> Result<Vec<(Vec<u32>, Vec<Nucleus>)>> {
+        let b = self.cfg.dspark_block_size;
+        if sampling.len() != reqs.len() || u.len() != reqs.len() * b {
+            return Err(format!("draft: {} lanes, {} samplings, {} uniforms", reqs.len(), sampling.len(), u.len()).into());
+        }
+        if sampling.iter().all(|s| s.is_greedy()) {
+            let drafts = self.draft_inner(reqs, None)?;
+            return Ok(drafts.into_iter().map(|(d, _)| {
+                let q = d.iter().map(|&t| Nucleus { ids: vec![t], probs: vec![1.0] }).collect();
+                (d, q)
+            }).collect());
+        }
+        self.draft_inner(reqs, Some((sampling, u)))
+    }
+
+    fn draft_inner(&mut self, reqs: &[(usize, u32, usize)], sampled: Option<(&[Sampling], &[f32])>)
+                   -> Result<Vec<(Vec<u32>, Vec<Nucleus>)>> {
         if self.dspark.is_none() {
             return Err("draft needs the drafter (spec)".into());
         }
@@ -1860,9 +2033,15 @@ impl Engine {
             return Ok(Vec::new());
         }
         self.mirror(|m| {
-            m.u32(OP_DRAFT).u32(n as u32);
+            m.u32(if sampled.is_some() { OP_DRAFT_SAMPLED } else { OP_DRAFT }).u32(n as u32);
             for &(lane, tok, last) in reqs {
                 m.u32(lane as u32).u32(tok).u64(last as u64);
+            }
+            if let Some((sm, u)) = sampled {
+                for x in sm {
+                    m.u32(x.temperature.to_bits()).u32(x.top_p.to_bits());
+                }
+                m.u32s(&u.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
             }
         })?;
         if n > self.max_draft_lanes() {
@@ -1893,32 +2072,64 @@ impl Engine {
             a.dwin.upload_async(0, &win, st)?;
             a.lane.upload_async(0, &lane, st)?;
             a.d_idx.upload_async(0, &reqs.iter().map(|r| r.1 as i32).collect::<Vec<_>>(), st)?;
+            if let Some((sm, u)) = sampled {
+                a.d_temp.upload_async(0, &sm.iter().map(|x| x.temperature).collect::<Vec<_>>(), st)?;
+                a.d_topp.upload_async(0, &sm.iter().map(|x| x.top_p).collect::<Vec<_>>(), st)?;
+                // [step][lane], as the chain reads them
+                a.d_u.upload_async(0, &(0..b * n).map(|k| u[(k % n) * b + k / n]).collect::<Vec<_>>(), st)?;
+            }
         }
         self.live_rows = n * b;
         self.embed_host(&ids, n * b)?;
+        let key = (n, sampled.is_some());
         if self.use_graphs {
-            if !self.draft_graphs.contains_key(&n) {
+            if !self.draft_graphs.contains_key(&key) {
                 self.stream.begin_capture()?;
-                let rec = self.draft_dev(n);
+                let rec = self.draft_dev(n, key.1);
                 let graph = self.stream.end_capture();
                 rec?;
-                self.draft_graphs.insert(n, graph?);
+                self.draft_graphs.insert(key, graph?);
                 self.graph_captures += 1;
             } else {
                 self.graph_replays += 1;
             }
-            self.draft_graphs[&n].launch(&self.stream)?;
+            self.draft_graphs[&key].launch(&self.stream)?;
         } else {
-            self.draft_dev(n)?;
+            self.draft_dev(n, key.1)?;
         }
         let mut out = vec![0i32; (b + 1) * n];
         let (mut cx, mut cm) = (vec![0f32; n * b], vec![0f32; b * n]);
         self.act.d_idx.download_async(0, &mut out, &self.stream)?;
         self.act.conf_x.download_async(0, &mut cx, &self.stream)?;
         self.act.conf_m.download_async(0, &mut cm, &self.stream)?;
+        let kq = DRAFT_NUCLEUS_K;
+        if sampled.is_some() {
+            let a = &self.act;
+            a.dq_cnt.download_async(0, &mut self.nuc_cnt_host[..b * n], &self.stream)?;
+            a.dq_ids.download_async(0, &mut self.nuc_ids_host[..b * n * kq], &self.stream)?;
+            a.dq_p.download_async(0, &mut self.nuc_p_host[..b * n * kq], &self.stream)?;
+        }
         self.stream.synchronize()?;
         self.draft_conf = (0..n).map(|j| (0..b).map(|i| cx[j * b + i] + cm[i * n + j]).collect()).collect();
-        Ok((0..n).map(|j| (0..b).map(|i| out[(i + 1) * n + j] as u32).collect()).collect())
+        Ok((0..n)
+            .map(|j| {
+                let toks: Vec<u32> = (0..b).map(|i| out[(i + 1) * n + j] as u32).collect();
+                // a cut-short draft nucleus is still exactly the distribution drawn from
+                let q = if sampled.is_some() {
+                    (0..b)
+                        .map(|i| {
+                            let r = i * n + j;
+                            let c = self.nuc_cnt_host[r].unsigned_abs() as usize;
+                            let (ids, p) = (&self.nuc_ids_host[r * kq..r * kq + c], &self.nuc_p_host[r * kq..r * kq + c]);
+                            Nucleus { ids: ids.iter().map(|&x| x as u32).collect(), probs: p.to_vec() }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                (toks, q)
+            })
+            .collect())
     }
 
     /// The last draft_batch's DSpark confidence logits (raw, before the sigmoid), per lane
@@ -1930,7 +2141,7 @@ impl Engine {
     /// The draft's device work for `n` lanes: embedding, the three blocks, the head, and the
     /// markov chain entirely on the device (each step's embedding rows are gathered by the
     /// indices the previous argmax wrote, so the chain needs no host sync).
-    fn draft_dev(&mut self, n: usize) -> Result<()> {
+    fn draft_dev(&mut self, n: usize, sampled: bool) -> Result<()> {
         let cfg = self.cfg.clone();
         let b = cfg.dspark_block_size;
         let rows = n * b;
@@ -1968,10 +2179,19 @@ impl Engine {
             ck(unsafe {
                 ds_linear_f32w(sr, np(&a.markov_e), r as i64, ds.w.conf_w.ptr_at(d), ni, 1, r as i32, 1, a.conf_m.ptr_at(i * n), 1, nul())
             }, "conf markov")?;
-            ck(unsafe {
-                ds_argmax_sum_bf16(sr, a.logits.ptr_at(i * v), (b * v) as i64, np(&a.markov_b), v as i64, ni, v as i32,
-                                   a.d_idx.ptr_at((i + 1) * n))
-            }, "markov argmax")?;
+            if sampled {
+                let kq = DRAFT_NUCLEUS_K;
+                ck(unsafe {
+                    ds_nucleus(sr, a.logits.ptr_at(i * v), (b * v) as i64, np(&a.markov_b), v as i64, ni, v as i32, np(&a.d_temp),
+                               np(&a.d_topp), a.d_u.ptr_at(i * n), kq as i32, a.dq_ids.ptr_at(i * n * kq), a.dq_p.ptr_at(i * n * kq),
+                               kq as i64, a.dq_cnt.ptr_at(i * n), a.d_idx.ptr_at((i + 1) * n))
+                }, "markov nucleus")?;
+            } else {
+                ck(unsafe {
+                    ds_argmax_sum_bf16(sr, a.logits.ptr_at(i * v), (b * v) as i64, np(&a.markov_b), v as i64, ni, v as i32,
+                                       a.d_idx.ptr_at((i + 1) * n))
+                }, "markov argmax")?;
+            }
         }
         Ok(())
     }

@@ -174,11 +174,23 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
   | window 3/5 (Python's default) | 25.9-26.7 | 38.2-39.2 |
   | depth 3 | 26.7 | 39.2 |
 
-  The README rows (25.6 prose, 43.3 code) are a different protocol - sampled at 0.6 over
-  1,024 tokens with hot reads and a learned 68% set - so these are not a like-for-like win:
-  per step the pair is now a little faster than Python (~87 ms at depth 5 against ~89 implied
-  by 43.3 tok/s at 3.84 tokens/step), and on code it accepts fewer drafts (3.0-3.1 tokens/step
-  greedy against 3.84 sampled).
+  The README protocol itself (bench/bench.py: the same "[req N]" prompts as the README runs,
+  1,024 tokens with EOS ignored, temperature 0.6 / top_p 0.95, decode rate after the first
+  token, median of three after one warmup; `tidelm-generate --bench prose,code`), same pair
+  and resident set, 2026-10-24:
+
+  | arm | prose tok/s (runs) | code tok/s (runs) |
+  |---|---:|---:|
+  | Python, README row (2026-10-22) | 25.59 (26.40 / 25.59 / 25.39) | 43.31 (43.31 / 42.31 / 43.79) |
+  | window 3/5, Python's policy | 26.27 (29.21 / 26.27 / 25.44) | 41.44 (40.07 / 45.30 / 41.44) |
+  | confidence 1..5 | **28.90** (28.72 / 29.16 / 28.90) | 42.66 (42.66 / 43.28 / 41.13) |
+
+  A verify step is shorter than Python's (code at depth 3-5: ~74 ms against ~88 implied by
+  43.3 tok/s at 3.83 tokens/step), but on code it accepts less: 3.1-3.6 tokens a step against
+  Python's 3.7-3.9. The two differ in what the target is: Python's 10,452 residents adapt to
+  each request (its warmup run re-ranks them) and its decode drops the low-share routed picks
+  (DSV41_EXPERT_TOPP=0.90); here 10,000 demand-ranked experts are fixed at boot. Python's
+  drafter is also cheaper per step (see M7's list).
   Original plan: NCCL from Rust, control message over NCCL (replacing Gloo), RoCE shim,
   full boot config guard (typed struct, broadcast, any differing field aborts — the
   repo's silent-pair-divergence rule). *Gate: two-rank token parity and tok/s vs the
@@ -212,19 +224,30 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
 - **M7 — server + adaptation.** Port or front: decided by measurement, the pipeline is
   already Python-free by M2.
 
-  Still missing for the README protocol, in order of what blocks an apples-to-apples row:
-  1. Sampling (bench.py runs temperature 0.6, top_p 0.95): temperature + nucleus target
-     probabilities, the drafter's nucleus-truncated q with Gumbel-max draws on the device
-     (fastdecode.py's DRAFT_NUCLEUS path), `tidelm_core::spec::verify_probabilities` (ported,
-     host) or its device form, and the confidence policy's sampled prefix rule
-     (`choose_sampled`, ported). Greedy only today.
-  2. The HTTP front (server/app.py's OpenAI + Anthropic routes) over `generate_batch`.
+  Sampling is in (2026-10-24): `ds_nucleus` computes each row's temperature + top-p nucleus on
+  the device (a log-probability histogram picks a candidate window, which is sorted and cut by
+  the `cum - p < top_p` rule; 39-42 us a row, rows in parallel, bench_nucleus), and only the
+  nucleus comes back; a nucleus over 2,048 tokens is recomputed on the host (none in the README
+  runs). The drafter draws inside its graph from its own nucleus at DRAFT_NUCLEUS_K = 512
+  (fastdecode.py's DSV41_DRAFT_NUCLEUS), with uniforms from the host, and verification is
+  `tidelm_core::spec::verify_sparse` - verify_probabilities' decisions bit for bit over sparse
+  rows. Every sampled speculative run checks itself: the acceptances it saw against the sum of
+  min(p, q) over the positions it tested agree within a standard deviation in every run so far.
+  Batched sampled requests draw from per-lane streams and match their alone runs token for token
+  on the FMA path.
+
+  Still missing for the Python profile's numbers, in order of decode payoff:
+  1. The drafter's cost: Python lists 81,920 draft ids (DSV41_DRAFT_VOCAB, -1.06 ms/step) and
+     splits the drafter over the pair (DSV41_TP_DRAFT_*, -1.7 to -2.1 ms/step each); here the
+     drafter reads the whole 662 MB FP8 head and 66 MB markov head five times on each rank.
+  2. DSV41_EXPERT_TOPP=0.90 (decode keeps a token's routed picks up to 0.90 of its weight
+     share, 91.8% of picks, measured free in held-out NLL) and the lossless packed verify head
+     (DSV41_HEAD_KERNEL=packed, 2.94 -> 2.25 ms/step in Python).
   3. Hot reads and adaptation (the resident set re-planned from demand, misses read from
-     NVMe): today the resident set is fixed at boot and the rest is pruned, which changes
-     routing where Python's substitutes or reads.
-  4. The drafter under TP (DSV41_TP_DRAFT_*: -1.7 to -2.1 ms/step each in Python), the
-     sharded head's argmax without gathering logits (`ds_argmax_bf16_pairs` / `_combine`
-     are in, unused), prefill at 2,048-row chunks.
+     NVMe): today the resident set is fixed at boot and the rest is pruned.
+  4. The HTTP front (server/app.py's OpenAI + Anthropic routes) over `generate_batch`, the
+     sharded head's argmax without gathering logits (`ds_argmax_bf16_pairs` / `_combine` are
+     in, unused), prefill at 2,048-row chunks.
 
 ## Rules carried over from the Python engine
 
