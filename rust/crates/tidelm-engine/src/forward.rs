@@ -488,6 +488,9 @@ struct Act {
     ekv_local: DeviceBuffer<u16>,
     tp_logits: DeviceBuffer<u16>,
     tp_scratch: DeviceBuffer<u8>,
+    /// the split-key attention's partials (ds_attn_work_bytes for TMAX rows of the drafter's
+    /// whole heads over the window and index_topk keys)
+    attn_work: DeviceBuffer<u8>,
     kvl: DeviceBuffer<f32>,
     sc: DeviceBuffer<f32>,
     lat: DeviceBuffer<u16>,
@@ -971,6 +974,9 @@ impl Engine {
             ekv_local: a(if opts.tp.is_some() { t * (hc + 1) * d } else { 1 })?,
             tp_logits: a(if opts.tp.is_some() { t * cfg.vocab_size } else { 1 })?,
             tp_scratch: DeviceBuffer::zeroed(if opts.tp.is_some() { 2 * TP_MAX_GATHER } else { 1 })?,
+            attn_work: DeviceBuffer::zeroed(unsafe {
+                ds_attn_work_bytes(t as i32, cfg.n_heads as i32, (cfg.window_size + cfg.index_topk.max(bsz)) as i32)
+            } as usize)?,
             kvl: f(t * hd)?,
             sc: f(t * hd)?,
             lat: a(t * hd)?,
@@ -2101,7 +2107,7 @@ impl Engine {
         ck(unsafe {
             ds_attn_decode(sr, np(&a.q), np(ring), RING as i32, np(win_pos), cfg.window_size as i32, 0, ckv_ptr, cidx_ptr,
                            c as i32, np(&w.attn_sink), (hd as f64).powf(-0.5) as f32, np(&a.o), ti, h as i32, np(&a.lane),
-                           (RING * hd) as i64, ckv_ls as i64)
+                           (RING * hd) as i64, ckv_ls as i64, np(&a.attn_work), a.attn_work.len() as i64)
         }, "attention")?;
         ck(unsafe { ds_rope(sr, np(&a.o), (h * hd) as i64, ti, h as i32, hd as i64, (hd - rd) as i32, rd as i32, np(&a.pos), np(table), 1) }, "o rope")?;
         let og = cfg.o_groups;

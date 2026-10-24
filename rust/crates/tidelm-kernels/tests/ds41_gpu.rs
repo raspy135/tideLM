@@ -558,10 +558,15 @@ fn attention_decode_matches_the_sinked_softmax_reference() {
     let sink: Vec<f32> = (0..h).map(|_| rng.normal()).collect();
     let scale = (d as f64).powf(-0.5) as f32;
     let (dq, dring, dpos, dckv, dcidx, dsink) = (dev(&q), dev(&ring), dev(&positions), dev(&ckv), dev(&cidx), dev(&sink));
+    // both kernels: the per-head one (no workspace) and the split-key one
+    let wb = unsafe { ds_attn_work_bytes(m as i32, h as i32, (w + c) as i32) } as usize;
+    let work = DeviceBuffer::<u8>::zeroed(wb).unwrap();
+    for split in [false, true] {
     let dout = DeviceBuffer::<u16>::zeroed(m * h * d).unwrap();
+    let (wp, wl) = if split { (p(&work), wb as i64) } else { (null(), 0) };
     ok(unsafe {
         ds_attn_decode(st.raw(), p(&dq), p(&dring), ring_size as i32, p(&dpos), w as i32, 0, p(&dckv), p(&dcidx),
-                       c as i32, p(&dsink), scale, p(&dout), m as i32, h as i32, null(), 0, 0)
+                       c as i32, p(&dsink), scale, p(&dout), m as i32, h as i32, null(), 0, 0, wp, wl)
     });
     st.synchronize().unwrap();
     let got = dout.download().unwrap();
@@ -594,8 +599,24 @@ fn attention_decode_matches_the_sinked_softmax_reference() {
             let want: Vec<f64> = (0..d)
                 .map(|dd| keys.iter().zip(&e).map(|(k, &p)| p / denom * f32_from_bf16(k[dd]) as f64).sum())
                 .collect();
-            assert_bf16_close(&got[(r * h + hh) * d..(r * h + hh + 1) * d], &want, &format!("attn r{r} h{hh}"));
+            let row = &got[(r * h + hh) * d..(r * h + hh + 1) * d];
+            if split {
+                // PV on the tensor cores takes p as a bf16 high part + remainder (~16 bits): its
+                // error scales with sum |p v|, which a cancelling output can sit far below
+                let mag: Vec<f64> = (0..d)
+                    .map(|dd| keys.iter().zip(&e).map(|(k, &p)| p / denom * (f32_from_bf16(k[dd]) as f64).abs()).sum())
+                    .collect();
+                for (i, ((&g, &w), &a)) in row.iter().zip(&want).zip(&mag).enumerate() {
+                    let g = f32_from_bf16(g) as f64;
+                    let ulp = 2f64.powf((w.abs().max(1e-30)).log2().floor() - 7.0);
+                    let tol = 0.51 * ulp + 2f64.powi(-15) * a + 1e-30;
+                    assert!((g - w).abs() <= tol, "attn (split) r{r} h{hh}[{i}]: got {g}, want {w} (tol {tol})");
+                }
+            } else {
+                assert_bf16_close(row, &want, &format!("attn r{r} h{hh}"));
+            }
         }
+    }
     }
 }
 
@@ -1069,9 +1090,12 @@ fn lane_rows_read_and_write_only_their_own_caches() {
     let q = rng.bf16_vec(3 * h * d, 0.2);
     let (dq, drings, dckvs, dsink, dl, dp, dc) = (dev(&q), dev(&rings), dev(&ckvs), dev(&sink), dev(&row_lane), dev(&pos), dev(&cidx));
     let both = DeviceBuffer::<u16>::zeroed(3 * h * d).unwrap();
+    // the split-key kernel: a row's bits must not depend on the rows beside it
+    let wb = unsafe { ds_attn_work_bytes(3, h as i32, (w + c) as i32) } as usize;
+    let work = DeviceBuffer::<u8>::zeroed(wb).unwrap();
     ok(unsafe {
         ds_attn_decode(st.raw(), p(&dq), p(&drings), ring as i32, p(&dp), w as i32, 0, p(&dckvs), p(&dc), c as i32, p(&dsink),
-                       scale, p(&both), 3, h as i32, p(&dl), (ring * d) as i64, (n_ckv * d) as i64)
+                       scale, p(&both), 3, h as i32, p(&dl), (ring * d) as i64, (n_ckv * d) as i64, p(&work), wb as i64)
     });
     st.synchronize().unwrap();
     let both = both.download().unwrap();
@@ -1082,7 +1106,7 @@ fn lane_rows_read_and_write_only_their_own_caches() {
         let one = DeviceBuffer::<u16>::zeroed(h * d).unwrap();
         ok(unsafe {
             ds_attn_decode(st.raw(), p(&dq1), p(&dr1), ring as i32, p(&dp1), w as i32, 0, p(&dk1), p(&dc1), c as i32, p(&dsink),
-                           scale, p(&one), 1, h as i32, null(), 0, 0)
+                           scale, p(&one), 1, h as i32, null(), 0, 0, p(&work), wb as i64)
         });
         st.synchronize().unwrap();
         assert_eq!(&both[row * h * d..(row + 1) * h * d], &one.download().unwrap()[..], "attention row {row} (lane {ln})");

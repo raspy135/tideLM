@@ -98,8 +98,12 @@ extern "C" {
         stream: CudaStream, q: *const c_void, ring: *const c_void, ring_size: c_int,
         pos: *const c_void, w: c_int, win_lo: c_int, ckv: *const c_void, cidx: *const c_void,
         c: c_int, sink: *const c_void, scale: f32, out: *mut c_void, m: c_int, h: c_int,
-        lane: *const c_void, ring_lstride: i64, ckv_lstride: i64,
+        lane: *const c_void, ring_lstride: i64, ckv_lstride: i64, work: *mut c_void, work_bytes: i64,
     ) -> c_int;
+
+    /// Workspace ds_attn_decode's split-key kernel needs for m rows, h heads, at most nk keys
+    /// (null / smaller: the per-head kernel).
+    pub fn ds_attn_work_bytes(m: c_int, h: c_int, nk: c_int) -> i64;
 
     pub fn ds_compress_pair(
         stream: CudaStream, kv_a: *const c_void, sc_a: *const c_void, kv_b: *const c_void,

@@ -19,6 +19,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
+#include <algorithm>
 
 namespace {
 
@@ -1097,6 +1098,198 @@ __global__ void moe_finish_kernel(const float* __restrict__ routed, const __nv_b
     out[(int64_t)m * D + d] = to_bf(routed[(int64_t)m * D + d] + bf(shared[(int64_t)m * D + d]));
 }
 
+// ------------------------------------------------------------------ attention (decode, split keys)
+// Flash-decoding of the same sinked softmax (tools/decode_attn.py's kernel, in CUDA): a block
+// takes 16 heads of one row (one mma m16 tile of queries; MQA, so every head reads the same
+// keys) and a run of 64-key tiles; each tile is staged in shared memory once for all 16 heads.
+// Scores q.k on mma.sync bf16 -> fp32, scaled; an online softmax per head (max clamped to
+// >= -1e30 like the reference, so an all-masked run stays finite); PV on the tensor cores with
+// the probabilities split into a bf16 high part and a bf16 remainder (~16 mantissa bits, the
+// Python kernel's PV_SPLIT). Each block writes an unnormalized partial (o, m, l); the combine
+// kernel adds the sink and normalizes. The key axis is split so a decode row fills the GPU
+// (the per-head kernel above walked keys serially: 328 us a layer at 1,024 indexed keys).
+constexpr int kFdH = 16, kFdN = 64, kFdD = 512, kFdKS = kFdD + 8, kFdPS = kFdN + 4;
+// Keys a split covers. Fixed in key space - never chosen from the row count - so a row's
+// partials, and its bits, do not depend on what else shares its step: a verify block's rows
+// equal one-row decode, as speculation requires.
+constexpr int kFdSplitTiles = 2;
+
+__device__ __forceinline__ void ldsm_x2_trans(uint32_t& b0, uint32_t& b1, const void* p) {
+    const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n" : "=r"(b0), "=r"(b1) : "r"(a));
+}
+
+__global__ void __launch_bounds__(256) attn_fd_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ ring_base, int ring_size,
+    const int* __restrict__ pos, int W, int win_lo, const __nv_bfloat16* __restrict__ ckv_base,
+    const int* __restrict__ cidx, int C, float scale, int H, const int* __restrict__ row_lane,
+    int64_t ring_lstride, int64_t ckv_lstride, int tiles_per_split, int S, float* __restrict__ part_o,
+    float* __restrict__ part_ml) {
+    extern __shared__ __align__(16) unsigned char fd_smem[];
+    __nv_bfloat16* Qs = reinterpret_cast<__nv_bfloat16*>(fd_smem);            // [16][KS]
+    __nv_bfloat16* Ks = Qs + kFdH * kFdKS;                                     // [64][KS]
+    float* Ps = reinterpret_cast<float*>(Ks + kFdN * kFdKS);                    // [16][PS]
+    float* m_run = Ps + kFdH * kFdPS;
+    float* l_run = m_run + kFdH;
+    float* alpha = l_run + kFdH;
+    int* valid = reinterpret_cast<int*>(alpha + kFdH);
+    const int m = blockIdx.z, split = blockIdx.y, h0 = blockIdx.x * kFdH;
+    const int nh = min(kFdH, H - h0);
+    const int NK = W + C;
+    const int p = pos[m];
+    const int ln = row_lane ? row_lane[m] : 0;
+    const __nv_bfloat16* ring = ring_base + (int64_t)ln * ring_lstride;
+    const __nv_bfloat16* ckv = ckv_base ? ckv_base + (int64_t)ln * ckv_lstride : nullptr;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, r = lane >> 2, qd = lane & 3;
+    const int n_tiles = (NK + kFdN - 1) / kFdN;
+    const int t0 = split * tiles_per_split, t1 = min(n_tiles, t0 + tiles_per_split);
+
+    for (int i = tid; i < kFdH * (kFdD / 8); i += blockDim.x) {
+        const int hh = i / (kFdD / 8), c = i % (kFdD / 8);
+        uint4 v = make_uint4(0, 0, 0, 0);
+        if (hh < nh) v = reinterpret_cast<const uint4*>(q + ((int64_t)m * H + h0 + hh) * kFdD)[c];
+        *reinterpret_cast<uint4*>(Qs + hh * kFdKS + c * 8) = v;
+    }
+    if (tid < kFdH) { m_run[tid] = -1e30f; l_run[tid] = 0.f; }
+    float acc[8][4];
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) acc[nt][i] = 0.f;
+
+    for (int tile = t0; tile < t1; ++tile) {
+        const int n0 = tile * kFdN;
+        __syncthreads();  // the previous tile's PV is done with Ks / Ps
+        for (int i = tid; i < kFdN * (kFdD / 8); i += blockDim.x) {
+            const int j = i / (kFdD / 8), c = i % (kFdD / 8);
+            const int n = n0 + j;
+            const __nv_bfloat16* kr = nullptr;
+            if (n < W) {
+                const int kp = p - (W - 1 - n);
+                if (kp >= 0 && kp >= win_lo) kr = ring + (int64_t)(kp % ring_size) * kFdD;
+            } else if (n < NK) {
+                const int jj = cidx[(int64_t)m * C + (n - W)];
+                if (jj >= 0) kr = ckv + (int64_t)jj * kFdD;
+            }
+            *reinterpret_cast<uint4*>(Ks + j * kFdKS + c * 8) = kr ? reinterpret_cast<const uint4*>(kr)[c] : make_uint4(0, 0, 0, 0);
+            if (c == 0) valid[j] = kr != nullptr;
+        }
+        __syncthreads();
+        // scores: warp w takes keys w*8 .. w*8+8 for all 16 heads
+        {
+            float c4[4] = {0.f, 0.f, 0.f, 0.f};
+            const __nv_bfloat16* kn = Ks + (warp * 8 + r) * kFdKS;
+#pragma unroll 8
+            for (int ks = 0; ks < kFdD / 16; ++ks) {
+                const int d0 = ks * 16;
+                const uint32_t a0 = *reinterpret_cast<const uint32_t*>(Qs + r * kFdKS + d0 + 2 * qd);
+                const uint32_t a1 = *reinterpret_cast<const uint32_t*>(Qs + (r + 8) * kFdKS + d0 + 2 * qd);
+                const uint32_t a2 = *reinterpret_cast<const uint32_t*>(Qs + r * kFdKS + d0 + 8 + 2 * qd);
+                const uint32_t a3 = *reinterpret_cast<const uint32_t*>(Qs + (r + 8) * kFdKS + d0 + 8 + 2 * qd);
+                const uint32_t b0 = *reinterpret_cast<const uint32_t*>(kn + d0 + 2 * qd);
+                const uint32_t b1 = *reinterpret_cast<const uint32_t*>(kn + d0 + 8 + 2 * qd);
+                mma_bf16(c4, a0, a1, a2, a3, b0, b1);
+            }
+            const int k0 = warp * 8 + 2 * qd;
+            Ps[r * kFdPS + k0] = valid[k0] ? c4[0] * scale : -INFINITY;
+            Ps[r * kFdPS + k0 + 1] = valid[k0 + 1] ? c4[1] * scale : -INFINITY;
+            Ps[(r + 8) * kFdPS + k0] = valid[k0] ? c4[2] * scale : -INFINITY;
+            Ps[(r + 8) * kFdPS + k0 + 1] = valid[k0 + 1] ? c4[3] * scale : -INFINITY;
+        }
+        __syncthreads();
+        // online softmax: warp w takes heads 2w and 2w+1, a lane keys lane and lane + 32
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {
+            const int hh = warp * 2 + u;
+            const float s0 = Ps[hh * kFdPS + lane], s1 = Ps[hh * kFdPS + lane + 32];
+            const float mo = m_run[hh];
+            const float mn = fmaxf(mo, warp_max(fmaxf(s0, s1)));
+            const float e0 = expf(s0 - mn), e1 = expf(s1 - mn);
+            const float ls = warp_sum(e0 + e1);
+            Ps[hh * kFdPS + lane] = e0;
+            Ps[hh * kFdPS + lane + 32] = e1;
+            __syncwarp();
+            if (lane == 0) {
+                const float al = expf(mo - mn);
+                alpha[hh] = al;
+                l_run[hh] = l_run[hh] * al + ls;
+                m_run[hh] = mn;
+            }
+        }
+        __syncthreads();
+        const float al0 = alpha[r], al1 = alpha[r + 8];
+#pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            acc[nt][0] *= al0; acc[nt][1] *= al0;
+            acc[nt][2] *= al1; acc[nt][3] *= al1;
+        }
+        // PV: warp w takes dims w*64 .. w*64+64; P split into bf16 hi + lo
+#pragma unroll
+        for (int ks = 0; ks < kFdN / 16; ++ks) {
+            const int k0 = ks * 16;
+            uint32_t ah[4], alo[4];
+            const float* pr0 = Ps + r * kFdPS + k0 + 2 * qd;
+            const float* pr1 = Ps + (r + 8) * kFdPS + k0 + 2 * qd;
+            const float pv[4][2] = {{pr0[0], pr0[1]}, {pr1[0], pr1[1]}, {pr0[8], pr0[9]}, {pr1[8], pr1[9]}};
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const __nv_bfloat162 hi = __floats2bfloat162_rn(pv[i][0], pv[i][1]);
+                const __nv_bfloat162 lo = __floats2bfloat162_rn(pv[i][0] - __low2float(hi), pv[i][1] - __high2float(hi));
+                ah[i] = *reinterpret_cast<const uint32_t*>(&hi);
+                alo[i] = *reinterpret_cast<const uint32_t*>(&lo);
+            }
+            const int key = k0 + (lane & 15);
+#pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+                uint32_t b0, b1;
+                ldsm_x2_trans(b0, b1, Ks + key * kFdKS + warp * 64 + nt * 8);
+                mma_bf16(acc[nt], ah[0], ah[1], ah[2], ah[3], b0, b1);
+                mma_bf16(acc[nt], alo[0], alo[1], alo[2], alo[3], b0, b1);
+            }
+        }
+    }
+    __syncthreads();
+    const int64_t base = ((int64_t)m * S + split) * H + h0;
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt) {
+        const int d = warp * 64 + nt * 8 + 2 * qd;
+        if (r < nh) {
+            part_o[(base + r) * kFdD + d] = acc[nt][0];
+            part_o[(base + r) * kFdD + d + 1] = acc[nt][1];
+        }
+        if (r + 8 < nh) {
+            part_o[(base + r + 8) * kFdD + d] = acc[nt][2];
+            part_o[(base + r + 8) * kFdD + d + 1] = acc[nt][3];
+        }
+    }
+    if (tid < nh) {
+        part_ml[(base + tid) * 2] = m_run[tid];
+        part_ml[(base + tid) * 2 + 1] = l_run[tid];
+    }
+}
+
+// The partials' merge with the sink: m* = max(m_s, sink), out = sum_s e^(m_s - m*) o_s /
+// (sum_s e^(m_s - m*) l_s + e^(sink - m*)), rounded to bf16. One block per (head, row).
+__global__ void attn_fd_combine_kernel(const float* __restrict__ part_o, const float* __restrict__ part_ml, int S, int H,
+                                       const float* __restrict__ sink, __nv_bfloat16* __restrict__ out) {
+    const int h = blockIdx.x, m = blockIdx.y;
+    float mx = sink[h];
+    for (int s = 0; s < S; ++s) mx = fmaxf(mx, part_ml[(((int64_t)m * S + s) * H + h) * 2]);
+    float den = expf(sink[h] - mx);
+    for (int s = 0; s < S; ++s) {
+        const float* ml = part_ml + (((int64_t)m * S + s) * H + h) * 2;
+        den += expf(ml[0] - mx) * ml[1];
+    }
+    for (int d = threadIdx.x; d < kFdD; d += blockDim.x) {
+        float o = 0.f;
+        for (int s = 0; s < S; ++s) {
+            const int64_t at = ((int64_t)m * S + s) * H + h;
+            o += expf(part_ml[at * 2] - mx) * part_o[at * kFdD + d];
+        }
+        out[((int64_t)m * H + h) * kFdD + d] = to_bf(o / den);
+    }
+}
+
 // ------------------------------------------------------------------ attention (decode)
 // model.py::attention + _softmax_attn for decode rows: keys are the layer's window ring
 // (positions pos-W+1 .. pos, oldest first, masked below `win_lo`) followed by `C` selected
@@ -1945,9 +2138,39 @@ static int launch_attn(cudaStream_t st, const void* q, const void* ring, int rin
 }
 }  // extern "C++"
 
+/// Workspace bytes ds_attn_decode's split-key kernel needs for M rows of H heads over at
+/// most NK keys (window + compressed).
+int64_t ds_attn_work_bytes(int M, int H, int NK) {
+    const int64_t S = (NK + kFdN * kFdSplitTiles - 1) / (kFdN * kFdSplitTiles);
+    return (int64_t)M * S * H * (kFdD + 2) * (int64_t)sizeof(float);
+}
+
 int ds_attn_decode(void* stream, const void* q, const void* ring, int ring_size, const void* pos, int W,
                    int win_lo, const void* ckv, const void* cidx, int C, const void* sink, float scale, void* out,
-                   int M, int H, const void* lane, int64_t ring_lstride, int64_t ckv_lstride) {
+                   int M, int H, const void* lane, int64_t ring_lstride, int64_t ckv_lstride, void* work,
+                   int64_t work_bytes) {
+    if (work && work_bytes >= ds_attn_work_bytes(M, H, W + C)) {
+        const int hb = (H + kFdH - 1) / kFdH;
+        const int n_tiles = (W + C + kFdN - 1) / kFdN;
+        const int tps = kFdSplitTiles;
+        const int S = (n_tiles + tps - 1) / tps;
+        float* po = static_cast<float*>(work);
+        float* pml = po + (int64_t)M * S * H * kFdD;
+        const size_t smem = (size_t)(kFdH + kFdN) * kFdKS * 2 + (size_t)kFdH * kFdPS * 4 + 3 * kFdH * 4 + kFdN * 4;
+        static bool configured = false;
+        if (!configured) {
+            const cudaError_t e = cudaFuncSetAttribute(attn_fd_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+            if (e != cudaSuccess) return static_cast<int>(e);
+            configured = true;
+        }
+        attn_fd_kernel<<<dim3(hb, S, M), 256, smem, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(ring), ring_size,
+            static_cast<const int*>(pos), W, win_lo, static_cast<const __nv_bfloat16*>(ckv), static_cast<const int*>(cidx),
+            C, scale, H, static_cast<const int*>(lane), ring_lstride, ckv_lstride, tps, S, po, pml);
+        attn_fd_combine_kernel<<<dim3(H, M), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+            po, pml, S, H, static_cast<const float*>(sink), static_cast<__nv_bfloat16*>(out));
+        return static_cast<int>(cudaGetLastError());
+    }
     if (H % kAttnHG) return cudaErrorInvalidValue;
     // about two blocks an SM: more heads a block re-read the (shared, MQA) keys fewer times,
     // fewer heads a block fill the GPU at decode sizes

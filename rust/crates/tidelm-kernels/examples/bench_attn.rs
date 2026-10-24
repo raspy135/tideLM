@@ -6,7 +6,7 @@
 use std::time::Instant;
 
 use tidelm_cuda::{check, set_device, DeviceBuffer, Stream};
-use tidelm_kernels::ds41::ds_attn_decode;
+use tidelm_kernels::ds41::{ds_attn_decode, ds_attn_work_bytes};
 
 const REPS: usize = 64;
 
@@ -25,9 +25,13 @@ fn main() {
         let pos = DeviceBuffer::from_slice(&vec![1000i32; m]).unwrap();
         let cidx: Vec<i32> = (0..m * c).map(|i| (i % c) as i32).collect();
         let cidx = DeviceBuffer::from_slice(&cidx).unwrap();
+        let wb = unsafe { ds_attn_work_bytes(m as i32, h as i32, (w + c) as i32) };
+        let work = DeviceBuffer::<u8>::zeroed(wb as usize).unwrap();
+        let split = std::env::args().any(|a| a == "--per-head");
         let launch = |s: &Stream| unsafe {
             ds_attn_decode(s.raw(), q.raw(), ringb.raw(), ring as i32, pos.raw(), w as i32, 0, ckv.raw(), cidx.raw(), c as i32,
-                           sink.raw(), 0.04, out.raw(), m as i32, h as i32, std::ptr::null_mut(), 0, 0)
+                           sink.raw(), 0.04, out.raw(), m as i32, h as i32, std::ptr::null_mut(), 0, 0,
+                           if split { std::ptr::null_mut() } else { work.raw() }, if split { 0 } else { wb })
         };
         assert_eq!(launch(&stream), 0);
         stream.synchronize().unwrap();
