@@ -232,10 +232,11 @@ impl Layer {
     }
 
     /// A DSpark block (`mtp.{k}.`, model.py::MTPWeights): a window-only block with its own
-    /// 128-expert, top-3 MoE. Whole on every rank.
-    pub fn load_mtp(ld: &mut Loader, cfg: &Config, k: usize) -> Result<Self> {
+    /// 128-expert, top-3 MoE; with `tp`, this rank's shard of it in the backbone's layout
+    /// (DSV41_TP_DRAFT_ATTN + DSV41_TP_DRAFT_DENSE).
+    pub fn load_mtp(ld: &mut Loader, cfg: &Config, k: usize, tp: Option<Tp>) -> Result<Self> {
         Self::load_block(ld, cfg, &format!("mtp.{k}."), None, cfg.dspark_n_routed_experts,
-                         cfg.dspark_n_activated_experts, None)
+                         cfg.dspark_n_activated_experts, tp)
     }
 
     #[allow(clippy::too_many_arguments)]

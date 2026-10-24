@@ -2137,6 +2137,12 @@ __global__ void __launch_bounds__(kNucThreads) nucleus_kernel(
     }
 }
 
+// x[i] = table[x[i]]: a listed draft vocabulary's columns to token ids (graph-safe).
+__global__ void map_i32_kernel(const int* __restrict__ table, int* __restrict__ x, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = table[x[i]];
+}
+
 // out[m] = table[idx[m]] for 16-bit rows of D values; idx lives on the device (graph-safe).
 __global__ void gather_rows_u16_kernel(const uint16_t* __restrict__ table, const int* __restrict__ idx,
                                        uint16_t* __restrict__ out, int D) {
@@ -2699,6 +2705,11 @@ int ds_nucleus(void* stream, const void* a, int64_t lda, const void* b, int64_t 
 }
 
 int ds_nucleus_cap() { return kNucCap; }
+
+int ds_map_i32(void* stream, const void* table, void* x, int n) {
+    map_i32_kernel<<<(n + 127) / 128, 128, 0, DS_ST>>>(static_cast<const int*>(table), static_cast<int*>(x), n);
+    DS_RET;
+}
 
 int ds_argmax_combine(void* stream, const void* pairs, int world, int M, void* out) {
     argmax_combine_kernel<<<(M + 127) / 128, 128, 0, DS_ST>>>(static_cast<const int*>(pairs), world, M,

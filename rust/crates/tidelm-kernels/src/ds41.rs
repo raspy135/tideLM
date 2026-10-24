@@ -218,6 +218,8 @@ extern "C" {
         tok: *mut c_void,
     ) -> c_int;
     pub fn ds_nucleus_cap() -> c_int;
+    /// x[i] = table[x[i]] (int32, on the device).
+    pub fn ds_map_i32(stream: CudaStream, table: *const c_void, x: *mut c_void, n: c_int) -> c_int;
     /// [world][M][n] -> [M][world * n].
     pub fn ds_unshard_u16(stream: CudaStream, src: *const c_void, dst: *mut c_void, m: c_int, n: c_int, world: c_int) -> c_int;
 

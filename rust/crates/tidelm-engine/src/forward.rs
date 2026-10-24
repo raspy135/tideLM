@@ -125,6 +125,17 @@ fn off(p: *mut c_void, bytes: usize) -> *mut c_void {
     }
 }
 
+/// ds_gather_rows_u16 over any number of rows (one launch takes at most 65,535): out[m] =
+/// table[ids[m]], rows of d bf16.
+fn gather_rows(stream: &Stream, table: *mut c_void, ids: &DeviceBuffer<i32>, out: *mut c_void, n: usize, d: usize) -> Result<()> {
+    for m0 in (0..n).step_by(65_535) {
+        let m = 65_535.min(n - m0);
+        ck(unsafe { ds_gather_rows_u16(stream.raw(), table, ids.ptr_at(m0), off(out, m0 * d * 2), m as i32, d as i32) }, "gather rows")?;
+    }
+    stream.synchronize()?;
+    Ok(())
+}
+
 fn dump_bf16(path: &std::path::Path, v: &[u16]) -> Result<()> {
     let bytes: Vec<u8> = v.iter().flat_map(|&h| f32::from_bits((h as u32) << 16).to_le_bytes()).collect();
     std::fs::write(path, bytes)?;
@@ -266,11 +277,17 @@ impl Options {
         let mask = |m: &Option<Vec<Vec<bool>>>| m.as_ref().map(|m| fnv(&m.iter().flatten().map(|&b| b as u8).collect::<Vec<_>>())).unwrap_or(0);
         let exe = std::fs::read("/proc/self/exe")?;
         let cfg = std::fs::read(model_dir.join("config.json")).or_else(|_| std::fs::read(model_dir.join("inference/config.json")))?;
-        Ok(format!("tidelm-pair v2 tp | max_seq {} lanes {} spec {} resident {} graphs {} layers {:?} | keep {:x} \
-                    dspark_keep {:x} | exe {:x} | config {:x} | env NO_QDQ={:?} ENGRAM_CACHE_MB={:?} DRAFT_HEAD_FMT={:?}",
+        // the drafter's listed vocabulary by content: two ranks listing different ids draft
+        // differently with nothing in the log
+        let vocab = Config::load(model_dir)?.vocab_size;
+        let listed = crate::draft_vocab::from_env(vocab)?.map(|ids| crate::draft_vocab::digest(&ids)).unwrap_or(0);
+        Ok(format!("tidelm-pair v3 tp | max_seq {} lanes {} spec {} resident {} graphs {} layers {:?} | keep {:x} \
+                    dspark_keep {:x} | exe {:x} | config {:x} | draft vocab {listed:x} | env NO_QDQ={:?} ENGRAM_CACHE_MB={:?} \
+                    DRAFT_HEAD_FMT={:?} TP_DRAFT={:?}",
                    self.max_seq, self.max_lanes, self.spec, self.resident, self.graphs, self.n_layers, mask(&self.keep),
                    mask(&self.dspark_keep), fnv(&exe), fnv(&cfg), std::env::var("TIDELM_NO_QDQ").ok(),
-                   std::env::var("TIDELM_ENGRAM_CACHE_MB").ok(), std::env::var("TIDELM_DRAFT_HEAD_FMT").ok()).into_bytes())
+                   std::env::var("TIDELM_ENGRAM_CACHE_MB").ok(), std::env::var("TIDELM_DRAFT_HEAD_FMT").ok(),
+                   std::env::var("TIDELM_TP_DRAFT").ok()).into_bytes())
     }
 }
 
@@ -577,6 +594,8 @@ struct Act {
     dcidx: DeviceBuffer<i32>,
     markov_e: DeviceBuffer<u16>,
     markov_b: DeviceBuffer<u16>,
+    /// a split drafter's own columns of the markov bias, before the gather
+    markov_bl: DeviceBuffer<u16>,
     d_idx: DeviceBuffer<i32>,
     /// the confidence head's two halves: per draft row from hc_pre (before the norm), and
     /// per [step][lane] from the markov embedding
@@ -747,8 +766,10 @@ struct Resident {
     layers: Vec<Option<Layer>>,
     embed: DeviceBuffer<u16>,
     head: DeviceBuffer<u16>,
-    /// the drafter's FP8 copy of the head (DSV41_DRAFT_HEAD_FMT=fp8): half the bytes of the
-    /// draft's largest read; verification keeps the bf16 head, so outputs are unchanged
+    /// the drafter's FP8 copy of the head (DSV41_DRAFT_HEAD_FMT=fp8) over this rank's run of
+    /// the draft vocabulary: half the bytes of the draft's largest read, and fewer rows with a
+    /// listed vocabulary or a split drafter; verification keeps the bf16 head, so outputs are
+    /// unchanged
     draft_head: Option<Fp8>,
     experts: ExpertSet,
     dspark_experts: Option<ExpertSet>,
@@ -799,6 +820,13 @@ pub struct Engine {
     dspark_keep: Option<DeviceBuffer<u8>>,
     /// per (drafting lanes, sampled)
     draft_graphs: HashMap<(usize, bool), GraphExec>,
+    /// the draft logits' width: the draft vocabulary's size (all ids, or the listed ones)
+    draft_cols: usize,
+    /// a listed draft vocabulary: column -> token id, on the device and the host
+    draft_ids: Option<(DeviceBuffer<i32>, Vec<u32>)>,
+    /// the markov bias head's rows of this rank's run of the draft vocabulary (None: the whole
+    /// head)
+    markov_rows: Option<DeviceBuffer<u16>>,
     /// the last draft_batch's confidence logits, per lane its `dspark_block_size`
     draft_conf: Vec<Vec<f32>>,
     n_layers: usize,
@@ -843,7 +871,10 @@ pub struct Engine {
 impl Resident {
     /// Every backbone layer's weights, the embedding and head tables, and the routable
     /// experts of the backbone (and of the drafter, with `spec`).
-    fn load(ckpt: &Checkpoint, stream: &Stream, cfg: &Config, n_layers: usize, opts: &Options) -> Result<Self> {
+    /// `draft_rows`: this rank's run of the draft vocabulary (DraftVocab), `draft_tp` the
+    /// drafter's shard (None: whole on every rank).
+    fn load(ckpt: &Checkpoint, stream: &Stream, cfg: &Config, n_layers: usize, opts: &Options, draft_rows: &[u32],
+            draft_tp: Option<Tp>) -> Result<Self> {
         let (d, v) = (cfg.dim, cfg.vocab_size);
         let mut ld = Loader::new(ckpt, stream)?;
         let mut layers = Vec::with_capacity(n_layers);
@@ -853,13 +884,28 @@ impl Resident {
         let embed = ld.bf16("embed.weight", &[v, d])?;
         let full_head = ld.bf16("head.weight", &[v, d])?;
         let draft_head = if opts.spec && std::env::var("TIDELM_DRAFT_HEAD_FMT").as_deref() != Ok("bf16") {
-            let (w, s) = (DeviceBuffer::<u8>::new(v * d)?, DeviceBuffer::<u8>::new(v.div_ceil(32) * d.div_ceil(32))?);
-            let rc = unsafe { ds_quant_fp8_block32(stream.raw(), np(&full_head), v as i32, d as i32, np(&w), np(&s)) };
-            if rc != 0 {
-                return Err(format!("draft head quantization: CUDA error {rc}").into());
-            }
+            // the rows in draft-vocabulary order: a contiguous run is read in place, a listed
+            // one gathered first. Quantized in 32-row blocks, so a rank's whole-block run gets
+            // the same codes as the same rows of one box's head.
+            let n = draft_rows.len();
+            let contiguous = draft_rows.windows(2).all(|w| w[1] == w[0] + 1);
+            let gathered = if contiguous {
+                None
+            } else {
+                let ids = DeviceBuffer::from_slice(&draft_rows.iter().map(|&x| x as i32).collect::<Vec<_>>())?;
+                let rows = DeviceBuffer::<u16>::new(n * d)?;
+                gather_rows(stream, np(&full_head), &ids, np(&rows), n, d)?;
+                stream.synchronize()?;
+                Some(rows)
+            };
+            let src = match &gathered {
+                Some(g) => np(g),
+                None => full_head.ptr_at(draft_rows[0] as usize * d),
+            };
+            let (w, s) = (DeviceBuffer::<u8>::new(n * d)?, DeviceBuffer::<u8>::new(n.div_ceil(32) * d.div_ceil(32))?);
+            ck(unsafe { ds_quant_fp8_block32(stream.raw(), src, n as i32, d as i32, np(&w), np(&s)) }, "draft head quantization")?;
             stream.synchronize()?;
-            Some(Fp8 { w, s, n: v, k: d })
+            Some(Fp8 { w, s, n, k: d })
         } else {
             None
         };
@@ -877,10 +923,10 @@ impl Resident {
         };
         let experts = ExpertSet::load(ckpt, stream, &|l| format!("layers.{l}."), n_layers, cfg.n_routed_experts,
                                       opts.keep.as_deref(), opts.tp)?;
-        // the drafter stays whole on each rank: no collective inside the draft
+        // the drafter's experts split like the backbone's under a split drafter, whole otherwise
         let dspark_experts = if opts.spec {
             Some(ExpertSet::load(ckpt, stream, &|k| format!("mtp.{k}."), cfg.n_mtp_layers, cfg.dspark_n_routed_experts,
-                                 opts.dspark_keep.as_deref(), None)?)
+                                 opts.dspark_keep.as_deref(), draft_tp)?)
         } else {
             None
         };
@@ -909,13 +955,31 @@ impl Engine {
             rd, max_seq + 8, cfg.original_seq_len, cfg.compress_rope_theta, cfg.rope_factor, cfg.beta_fast,
             cfg.beta_slow,
         )))?;
+        // the drafter's vocabulary (listed, or all ids) and, under tensor parallel, its split
+        // (TIDELM_TP_DRAFT=0 keeps it whole on each rank): rank r scores its contiguous run
+        let listed = if spec { crate::draft_vocab::from_env(cfg.vocab_size)? } else { None };
+        let draft_vocab: Vec<u32> = listed.clone().unwrap_or_else(|| (0..cfg.vocab_size as u32).collect());
+        let draft_tp = opts.tp.filter(|_| spec && std::env::var("TIDELM_TP_DRAFT").as_deref() != Ok("0"));
+        let draft_run = match draft_tp {
+            Some(tp) => {
+                let n = draft_vocab.len() / tp.world;
+                if draft_vocab.len() % (32 * tp.world) != 0 {
+                    return Err(format!("a {}-id draft vocabulary does not split into whole 32-row blocks", draft_vocab.len()).into());
+                }
+                draft_vocab[tp.rank * n..(tp.rank + 1) * n].to_vec()
+            }
+            None => draft_vocab.clone(),
+        };
+        if listed.is_some() && std::env::var("TIDELM_DRAFT_HEAD_FMT").as_deref() == Ok("bf16") {
+            return Err("a listed draft vocabulary needs the fp8 draft head".into());
+        }
         let (norm, dspark) = {
             let mut ld = Loader::new(&ckpt, &stream)?;
             let norm = ld.bf16("norm.weight", &[d])?;
             let dspark = if spec {
                 let mut blocks = Vec::new();
                 for k in 0..cfg.n_mtp_layers {
-                    blocks.push(Layer::load_mtp(&mut ld, &cfg, k)?);
+                    blocks.push(Layer::load_mtp(&mut ld, &cfg, k, draft_tp)?);
                 }
                 let w = DsparkW::load(&mut ld, &cfg)?;
                 let noise_row = DeviceBuffer::<u16>::new(d)?;
@@ -1080,6 +1144,7 @@ impl Engine {
             dcidx: DeviceBuffer::from_slice(&(0..t * bsz).map(|j| (j % bsz) as i32).collect::<Vec<_>>())?,
             markov_e: a(draft_lanes * cfg.dspark_markov_rank)?,
             markov_b: a(draft_lanes * cfg.vocab_size)?,
+            markov_bl: a(if opts.tp.is_some() { draft_lanes * cfg.vocab_size } else { 1 })?,
             d_idx: i((bsz + 1) * draft_lanes)?,
             xpre: a(t * d)?,
             conf_x: f(t)?,
@@ -1152,9 +1217,28 @@ impl Engine {
             return Err("tensor parallel needs resident mode".into());
         }
         let resident = if opts.resident {
-            Some(Resident::load(&ckpt, &stream, &cfg, n_layers, &opts)?)
+            Some(Resident::load(&ckpt, &stream, &cfg, n_layers, &opts, &draft_run, draft_tp)?)
         } else {
             None
+        };
+        if draft_tp.is_some() && listed.is_none() && resident.as_ref().is_some_and(|r| r.draft_head.is_none()) {
+            return Err("a split drafter needs the fp8 draft head".into());
+        }
+        // the markov bias head's rows for the same run (None: the whole head, in id order)
+        let markov_rows = match (&dspark, listed.is_some() || draft_tp.is_some()) {
+            (Some(ds), true) => {
+                let r = cfg.dspark_markov_rank;
+                let ids = DeviceBuffer::from_slice(&draft_run.iter().map(|&x| x as i32).collect::<Vec<_>>())?;
+                let rows = DeviceBuffer::<u16>::new(draft_run.len() * r)?;
+                gather_rows(&stream, np(&ds.w.markov_head), &ids, np(&rows), draft_run.len(), r)?;
+                stream.synchronize()?;
+                Some(rows)
+            }
+            _ => None,
+        };
+        let draft_ids = match &listed {
+            Some(ids) => Some((DeviceBuffer::from_slice(&ids.iter().map(|&x| x as i32).collect::<Vec<_>>())?, ids.clone())),
+            None => None,
         };
         let dspark_keep = match &opts.dspark_keep {
             Some(k) => {
@@ -1200,6 +1284,9 @@ impl Engine {
             keep,
             dspark_keep,
             draft_graphs: HashMap::new(),
+            draft_cols: draft_vocab.len(),
+            draft_ids,
+            markov_rows,
             draft_conf: Vec::new(),
             n_layers,
             cpos1: i(t)?,
@@ -1897,7 +1984,12 @@ impl Engine {
         if let Some(res) = &self.resident {
             let vl = res.head.len() / d;
             match (&res.draft_head, draft) {
-                (Some(f), true) => gemm(sr, &a.mma_part, x, d, Wt::Fp8(f), rows, np(&a.logits), false, v)?,
+                // the draft vocabulary's columns, [rows][draft_cols]; a split drafter's run, gathered
+                (Some(f), true) if f.n == self.draft_cols => gemm(sr, &a.mma_part, x, d, Wt::Fp8(f), rows, np(&a.logits), false, f.n)?,
+                (Some(f), true) => {
+                    gemm(sr, &a.mma_part, x, d, Wt::Fp8(f), rows, np(&a.tp_logits), false, f.n)?;
+                    self.tp_gather(np(&a.tp_logits), rows, f.n, np(&a.logits))?;
+                }
                 _ if vl == v => gemm(sr, &a.mma_part, x, d, Wt::Bf16 { w: np(&res.head), n: v, k: d }, rows, np(&a.logits), false, v)?,
                 // tensor parallel: this rank's vocabulary rows, gathered into whole rows
                 _ => {
@@ -2121,7 +2213,8 @@ impl Engine {
                             let r = i * n + j;
                             let c = self.nuc_cnt_host[r].unsigned_abs() as usize;
                             let (ids, p) = (&self.nuc_ids_host[r * kq..r * kq + c], &self.nuc_p_host[r * kq..r * kq + c]);
-                            Nucleus { ids: ids.iter().map(|&x| x as u32).collect(), probs: p.to_vec() }
+                            let id = |c: i32| self.draft_ids.as_ref().map_or(c as u32, |(_, t)| t[c as usize]);
+                            Nucleus { ids: ids.iter().map(|&x| id(x)).collect(), probs: p.to_vec() }
                         })
                         .collect()
                 } else {
@@ -2171,10 +2264,22 @@ impl Engine {
                 ds_linear_f32w(sr, a.xpre.ptr_at(r0 * d), d as i64, np(&ds.w.conf_w), mt, 1, d as i32, 1, a.conf_x.ptr_at(r0), 1, nul())
             }, "conf x")?;
         }
-        // logits row j * b + i is lane j's draft step i
+        // logits row j * b + i is lane j's draft step i, over the draft vocabulary's l columns
+        let l = self.draft_cols;
         for i in 0..b {
             ck(unsafe { ds_gather_rows_u16(sr, np(&ds.w.markov_embed), a.d_idx.ptr_at(i * n), np(&a.markov_e), ni, r as i32) }, "markov embed")?;
-            gemm(sr, &a.mma_part, np(&a.markov_e), r, Wt::Bf16 { w: np(&ds.w.markov_head), n: v, k: r }, n, np(&a.markov_b), false, v)?;
+            match &self.markov_rows {
+                None => gemm(sr, &a.mma_part, np(&a.markov_e), r, Wt::Bf16 { w: np(&ds.w.markov_head), n: v, k: r }, n, np(&a.markov_b), false, v)?,
+                Some(m) if m.len() / r == l => {
+                    gemm(sr, &a.mma_part, np(&a.markov_e), r, Wt::Bf16 { w: np(m), n: l, k: r }, n, np(&a.markov_b), false, l)?
+                }
+                // a split drafter: this rank's columns, gathered
+                Some(m) => {
+                    let mn = m.len() / r;
+                    gemm(sr, &a.mma_part, np(&a.markov_e), r, Wt::Bf16 { w: np(m), n: mn, k: r }, n, np(&a.markov_bl), false, mn)?;
+                    self.tp_gather(np(&a.markov_bl), n, mn, np(&a.markov_b))?;
+                }
+            }
             // confidence, markov half: the embedding of step i's input token
             ck(unsafe {
                 ds_linear_f32w(sr, np(&a.markov_e), r as i64, ds.w.conf_w.ptr_at(d), ni, 1, r as i32, 1, a.conf_m.ptr_at(i * n), 1, nul())
@@ -2182,15 +2287,19 @@ impl Engine {
             if sampled {
                 let kq = DRAFT_NUCLEUS_K;
                 ck(unsafe {
-                    ds_nucleus(sr, a.logits.ptr_at(i * v), (b * v) as i64, np(&a.markov_b), v as i64, ni, v as i32, np(&a.d_temp),
+                    ds_nucleus(sr, a.logits.ptr_at(i * l), (b * l) as i64, np(&a.markov_b), l as i64, ni, l as i32, np(&a.d_temp),
                                np(&a.d_topp), a.d_u.ptr_at(i * n), kq as i32, a.dq_ids.ptr_at(i * n * kq), a.dq_p.ptr_at(i * n * kq),
                                kq as i64, a.dq_cnt.ptr_at(i * n), a.d_idx.ptr_at((i + 1) * n))
                 }, "markov nucleus")?;
             } else {
                 ck(unsafe {
-                    ds_argmax_sum_bf16(sr, a.logits.ptr_at(i * v), (b * v) as i64, np(&a.markov_b), v as i64, ni, v as i32,
+                    ds_argmax_sum_bf16(sr, a.logits.ptr_at(i * l), (b * l) as i64, np(&a.markov_b), l as i64, ni, l as i32,
                                        a.d_idx.ptr_at((i + 1) * n))
                 }, "markov argmax")?;
+            }
+            // a listed vocabulary's column -> its token id, before the next step embeds it
+            if let Some((ids, _)) = &self.draft_ids {
+                ck(unsafe { ds_map_i32(sr, np(ids), a.d_idx.ptr_at((i + 1) * n), ni) }, "draft ids")?;
             }
         }
         Ok(())

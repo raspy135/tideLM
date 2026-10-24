@@ -236,16 +236,29 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
   Batched sampled requests draw from per-lane streams and match their alone runs token for token
   on the FMA path.
 
+  The drafter is split over the pair and lists 81,920 ids (2026-10-24): its blocks shard like
+  the backbone's (heads, wo_a groups, wo_b, the shared and routed experts by output rows, every
+  output gathered whole), and its FP8 head and markov bias head score only the ids of the
+  Python profile's DSV41_DRAFT_VOCAB list (the v1 ranking, built in; TIDELM_DRAFT_VOCAB=all
+  turns it off), each rank its contiguous half. The pair's drafts stay bit-identical to one
+  box's. A draft step on the pair (tidelm-batch, 4-layer backbone under the whole drafter,
+  depth 5):
+
+  | drafter | all ids | listed |
+  |---|---:|---:|
+  | whole on each rank | 8.9 ms | 7.4 ms |
+  | split (TIDELM_TP_DRAFT, default) | 5.7 ms | **4.7 ms** |
+
+  Sampled drafts: 9.1 -> 4.8 ms. Python's drafter, split and listed, is 4.58 ms a pass in its
+  traces.
+
   Still missing for the Python profile's numbers, in order of decode payoff:
-  1. The drafter's cost: Python lists 81,920 draft ids (DSV41_DRAFT_VOCAB, -1.06 ms/step) and
-     splits the drafter over the pair (DSV41_TP_DRAFT_*, -1.7 to -2.1 ms/step each); here the
-     drafter reads the whole 662 MB FP8 head and 66 MB markov head five times on each rank.
-  2. DSV41_EXPERT_TOPP=0.90 (decode keeps a token's routed picks up to 0.90 of its weight
+  1. DSV41_EXPERT_TOPP=0.90 (decode keeps a token's routed picks up to 0.90 of its weight
      share, 91.8% of picks, measured free in held-out NLL) and the lossless packed verify head
      (DSV41_HEAD_KERNEL=packed, 2.94 -> 2.25 ms/step in Python).
-  3. Hot reads and adaptation (the resident set re-planned from demand, misses read from
+  2. Hot reads and adaptation (the resident set re-planned from demand, misses read from
      NVMe): today the resident set is fixed at boot and the rest is pruned.
-  4. The HTTP front (server/app.py's OpenAI + Anthropic routes) over `generate_batch`, the
+  3. The HTTP front (server/app.py's OpenAI + Anthropic routes) over `generate_batch`, the
      sharded head's argmax without gathering logits (`ds_argmax_bf16_pairs` / `_combine` are
      in, unused), prefill at 2,048-row chunks.
 

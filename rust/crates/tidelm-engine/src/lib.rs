@@ -7,6 +7,7 @@
 
 pub mod config;
 pub mod decode;
+pub mod draft_vocab;
 pub mod forward;
 pub mod keep;
 pub mod pair;
