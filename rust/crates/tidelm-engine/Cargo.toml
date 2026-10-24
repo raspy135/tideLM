@@ -17,3 +17,7 @@ serde_json = "1"
 [[bin]]
 name = "tidelm-generate"
 path = "src/bin/generate.rs"
+
+[[bin]]
+name = "tidelm-parity"
+path = "src/bin/parity.rs"

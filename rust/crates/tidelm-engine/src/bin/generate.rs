@@ -3,6 +3,7 @@
 //!   tidelm-generate --prompt "The capital of France is" [--max-tokens 16]
 //!                   [--prompt-file F] [--model-dir DIR] [--max-seq 1024] [--no-bos]
 //!                   [--spec [--depth 5]] [--compare]
+//!                   [--resident] [--layers N] [--keep-first K]   (tests: truncate / restrict experts)
 //!
 //! --spec decodes with the DSpark drafter; --compare runs plain greedy and then speculative
 //! greedy on the same engine and checks the two token sequences are identical (the repo's
@@ -16,7 +17,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use tidelm_engine::decode::{generate_plain, generate_spec, Generation};
-use tidelm_engine::forward::Engine;
+use tidelm_engine::forward::{Engine, Options};
 use tidelm_text::Text;
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -46,6 +47,8 @@ fn main() -> tidelm_engine::Result<()> {
     let max_seq: usize = arg(&args, "--max-seq").map(|v| v.parse().unwrap()).unwrap_or(1024);
     let depth: usize = arg(&args, "--depth").map(|v| v.parse().unwrap()).unwrap_or(5);
     let (spec, compare) = (flag("--spec"), flag("--compare"));
+    let n_layers: Option<usize> = arg(&args, "--layers").map(|v| v.parse().unwrap());
+    let keep_first: Option<usize> = arg(&args, "--keep-first").map(|v| v.parse().unwrap());
 
     let t0 = Instant::now();
     let text = Text::load(&model_dir)?;
@@ -55,7 +58,9 @@ fn main() -> tidelm_engine::Result<()> {
     eprintln!("prompt: {} tokens", ids.len());
 
     tidelm_cuda::set_device(0)?;
-    let mut engine = Engine::new(&model_dir, token_map, max_seq, spec || compare)?;
+    let keep = keep_first.map(|k| vec![(0..384).map(|e| e < k).collect::<Vec<bool>>(); 40]);
+    let opts = Options { max_seq, spec: spec || compare, resident: flag("--resident"), n_layers, keep };
+    let mut engine = Engine::new(&model_dir, token_map, opts)?;
     eprintln!("engine up in {:.1}s", t0.elapsed().as_secs_f64());
     let stop = [1u32]; // <｜end▁of▁sentence｜>
 
