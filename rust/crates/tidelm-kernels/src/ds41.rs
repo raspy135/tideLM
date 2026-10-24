@@ -197,6 +197,21 @@ extern "C" {
     /// Output rows per block of the tensor-core GEMM at m rows (for choosing split-K).
     pub fn ds_mma_rows_per_block(m: c_int) -> c_int;
 
+    /// The FP4 MoE up GEMM + SwiGLU on the tensor cores: fp4_moe_cuda_up_v2's contract
+    /// (route_small blocks, `block_route` = pair | token << 16), for steps past 16 rows.
+    pub fn ds_moe_up_mma(
+        stream: CudaStream, x: *const c_void, ldx: i64, w1: *const c_void, s1: *const c_void, w3: *const c_void,
+        s3: *const c_void, h: *mut c_void, ldh: i64, route_weight: *const c_void, block_slot: *const c_void,
+        block_route: *const c_void, nb: c_int, n: c_int, k: c_int, limit: f32, null_slot: c_int,
+    ) -> c_int;
+
+    /// The FP4 MoE down GEMM on the tensor cores: fp4_moe_cuda_down_v2's contract.
+    pub fn ds_moe_down_mma(
+        stream: CudaStream, h: *const c_void, ldh: i64, w2: *const c_void, s2: *const c_void, y: *mut c_void, ldy: i64,
+        block_slot: *const c_void, block_pair: *const c_void, nb: c_int, n: c_int, k: c_int, topk: c_int, ntok: c_int,
+        null_slot: c_int, partial: c_int, parts_world: c_int,
+    ) -> c_int;
+
     /// Benchmark-only: the tensor-core fp8 GEMM at an explicit (ng, depth).
     pub fn ds_mma_fp8_cfg(
         stream: CudaStream, x: *const c_void, ldx: i64, w: *const c_void, s: *const c_void, lds: i64, m: c_int, n: c_int,

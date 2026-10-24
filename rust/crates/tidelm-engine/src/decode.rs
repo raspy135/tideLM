@@ -150,6 +150,9 @@ pub struct BatchOptions {
     /// rows per backbone step (<= TMAX): decode rows first, prefill chunks fill the rest
     pub step_rows: usize,
     pub stop: Vec<u32>,
+    /// read back full logits and hash them into each Generation's digest (checks); off,
+    /// only the device argmaxes come back
+    pub logits: bool,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -273,19 +276,25 @@ pub fn generate_batch(engine: &mut Engine, reqs: &[Request], opt: &BatchOptions)
         stats.rows += segs.iter().map(|s| s.ids.len()).sum::<usize>();
         let tf = std::time::Instant::now();
         stats.draft_s += (tf - td).as_secs_f64();
-        let logits = engine.forward_batch(&segs)?;
+        // per segment, the argmax of each wanted row (and with opt.logits, the rows' logits)
+        let (am, logits): (Vec<Vec<u32>>, Vec<Vec<u16>>) = if opt.logits {
+            let lg = engine.forward_batch(&segs)?;
+            (lg.iter().map(|l| l.chunks(v).map(argmax_bf16).collect()).collect(), lg)
+        } else {
+            (engine.forward_batch_argmax(&segs)?, Vec::new())
+        };
         let tp = std::time::Instant::now();
         stats.forward_s += (tp - tf).as_secs_f64();
         let (mut rollbacks, mut seeds) = (Vec::new(), Vec::new());
         for (i, &lane) in decode.iter().enumerate() {
             let s = slots[lane].as_mut().unwrap();
-            let lg = &logits[i];
-            s.gen.digest = digest(s.gen.digest, lg);
+            if opt.logits {
+                s.gen.digest = digest(s.gen.digest, &logits[i]);
+            }
             s.gen.steps += 1;
             if spec {
                 let block = &blocks[i];
-                let am: Vec<u32> = (0..block.len()).map(|r| argmax_bf16(&lg[r * v..(r + 1) * v])).collect();
-                let (a, mut emitted) = accept(block, &am, &opt.stop);
+                let (a, mut emitted) = accept(block, &am[i], &opt.stop);
                 let pos = engine.lane_len(lane) - block.len(); // position of the block's first token
                 rollbacks.push((lane, pos + a + 1));
                 seeds.push((lane, a + 1));
@@ -296,7 +305,7 @@ pub fn generate_batch(engine: &mut Engine, reqs: &[Request], opt: &BatchOptions)
                 }
                 s.gen.tokens.extend_from_slice(&emitted);
             } else {
-                let t = argmax_bf16(lg);
+                let t = am[i][0];
                 s.gen.tokens.push(t);
                 s.tok = Some(t);
             }
@@ -308,9 +317,10 @@ pub fn generate_batch(engine: &mut Engine, reqs: &[Request], opt: &BatchOptions)
                 seeds.push((lane, c));
             }
             if s.fed == reqs[s.req].prompt.len() {
-                let lg = &logits[decode.len() + j];
-                s.gen.digest = digest(s.gen.digest, lg);
-                let t = argmax_bf16(lg);
+                if opt.logits {
+                    s.gen.digest = digest(s.gen.digest, &logits[decode.len() + j]);
+                }
+                let t = am[decode.len() + j][0];
                 s.gen.tokens.push(t);
                 s.tok = Some(t);
             }

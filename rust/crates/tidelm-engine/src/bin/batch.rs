@@ -74,7 +74,9 @@ fn main() -> tidelm_engine::Result<()> {
     let mut engine = Engine::new(&model_dir, token_map, opts)?;
     eprintln!("engine up in {:.1}s: {lanes} lanes, {step_rows} rows per step, {}", t0.elapsed().as_secs_f64(),
               if spec { format!("speculative depth {depth}") } else { "plain".into() });
-    let opt = BatchOptions { spec_depth: spec.then_some(depth), step_rows, stop: vec![] };
+    // --check compares logits digests; timing runs read back only the device argmaxes
+    let check = flag("--check");
+    let opt = BatchOptions { spec_depth: spec.then_some(depth), step_rows, stop: vec![], logits: check };
 
     if flag("--warmup") {
         generate_batch(&mut engine, &reqs, &opt)?;
@@ -82,9 +84,12 @@ fn main() -> tidelm_engine::Result<()> {
             generate_batch(&mut engine, std::slice::from_ref(r), &opt)?;
         }
     }
+    engine.times = Default::default();
+    let caps = engine.graph_captures;
     let t = Instant::now();
     let (batched, stats) = generate_batch(&mut engine, &reqs, &opt)?;
     let dt_b = t.elapsed().as_secs_f64();
+    eprintln!("graph captures during the batched run: {}", engine.graph_captures - caps);
     let toks: usize = batched.iter().map(|g| g.tokens.len()).sum();
     eprintln!("batched: {n_req} requests, {toks} tokens in {dt_b:.2}s = {:.1} tok/s; {} steps, {:.1} rows/step, {} draft calls, \
                up to {} lanes busy", toks as f64 / dt_b, stats.steps, stats.rows as f64 / stats.steps as f64, stats.drafts,
@@ -93,6 +98,9 @@ fn main() -> tidelm_engine::Result<()> {
               1e3 * stats.draft_s / stats.steps as f64, 1e3 * stats.forward_s / stats.steps as f64,
               1e3 * stats.post_s / stats.steps as f64, 1e3 * stats.cache_s / stats.steps as f64, engine.times);
 
+    if flag("--no-alone") {
+        return Ok(());
+    }
     let t = Instant::now();
     let mut alone: Vec<Generation> = Vec::new();
     let mut steps_alone = 0;
@@ -106,11 +114,19 @@ fn main() -> tidelm_engine::Result<()> {
               toks as f64 / dt_a, dt_a / dt_b);
     eprintln!("graph captures {}, replays {}", engine.graph_captures, engine.graph_replays);
 
-    if !flag("--check") {
+    if !check {
         return Ok(());
     }
     let bitwise = step_rows <= FMA_ROWS;
     let mut ok = true;
+    // the argmax-only read-back must pick the same tokens as the host argmax of the logits
+    let (fast, _) = generate_batch(&mut engine, &reqs, &BatchOptions { logits: false, ..opt.clone() })?;
+    for (i, (b, f)) in batched.iter().zip(&fast).enumerate() {
+        if b.tokens != f.tokens {
+            ok = false;
+            eprintln!("request {i}: device argmax and host argmax DIFFER\n  host   {:?}\n  device {:?}", b.tokens, f.tokens);
+        }
+    }
     for (i, (b, a)) in batched.iter().zip(&alone).enumerate() {
         let same_tokens = b.tokens == a.tokens;
         let same_bits = b.digest == a.digest;

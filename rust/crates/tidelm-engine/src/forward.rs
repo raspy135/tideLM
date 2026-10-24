@@ -239,6 +239,9 @@ pub struct StepTimes {
     pub engram_s: f64,
     pub compute_s: f64,
     pub experts_loaded: usize,
+    /// backbone steps: host preparation (incl. engram), and launch to logits on the host
+    pub prepare_s: f64,
+    pub device_s: f64,
 }
 
 struct EngramTable {
@@ -343,6 +346,8 @@ struct Act {
     head_rows: DeviceBuffer<i32>,
     head_w: DeviceBuffer<u16>,
     logits: DeviceBuffer<u16>,
+    /// each head row's argmax (greedy decoding reads these, not the logits)
+    am: DeviceBuffer<i32>,
     // indexer (model.py::_indexer): per-row scores over every compressed position
     iq: DeviceBuffer<u16>,
     iwb: DeviceBuffer<u16>,
@@ -538,6 +543,10 @@ pub struct Engine {
     engram_tables: BTreeMap<usize, EngramTable>,
     arena: Arena,
     expert_stage: PinnedBuffer<u8>,
+    /// read-back targets: a fresh pageable Vec took ~40 ms per 12 MB of logits (145 MB/s,
+    /// nsys, 48-row steps), more than the step's kernels
+    logits_host: PinnedBuffer<u16>,
+    am_host: PinnedBuffer<i32>,
     act: Act,
     caches: Caches,
     lanes: Vec<Lane>,
@@ -742,6 +751,7 @@ impl Engine {
             head_rows: i(t)?,
             head_w: a(HEAD_ROWS * d)?,
             logits: a(t * cfg.vocab_size)?,
+            am: i(t)?,
             iq: a(t * cfg.index_n_heads * cfg.index_head_dim)?,
             iwb: a(t * cfg.index_n_heads)?,
             iwf: f(t * cfg.index_n_heads)?,
@@ -837,6 +847,8 @@ impl Engine {
         Ok(Engine {
             arena: Arena::new(ARENA_SLOTS + 1)?,
             expert_stage: PinnedBuffer::uninit(STAGE_BYTES)?,
+            logits_host: PinnedBuffer::zeroed(t * cfg.vocab_size)?,
+            am_host: PinnedBuffer::zeroed(t)?,
             cfg,
             ckpt,
             stream,
@@ -1011,8 +1023,25 @@ impl Engine {
     /// once, rows of a lane in position order): returns per segment the bf16 logits its
     /// `want` asks for (the engine's head rounds them).
     pub fn forward_batch(&mut self, segs: &[Seg]) -> Result<Vec<Vec<u16>>> {
+        let v = self.cfg.vocab_size;
+        let plan = self.run_step(segs, true)?;
+        Ok(plan.heads.iter().map(|&(h0, n)| self.logits_host[h0 * v..(h0 + n) * v].to_vec()).collect())
+    }
+
+    /// `forward_batch` for greedy decoding: per segment, the argmax of each row its `want`
+    /// asks for (first index on ties, as decode::argmax_bf16), computed on the device so
+    /// only the ids come back.
+    pub fn forward_batch_argmax(&mut self, segs: &[Seg]) -> Result<Vec<Vec<u32>>> {
+        let plan = self.run_step(segs, false)?;
+        Ok(plan.heads.iter().map(|&(h0, n)| self.am_host[h0..h0 + n].iter().map(|&x| x as u32).collect()).collect())
+    }
+
+    fn run_step(&mut self, segs: &[Seg], logits: bool) -> Result<Plan> {
+        let tp = Instant::now();
         let plan = self.prepare(segs)?;
         let shape = plan.shape;
+        let td = Instant::now();
+        self.times.prepare_s += (td - tp).as_secs_f64();
         if self.use_graphs {
             if !self.graphs.contains_key(&shape) {
                 // capture records the step without running it; the launch below runs it once
@@ -1029,7 +1058,9 @@ impl Engine {
         } else {
             self.device_step(shape)?;
         }
-        self.collect(segs, &plan)
+        self.collect(segs, &plan, logits)?;
+        self.times.device_s += td.elapsed().as_secs_f64();
+        Ok(plan)
     }
 
     /// Host work before a step's device work: the rows' positions and lanes, the segments,
@@ -1233,18 +1264,22 @@ impl Engine {
         if shape.head > 0 {
             let norm = np(&self.norm);
             self.head_dev(t, Some(shape.head), norm)?;
+            let v = cfg.vocab_size;
+            ck(unsafe { ds_argmax_bf16(self.stream.raw(), np(&self.act.logits), v as i64, shape.head as i32, v as i32, np(&self.act.am)) }, "head argmax")?;
         }
         Ok(())
     }
 
-    /// After the step's device work: read back the logits it computed, advance the lanes.
-    fn collect(&mut self, segs: &[Seg], plan: &Plan) -> Result<Vec<Vec<u16>>> {
+    /// After the step's device work: read back the logits (or only their argmaxes) it
+    /// computed into the pinned buffers, advance the lanes.
+    fn collect(&mut self, segs: &[Seg], plan: &Plan, logits: bool) -> Result<()> {
         let st = &self.stream;
         let v = self.cfg.vocab_size;
         let nw: usize = plan.heads.iter().map(|h| h.1).sum();
-        let mut logits = vec![0u16; nw * v];
-        if nw > 0 {
-            self.act.logits.download_async(0, &mut logits, st)?;
+        if nw > 0 && logits {
+            self.act.logits.download_async(0, &mut self.logits_host[..nw * v], st)?;
+        } else if nw > 0 {
+            self.act.am.download_async(0, &mut self.am_host[..nw], st)?;
         }
         st.synchronize()?;
         self.step_no += 1;
@@ -1254,10 +1289,10 @@ impl Engine {
             l.step = self.step_no;
             l.len += sg.ids.len();
         }
-        if let (Some(dir), true, 1) = (&self.dump_dir, nw > 0, segs.len()) {
-            dump_bf16(&dir.join("logits.f32"), &logits[(nw - 1) * v..])?;
+        if let (Some(dir), true, true, 1) = (&self.dump_dir, logits, nw > 0, segs.len()) {
+            dump_bf16(&dir.join("logits.f32"), &self.logits_host[(nw - 1) * v..nw * v])?;
         }
-        Ok(plan.heads.iter().map(|&(h0, n)| logits[h0 * v..(h0 + n) * v].to_vec()).collect())
+        Ok(())
     }
 
     /// hc_pre with the final pre_mix + `norm` over the step's `t` rows, then the head over
@@ -1732,7 +1767,7 @@ impl Engine {
         let cfg = self.cfg.clone();
         let st = &self.stream;
         let sr = st.raw();
-        let (d, inter, e, k) = (cfg.dim, cfg.moe_inter_dim, w.n_experts, w.topk);
+        let (d, e, k) = (cfg.dim, w.n_experts, w.topk);
         let ti = t as i32;
         let p = t * k;
         let index = |pre: &str| w.prefix.strip_prefix(pre).and_then(|r| r.trim_end_matches('.').parse::<usize>().ok());
@@ -1760,16 +1795,7 @@ impl Engine {
             let live = if layer.is_some() { np(&a.live_pairs) } else { nul() };
             ck(unsafe { ds_lut_slots(sr, np(&a.idx), set.lut.ptr_at(bi * e), p as i32, np(&a.keys), live) }, "lut slots")?;
             ck(unsafe { fp4::fp4_moe_cuda_route_small(sr, np(&a.keys), np(&a.block_slot), np(&a.block_pair), np(&a.block_route), p as i32, k as i32) }, "route")?;
-            ck(unsafe {
-                fp4::fp4_moe_cuda_up_v2(sr, np(&a.y), np(&ar.w1), np(&ar.s1), np(&ar.w3), np(&ar.s3), np(&a.hm), np(&a.rw),
-                                        np(&a.block_slot), np(&a.block_route), d as i64, inter as i64, cfg.swiglu_limit,
-                                        k as i32, inter as i32, d as i32, p as i32, -1)
-            }, "moe up")?;
-            ck(unsafe {
-                fp4::fp4_moe_cuda_down_v2(sr, np(&a.hm), np(&ar.w2), np(&ar.s2), np(&a.parts), np(&a.block_slot),
-                                          np(&a.block_pair), inter as i64, d as i64, k as i32, d as i32, inter as i32,
-                                          ti, p as i32, -1, 0, 1)
-            }, "moe down")?;
+            self.routed_experts(ar, t, k)?;
             return self.shared_and_combine(w, t);
         }
         let mut idx = vec![0i32; p];
@@ -1820,18 +1846,40 @@ impl Engine {
             a.keys.upload_async(0, &keys, st)?;
             let ar = &self.arena;
             ck(unsafe { fp4::fp4_moe_cuda_route_small(sr, np(&a.keys), np(&a.block_slot), np(&a.block_pair), np(&a.block_route), p as i32, k as i32) }, "route")?;
-            ck(unsafe {
-                fp4::fp4_moe_cuda_up_v2(sr, np(&a.y), np(&ar.w1), np(&ar.s1), np(&ar.w3), np(&ar.s3), np(&a.hm), np(&a.rw),
-                                        np(&a.block_slot), np(&a.block_route), d as i64, inter as i64, cfg.swiglu_limit,
-                                        k as i32, inter as i32, d as i32, p as i32, -1)
-            }, "moe up")?;
-            ck(unsafe {
-                fp4::fp4_moe_cuda_down_v2(sr, np(&a.hm), np(&ar.w2), np(&ar.s2), np(&a.parts), np(&a.block_slot),
-                                          np(&a.block_pair), inter as i64, d as i64, k as i32, d as i32, inter as i32,
-                                          ti, p as i32, -1, 0, 1)
-            }, "moe down")?;
+            self.routed_experts(ar, t, k)?;
         }
         self.shared_and_combine(w, t)
+    }
+
+    /// The routed experts' up + down over the routing blocks in act (route_small's output),
+    /// with arena `ar`: the bm16 kernels up to FMA_ROWS rows (one-row bits), the tensor-core
+    /// kernels above, where bm16 goes compute-bound as pairs concentrate on experts.
+    fn routed_experts(&self, ar: &Arena, t: usize, k: usize) -> Result<()> {
+        let cfg = &self.cfg;
+        let sr = self.stream.raw();
+        let a = &self.act;
+        let (d, inter) = (cfg.dim, cfg.moe_inter_dim);
+        let (ti, p) = (t as i32, (t * k) as i32);
+        if t > FMA_ROWS {
+            ck(unsafe {
+                ds_moe_up_mma(sr, np(&a.y), d as i64, np(&ar.w1), np(&ar.s1), np(&ar.w3), np(&ar.s3), np(&a.hm), inter as i64,
+                              np(&a.rw), np(&a.block_slot), np(&a.block_route), p, inter as i32, d as i32, cfg.swiglu_limit, -1)
+            }, "moe up (mma)")?;
+            return ck(unsafe {
+                ds_moe_down_mma(sr, np(&a.hm), inter as i64, np(&ar.w2), np(&ar.s2), np(&a.parts), d as i64, np(&a.block_slot),
+                                np(&a.block_pair), p, d as i32, inter as i32, k as i32, ti, -1, 0, 1)
+            }, "moe down (mma)");
+        }
+        ck(unsafe {
+            fp4::fp4_moe_cuda_up_v2(sr, np(&a.y), np(&ar.w1), np(&ar.s1), np(&ar.w3), np(&ar.s3), np(&a.hm), np(&a.rw),
+                                    np(&a.block_slot), np(&a.block_route), d as i64, inter as i64, cfg.swiglu_limit,
+                                    k as i32, inter as i32, d as i32, p, -1)
+        }, "moe up")?;
+        ck(unsafe {
+            fp4::fp4_moe_cuda_down_v2(sr, np(&a.hm), np(&ar.w2), np(&ar.s2), np(&a.parts), np(&a.block_slot),
+                                      np(&a.block_pair), inter as i64, d as i64, k as i32, d as i32, inter as i32, ti, p, -1,
+                                      0, 1)
+        }, "moe down")
     }
 
     /// The shared expert and the one-box combine (model.py::moe's tail).

@@ -461,6 +461,282 @@ extern "C" int ds_mma_fp8_cfg(void* stream, const void* x, int64_t ldx, const vo
     return cudaErrorInvalidValue;
 }
 
+// ------------------------------------------------------------------ tensor-core FP4 MoE
+// The routed-expert GEMMs of tools/fp4_moe_cuda.cu (moe_up_bm16_v2 / moe_down_bm16_v2) on
+// mma.sync, for steps of more than 16 rows. The bm16 kernels run every routed pair's dot
+// products on the CUDA cores: streaming-bound while an expert has a pair or two, compute-
+// bound once pairs concentrate (a 64-row step over 16 experts: 13.8 ms against 1.5 here), and
+// the Python engine leaves them for Triton tensor-core kernels above 64 pairs too. Same inputs
+// - the route_small blocks of up to 16 pairs of one slot - and the same outputs and rounding
+// points: gate and up rounded to bf16, the clamped
+// SwiGLU times the routing weight rounded to bf16; each down output rounded to bf16 into its
+// (k, token) row of `parts`. The dot products differ only in summation order (inside fp16's normal
+// range), the same relation ds_mma_* has to the FMA GEMM. The tensor cores take f16: the
+// hardware e2m1 -> f16x2 conversion is the weight decode, and the activations are bm16's own
+// fp16 rounding (mma_fp4_chunk has the scale handling). Row-invariant: a pair's output never
+// depends on which pairs share its block or its step.
+
+constexpr int kMoeNB = 4, kMoeNG = 1, kMoeKC = 512;  // tile shape: see mma_fp4_chunk
+
+__device__ __forceinline__ float silu_triton(float x) {
+    // fp4_moe_cuda.cu::silu_like_triton, instruction for instruction
+    float e, inv;
+    const float exponent = -x * 1.4426950408889634f;
+    asm("ex2.approx.f32 %0, %1;" : "=f"(e) : "f"(exponent));
+    const float denom = 1.0f + e;
+    asm("div.full.f32 %0, %1, %2;" : "=f"(inv) : "f"(1.0f), "f"(denom));
+    return x * inv;
+}
+
+__device__ __forceinline__ void mma_f16(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
+                                        uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// 8 FP4 weights (4 bytes, low nibble = even k) as 4 f16x2 words: the B operands (b0, b1) of
+// two consecutive mma steps.
+__device__ __forceinline__ void e2m1x8_f16(uint32_t w, uint32_t* b) {
+    asm("{\n\t.reg .b8 b0, b1, b2, b3;\n\tmov.b32 {b0, b1, b2, b3}, %4;\n\t"
+        "cvt.rn.f16x2.e2m1x2 %0, b0;\n\tcvt.rn.f16x2.e2m1x2 %1, b1;\n\t"
+        "cvt.rn.f16x2.e2m1x2 %2, b2;\n\tcvt.rn.f16x2.e2m1x2 %3, b3;\n\t}"
+        : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3]) : "r"(w));
+}
+
+// Stage rows of the block's pairs (row index per m, -1 for none) for K values k0..k0+kc as
+// f16 - bm16's activation rounding (bf16 -> fp16), exact inside fp16's normal range.
+template <int KC>
+__device__ __forceinline__ void stage_rows_f16(__half* xs, const __nv_bfloat16* __restrict__ x, int64_t ldx,
+                                               const int* rows, int k0, int kc) {
+    constexpr int XS = KC + 8;
+    for (int i = threadIdx.x; i < 16 * (KC / 2); i += blockDim.x) {
+        const int m = i / (KC / 2), j = (i % (KC / 2)) * 2;
+        __half2 v = __floats2half2_rn(0.f, 0.f);
+        if (rows[m] >= 0 && j < kc) {
+            const __nv_bfloat162 b = *reinterpret_cast<const __nv_bfloat162*>(x + (int64_t)rows[m] * ldx + k0 + j);
+            v = __floats2half2_rn(__low2float(b), __high2float(b));
+        }
+        *reinterpret_cast<__half2*>(&xs[m * XS + j]) = v;
+    }
+}
+
+// 2^-d as an f16x2 pair (d >= 0; subnormal past 14, zero past 24).
+__device__ __forceinline__ uint32_t pow2_neg_f16x2(int d) {
+    const uint32_t h = d <= 14 ? (uint32_t)(15 - d) << 10 : d <= 24 ? 1u << (24 - d) : 0u;
+    return h | (h << 16);
+}
+
+__device__ __forceinline__ uint32_t hmul2(uint32_t a, uint32_t b) {
+    uint32_t r;
+    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+    return r;
+}
+
+// acc[w][g] += xs (16 rows) . W_w rows n0 + g*8 .. over the staged chunk, for NW weight
+// matrices sharing the activations (up: w1 and w3). Per 128 K (four scale groups) lane
+// (r, q) loads group q of row n0 + g*8 + r whole - 16 contiguous bytes, a quad covers 64,
+// NB blocks of a pass 64 * NB: the access pattern that streams. (4-byte loads that kept each
+// lane inside one group ran at 125 GB/s against 190 for this pattern at NB=1, bench_moe; a
+// bf16 decode-and-repack of the weights instead of the f16 conversion, 119 GB/s.) A lane's 32 values feed its fragment
+// positions of the block's eight mma steps, so one step mixes four groups: each lane
+// pre-scales its group by 2^(its scale - the row's largest of the four) - exact in f16
+// unless a group sits 2^-23 below its neighbours - and the largest scale multiplies the
+// block's partial in fp32.
+// Tile shape, examples/bench_moe.rs (2026-10-24, up + down, cold 192-expert arena; GB/s of
+// weights at 6 / 16 / 64 rows spread over 32 / 72 / 162 experts, then 64 rows over 16):
+//   NB=4 NG=1 KC=512   204 / 204 / 201, 1.52 ms   <- shipped
+//   NB=2 NG=2 KC=512   195 / 196 / 193, 1.64 ms   (NG 1 or 4, KC 1024: within 2%)
+//   NB=8 NG=1 KC=1024  210 / 209 / 208, 2.06 ms   (concentrated case loses a third)
+//   ld.global.nc.L1::no_allocate on the weights: no gain spread, 1.80 ms concentrated.
+// bm16 streams 214 / 213 / 167 and takes 13.8 ms concentrated: at <= 16 rows it is within 6%
+// and keeps those steps bit-identical to one-row decode, so it keeps them.
+template <int NW, int NG, int KC, int NB>
+__device__ __forceinline__ void mma_fp4_chunk(float (*acc)[NG][4], const __half* xs, const uint8_t* const* w,
+                                              const uint8_t* const* s, int N, int K, int n0, int k0, int kc) {
+    constexpr int XS = KC + 8;
+    const int lane = threadIdx.x & 31, r = lane >> 2, q = lane & 3;
+    for (int kb0 = 0; kb0 < kc; kb0 += 128 * NB) {
+        // NB blocks of 128 K per pass, all loads issued first
+        uint4 wv[NB][NW][NG];
+        uint32_t pre[NB][NW][NG], sref[NB][NW][NG];
+#pragma unroll
+        for (int bi = 0; bi < NB; ++bi)
+#pragma unroll
+            for (int wi = 0; wi < NW; ++wi)
+#pragma unroll
+                for (int g = 0; g < NG; ++g) {
+                    const int n = n0 + g * 8 + r, kb = kb0 + bi * 128;
+                    const bool ok = n < N && kb < kc;
+                    const uint4* src = reinterpret_cast<const uint4*>(w[wi] + (int64_t)n * (K >> 1) + ((k0 + kb) >> 1) + q * 16);
+                    wv[bi][wi][g] = ok ? *src : make_uint4(0, 0, 0, 0);
+                    // the row's four scales (K/32 is a multiple of 4: K % 128 == 0)
+                    const uint32_t sw = ok ? *reinterpret_cast<const uint32_t*>(s[wi] + (int64_t)n * (K >> 5) + ((k0 + kb) >> 5)) : 0u;
+                    uint32_t m = __vmaxu4(sw, sw >> 16);
+                    m = __vmaxu4(m, m >> 8) & 0xff;
+                    sref[bi][wi][g] = m;
+                    pre[bi][wi][g] = pow2_neg_f16x2((int)m - (int)((sw >> (8 * q)) & 0xff));
+                }
+#pragma unroll
+        for (int bi = 0; bi < NB; ++bi) {
+            const int kb = kb0 + bi * 128;
+            if (kb >= kc) break;
+            float c[NW][NG][4];
+#pragma unroll
+            for (int wi = 0; wi < NW; ++wi)
+#pragma unroll
+                for (int g = 0; g < NG; ++g)
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) c[wi][g][i] = 0.f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                // word j: this lane's values 8j .. 8j+8 of its group = steps 2j and 2j+1
+                uint32_t a[2][4];
+#pragma unroll
+                for (int st = 0; st < 2; ++st) {
+                    const int kx = kb + q * 32 + j * 8 + st * 4;
+                    const uint2 r0 = *reinterpret_cast<const uint2*>(&xs[r * XS + kx]);
+                    const uint2 r1 = *reinterpret_cast<const uint2*>(&xs[(r + 8) * XS + kx]);
+                    a[st][0] = r0.x; a[st][1] = r1.x; a[st][2] = r0.y; a[st][3] = r1.y;
+                }
+#pragma unroll
+                for (int wi = 0; wi < NW; ++wi)
+#pragma unroll
+                    for (int g = 0; g < NG; ++g) {
+                        const uint4 v = wv[bi][wi][g];
+                        const uint32_t word = j == 0 ? v.x : j == 1 ? v.y : j == 2 ? v.z : v.w;
+                        uint32_t b[4];
+                        e2m1x8_f16(word, b);
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) b[i] = hmul2(b[i], pre[bi][wi][g]);
+                        mma_f16(c[wi][g], a[0][0], a[0][1], a[0][2], a[0][3], b[0], b[1]);
+                        mma_f16(c[wi][g], a[1][0], a[1][1], a[1][2], a[1][3], b[2], b[3]);
+                    }
+            }
+            // the C fragment's columns are rows 2q and 2q+1 of each 8-row group
+#pragma unroll
+            for (int wi = 0; wi < NW; ++wi)
+#pragma unroll
+                for (int g = 0; g < NG; ++g) {
+                    const float fa = e8m0_lin(__shfl_sync(0xffffffffu, sref[bi][wi][g], (2 * q) * 4));
+                    const float fb = e8m0_lin(__shfl_sync(0xffffffffu, sref[bi][wi][g], (2 * q + 1) * 4));
+                    acc[wi][g][0] += c[wi][g][0] * fa;
+                    acc[wi][g][1] += c[wi][g][1] * fb;
+                    acc[wi][g][2] += c[wi][g][2] * fa;
+                    acc[wi][g][3] += c[wi][g][3] * fb;
+                }
+        }
+    }
+}
+
+template <int NG>
+__global__ void __launch_bounds__(256) moe_up_mma_kernel(
+    const __nv_bfloat16* __restrict__ x, int64_t ldx, const uint8_t* __restrict__ w1, const uint8_t* __restrict__ s1,
+    const uint8_t* __restrict__ w3, const uint8_t* __restrict__ s3, __nv_bfloat16* __restrict__ h, int64_t ldh,
+    const float* __restrict__ route_weight, const int* __restrict__ block_slot, const int* __restrict__ block_route,
+    int N, int K, float limit, int null_slot) {
+    constexpr int KC = kMoeKC;
+    __shared__ __align__(16) __half xs[16 * (KC + 8)];
+    __shared__ int tok_s[16], pair_s[16];
+    const int slot = block_slot[blockIdx.x];
+    if (slot < 0 || slot == null_slot) return;
+    if (threadIdx.x < 16) {
+        const int route = block_route[(int64_t)blockIdx.x * 16 + threadIdx.x];
+        tok_s[threadIdx.x] = route < 0 ? -1 : route >> 16;
+        pair_s[threadIdx.x] = route < 0 ? -1 : route & 0xffff;
+    }
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, r = lane >> 2, q = lane & 3;
+    const int n0 = blockIdx.y * (kWarps * 8 * NG) + warp * 8 * NG;
+    const uint8_t* w[2] = {w1 + (int64_t)slot * N * (K >> 1), w3 + (int64_t)slot * N * (K >> 1)};
+    const uint8_t* sc[2] = {s1 + (int64_t)slot * N * (K >> 5), s3 + (int64_t)slot * N * (K >> 5)};
+    float acc[2][NG][4];
+#pragma unroll
+    for (int wi = 0; wi < 2; ++wi)
+#pragma unroll
+        for (int g = 0; g < NG; ++g)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) acc[wi][g][i] = 0.f;
+    for (int k0 = 0; k0 < K; k0 += KC) {
+        const int kc = min(KC, K - k0);
+        __syncthreads();
+        stage_rows_f16<KC>(xs, x, ldx, tok_s, k0, kc);
+        __syncthreads();
+        mma_fp4_chunk<2, NG, KC, kMoeNB>(acc, xs, w, sc, N, K, n0, k0, kc);
+    }
+#pragma unroll
+    for (int g = 0; g < NG; ++g)
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int pair = pair_s[r + half * 8];
+            if (pair < 0) continue;
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const int n = n0 + g * 8 + q * 2 + j;
+                if (n >= N) continue;
+                float gt = bf(to_bf(acc[0][g][half * 2 + j]));
+                float up = bf(to_bf(acc[1][g][half * 2 + j]));
+                gt = fminf(gt, limit);
+                up = fminf(fmaxf(up, -limit), limit);
+                h[(int64_t)pair * ldh + n] = to_bf(silu_triton(gt) * up * route_weight[pair]);
+            }
+        }
+}
+
+template <int NG>
+__global__ void __launch_bounds__(256) moe_down_mma_kernel(
+    const __nv_bfloat16* __restrict__ h, int64_t ldh, const uint8_t* __restrict__ w2, const uint8_t* __restrict__ s2,
+    float* __restrict__ y, int64_t ldy, const int* __restrict__ block_slot, const int* __restrict__ block_pair,
+    int N, int K, int topk, int ntok, int null_slot, int partial, int parts_world) {
+    constexpr int KC = kMoeKC;
+    __shared__ __align__(16) __half xs[16 * (KC + 8)];
+    __shared__ int pair_s[16];
+    const int slot = block_slot[blockIdx.x];
+    if (slot < 0) return;
+    const bool real = slot != null_slot;
+    if (threadIdx.x < 16) pair_s[threadIdx.x] = block_pair[(int64_t)blockIdx.x * 16 + threadIdx.x];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, r = lane >> 2, q = lane & 3;
+    const int n0 = blockIdx.y * (kWarps * 8 * NG) + warp * 8 * NG;
+    const uint8_t* w[1] = {w2 + (int64_t)slot * N * (K >> 1)};
+    const uint8_t* sc[1] = {s2 + (int64_t)slot * N * (K >> 5)};
+    float acc[1][NG][4];
+#pragma unroll
+    for (int g = 0; g < NG; ++g)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) acc[0][g][i] = 0.f;
+    if (real) {
+        for (int k0 = 0; k0 < K; k0 += KC) {
+            const int kc = min(KC, K - k0);
+            __syncthreads();
+            stage_rows_f16<KC>(xs, h, ldh, pair_s, k0, kc);
+            __syncthreads();
+            mma_fp4_chunk<1, NG, KC, kMoeNB>(acc, xs, w, sc, N, K, n0, k0, kc);
+        }
+    } else {
+        __syncthreads();
+    }
+    const int local_n = N / parts_world;
+#pragma unroll
+    for (int g = 0; g < NG; ++g)
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int pair = pair_s[r + half * 8];
+            if (pair < 0) continue;
+            const int64_t out_row = (int64_t)(pair % topk) * ntok + pair / topk;
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const int n = n0 + g * 8 + q * 2 + j;
+                if (n >= N) continue;
+                float v = real ? acc[0][g][half * 2 + j] : 0.f;
+                if (!partial) v = bf(to_bf(v));
+                const int64_t off = parts_world > 1
+                    ? ((int64_t)(n / local_n) * topk * ntok + out_row) * local_n + n % local_n
+                    : out_row * ldy + n;
+                y[off] = v;
+            }
+        }
+}
+
 // ------------------------------------------------------------------ norms
 // v41_ref.rmsnorm: y = bf16(w * (x * rsqrt(mean(x^2) + eps))), fp32 math. One block per row.
 __global__ void rmsnorm_kernel(const __nv_bfloat16* __restrict__ x, int64_t ldx,
@@ -1655,6 +1931,33 @@ int ds_greedy_accept(void* stream, const void* am, const void* block, int T, con
 
 int ds_wait_flag(void* stream, const void* flag, int expect, long long timeout_ns, void* err) {
     wait_flag_kernel<<<1, 32, 0, DS_ST>>>(static_cast<const volatile int*>(flag), expect, timeout_ns, static_cast<int*>(err));
+    DS_RET;
+}
+
+int ds_moe_up_mma(void* stream, const void* x, int64_t ldx, const void* w1, const void* s1, const void* w3,
+                  const void* s3, void* h, int64_t ldh, const void* route_weight, const void* block_slot,
+                  const void* block_route, int nb, int N, int K, float limit, int null_slot) {
+    constexpr int NG = kMoeNG;
+    if (K % 128 || nb < 1) return cudaErrorInvalidValue;
+    dim3 grid(nb, (N + kWarps * 8 * NG - 1) / (kWarps * 8 * NG));
+    moe_up_mma_kernel<NG><<<grid, kThreads, 0, DS_ST>>>(
+        static_cast<const __nv_bfloat16*>(x), ldx, static_cast<const uint8_t*>(w1), static_cast<const uint8_t*>(s1),
+        static_cast<const uint8_t*>(w3), static_cast<const uint8_t*>(s3), static_cast<__nv_bfloat16*>(h), ldh,
+        static_cast<const float*>(route_weight), static_cast<const int*>(block_slot), static_cast<const int*>(block_route),
+        N, K, limit, null_slot);
+    DS_RET;
+}
+
+int ds_moe_down_mma(void* stream, const void* h, int64_t ldh, const void* w2, const void* s2, void* y, int64_t ldy,
+                    const void* block_slot, const void* block_pair, int nb, int N, int K, int topk, int ntok,
+                    int null_slot, int partial, int parts_world) {
+    constexpr int NG = kMoeNG;
+    if (K % 128 || nb < 1 || parts_world < 1 || N % parts_world) return cudaErrorInvalidValue;
+    dim3 grid(nb, (N + kWarps * 8 * NG - 1) / (kWarps * 8 * NG));
+    moe_down_mma_kernel<NG><<<grid, kThreads, 0, DS_ST>>>(
+        static_cast<const __nv_bfloat16*>(h), ldh, static_cast<const uint8_t*>(w2), static_cast<const uint8_t*>(s2),
+        static_cast<float*>(y), ldy, static_cast<const int*>(block_slot), static_cast<const int*>(block_pair), N, K,
+        topk, ntok, null_slot, partial, parts_world);
     DS_RET;
 }
 

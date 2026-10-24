@@ -1181,3 +1181,96 @@ fn pending_update_and_rollback_per_lane_segment() {
     assert_eq!(&dl(&both.pkv)[..d], &kv[3 * d..4 * d], "lane 0's pending restored from its own memory");
     assert_eq!(&dl(&both.psc)[..d], &sc[3 * d..4 * d]);
 }
+
+// ------------------------------------------------------------------ tensor-core FP4 MoE
+/// The tensor-core MoE kernels against the bm16 kernels they stand in for: same rounding
+/// points, so outputs agree to a bf16 ulp or two of the summation-order difference; and a
+/// pair's output must not depend on which pairs share its step.
+#[test]
+fn moe_mma_matches_bm16_and_is_row_invariant() {
+    use tidelm_kernels::fp4;
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(97);
+    let (slots, inter, dim, t, topk) = (8usize, 256usize, 512usize, 20usize, 4usize);
+    let p_all = t * topk;
+    let bytes = |rng: &mut Rng, n: usize| -> Vec<u8> { (0..n).map(|_| (rng.next() & 0xff) as u8).collect() };
+    let scales = |rng: &mut Rng, n: usize| -> Vec<u8> { (0..n).map(|_| 119 + (rng.next() % 6) as u8).collect() };
+    let (w1, w3) = (bytes(&mut rng, slots * inter * dim / 2), bytes(&mut rng, slots * inter * dim / 2));
+    let (s1, s3) = (scales(&mut rng, slots * inter * dim / 32), scales(&mut rng, slots * inter * dim / 32));
+    let w2 = bytes(&mut rng, slots * dim * inter / 2);
+    let s2 = scales(&mut rng, slots * dim * inter / 32);
+    let x = rng.bf16_vec(t * dim, 1.0);
+    // distinct experts per token
+    let mut keys = Vec::new();
+    for _ in 0..t {
+        let mut picked: Vec<i32> = Vec::new();
+        while picked.len() < topk {
+            let e = (rng.next() % slots as u64) as i32;
+            if !picked.contains(&e) {
+                picked.push(e);
+            }
+        }
+        keys.extend(picked);
+    }
+    let rw: Vec<f32> = (0..p_all).map(|_| 0.2 + (rng.next() % 1000) as f32 / 1000.0).collect();
+    let (dw1, dw3, ds1, ds3, dw2, ds2, dx, drw) = (dev(&w1), dev(&w3), dev(&s1), dev(&s3), dev(&w2), dev(&s2), dev(&x), dev(&rw));
+    let limit = 10.0f32;
+    // `h_in`: feed the down kernel this h instead of the up kernel's
+    let run = |keys: &[i32], tt: usize, mma: bool, h_in: Option<&[u16]>| -> (Vec<u16>, Vec<f32>) {
+        let pairs = keys.len();
+        let dk = dev(keys);
+        let (bs, bp, br) = (DeviceBuffer::<i32>::zeroed(pairs).unwrap(), DeviceBuffer::<i32>::zeroed(pairs * 16).unwrap(),
+                            DeviceBuffer::<i32>::zeroed(pairs * 16).unwrap());
+        let h = DeviceBuffer::<u16>::zeroed(pairs * inter).unwrap();
+        let parts = DeviceBuffer::<f32>::zeroed(pairs * dim).unwrap();
+        ok(unsafe { fp4::fp4_moe_cuda_route_small(st.raw(), p(&dk), p(&bs), p(&bp), p(&br), pairs as i32, topk as i32) });
+        let h_down = match h_in {
+            Some(v) => dev(v),
+            None => DeviceBuffer::<u16>::zeroed(1).unwrap(),
+        };
+        if mma {
+            ok(unsafe {
+                ds_moe_up_mma(st.raw(), p(&dx), dim as i64, p(&dw1), p(&ds1), p(&dw3), p(&ds3), p(&h), inter as i64, p(&drw),
+                              p(&bs), p(&br), pairs as i32, inter as i32, dim as i32, limit, -1)
+            });
+            let hd = if h_in.is_some() { &h_down } else { &h };
+            ok(unsafe {
+                ds_moe_down_mma(st.raw(), p(hd), inter as i64, p(&dw2), p(&ds2), p(&parts), dim as i64, p(&bs), p(&bp),
+                                pairs as i32, dim as i32, inter as i32, topk as i32, tt as i32, -1, 0, 1)
+            });
+        } else {
+            ok(unsafe {
+                fp4::fp4_moe_cuda_up_v2(st.raw(), p(&dx), p(&dw1), p(&ds1), p(&dw3), p(&ds3), p(&h), p(&drw), p(&bs), p(&br),
+                                        dim as i64, inter as i64, limit, topk as i32, inter as i32, dim as i32, pairs as i32, -1)
+            });
+            let hd = if h_in.is_some() { &h_down } else { &h };
+            ok(unsafe {
+                fp4::fp4_moe_cuda_down_v2(st.raw(), p(hd), p(&dw2), p(&ds2), p(&parts), p(&bs), p(&bp), inter as i64,
+                                          dim as i64, topk as i32, dim as i32, inter as i32, tt as i32, pairs as i32, -1, 0, 1)
+            });
+        }
+        st.synchronize().unwrap();
+        (h.download().unwrap(), parts.download().unwrap())
+    };
+    let (h_ref, parts_ref) = run(&keys, t, false, None);
+    let (h_mma, parts_mma) = run(&keys, t, true, None);
+    let (_, parts_mma_same_h) = run(&keys, t, true, Some(&h_ref));
+    let close = |a: f32, b: f32, scale: f32| (a - b).abs() <= 2f32.powi(-6) * a.abs().max(b.abs()) + 1e-3 * scale;
+    let hmax = h_ref.iter().map(|&v| f32_from_bf16(v).abs()).fold(0f32, f32::max);
+    let bad_h = h_ref.iter().zip(&h_mma).filter(|(&a, &b)| !close(f32_from_bf16(a), f32_from_bf16(b), hmax)).count();
+    assert!(hmax > 0.0 && bad_h == 0, "up: {bad_h} of {} values outside bf16 accumulation tolerance (max |h| {hmax})", h_ref.len());
+    // down from the same h on both sides isolates the down kernel
+    let pmax = parts_ref.iter().map(|v| v.abs()).fold(0f32, f32::max);
+    let bad_p = parts_ref.iter().zip(&parts_mma_same_h).filter(|(&a, &b)| !close(a, b, pmax)).count();
+    assert!(pmax > 0.0 && bad_p == 0, "down: {bad_p} of {} values outside tolerance", parts_ref.len());
+    // end to end, each side's own up feeding its down
+    let bad_e2e = parts_ref.iter().zip(&parts_mma).filter(|(&a, &b)| !close(a, b, pmax)).count();
+    assert!(bad_e2e == 0, "up + down: {bad_e2e} of {} values outside tolerance", parts_ref.len());
+    // token 0 alone: its pairs (0..topk) get the same bits as in the full step
+    let (h1, parts1) = run(&keys[..topk], 1, true, None);
+    assert_eq!(&h1[..], &h_mma[..topk * inter], "up output of a pair depends on the other pairs");
+    for k in 0..topk {
+        // parts rows are (k, token): row k * ntok + 0
+        assert_eq!(&parts1[k * dim..(k + 1) * dim], &parts_mma[(k * t) * dim..(k * t + 1) * dim], "down row k={k}");
+    }
+}
