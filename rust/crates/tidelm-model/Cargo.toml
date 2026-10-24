@@ -1,0 +1,11 @@
+[package]
+name = "tidelm-model"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Checkpoint access for the DS v4.1 engine: safetensors shard parsing, the weight index, and O_DIRECT expert reads"
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
