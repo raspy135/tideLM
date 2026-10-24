@@ -16,6 +16,8 @@
 //! ABI means a kernel change on the Python side is a build change here, never a silent
 //! semantic drift.
 
+pub mod ds41;
+
 use std::os::raw::{c_int, c_void};
 
 /// A raw `cudaStream_t`.

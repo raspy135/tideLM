@@ -28,6 +28,8 @@ fn main() {
 
     let fp4_src = repo.join("tools/fp4_moe_cuda.cu");
     let engram_src = repo.join("engine/engram_gather.cpp");
+    let ds41_src = manifest.join("cuda/ds41.cu");
+    println!("cargo:rerun-if-changed={}", ds41_src.display());
     println!("cargo:rerun-if-changed={}", fp4_src.display());
     println!("cargo:rerun-if-changed={}", engram_src.display());
     println!("cargo:rerun-if-env-changed=TIDELM_CUDA_ARCH");
@@ -57,6 +59,21 @@ fn main() {
         fp4_obj.to_str().unwrap(),
     ]));
 
+    // The Rust engine's own decode kernels: no tuning defines, same arch flags.
+    let ds41_obj = out.join("ds41.o");
+    run(Command::new(&nvcc).args([
+        "-std=c++17",
+        "-O3",
+        "-DNDEBUG",
+        "-Xcompiler=-fPIC",
+        "-c",
+        "-gencode",
+        &format!("arch=compute_{arch},code=sm_{arch}"),
+        ds41_src.to_str().unwrap(),
+        "-o",
+        ds41_obj.to_str().unwrap(),
+    ]));
+
     let engram_obj = out.join("engram_gather.o");
     run(Command::new("g++").args([
         "-std=c++17",
@@ -76,6 +93,7 @@ fn main() {
         "crs",
         archive.to_str().unwrap(),
         fp4_obj.to_str().unwrap(),
+        ds41_obj.to_str().unwrap(),
         engram_obj.to_str().unwrap(),
     ]));
 
