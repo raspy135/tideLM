@@ -38,6 +38,12 @@ extern "C" {
     pub fn cudaMallocHost(ptr: *mut *mut c_void, size: usize) -> cudaError_t;
     pub fn cudaFreeHost(ptr: *mut c_void) -> cudaError_t;
     pub fn cudaMemset(ptr: *mut c_void, value: c_int, count: usize) -> cudaError_t;
+    pub fn cudaMemsetAsync(
+        ptr: *mut c_void,
+        value: c_int,
+        count: usize,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub fn cudaMemcpy(
         dst: *mut c_void,
         src: *const c_void,

@@ -1,7 +1,7 @@
 //! Safetensors shard headers and expert run grouping, from `engine/experts.py`
-//! (`ShardFile`). Only the header layout is parsed here — a u64 LE length, a JSON
-//! object of `{name: {dtype, shape, data_offsets: [lo, hi]}}` — tensors are read
-//! through `direct_io` by byte span.
+//! (`ShardFile`). Only the header is parsed here — a u64 LE length, then a JSON object
+//! of `{name: {dtype, shape, data_offsets: [lo, hi]}}` — tensor bytes are read through
+//! `direct_io` by span.
 
 use std::collections::HashMap;
 use std::io;
@@ -13,6 +13,24 @@ use crate::direct_io::DirectFile;
 pub const EXPERT_NAMES: [&str; 6] =
     ["w1.weight", "w1.scale", "w2.weight", "w2.scale", "w3.weight", "w3.scale"];
 
+/// One tensor's place in its shard: absolute byte span plus its declared type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorMeta {
+    pub dtype: String,
+    pub shape: Vec<usize>,
+    pub lo: u64,
+    pub hi: u64,
+}
+
+impl TensorMeta {
+    pub fn nbytes(&self) -> usize {
+        (self.hi - self.lo) as usize
+    }
+    pub fn numel(&self) -> usize {
+        self.shape.iter().product()
+    }
+}
+
 /// One maximal contiguous file range covering some of an expert's tensors:
 /// `members` are `(index into EXPERT_NAMES, offset inside the run, nbytes)`.
 #[derive(Debug, Clone)]
@@ -22,13 +40,17 @@ pub struct Run {
     pub members: Vec<(usize, usize, usize)>,
 }
 
-/// One safetensors shard: header spans + an O_DIRECT fd.
+/// One safetensors shard: header metadata + an O_DIRECT fd.
 pub struct Shard {
     pub path: PathBuf,
     pub base: u64,
-    spans: HashMap<String, (u64, u64)>,
+    tensors: HashMap<String, TensorMeta>,
     pub file: DirectFile,
     runs: Mutex<HashMap<String, Vec<Run>>>,
+}
+
+fn bad(msg: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
 impl Shard {
@@ -39,30 +61,38 @@ impl Shard {
         let n = u64::from_le_bytes(len8);
         let mut raw = vec![0u8; n as usize];
         file.pread_buffered(&mut raw, 8)?;
-        let header: HashMap<String, serde_json::Value> = serde_json::from_slice(&raw)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let header: HashMap<String, serde_json::Value> =
+            serde_json::from_slice(&raw).map_err(|e| bad(e.to_string()))?;
         let base = 8 + n;
-        let mut spans = HashMap::with_capacity(header.len());
+        let mut tensors = HashMap::with_capacity(header.len());
         for (name, meta) in header {
             if name == "__metadata__" {
                 continue;
             }
-            let offs = meta
-                .get("data_offsets")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing data_offsets"))?;
+            let offs = meta["data_offsets"].as_array().ok_or_else(|| bad("missing data_offsets"))?;
+            let shape = meta["shape"]
+                .as_array()
+                .ok_or_else(|| bad("missing shape"))?
+                .iter()
+                .map(|v| v.as_u64().unwrap_or(0) as usize)
+                .collect();
+            let dtype = meta["dtype"].as_str().ok_or_else(|| bad("missing dtype"))?.to_string();
             let lo = offs[0].as_u64().unwrap_or(0) + base;
             let hi = offs[1].as_u64().unwrap_or(0) + base;
-            spans.insert(name, (lo, hi));
+            tensors.insert(name, TensorMeta { dtype, shape, lo, hi });
         }
-        Ok(Shard { path: path.to_path_buf(), base, spans, file, runs: Mutex::new(HashMap::new()) })
+        Ok(Shard { path: path.to_path_buf(), base, tensors, file, runs: Mutex::new(HashMap::new()) })
+    }
+
+    pub fn meta(&self, name: &str) -> io::Result<&TensorMeta> {
+        self.tensors.get(name).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("{name} not in {}", self.path.display()))
+        })
     }
 
     /// Absolute byte span of one tensor.
     pub fn span(&self, name: &str) -> io::Result<(u64, u64)> {
-        self.spans.get(name).copied().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("{name} not in {}", self.path.display()))
-        })
+        self.meta(name).map(|m| (m.lo, m.hi))
     }
 
     /// The 6 tensors of one expert grouped into maximal contiguous file ranges.
@@ -105,27 +135,21 @@ mod tests {
 
     fn tiny_shard(dir: &Path) -> PathBuf {
         // two experts' tensors laid out scales-first, weights-behind, like the real shards
-        let names = EXPERT_NAMES;
-        let mut header = serde_json::Map::new();
-        let mut off = 0u64;
         let mut order: Vec<(String, u64)> = Vec::new();
         for group in [["w1.scale", "w2.scale", "w3.scale"], ["w1.weight", "w2.weight", "w3.weight"]] {
             for e in 0..2 {
                 for name in group {
                     let len = if name.ends_with("scale") { 64 } else { 256 };
                     order.push((format!("layers.0.ffn.experts.{e}.{name}"), len));
-                    off += len;
                 }
             }
         }
+        let mut header = serde_json::Map::new();
         let mut pos = 0u64;
         for (name, len) in &order {
             header.insert(
                 name.clone(),
-                serde_json::json!({
-                    "dtype": "U8", "shape": [len],
-                    "data_offsets": [pos, pos + len]
-                }),
+                serde_json::json!({"dtype": "U8", "shape": [len], "data_offsets": [pos, pos + len]}),
             );
             pos += len;
         }
@@ -134,9 +158,8 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(&(hdr.len() as u64).to_le_bytes()).unwrap();
         f.write_all(&hdr).unwrap();
-        let data: Vec<u8> = (0..off).map(|i| (i % 251) as u8).collect();
+        let data: Vec<u8> = (0..pos).map(|i| (i % 251) as u8).collect();
         f.write_all(&data).unwrap();
-        let _ = names;
         path
     }
 
@@ -147,15 +170,13 @@ mod tests {
         let path = tiny_shard(&dir);
         let shard = Shard::open(&path).unwrap();
         let runs = shard.expert_runs("layers.0.ffn.experts.0.").unwrap();
-        // scales of expert 0 are adjacent (one run), weights of expert 0 adjacent (one run)
         assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].members.len(), 3);
-        assert_eq!(runs[1].members.len(), 3);
-        // members carry EXPERT_NAMES indices: scales are 1, 3, 5; weights 0, 2, 4
         let scale_ids: Vec<usize> = runs[0].members.iter().map(|m| m.0).collect();
         assert_eq!(scale_ids, vec![1, 3, 5]);
         let weight_ids: Vec<usize> = runs[1].members.iter().map(|m| m.0).collect();
         assert_eq!(weight_ids, vec![0, 2, 4]);
+        let meta = shard.meta("layers.0.ffn.experts.1.w2.weight").unwrap();
+        assert_eq!((meta.dtype.as_str(), meta.shape.as_slice(), meta.nbytes()), ("U8", &[256usize][..], 256));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

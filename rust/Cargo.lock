@@ -678,6 +678,19 @@ name = "tidelm-cuda"
 version = "0.1.0"
 
 [[package]]
+name = "tidelm-engine"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tidelm-core",
+ "tidelm-cuda",
+ "tidelm-kernels",
+ "tidelm-model",
+ "tidelm-text",
+]
+
+[[package]]
 name = "tidelm-kernels"
 version = "0.1.0"
 dependencies = [

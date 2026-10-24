@@ -244,7 +244,64 @@ impl<T: Copy> DeviceBuffer<T> {
     pub fn raw(&self) -> *mut c_void {
         self.ptr
     }
+
+    /// Device pointer to element `elem` (bounds-checked).
+    pub fn ptr_at(&self, elem: usize) -> *mut c_void {
+        assert!(elem <= self.len, "device offset {elem} past length {}", self.len);
+        unsafe { (self.ptr as *mut u8).add(elem * size_of::<T>()) as *mut c_void }
+    }
+
+    /// Host -> device into `[elem, elem + src.len())`, ordered on `stream`. From pageable
+    /// memory this returns once the source is consumed; from pinned memory it is async,
+    /// and the caller keeps `src` alive until the stream passes this point.
+    pub fn upload_async(&self, elem: usize, src: &[T], stream: &Stream) -> Result<()> {
+        assert!(elem + src.len() <= self.len, "upload past the end of the buffer");
+        unsafe {
+            memcpy_async(self.ptr_at(elem), src.as_ptr() as *const c_void, std::mem::size_of_val(src),
+                         ffi::MEMCPY_HOST_TO_DEVICE, stream)
+        }
+    }
+
+    /// Device -> host from `[elem, elem + dst.len())`, ordered on `stream`; the data is
+    /// valid once the stream is synchronized.
+    pub fn download_async(&self, elem: usize, dst: &mut [T], stream: &Stream) -> Result<()> {
+        assert!(elem + dst.len() <= self.len, "download past the end of the buffer");
+        unsafe {
+            memcpy_async(dst.as_mut_ptr() as *mut c_void, self.ptr_at(elem), std::mem::size_of_val(dst),
+                         ffi::MEMCPY_DEVICE_TO_HOST, stream)
+        }
+    }
+
+    /// Device -> device copy of `n` elements, ordered on `stream`.
+    pub fn copy_from(&self, elem: usize, src: &DeviceBuffer<T>, src_elem: usize, n: usize, stream: &Stream) -> Result<()> {
+        assert!(elem + n <= self.len && src_elem + n <= src.len, "device copy out of bounds");
+        unsafe { memcpy_async(self.ptr_at(elem), src.ptr_at(src_elem), n * size_of::<T>(), ffi::MEMCPY_DEVICE_TO_DEVICE, stream) }
+    }
+
+    pub fn zero_async(&self, stream: &Stream) -> Result<()> {
+        check(unsafe { ffi::cudaMemsetAsync(self.ptr, 0, self.len * size_of::<T>(), stream.raw()) }, "cudaMemsetAsync")
+    }
+
+    /// Fill with a byte pattern (0xff makes every i32 -1).
+    pub fn fill_bytes_async(&self, byte: u8, stream: &Stream) -> Result<()> {
+        check(unsafe { ffi::cudaMemsetAsync(self.ptr, byte as i32, self.len * size_of::<T>(), stream.raw()) },
+              "cudaMemsetAsync")
+    }
 }
+
+/// Raw async copy between any two addresses (pinned host <-> device in the hot paths).
+///
+/// # Safety
+/// `dst` and `src` must be valid for `bytes` in the memory spaces `kind` names, and stay
+/// valid until `stream` passes this point.
+pub unsafe fn memcpy_async(dst: *mut c_void, src: *const c_void, bytes: usize, kind: i32, stream: &Stream) -> Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    check(unsafe { ffi::cudaMemcpyAsync(dst, src, bytes, kind, stream.raw()) }, "cudaMemcpyAsync")
+}
+
+pub use ffi::{MEMCPY_DEVICE_TO_DEVICE, MEMCPY_DEVICE_TO_HOST, MEMCPY_HOST_TO_DEVICE};
 
 impl<T: Copy> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
@@ -271,6 +328,16 @@ impl<T: Copy> PinnedBuffer<T> {
 
     pub fn raw(&self) -> *mut c_void {
         self.ptr as *mut c_void
+    }
+}
+
+impl PinnedBuffer<u8> {
+    /// Allocate pinned memory without touching it (cudaMallocHost pages are already
+    /// page-aligned, which O_DIRECT needs); contents are unspecified.
+    pub fn uninit(len: usize) -> Result<Self> {
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        check(unsafe { ffi::cudaMallocHost(&mut ptr, len) }, "cudaMallocHost")?;
+        Ok(PinnedBuffer { ptr: ptr as *mut u8, len })
     }
 }
 

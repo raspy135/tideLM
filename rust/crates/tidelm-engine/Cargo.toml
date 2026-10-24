@@ -1,0 +1,19 @@
+[package]
+name = "tidelm-engine"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The DS v4.1 engine in Rust: weights, caches, the forward pass and the decode loop"
+
+[dependencies]
+tidelm-core = { path = "../tidelm-core" }
+tidelm-cuda = { path = "../tidelm-cuda" }
+tidelm-kernels = { path = "../tidelm-kernels" }
+tidelm-model = { path = "../tidelm-model" }
+tidelm-text = { path = "../tidelm-text" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "tidelm-generate"
+path = "src/bin/generate.rs"

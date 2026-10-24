@@ -36,6 +36,11 @@ impl DirectFile {
         Ok(DirectFile { fd, fd_buffered })
     }
 
+    /// The O_DIRECT descriptor, for native readers (the engram gather) that pread it.
+    pub fn direct_fd(&self) -> i32 {
+        self.fd
+    }
+
     /// O_DIRECT-read `need` bytes at `off` into `buf` (an ALIGN-aligned slice whose
     /// length is the aligned request size). The request length is always the full
     /// slice — O_DIRECT rejects unaligned lengths — and the loop stops as soon as the
