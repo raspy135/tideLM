@@ -125,6 +125,29 @@ fn off(p: *mut c_void, bytes: usize) -> *mut c_void {
     }
 }
 
+/// TIDELM_EXPERT_TOPP (unset, 0 or off: none) and TIDELM_EXPERT_TOPP_MIN_K (default 3), as
+/// engine/expert_topp.py::config. Off by default: on the README protocol (pair, drafter split
+/// and listed, same prompts and seed) 0.90 moved the medians by +1.6 / -1.0% on prose and -2.1 /
+/// -3.4% on code (window / confidence), and code's acceptance fell (window 3.79 / 3.72 / 3.37
+/// -> 3.45 / 3.61 / 3.29 tokens a step): the drafter predicts the unpruned target, so the
+/// expert reads it saves come back as rejected drafts.
+fn expert_topp_from_env() -> Result<Option<(f32, i32)>> {
+    let raw = std::env::var("TIDELM_EXPERT_TOPP").unwrap_or_default().trim().to_lowercase();
+    if matches!(raw.as_str(), "" | "0" | "off" | "none") {
+        return Ok(None);
+    }
+    let topp: f32 = raw.parse().map_err(|_| format!("TIDELM_EXPERT_TOPP={raw}: a share in (0, 1), e.g. 0.90"))?;
+    if !(topp > 0.0 && topp < 1.0) {
+        return Err(format!("TIDELM_EXPERT_TOPP={raw}: a share in (0, 1), e.g. 0.90").into());
+    }
+    let min_k: i32 = std::env::var("TIDELM_EXPERT_TOPP_MIN_K").ok().map(|v| v.trim().parse()).transpose()
+        .map_err(|_| "TIDELM_EXPERT_TOPP_MIN_K must be 1..6")?.unwrap_or(3);
+    if !(1..=6).contains(&min_k) {
+        return Err("TIDELM_EXPERT_TOPP_MIN_K must be 1..6".into());
+    }
+    Ok(Some((topp, min_k)))
+}
+
 /// ds_gather_rows_u16 over any number of rows (one launch takes at most 65,535): out[m] =
 /// table[ids[m]], rows of d bf16.
 fn gather_rows(stream: &Stream, table: *mut c_void, ids: &DeviceBuffer<i32>, out: *mut c_void, n: usize, d: usize) -> Result<()> {
@@ -283,11 +306,12 @@ impl Options {
         let listed = crate::draft_vocab::from_env(vocab)?.map(|ids| crate::draft_vocab::digest(&ids)).unwrap_or(0);
         Ok(format!("tidelm-pair v3 tp | max_seq {} lanes {} spec {} resident {} graphs {} layers {:?} | keep {:x} \
                     dspark_keep {:x} | exe {:x} | config {:x} | draft vocab {listed:x} | env NO_QDQ={:?} ENGRAM_CACHE_MB={:?} \
-                    DRAFT_HEAD_FMT={:?} TP_DRAFT={:?}",
+                    DRAFT_HEAD_FMT={:?} TP_DRAFT={:?} EXPERT_TOPP={:?}/{:?}",
                    self.max_seq, self.max_lanes, self.spec, self.resident, self.graphs, self.n_layers, mask(&self.keep),
                    mask(&self.dspark_keep), fnv(&exe), fnv(&cfg), std::env::var("TIDELM_NO_QDQ").ok(),
                    std::env::var("TIDELM_ENGRAM_CACHE_MB").ok(), std::env::var("TIDELM_DRAFT_HEAD_FMT").ok(),
-                   std::env::var("TIDELM_TP_DRAFT").ok()).into_bytes())
+                   std::env::var("TIDELM_TP_DRAFT").ok(), std::env::var("TIDELM_EXPERT_TOPP").ok(),
+                   std::env::var("TIDELM_EXPERT_TOPP_MIN_K").ok()).into_bytes())
     }
 }
 
@@ -323,12 +347,15 @@ pub enum Want {
     All,
 }
 
-/// One lane's rows in a step: tokens `ids` at that lane's next positions.
+/// One lane's rows in a step: tokens `ids` at that lane's next positions. `decode`: the rows
+/// are generated tokens (a decode step or a verify block), not prompt - only those take
+/// TIDELM_EXPERT_TOPP.
 #[derive(Clone, Copy, Debug)]
 pub struct Seg<'a> {
     pub lane: usize,
     pub ids: &'a [u32],
     pub want: Want,
+    pub decode: bool,
 }
 
 /// Per-call wall-clock split, printed by the CLI: where a streaming step's time goes.
@@ -525,6 +552,8 @@ struct Act {
     seg_lane: DeviceBuffer<i32>,
     /// routed pairs of the step's live rows (filler rows' pairs route nowhere)
     live_pairs: DeviceBuffer<i32>,
+    /// per row: a generated token's row (Seg::decode), the rows TIDELM_EXPERT_TOPP applies to
+    topp_rows: DeviceBuffer<i32>,
     cidx1: DeviceBuffer<i32>,
     cidx2: DeviceBuffer<i32>,
     z: DeviceBuffer<f32>,
@@ -719,7 +748,11 @@ struct Lane {
 /// (model.py's slot_lut; -1 for an expert that is not routable).
 struct ExpertSet {
     arena: Arena,
+    /// per block, expert -> slot, plus a last column (the expert id `n_experts`) at the null
+    /// slot: a pick TIDELM_EXPERT_TOPP drops routes there and its output is an exact 0
     lut: DeviceBuffer<i32>,
+    /// one past the arena's slots: the FP4 kernels read no weights for it
+    null_slot: i32,
 }
 
 impl ExpertSet {
@@ -734,7 +767,7 @@ impl ExpertSet {
         let arena = Arena::new(n_slots.max(1), tp)?;
         let rank = tp.map(|t| t.rank).unwrap_or(0);
         let world = tp.map(|t| t.world).unwrap_or(1);
-        let mut lut = vec![-1i32; blocks * n_experts];
+        let mut lut = vec![-1i32; blocks * (n_experts + 1)];
         let mut stage = PinnedBuffer::uninit(STAGE_BYTES)?;
         let reader = ExpertReader::new(ckpt);
         let mut slot = 0usize;
@@ -752,11 +785,12 @@ impl ExpertSet {
                     unsafe { memcpy_async(dst, src, n, MEMCPY_HOST_TO_DEVICE, stream)? };
                 }
                 stream.synchronize()?;
-                lut[b * n_experts + x] = slot as i32;
+                lut[b * (n_experts + 1) + x] = slot as i32;
                 slot += 1;
             }
+            lut[b * (n_experts + 1) + n_experts] = n_slots as i32;
         }
-        Ok(ExpertSet { arena, lut: DeviceBuffer::from_slice(&lut)? })
+        Ok(ExpertSet { arena, lut: DeviceBuffer::from_slice(&lut)?, null_slot: n_slots as i32 })
     }
 }
 
@@ -866,6 +900,9 @@ pub struct Engine {
     pub indexed_layers: usize,
     /// sampled rows whose nucleus outgrew the device's window (recomputed on the host)
     pub nucleus_fallbacks: usize,
+    /// TIDELM_EXPERT_TOPP (Python's DSV41_EXPERT_TOPP) and its MIN_K: decode rows keep their
+    /// routed picks up to this share of their weight, at least MIN_K of them
+    expert_topp: Option<(f32, i32)>,
 }
 
 impl Resident {
@@ -1082,6 +1119,7 @@ impl Engine {
             seg_count: i(lanes)?,
             seg_lane: i(lanes)?,
             live_pairs: i(1)?,
+            topp_rows: i(t)?,
             cidx1: i(t * cfg.index_topk)?,
             cidx2: i(t * cfg.index_topk)?,
             z: f(t * cfg.n_routed_experts)?,
@@ -1216,6 +1254,10 @@ impl Engine {
         if opts.tp.is_some() && !opts.resident {
             return Err("tensor parallel needs resident mode".into());
         }
+        let expert_topp = expert_topp_from_env()?;
+        if expert_topp.is_some() && !opts.resident {
+            return Err("TIDELM_EXPERT_TOPP needs resident mode (its dropped picks route to the arena's null slot)".into());
+        }
         let resident = if opts.resident {
             Some(Resident::load(&ckpt, &stream, &cfg, n_layers, &opts, &draft_run, draft_tp)?)
         } else {
@@ -1310,6 +1352,7 @@ impl Engine {
             cand_live: false,
             indexed_layers: 0,
             nucleus_fallbacks: 0,
+            expert_topp,
         })
     }
 
@@ -1354,7 +1397,7 @@ impl Engine {
                 OP_FORWARD => {
                     let _logits = r.u32()?;
                     let n = r.u32()? as usize;
-                    let mut owned: Vec<(usize, Want, Vec<u32>)> = Vec::with_capacity(n);
+                    let mut owned: Vec<(usize, Want, bool, Vec<u32>)> = Vec::with_capacity(n);
                     for _ in 0..n {
                         let lane = r.u32()? as usize;
                         let want = match r.u32()? {
@@ -1362,9 +1405,11 @@ impl Engine {
                             1 => Want::Last,
                             _ => Want::All,
                         };
-                        owned.push((lane, want, r.u32s()?));
+                        let decode = r.u32()? != 0;
+                        owned.push((lane, want, decode, r.u32s()?));
                     }
-                    let segs: Vec<Seg> = owned.iter().map(|(lane, want, ids)| Seg { lane: *lane, ids, want: *want }).collect();
+                    let segs: Vec<Seg> =
+                        owned.iter().map(|(lane, want, decode, ids)| Seg { lane: *lane, ids, want: *want, decode: *decode }).collect();
                     // what comes back is rank 0's business: the cheapest read-back
                     self.run_step(&segs, Readback::Argmax)?;
                 }
@@ -1545,9 +1590,10 @@ impl Engine {
         Ok(())
     }
 
-    /// Lane 0: tokens `ids` at its next positions; returns the bf16 logits `want` asks for.
+    /// Lane 0: prompt tokens `ids` at its next positions; returns the bf16 logits `want` asks
+    /// for.
     pub fn forward(&mut self, ids: &[u32], want: Want) -> Result<Vec<u16>> {
-        Ok(self.forward_batch(&[Seg { lane: 0, ids, want }])?.remove(0))
+        Ok(self.forward_batch(&[Seg { lane: 0, ids, want, decode: false }])?.remove(0))
     }
 
     /// One backbone step over every segment's rows (at most TMAX together, each lane at most
@@ -1630,7 +1676,7 @@ impl Engine {
                     Want::Last => 1,
                     Want::All => 2,
                 };
-                m.u32(sg.lane as u32).u32(want).u32s(sg.ids);
+                m.u32(sg.lane as u32).u32(want).u32(sg.decode as u32).u32s(sg.ids);
             }
         })?;
         let tp = Instant::now();
@@ -1734,7 +1780,7 @@ impl Engine {
         let tw = Instant::now();
         let tb = row_bucket(rows);
         let scratch = self.max_lanes as i32;
-        let (mut pos, mut lane, mut ids) = (vec![0i32; tb], vec![scratch; tb], vec![0u32; tb]);
+        let (mut pos, mut lane, mut ids, mut dec) = (vec![0i32; tb], vec![scratch; tb], vec![0u32; tb], vec![0i32; tb]);
         let nseg = self.max_lanes + 1;
         let (mut sf, mut sn, mut sl) = (vec![0i32; nseg], vec![0i32; nseg], vec![scratch; nseg]);
         let (mut head_rows, mut heads, mut firsts) = (Vec::new(), Vec::new(), Vec::new());
@@ -1746,6 +1792,7 @@ impl Engine {
                 pos[r + j] = (s + j) as i32;
                 lane[r + j] = sg.lane as i32;
                 ids[r + j] = sg.ids[j];
+                dec[r + j] = sg.decode as i32;
             }
             (sf[i], sn[i], sl[i]) = (r as i32, t as i32, sg.lane as i32);
             let h0 = head_rows.len();
@@ -1776,6 +1823,9 @@ impl Engine {
             a.seg_lane.upload_async(0, &sl, st)?;
             a.head_rows.upload_async(0, &head_rows, st)?;
             a.live_pairs.upload_async(0, &[(rows * cfg.n_activated_experts) as i32], st)?;
+            if self.expert_topp.is_some() {
+                a.topp_rows.upload_async(0, &dec, st)?;
+            }
         }
         self.live_rows = rows;
         self.embed_host(&ids, rows)?;
@@ -2598,6 +2648,10 @@ impl Engine {
             };
             gemm(sr, &a.mma_part, np(&a.y), d, Wt::Bf16 { w: np(&w.gate_w), n: e, k: d }, t, np(&a.z), true, e)?;
             ck(unsafe { ds_router(sr, np(&a.z), np(&w.gate_bias), keep, ti, e as i32, k as i32, cfg.route_scale, np(&a.idx), np(&a.rw)) }, "router")?;
+            // the backbone's decode rows only; the drafter's router is untouched
+            if let (Some(_), Some((topp, min_k))) = (layer, self.expert_topp) {
+                ck(unsafe { ds_expert_topp(sr, np(&a.idx), np(&a.rw), ti, k as i32, topp, min_k, e as i32, np(&a.topp_rows)) }, "expert top-p")?;
+            }
         }
         let set = match (&self.resident, layer, block) {
             (Some(res), Some(l), _) => Some((&res.experts, l)),
@@ -2610,12 +2664,12 @@ impl Engine {
             let a = &self.act;
             let ar = &set.arena;
             let live = if layer.is_some() { np(&a.live_pairs) } else { nul() };
-            ck(unsafe { ds_lut_slots(sr, np(&a.idx), set.lut.ptr_at(bi * e), p as i32, np(&a.keys), live) }, "lut slots")?;
+            ck(unsafe { ds_lut_slots(sr, np(&a.idx), set.lut.ptr_at(bi * (e + 1)), p as i32, np(&a.keys), live) }, "lut slots")?;
             ck(unsafe { fp4::fp4_moe_cuda_route_small(sr, np(&a.keys), np(&a.block_slot), np(&a.block_pair), np(&a.block_route), p as i32, k as i32) }, "route")?;
             if ar.inter < cfg.moe_inter_dim {
-                return self.moe_tp(w, ar, t, k);
+                return self.moe_tp(w, ar, t, k, set.null_slot);
             }
-            self.routed_experts(ar, t, k)?;
+            self.routed_experts(ar, t, k, set.null_slot)?;
             return self.shared_and_combine(w, t);
         }
         let mut idx = vec![0i32; p];
@@ -2660,7 +2714,7 @@ impl Engine {
             a.keys.upload_async(0, &keys, st)?;
             let ar = &self.arena;
             ck(unsafe { fp4::fp4_moe_cuda_route_small(sr, np(&a.keys), np(&a.block_slot), np(&a.block_pair), np(&a.block_route), p as i32, k as i32) }, "route")?;
-            self.routed_experts(ar, t, k)?;
+            self.routed_experts(ar, t, k, -1)?;
         }
         self.shared_and_combine(w, t)
     }
@@ -2668,8 +2722,9 @@ impl Engine {
     /// The routed experts' up + down over the routing blocks in act (route_small's output),
     /// with arena `ar`: the bm16 kernels up to FMA_ROWS rows (one-row bits), the tensor-core
     /// kernels above, where bm16 goes compute-bound as pairs concentrate on experts.
-    fn routed_experts(&self, ar: &Arena, t: usize, k: usize) -> Result<()> {
-        let null_slot = -1;
+    /// `null_slot`: pairs routed there read no weights and write exact zeros (TIDELM_EXPERT_TOPP's
+    /// dropped picks); -1 for none.
+    fn routed_experts(&self, ar: &Arena, t: usize, k: usize, null_slot: i32) -> Result<()> {
         let cfg = &self.cfg;
         let sr = self.stream.raw();
         let a = &self.act;
@@ -2718,7 +2773,7 @@ impl Engine {
     /// behind each other: shared rows, then the pairs), one gather makes them whole, then its
     /// half of every output row, and a second gather the layer's output. Each element is the
     /// one-box dot product: no partial sums cross the pair.
-    fn moe_tp(&self, w: &Layer, ar: &Arena, t: usize, k: usize) -> Result<()> {
+    fn moe_tp(&self, w: &Layer, ar: &Arena, t: usize, k: usize, null_slot: i32) -> Result<()> {
         let cfg = &self.cfg;
         let sr = self.stream.raw();
         let a = &self.act;
@@ -2731,13 +2786,13 @@ impl Engine {
         if t > FMA_ROWS {
             ck(unsafe {
                 ds_moe_up_mma(sr, np(&a.y), d as i64, np(&ar.w1), np(&ar.s1), np(&ar.w3), np(&ar.s3), hl, il as i64, np(&a.rw),
-                              np(&a.block_slot), np(&a.block_route), pi, il as i32, d as i32, cfg.swiglu_limit, -1)
+                              np(&a.block_slot), np(&a.block_route), pi, il as i32, d as i32, cfg.swiglu_limit, null_slot)
             }, "moe up (mma, tp)")?;
         } else {
             ck(unsafe {
                 fp4::fp4_moe_cuda_up_v2(sr, np(&a.y), np(&ar.w1), np(&ar.s1), np(&ar.w3), np(&ar.s3), hl, np(&a.rw),
                                         np(&a.block_slot), np(&a.block_route), d as i64, il as i64, cfg.swiglu_limit,
-                                        k as i32, il as i32, d as i32, pi, -1)
+                                        k as i32, il as i32, d as i32, pi, null_slot)
             }, "moe up (tp)")?;
         }
         gemm(sr, part, np(&a.y), d, Wt::Fp8(&w.sh_w1), t, np(&a.g), false, il)?;
@@ -2748,12 +2803,12 @@ impl Engine {
         if t > FMA_ROWS {
             ck(unsafe {
                 ds_moe_down_mma(sr, hf, inter as i64, np(&ar.w2), np(&ar.s2), np(&a.parts), dl as i64, np(&a.block_slot),
-                                np(&a.block_pair), pi, dl as i32, inter as i32, k as i32, ti, -1, 0, 1)
+                                np(&a.block_pair), pi, dl as i32, inter as i32, k as i32, ti, null_slot, 0, 1)
             }, "moe down (mma, tp)")?;
         } else {
             ck(unsafe {
                 fp4::fp4_moe_cuda_down_v2(sr, hf, np(&ar.w2), np(&ar.s2), np(&a.parts), np(&a.block_slot), np(&a.block_pair),
-                                          inter as i64, dl as i64, k as i32, dl as i32, inter as i32, ti, pi, -1, 0, 1)
+                                          inter as i64, dl as i64, k as i32, dl as i32, inter as i32, ti, pi, null_slot, 0, 1)
             }, "moe down (tp)")?;
         }
         gemm(sr, part, np(&a.hcat_full), inter, Wt::Fp8(&w.sh_w2), t, np(&a.sh), false, dl)?;

@@ -170,7 +170,7 @@ fn mma_rounding(model_dir: &std::path::Path, token_map: Vec<i64>, text: &Text, l
         e.reset();
         let a = e.forward(&ids, Want::Last)?;
         e.reset();
-        let b = e.forward_batch(&[Seg { lane: 0, ids: &ids, want: Want::Last }, Seg { lane: 1, ids: &filler, want: Want::Nothing }])?.remove(0);
+        let b = e.forward_batch(&[Seg { lane: 0, ids: &ids, want: Want::Last, decode: false }, Seg { lane: 1, ids: &filler, want: Want::Nothing, decode: false }])?.remove(0);
         let (mut num, mut den) = (0.0, 0.0);
         for (x, y) in a.iter().zip(&b) {
             num += (f(*x) - f(*y)).powi(2);

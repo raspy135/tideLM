@@ -161,7 +161,7 @@ fn prefill_first(engine: &mut Engine, prompt: &[u32], seed: bool, opt: &DecodeOp
     let mut first = None;
     for (i, chunk) in chunks.iter().enumerate() {
         if i + 1 == chunks.len() {
-            first = Some(next_token(step_rows(engine, Seg { lane: 0, ids: chunk, want: Want::Last }, opt, g)?, rng));
+            first = Some(next_token(step_rows(engine, Seg { lane: 0, ids: chunk, want: Want::Last, decode: false }, opt, g)?, rng));
         } else {
             engine.forward(chunk, Want::Nothing)?;
         }
@@ -198,7 +198,7 @@ pub fn generate(engine: &mut Engine, prompt: &[u32], max_tokens: usize, stop: &[
     let mut pos = prompt.len(); // position of `tok`, not yet forwarded
     while g.tokens.len() < max_tokens && !stop.contains(&tok) {
         if !spec {
-            tok = next_token(step_rows(engine, Seg { lane: 0, ids: &[tok], want: Want::Last }, opt, &mut g)?, &mut rng);
+            tok = next_token(step_rows(engine, Seg { lane: 0, ids: &[tok], want: Want::Last, decode: true }, opt, &mut g)?, &mut rng);
             pos += 1;
             g.tokens.push(tok);
             g.steps += 1;
@@ -229,7 +229,7 @@ pub fn generate(engine: &mut Engine, prompt: &[u32], max_tokens: usize, stop: &[
         .min(drafts.len());
         let mut block = vec![tok];
         block.extend_from_slice(&drafts[..d]);
-        let (a, mut emitted) = match step_rows(engine, Seg { lane: 0, ids: &block, want: Want::All }, opt, &mut g)? {
+        let (a, mut emitted) = match step_rows(engine, Seg { lane: 0, ids: &block, want: Want::All, decode: true }, opt, &mut g)? {
             Rows::Greedy(am) => accept(&block, &am, stop),
             Rows::Sampled(p) => {
                 let pr: Vec<SparseRow> = p.iter().map(|n| n.row()).collect();
@@ -514,13 +514,13 @@ pub fn generate_batch(engine: &mut Engine, reqs: &[Request], opt: &BatchOptions)
         let mut segs: Vec<Seg> = decode
             .iter()
             .zip(&blocks)
-            .map(|(&lane, b)| Seg { lane, ids: b, want: if spec { Want::All } else { Want::Last } })
+            .map(|(&lane, b)| Seg { lane, ids: b, want: if spec { Want::All } else { Want::Last }, decode: true })
             .collect();
         for &(lane, c) in &prefill {
             let s = slots[lane].as_ref().unwrap();
             let p = &reqs[s.req].prompt;
             let want = if s.fed + c == p.len() { Want::Last } else { Want::Nothing };
-            segs.push(Seg { lane, ids: &p[s.fed..s.fed + c], want });
+            segs.push(Seg { lane, ids: &p[s.fed..s.fed + c], want, decode: false });
         }
         stats.steps += 1;
         stats.rows += segs.iter().map(|s| s.ids.len()).sum::<usize>();

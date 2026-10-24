@@ -183,7 +183,12 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
   |---|---:|---:|
   | Python, README row (2026-10-22) | 25.59 (26.40 / 25.59 / 25.39) | 43.31 (43.31 / 42.31 / 43.79) |
   | window 3/5, Python's policy | 26.27 (29.21 / 26.27 / 25.44) | 41.44 (40.07 / 45.30 / 41.44) |
-  | confidence 1..5 | **28.90** (28.72 / 29.16 / 28.90) | 42.66 (42.66 / 43.28 / 41.13) |
+  | confidence 1..5 | 28.90 (28.72 / 29.16 / 28.90) | 42.66 (42.66 / 43.28 / 41.13) |
+  | window 3/5, drafter split + listed | 28.10 (31.09 / 28.10 / 27.57) | 48.58 (48.58 / 48.83 / 47.11) |
+  | confidence, drafter split + listed | **31.92** (31.92 / 30.55 / 33.02) | **49.73** (49.26 / 49.80 / 49.73) |
+
+  The drafter rows are the same prompts and seed: prose run 2 under the window policy took the
+  same 524 steps and 499 accepts in both (its sampled text unchanged) and went 26.27 -> 28.10.
 
   A verify step is shorter than Python's (code at depth 3-5: ~74 ms against ~88 implied by
   43.3 tok/s at 3.83 tokens/step), but on code it accepts less: 3.1-3.6 tokens a step against
@@ -252,10 +257,16 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
   Sampled drafts: 9.1 -> 4.8 ms. Python's drafter, split and listed, is 4.58 ms a pass in its
   traces.
 
+  DSV41_EXPERT_TOPP is ported as TIDELM_EXPERT_TOPP (decode rows keep their routed picks up to
+  that share of their weight, at least 3; a dropped pick routes to the arena's null slot, which
+  reads no weights and adds an exact 0), off by default because it did not pay: at 0.90 the
+  README protocol's medians moved +1.6 / -1.0% on prose and -2.1 / -3.4% on code (window /
+  confidence), and code's acceptance fell from 3.79 / 3.72 / 3.37 to 3.45 / 3.61 / 3.29 tokens
+  a step under the window policy - the drafter predicts the unpruned target.
+
   Still missing for the Python profile's numbers, in order of decode payoff:
-  1. DSV41_EXPERT_TOPP=0.90 (decode keeps a token's routed picks up to 0.90 of its weight
-     share, 91.8% of picks, measured free in held-out NLL) and the lossless packed verify head
-     (DSV41_HEAD_KERNEL=packed, 2.94 -> 2.25 ms/step in Python).
+  1. The lossless packed verify head (DSV41_HEAD_KERNEL=packed, 2.94 -> 2.25 ms/step in
+     Python).
   2. Hot reads and adaptation (the resident set re-planned from demand, misses read from
      NVMe): today the resident set is fixed at boot and the rest is pruned.
   3. The HTTP front (server/app.py's OpenAI + Anthropic routes) over `generate_batch`, the

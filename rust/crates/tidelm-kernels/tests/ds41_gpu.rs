@@ -1430,3 +1430,52 @@ fn nucleus_matches_the_sorted_softmax_reference() {
         }
     }
 }
+
+/// engine/expert_topp.py::keep_mask on one row: shares w / sum, stable order by share
+/// descending, kept while (running - share) < topp, the first min_k always.
+fn ref_topp_keep(w: &[f32], topp: f32, min_k: usize) -> Vec<bool> {
+    let s: f32 = w.iter().sum();
+    let f: Vec<f32> = w.iter().map(|x| x / s).collect();
+    let mut ord: Vec<usize> = (0..w.len()).collect();
+    ord.sort_by(|&a, &b| f[b].partial_cmp(&f[a]).unwrap());
+    let mut keep = vec![false; w.len()];
+    let mut run = 0f32;
+    for (j, &k) in ord.iter().enumerate() {
+        run += f[k];
+        keep[k] = j < min_k || (run - f[k]) < topp;
+    }
+    keep
+}
+
+#[test]
+fn expert_topp_drops_the_low_share_tail_of_decode_rows() {
+    let Some(st) = setup() else { return };
+    let (t, k, e) = (64usize, 6usize, 384i32);
+    let mut rng = Rng(0x70_9917);
+    let mut w: Vec<f32> = (0..t * k).map(|_| 0.05 + rng.unif()).collect();
+    // ties between picks, and one dominant pick
+    w[k..2 * k].copy_from_slice(&[0.3, 0.3, 0.2, 0.2, 0.1, 0.1]);
+    w[2 * k..3 * k].copy_from_slice(&[5.0, 0.1, 0.1, 0.1, 0.1, 0.1]);
+    let idx: Vec<i32> = (0..t * k).map(|i| (i * 7 % 384) as i32).collect();
+    let rows: Vec<i32> = (0..t).map(|r| (r % 5 != 4) as i32).collect();
+    let (di, dw, dr) = (dev(&idx), dev(&w), dev(&rows));
+    ok(unsafe { ds_expert_topp(st.raw(), p(&di), p(&dw), t as i32, k as i32, 0.9, 3, e, p(&dr)) });
+    st.synchronize().unwrap();
+    let (gi, gw) = (di.download().unwrap(), dw.download().unwrap());
+    let mut dropped = 0;
+    for r in 0..t {
+        let keep = if rows[r] != 0 { ref_topp_keep(&w[r * k..(r + 1) * k], 0.9, 3) } else { vec![true; k] };
+        for j in 0..k {
+            let i = r * k + j;
+            if keep[j] {
+                assert_eq!((gi[i], gw[i]), (idx[i], w[i]), "row {r} pick {j}: kept picks keep their expert and weight");
+            } else {
+                assert_eq!((gi[i], gw[i]), (e, 0.0), "row {r} pick {j}: dropped");
+                dropped += 1;
+            }
+        }
+    }
+    assert!(dropped > 0, "the test drops nothing");
+    // row 2: the dominant pick holds > 0.9 alone, min_k still keeps three
+    assert_eq!(gw[2 * k + 3..3 * k], [0.0, 0.0, 0.0]);
+}

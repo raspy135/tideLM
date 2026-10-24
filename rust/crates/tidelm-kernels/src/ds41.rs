@@ -182,6 +182,10 @@ extern "C" {
     pub fn ds_rollback_pending(stream: CudaStream, n_dev: *const c_void, lanes: *const c_void, entries: c_int, mem_kv: *const c_void, mem_sc: *const c_void, mem_start: *const c_void, before_kv: *const c_void, before_sc: *const c_void, before_flag: *const c_void, pkv: *mut c_void, psc: *mut c_void, flag: *mut c_void, d: c_int, mem_rows: c_int) -> c_int;
     /// `live` (int32 on the device, or null): pairs at or past it get slot -1.
     pub fn ds_lut_slots(stream: CudaStream, idx: *const c_void, lut: *const c_void, p: c_int, slots: *mut c_void, live: *const c_void) -> c_int;
+    /// DSV41_EXPERT_TOPP over the router's idx/rw [T][K] on rows with rows[t] != 0: dropped
+    /// picks get weight 0 and expert `sentinel`.
+    pub fn ds_expert_topp(stream: CudaStream, idx: *mut c_void, rw: *mut c_void, t: c_int, k: c_int, topp: f32, min_k: c_int,
+                          sentinel: c_int, rows: *const c_void) -> c_int;
     pub fn ds_greedy_accept(stream: CudaStream, am: *const c_void, block: *const c_void, t: c_int, pos: *const c_void, out: *mut c_void) -> c_int;
     pub fn ds_wait_flag(stream: CudaStream, flag: *const c_void, expect: c_int, timeout_ns: i64, err: *mut c_void) -> c_int;
 

@@ -2285,6 +2285,41 @@ __global__ void lut_slots_kernel(const int* __restrict__ idx, const int* __restr
     if (p < P) slots[p] = (live && p >= *live) ? -1 : lut[idx[p]];
 }
 
+// DSV41_EXPERT_TOPP (engine/expert_topp.py) on the rows with rows[t] set: by weight share
+// descending (ties: the lower pick), keep the shortest prefix whose share before it is < topp,
+// never fewer than min_k; a dropped pick weighs 0 and routes to expert `sentinel`, whose slot
+// table column is the arena's null slot (its weights are never read, its output is an exact 0).
+// The kept picks keep the router's own weights. In fp32 as keep_mask: shares w / sum(w), the
+// running share a sequential inclusive sum, tested as (running - share) < topp.
+__global__ void expert_topp_kernel(int* __restrict__ idx, float* __restrict__ rw, int T, int K, float topp, int min_k,
+                                   int sentinel, const int* __restrict__ rows) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= T || !rows[t]) return;
+    float f[8];
+    int ord[8];
+    float s = 0.f;
+    for (int k = 0; k < K; ++k) s += rw[t * K + k];
+    for (int k = 0; k < K; ++k) {
+        f[k] = rw[t * K + k] / s;
+        // stable insertion by share, descending
+        int j = k;
+        while (j > 0 && f[ord[j - 1]] < f[k]) {
+            ord[j] = ord[j - 1];
+            --j;
+        }
+        ord[j] = k;
+    }
+    float run = 0.f;
+    for (int j = 0; j < K; ++j) {
+        const int k = ord[j];
+        run += f[k];
+        if (j >= min_k && !((run - f[k]) < topp)) {
+            rw[t * K + k] = 0.f;
+            idx[t * K + k] = sentinel;
+        }
+    }
+}
+
 // v41_engine.py lean greedy verify: am[t] is row t's argmax, block the verified tokens.
 // out = [accepted a, bonus am[a], n = pos0 + a + 1, next draft position pos0 + a].
 // Stop tokens are the host's business (it truncates on the copy it reads).
@@ -2674,6 +2709,13 @@ int ds_rollback_pending(void* stream, const void* n_dev, const void* lanes, int 
 int ds_lut_slots(void* stream, const void* idx, const void* lut, int P, void* slots, const void* live) {
     lut_slots_kernel<<<(P + 127) / 128, 128, 0, DS_ST>>>(static_cast<const int*>(idx), static_cast<const int*>(lut), P,
         static_cast<int*>(slots), static_cast<const int*>(live));
+    DS_RET;
+}
+
+int ds_expert_topp(void* stream, void* idx, void* rw, int T, int K, float topp, int min_k, int sentinel, const void* rows) {
+    if (K > 8 || min_k < 1 || min_k > K) return cudaErrorInvalidValue;
+    expert_topp_kernel<<<(T + 127) / 128, 128, 0, DS_ST>>>(static_cast<int*>(idx), static_cast<float*>(rw), T, K, topp,
+                                                           min_k, sentinel, static_cast<const int*>(rows));
     DS_RET;
 }
 
