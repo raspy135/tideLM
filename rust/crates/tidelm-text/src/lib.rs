@@ -7,6 +7,8 @@
 //! the Python calls the same normalizer code this crate calls, so the map is identical
 //! by construction and the test pins it against the checkpoint's sha256 anyway.
 
+pub mod chat;
+
 use std::collections::HashMap;
 use std::path::Path;
 

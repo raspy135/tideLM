@@ -1,0 +1,179 @@
+//! An OpenAI-compatible HTTP front for the Rust DS v4.1 engine: server/app.py's chat routes,
+//! no Python anywhere.
+//!
+//!   tidelm-server [--host 0.0.0.0] [--port 8000] [--served-model-name deepseek]
+//!                 [--lanes 1] [--depth window|confidence|plain|N] [--step-rows 64]
+//!                 [--thinking] [--effort 75]
+//!                 --resident --graphs [--keep-db FILE --budget N] [--max-seq 32768]
+//!                 [--world 2 --rank R --addr HOST:PORT]
+//!
+//! Routes: GET /health, GET /v1/models, POST /v1/chat/completions (streamed or not, with
+//! usage), POST /v1/debug/prompt (the rendered prompt and its ids, no engine work - what
+//! bench/bench.py's token_len calls). Requests run through the engine's continuous-batching
+//! scheduler, one lane each; with --world 2, rank 1 follows rank 0's engine calls and serves
+//! nothing.
+//!
+//! Text messages only: tool definitions, tool calls and images are refused (400) rather than
+//! rendered differently from the Python server.
+
+mod api;
+mod http;
+
+use std::net::TcpListener;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::time::Instant;
+
+use tidelm_engine::decode::{DepthMode, Job, SchedOptions, Scheduler};
+use tidelm_engine::forward::{Engine, Options};
+use tidelm_text::Text;
+
+fn arg(args: &[String], name: &str) -> Option<String> {
+    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
+}
+
+/// What connection threads send the engine thread.
+pub enum Cmd {
+    Submit(Job),
+    Cancel(u64),
+}
+
+/// Everything a connection thread needs.
+pub struct Ctx {
+    pub text: Text,
+    pub model: String,
+    pub max_seq: usize,
+    pub default_thinking: bool,
+    pub default_effort: u32,
+    pub eos: u32,
+    pub think_end: Option<u32>,
+    pub engine: mpsc::Sender<Cmd>,
+    pub next_id: AtomicU64,
+}
+
+fn main() -> tidelm_engine::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let flag = |name: &str| args.iter().any(|a| a == name);
+    let model_dir = arg(&args, "--model-dir").map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from(std::env::var("HOME").unwrap()).join("models/DeepSeek-V4.1-Flash-1017")
+    });
+    let max_seq: usize = arg(&args, "--max-seq").map(|v| v.parse().unwrap()).unwrap_or(32768);
+    let lanes: usize = arg(&args, "--lanes").map(|v| v.parse().unwrap()).unwrap_or(1);
+    let depth = match arg(&args, "--depth").as_deref().unwrap_or("confidence") {
+        "plain" => DepthMode::Plain,
+        "window" => DepthMode::Window,
+        "confidence" => DepthMode::Confidence,
+        d => DepthMode::Fixed(d.parse().map_err(|_| format!("--depth {d}: window, confidence, plain or a depth"))?),
+    };
+    // a step's row budget: prompt chunks fill what decoding rows leave, so the full TMAX keeps
+    // a prompt's chunks as wide as the single-sequence loop's
+    let step_rows: usize = arg(&args, "--step-rows").map(|v| v.parse().unwrap()).unwrap_or(tidelm_engine::forward::TMAX);
+    let t0 = Instant::now();
+    let text = Text::load(&model_dir)?;
+    let (token_map, _) = text.compressed_token_map()?;
+    tidelm_cuda::set_device(0)?;
+    let scores = match arg(&args, "--keep-db") {
+        Some(db) => Some(tidelm_engine::keep::load_demand(std::path::Path::new(&db), 40, 384)?),
+        None => None,
+    };
+    let keep = match (&scores, arg(&args, "--budget")) {
+        (Some(s), Some(b)) => Some(tidelm_engine::keep::keep_from_scores(s, 6, b.parse().unwrap())?),
+        _ => None,
+    };
+    let mut opts = Options {
+        max_seq,
+        max_lanes: lanes,
+        spec: depth != DepthMode::Plain,
+        resident: flag("--resident"),
+        graphs: flag("--graphs"),
+        n_layers: arg(&args, "--layers").map(|v| v.parse().unwrap()),
+        keep,
+        dspark_keep: None,
+        tp: None,
+    };
+    let pair_args = tidelm_engine::pair::pair_args(&args)?;
+    let pair = match &pair_args {
+        Some(pa) => Some(tidelm_engine::pair::join(&mut opts, &model_dir, pa)?),
+        None => None,
+    };
+    let mut engine = Engine::new(&model_dir, token_map, opts)?;
+    if let Some(p) = pair {
+        engine.attach_pair(p)?;
+        if engine.rank() == 1 {
+            eprintln!("rank 1: engine up in {:.1}s, following rank 0", t0.elapsed().as_secs_f64());
+            engine.follow()?;
+            std::process::exit(0);
+        }
+    }
+    let sched = Scheduler::new(&engine, SchedOptions { depth, step_rows, logits: false })?;
+    let single = |s: &str| -> Option<u32> {
+        match text.encode(s) {
+            Ok(ids) if ids.len() == 1 => Some(ids[0]),
+            _ => None,
+        }
+    };
+    let eos = single(tidelm_text::chat::EOS).ok_or("the tokenizer has no single end-of-sentence token")?;
+    let think_end = single(tidelm_text::chat::THINK_END);
+    let (tx, rx) = mpsc::channel::<Cmd>();
+    let ctx = Arc::new(Ctx {
+        text,
+        model: arg(&args, "--served-model-name").unwrap_or_else(|| "deepseek".into()),
+        max_seq,
+        default_thinking: flag("--thinking"),
+        default_effort: arg(&args, "--effort").map(|v| v.parse().unwrap()).unwrap_or(75),
+        eos,
+        think_end,
+        engine: tx,
+        next_id: AtomicU64::new(1),
+    });
+    let addr = format!("{}:{}", arg(&args, "--host").unwrap_or_else(|| "0.0.0.0".into()),
+                       arg(&args, "--port").unwrap_or_else(|| "8000".into()));
+    let listener = TcpListener::bind(&addr)?;
+    eprintln!("engine up in {:.1}s; serving {} on {addr} ({lanes} lane{}, depth {depth:?})", t0.elapsed().as_secs_f64(),
+              ctx.model, if lanes == 1 { "" } else { "s" });
+    {
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || http::serve(stream, &ctx));
+            }
+        });
+    }
+    engine_loop(engine, sched, rx)
+}
+
+/// The engine thread: admit and cancel at step boundaries, step while there is work, block on
+/// the channel while there is none. An engine error is fatal - a pair that failed one call
+/// cannot continue in step.
+fn engine_loop(mut engine: Engine, mut sched: Scheduler, rx: mpsc::Receiver<Cmd>) -> tidelm_engine::Result<()> {
+    let apply = |sched: &mut Scheduler, cmd: Cmd| match cmd {
+        Cmd::Submit(job) => {
+            let id = job.id;
+            if let Err(e) = sched.submit(job) {
+                eprintln!("request {id} refused: {e}");
+            }
+        }
+        Cmd::Cancel(id) => sched.cancel(id),
+    };
+    loop {
+        if sched.idle() {
+            match rx.recv() {
+                Ok(cmd) => apply(&mut sched, cmd),
+                Err(_) => break,
+            }
+        }
+        while let Ok(cmd) = rx.try_recv() {
+            apply(&mut sched, cmd);
+        }
+        if let Err(e) = sched.step(&mut engine) {
+            eprintln!("engine step failed: {e}");
+            let _ = engine.release_follower();
+            std::process::exit(1);
+        }
+    }
+    engine.release_follower()?;
+    Ok(())
+}

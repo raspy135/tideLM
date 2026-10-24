@@ -717,6 +717,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidelm-server"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tidelm-core",
+ "tidelm-cuda",
+ "tidelm-engine",
+ "tidelm-text",
+]
+
+[[package]]
 name = "tidelm-text"
 version = "0.1.0"
 dependencies = [

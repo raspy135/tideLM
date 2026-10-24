@@ -72,7 +72,7 @@ host waits. Prefill is eager (graphs off in the profile).
 | `tidelm-cuda` | done | streams, events, device/pinned buffers, async copies, graph capture/replay |
 | `tidelm-model` | done | safetensors headers, O_DIRECT span reads (parallel aligned pieces), expert run grouping — byte-exact vs buffered IO on the real checkpoint |
 | `tidelm-engine` | in progress | forward pass (streaming and resident), indexer, DSpark spec decode, rollback, one-graph steps, lanes + continuous batching; CLIs `tidelm-generate`, `tidelm-parity`, `tidelm-batch` |
-| `tidelm-server` | later | HTTP front, same API as `server/app.py` |
+| `tidelm-server` | in progress | HTTP front over the online scheduler: `server/app.py`'s chat routes for text messages (`/v1/chat/completions` streamed or not, `/v1/models`, `/health`, `/v1/debug/prompt`); `tidelm_text::chat` is the V4.1 prompt encoder for text turns |
 
 Kernel strategy, as built: the Triton/Gluon kernels were **not** AOT-compiled. Every op
 on the step path is a hand-written CUDA kernel in `ds41.cu` (the decode MoE stays the
@@ -229,6 +229,25 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
 - **M7 — server + adaptation.** Port or front: decided by measurement, the pipeline is
   already Python-free by M2.
 
+  Status 2026-10-24: `tidelm-server` serves the engine over HTTP with no Python
+  (`decode::Scheduler`: continuous batching that takes requests at any time, a depth policy
+  per lane, tokens streamed per step; `generate_batch` now runs on it, and every batch check
+  still passes). bench/bench.py run unchanged against it, on the pair (10,000 experts
+  resident, drafter split and listed, confidence policy, one lane - Python's
+  MAX_CONCURRENCY=1), with the README runs' labels and seed:
+
+  | workload | Rust over HTTP (runs) | Python README row |
+  |---|---:|---:|
+  | prose, decode | **31.04** tok/s (31.04 / 30.42 / 31.23) | 25.59 |
+  | code, decode | **51.03** tok/s (51.03 / 49.47 / 51.16) | 43.31 |
+  | prose / code, first token | 0.22 / 0.24 s | 1.22 / 1.25 s |
+  | 8K-token prompt, first token | **27.3 s** (27.36 / 27.24 / 27.28) | 7.3 s |
+  | 8K-token prompt, decode | 38.6 tok/s | 32.65 |
+
+  The 8K first token is 3.7x slower: prefill steps carry at most TMAX = 64 rows, so an 8K
+  prompt is 128 steps and each re-reads every dense weight and every expert its rows touch.
+  Python prefills 2,048 rows a chunk.
+
   Sampling is in (2026-10-24): `ds_nucleus` computes each row's temperature + top-p nucleus on
   the device (a log-probability histogram picks a candidate window, which is sorted and cut by
   the `cum - p < top_p` rule; 39-42 us a row, rows in parallel, bench_nucleus), and only the
@@ -264,14 +283,15 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
   confidence), and code's acceptance fell from 3.79 / 3.72 / 3.37 to 3.45 / 3.61 / 3.29 tokens
   a step under the window policy - the drafter predicts the unpruned target.
 
-  Still missing for the Python profile's numbers, in order of decode payoff:
-  1. The lossless packed verify head (DSV41_HEAD_KERNEL=packed, 2.94 -> 2.25 ms/step in
-     Python).
+  Still missing, in order of what the numbers above say:
+  1. Prefill at large chunks (M5): the 8K first token is 27.3 s against Python's 7.3. Needs
+     steps past 64 rows - a large-M dense GEMM that reads each weight once per M tile, MoE
+     routing past 512 pairs, a ring that holds a chunk's keys - for prompt rows only.
   2. Hot reads and adaptation (the resident set re-planned from demand, misses read from
      NVMe): today the resident set is fixed at boot and the rest is pruned.
-  3. The HTTP front (server/app.py's OpenAI + Anthropic routes) over `generate_batch`, the
-     sharded head's argmax without gathering logits (`ds_argmax_bf16_pairs` / `_combine` are
-     in, unused), prefill at 2,048-row chunks.
+  3. The lossless packed verify head (DSV41_HEAD_KERNEL=packed, 2.94 -> 2.25 ms/step in
+     Python), the sharded head's argmax without gathering logits (`ds_argmax_bf16_pairs` /
+     `_combine` are in, unused), the server's tool calls, images and Anthropic routes.
 
 ## Rules carried over from the Python engine
 

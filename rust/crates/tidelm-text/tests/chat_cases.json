@@ -1,0 +1,169 @@
+[
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "thinking": false,
+  "effort": null,
+  "prompt": "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "thinking": true,
+  "effort": null,
+  "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>hi<｜Assistant｜><think>"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "thinking": true,
+  "effort": 60,
+  "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 60 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>hi<｜Assistant｜><think>"
+ },
+ {
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are terse."
+   },
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "thinking": false,
+  "effort": null,
+  "prompt": "<｜begin▁of▁sentence｜><｜System｜>You are terse.<｜User｜>hi<｜Assistant｜></think>"
+ },
+ {
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are terse."
+   },
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ],
+  "thinking": true,
+  "effort": 40,
+  "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 40 (range 1-100, the higher the value, the more thorough the reasoning)\n\nYou are terse.<｜User｜>hi<｜Assistant｜><think>"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "a"
+   },
+   {
+    "role": "assistant",
+    "content": "b",
+    "reasoning_content": "r1"
+   },
+   {
+    "role": "user",
+    "content": "c"
+   }
+  ],
+  "thinking": true,
+  "effort": null,
+  "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>a<｜Assistant｜></think>b<｜end▁of▁sentence｜><｜User｜>c<｜Assistant｜><think>"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "a"
+   },
+   {
+    "role": "assistant",
+    "content": "b",
+    "reasoning_content": "r1"
+   },
+   {
+    "role": "user",
+    "content": "c"
+   }
+  ],
+  "thinking": false,
+  "effort": null,
+  "prompt": "<｜begin▁of▁sentence｜><｜User｜>a<｜Assistant｜></think>b<｜end▁of▁sentence｜><｜User｜>c<｜Assistant｜></think>"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "a"
+   },
+   {
+    "role": "assistant",
+    "content": "b",
+    "reasoning_content": "r1"
+   }
+  ],
+  "thinking": true,
+  "effort": null,
+  "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>a<｜Assistant｜><think>r1</think>b<｜end▁of▁sentence｜>"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "a"
+   },
+   {
+    "role": "assistant",
+    "content": "b"
+   },
+   {
+    "role": "system",
+    "content": "mid"
+   }
+  ],
+  "thinking": true,
+  "effort": 100,
+  "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 100 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>a<｜Assistant｜></think>b<｜end▁of▁sentence｜><｜System｜>mid<｜Assistant｜><think>"
+ },
+ {
+  "messages": [
+   {
+    "role": "system",
+    "content": "s"
+   },
+   {
+    "role": "user",
+    "content": "a"
+   },
+   {
+    "role": "assistant",
+    "content": "b",
+    "reasoning_content": "r"
+   },
+   {
+    "role": "user",
+    "content": "c"
+   },
+   {
+    "role": "assistant",
+    "content": "d",
+    "reasoning_content": "r2"
+   }
+  ],
+  "thinking": true,
+  "effort": 75,
+  "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\ns<｜User｜>a<｜Assistant｜></think>b<｜end▁of▁sentence｜><｜User｜>c<｜Assistant｜><think>r2</think>d<｜end▁of▁sentence｜>"
+ }
+]
