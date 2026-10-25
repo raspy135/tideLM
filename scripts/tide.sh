@@ -55,7 +55,8 @@ esac
 # logs: whichever engine's containers are up (the Rust engine's, else the Python pair's)
 [[ -f "$f" ]] || { [[ -f "$ROOT/$f" ]] && f="$ROOT/$f"; } || err "no env file $f"
 peer=$(sed -nE 's/^[[:space:]]*PEER=["'"'"']?([^"'"'"' #]+).*/\1/p' "$f" | tail -1)
-on() { if [[ $rank == 1 ]]; then [[ -n "$peer" ]] || err "$f has no PEER"; ssh -t -o LogLevel=QUIET "$peer" "$@"; else "$@"; fi; }
+# docker logs replays the server's stderr on stderr: both onto stdout, so the log pipes into grep
+on() { if [[ $rank == 1 ]]; then [[ -n "$peer" ]] || err "$f has no PEER"; ssh -o LogLevel=QUIET "$peer" "$* 2>&1"; else "$@" 2>&1; fi; }
 for c in tidelm-rank deepseek-v41-ep2-rank glm-serve-rank; do
     if on docker container inspect "$c$rank" > /dev/null 2>&1; then
         tail=(--tail "$lines")
