@@ -32,11 +32,17 @@ fn main() -> Result<()> {
     ];
     let members = Members::new()?;
     let scratch = Exl3Scratch::new(16, 16384, 8, 32 * 16 * 77440)?;
-    // an L2 flusher: 256 MB touched between calls
+    // The L2 is evicted between calls by a read: the head's decode GEMV, 357 MB in, 0.3 MB out.
+    // FLUSH=memset (FLUSH_MB, default 256) is the first version's flusher, kept to reproduce its
+    // numbers: the timed call then writes the memset's dirty lines back as it reads, and q_b
+    // measured 105-112 us (95 GB/s) against 63-72 us after the read and 58-67 in the decode pass.
+    let memset = std::env::var("FLUSH").map(|v| v == "memset").unwrap_or(false);
     let flush_mb: usize = std::env::var("FLUSH_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
-    let flush = DeviceBuffer::<u8>::zeroed(flush_mb << 20)?;
+    let flush = DeviceBuffer::<u8>::zeroed(if memset { flush_mb << 20 } else { 1 })?;
     let x = DeviceBuffer::<u16>::from_slice(&vec![0x3c00u16; 16 * 16384])?;
     let out = DeviceBuffer::<f32>::new(16 * 2 * 77440)?;
+    let flusher = if memset { None } else { Some(ld.exl3(&["lm_head"], 1, Cut::N, None)?) };
+    let fout = DeviceBuffer::<f32>::new(2 * 77440)?;
     for (name, pre, cut) in mats {
         let refs: Vec<&str> = pre.iter().map(|s| s.as_str()).collect();
         let mut mat = ld.exl3(&refs, 1, cut, None)?;
@@ -55,7 +61,10 @@ fn main() -> Result<()> {
                 let mut ts = vec![];
                 let (e0, e1) = (tidelm_cuda::Event::timing()?, tidelm_cuda::Event::timing()?);
                 for i in 0..12 {
-                    if std::env::var("WARM").is_err() {
+                    if std::env::var("WARM").is_ok() {
+                    } else if let Some(f) = &flusher {
+                        f.decode(&st, &members, &scratch, x.raw(), f.k, 1, fout.raw(), true)?;
+                    } else {
                         flush.zero_async(&st)?;
                     }
                     e0.record(&st)?;

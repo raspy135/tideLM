@@ -493,14 +493,26 @@ fp64 at 2.1e-4 (Python's routed bar 3.5e-4); MLA attention 1.8e-3 in every mode 
 1.7e-3 against fp32).
 
 Where a decode pass goes (one row, graphs, the pair; nsys with node tracing): the EXL3 grouped
-GEMV ~60% (the same kernel as Python's; small matrices are DRAM-latency-bound when cold: q_b
-10.5 MB in 112 us, 95 GB/s, against the 357 MB head's 226 GB/s), the RoCE gathers ~8% (five a
-layer: the split attention's two, o_proj's sum, the MoE's two), the router's fp32 GEMV ~4%.
-Measured and not taken: split-K counts other than tp.py's (within 3%), trellis prefetch depth 2,
-4 n-tiles a warp; prefetching prefill attention's key tiles. The next levers: the EXL3 decode
-GEMV's cold-read latency (concurrency or an L2 prefetch of the next matrix), prefill attention
-(5.1 of an 8K prefill's 19.4 s: its 32-key tiles are bound by shared-memory work; Triton's
-64-key tiles were ~1.8x faster per pick).
+GEMV ~60% (the same kernel as Python's), the RoCE gathers ~8% (five a layer: the split
+attention's two, o_proj's sum, the MoE's two), the router's fp32 GEMV ~4%.
+
+The GEMV is at the DRAM roof (2026-10-25, cold reads; `glm_bench_moe` on random 3-bit experts at
+the rank shapes, `glm_bench_exl3` on layer 40): routed experts at one row and 8 experts 212 GB/s
+gate+up and 190-205 down, 212-220 at 2-8 rows; o_proj 31 MB 208-217, the head 229-242, q_b 10.5 MB
+147-156 (58-67 us in the decode pass), q_a 7.9 MB 145; only the 2-4 MB matrices fall short (kv_a
+94, shared down 107). TensorFold's GLM-5.3-Flash kit measures the same kernel on this hardware at
+207 / 204 GB/s for one row and its small dense matrices at 94-95
+(`glm53-tensorfold-spark/docs/DECODE-KERNELS.md`); its persistent-grid rewrite (0440) ran slower.
+This section first said "q_b 95 GB/s, latency-bound when cold": that was the bench's own artifact.
+Its L2 flush was a memset, and the timed call wrote the dirty lines back as it read (105-112 us
+then, 63-72 after a read flush).
+
+Measured and not taken: split-K counts other than tp.py's (dense within ~5% of the best setting
+except kv_a, 31 vs 26 us at 16 splits on the side stream; routed within 3% at every row count,
+TensorFold's 4-way gate/up split included), trellis prefetch depth 2, 4 n-tiles a warp;
+prefetching prefill attention's key tiles. The next levers: the ~40% of a decode pass outside the
+GEMV, and prefill attention (5.1 of an 8K prefill's 19.4 s: its 32-key tiles are bound by
+shared-memory work; Triton's 64-key tiles were ~1.8x faster per pick).
 
 ## Rules carried over from the Python engine
 
