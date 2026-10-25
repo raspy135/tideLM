@@ -403,6 +403,21 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
     none. The first image prompt missed 30% of its expert picks with residents fitted to text
     (the boundary pass then moved 311 experts).
 
+  CPU drafting (2026-10-24, measured, not built). The CPU cores pull 128-145 GB/s of the
+  LPDDR5X the GPU decodes from (10 X925 / 10 A725 cores, a 512 MB read): a CPU bandwidth load
+  beside a greedy decode took it from 32.2 to 26.9 tok/s (the 10 A725 cores) and 28.3 (7 X925),
+  so a CPU drafter that streams weights costs the GPU what it reads. A prompt-lookup (copy)
+  drafter does not: 30 ns a lookup on one core over a 2M-token 8-gram index. What decides it is
+  the verify width a long copy needs - the pair's verify step by rows on copy text (2,585 tokens
+  of context, `tidelm-server --bench-width`): 1 / 2 / 4 / 6 rows 43.1 / 51.0 / 65.8 / 84.3 ms,
+  8 / 12 / 16 / 17 96.3 / 132.5 / 149.1 / 153.1, 24 / 32 / 33 176.5 / 205.8 / 217.4, against a
+  4.88 ms DSpark pass. DSpark already accepts 5.2 of its 6-token cap a step on a file rewrite,
+  so a copy only pays past it; replayed exactly over greedy runs the server logged (x_debug,
+  rust/tools/copy_draft_replay.py), copies of up to 16 / 32 tokens after a 6-token match:
+  file rewrite 61.8 -> 107.0 / 139.5 tok/s, tool call re-run 63.2 -> 89.4 / 93.2, quoting code
+  53.3 -> 67.6 / 74.1, fresh code 55.5 -> 53.8 / 53.5 (a few early-failing copies), prose
+  unchanged (no copy fires). The pricing reproduces the logged DSpark runs within ~5%.
+
   Still missing, in order of what the numbers above say (prefill at large chunks is in: M5,
   8K first token 27.3 -> 6.76 s):
   1. With speculation the pair's logits digest no longer equals one box's (4 layers, prose

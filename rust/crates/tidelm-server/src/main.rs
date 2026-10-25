@@ -61,7 +61,7 @@ fn main() -> tidelm_engine::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     // an unknown flag is an error: a test flag the server ignores (--keep-first once) loaded
     // every expert and ran the box out of memory
-    const VALUED: [&str; 29] = ["--vision", "--model-dir", "--max-seq", "--lanes", "--depth", "--step-rows", "--keep-db", "--budget",
+    const VALUED: [&str; 30] = ["--bench-width", "--vision", "--model-dir", "--max-seq", "--lanes", "--depth", "--step-rows", "--keep-db", "--budget",
                                 "--keep-first", "--layers", "--served-model-name", "--effort", "--host", "--port", "--world",
                                 "--rank", "--adapt-db", "--trace", "--adapt-sensitivity", "--adapt-prior", "--adapt-decode-tokens", "--adapt-probe", "--hot-ring", "--prefix-cache",
                                 "--prefix-snapshots", "--prefix-disk", "--prefix-disk-gb", "--prefix-disk-interval",
@@ -191,6 +191,11 @@ fn main() -> tidelm_engine::Result<()> {
             std::process::exit(0);
         }
     }
+    // --bench-width RUN.json (rank 0, instead of serving): verify steps of each width timed on a
+    // logged run's real continuation - what a longer draft costs - then rank 1 is released
+    if let Some(path) = arg(&args, "--bench-width") {
+        return bench_width(&mut engine, &path);
+    }
     // a step no lane decodes in prefills up to the engine's prefill rows (TIDELM_PREFILL_ROWS)
     let mut sched = Scheduler::new(&engine, SchedOptions { depth, step_rows, prefill_rows: Some(engine.pmax), logits: false })?;
     // the RAM prefix cache (DSV41_PREFIX_CACHE=1, DSV41_PREFIX_SNAPSHOTS=16): --prefix-cache 0 off
@@ -245,6 +250,60 @@ fn main() -> tidelm_engine::Result<()> {
         });
     }
     engine_loop(engine, sched, rx)
+}
+
+/// The verify cost of a draft by width: the prompt and the first 200 tokens of a logged run
+/// (x_debug's prompt_ids / token_ids) as context, then decode steps of 1..33 rows of the run's
+/// own continuation, each rolled back (20 timed after 5 warm); and the DSpark pass a step
+/// drafted by lookup would not run.
+fn bench_width(engine: &mut Engine, path: &str) -> tidelm_engine::Result<()> {
+    use tidelm_engine::forward::{Seg, Want};
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let ids = |k: &str| -> Vec<u32> { v[k].as_array().map(|a| a.iter().filter_map(|x| x.as_u64()).map(|x| x as u32).collect()).unwrap_or_default() };
+    let (prompt, out) = (ids("prompt_ids"), ids("token_ids"));
+    let k0 = 200.min(out.len().saturating_sub(40));
+    if prompt.is_empty() || out.len() < k0 + 33 {
+        return Err(format!("{path}: needs prompt_ids and at least {} token_ids", k0 + 33).into());
+    }
+    let lane = 0;
+    engine.reset_lane(lane)?;
+    let ctx: Vec<u32> = prompt.iter().chain(&out[..k0]).copied().collect();
+    for c in ctx.chunks(engine.pmax) {
+        engine.forward_batch_argmax(&[Seg { lane, ids: c, want: Want::Last, decode: false, next: &[], hashes: None }])?;
+    }
+    let base = engine.lane_len(lane);
+    let median = |mut ts: Vec<f64>| -> (f64, f64, f64) {
+        ts.sort_by(f64::total_cmp);
+        (ts[ts.len() / 2], ts[0], ts[ts.len() - 1])
+    };
+    eprintln!("bench-width: context {base} tokens");
+    for w in [1, 2, 4, 6, 8, 12, 16, 17, 24, 32, 33] {
+        let block = &out[k0..k0 + w];
+        let mut ts = Vec::new();
+        for i in 0..25 {
+            let t = Instant::now();
+            engine.forward_batch_argmax(&[Seg { lane, ids: block, want: Want::All, decode: true, next: &[], hashes: None }])?;
+            let dt = t.elapsed().as_secs_f64() * 1e3;
+            engine.rollback_batch(&[(lane, base)])?;
+            if i >= 5 {
+                ts.push(dt);
+            }
+        }
+        let (m, lo, hi) = median(ts);
+        eprintln!("bench-width: {w:2} rows: verify {m:.2} ms (min {lo:.2}, max {hi:.2})");
+    }
+    let mut ts = Vec::new();
+    for i in 0..25 {
+        let t = Instant::now();
+        engine.draft_batch(&[(lane, out[k0], base - 1)])?;
+        if i >= 5 {
+            ts.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+    let (m, lo, hi) = median(ts);
+    eprintln!("bench-width: DSpark draft pass {m:.2} ms (min {lo:.2}, max {hi:.2})");
+    engine.release_follower()?;
+    Ok(())
 }
 
 /// The engine thread: admit and cancel at step boundaries, step while there is work, block on

@@ -57,6 +57,9 @@ struct ChatReq {
     ignore_eos: bool,
     stream: bool,
     include_usage: bool,
+    /// x_debug: the stats also carry the prompt and output ids and each speculative step's
+    /// depth and accepted drafts (offline drafter replays)
+    debug: bool,
 }
 
 fn num(body: &Value, key: &'static str, default: f64, lo: f64, hi: f64) -> Result<f64, ApiError> {
@@ -273,6 +276,7 @@ fn parse(body: &[u8], ctx: &Ctx) -> Result<ChatReq, ApiError> {
         ignore_eos: flag("ignore_eos")?,
         stream: flag("stream")?,
         include_usage: body.get("stream_options").and_then(|o| o.get("include_usage")).and_then(|b| b.as_bool()).unwrap_or(false),
+        debug: flag("x_debug")?,
     })
 }
 
@@ -464,6 +468,12 @@ pub fn chat(stream: &mut TcpStream, body: &[u8], ctx: &Ctx) -> Result<(), Failur
         "ttft_s": first_token_s.unwrap_or(0.0),
         "engine": "tidelm-rust",
     });
+    if req.debug {
+        stats["prompt_ids"] = json!(ids);
+        stats["token_ids"] = json!(gen.tokens);
+        stats["depths"] = json!(gen.depths);
+        stats["accepted"] = json!(gen.accepted);
+    }
     // adaptive residency: the Python engine's prune_miss_request, plus each phase's rate
     let m = &gen.miss;
     let (missed, picks) = (m[0] + m[4], m[1] + m[5]);
