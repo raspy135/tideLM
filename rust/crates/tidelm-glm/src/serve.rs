@@ -256,6 +256,8 @@ pub struct Server {
     pub opt: ServeOptions,
     pub cal: Option<CalGate>,
     pub stats: Stats,
+    /// the disk prefix store's index (rank 0), when on
+    pub store: Option<crate::prefix::Store>,
     sampling: Option<f32>,
     pub log: Box<dyn Fn(&str) + Send>,
 }
@@ -263,7 +265,7 @@ pub struct Server {
 impl Server {
     pub fn new(eng: Engine, opt: ServeOptions, log: Box<dyn Fn(&str) + Send>) -> Self {
         let cal = opt.cal.map(|t| CalGate::new(t, true));
-        Server { eng, opt, cal, stats: Stats::default(), sampling: None, log }
+        Server { eng, opt, cal, stats: Stats::default(), store: None, sampling: None, log }
     }
 
     /// Row `row` of the last pass as a distribution (sampled requests).
@@ -288,7 +290,34 @@ impl Server {
     pub fn run(&mut self, mut job: Job, cancelled: &mut dyn FnMut() -> bool) -> Result<()> {
         let mut g = Generation::default();
         let finish = self.generate(&mut job, &mut g, cancelled)?;
+        let ok = !matches!(finish, Finish::Error(_));
         (job.sink)(Event::Done(finish, g));
+        if ok {
+            self.disk_save(&job.prompt)?;
+        }
+        Ok(())
+    }
+
+    /// The prompt's rows past its deepest saved prefix to the disk store (both ranks), when
+    /// they are new enough to keep and the disks have room.
+    fn disk_save(&mut self, prompt: &[u32]) -> Result<()> {
+        let Some(store) = self.store.as_mut() else { return Ok(()) };
+        if self.eng.tokens.len() < prompt.len() || self.eng.tokens[..prompt.len()] != *prompt {
+            return Ok(());
+        }
+        if crate::prefix::free_bytes(&store.dir) < 10_000_000_000 {
+            return Ok(());
+        }
+        let bpp = self.eng.bytes_per_position();
+        let Some((seg, evict)) = store.plan_save(prompt, bpp) else { return Ok(()) };
+        let t0 = Instant::now();
+        if self.eng.disk_save(seg.id, seg.start, seg.end, &seg.hash, &evict)? {
+            store.drop_segments(&evict);
+            store.write_tokens(seg.id, &prompt[seg.start..seg.end])?;
+            let (s, e) = (seg.start, seg.end);
+            store.commit(seg)?;
+            (self.log)(&format!("[prefix] saved [{s}, {e}) in {:.2} s", t0.elapsed().as_secs_f64()));
+        }
         Ok(())
     }
 
@@ -314,7 +343,29 @@ impl Server {
         let stop = job.stop.clone();
         let depth = if self.eng.cfg.mtp { opt.depth } else { 0 };
         // the live sequence's prefix, one token back so the reprefilled row refills its MTP row
-        let common = prompt.iter().zip(&self.eng.tokens).take_while(|(a, b)| a == b).count().min(prompt.len() - 1);
+        let mut common = prompt.iter().zip(&self.eng.tokens).take_while(|(a, b)| a == b).count().min(prompt.len() - 1);
+        // the disk store's deepest saved prefix, when it gains enough over the live sequence's
+        if let Some(store) = self.store.as_mut() {
+            if let Some((chain, end)) = store.plan_restore(&prompt, common) {
+                let c: Vec<(u64, usize, usize, String)> = chain.iter().map(|s| (s.id, s.start, s.end, s.hash.clone())).collect();
+                let t0 = Instant::now();
+                if self.eng.disk_load(&c, &prompt, end)? {
+                    store.touch(&chain.iter().map(|s| s.id).collect::<Vec<_>>());
+                    store.save_index()?;
+                    (self.log)(&format!("[prefix] restored [{common}, {end}) from {} segment(s) in {:.2} s", chain.len(),
+                                        t0.elapsed().as_secs_f64()));
+                    common = end;
+                } else {
+                    // a segment some rank could not read: forget it (and what extends it)
+                    let bad = chain.last().unwrap().id;
+                    let doomed: Vec<u64> = store.index.segs.values().filter(|s| store.chain(s.id).iter().any(|x| x.id == bad))
+                        .map(|s| s.id).collect();
+                    store.drop_segments(&doomed);
+                    store.save_index()?;
+                    (self.log)("[prefix] restore miss: segments dropped");
+                }
+            }
+        }
         let keep = common.saturating_sub(1);
         self.eng.set_pos(keep)?;
         g.cached = keep;

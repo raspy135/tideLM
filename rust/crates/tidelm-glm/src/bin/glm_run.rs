@@ -30,6 +30,7 @@ fn main() -> Result<()> {
         prefill_reduce_bf16: arg(&args, "--reduce").as_deref() != Some("fp32"),
         moe_rows: arg(&args, "--moe-rows").map(|s| s.parse()).transpose()?.unwrap_or(2048),
         pack: PathBuf::from(&pack),
+        guard_extra: format!("graphs {} hot {}", args.iter().any(|a| a == "--graphs"), args.iter().any(|a| a == "--hot")),
     };
     let log = move |s: &str| {
         if rank == 0 {
@@ -79,7 +80,17 @@ fn main() -> Result<()> {
     let prompt = arg(&args, "--prompt").unwrap_or_else(|| "Write a short poem about the sea.".into());
     let msgs = vec![serde_json::json!({"role": "user", "content": prompt})];
     let rendered = tidelm_text::glm::render(&msgs, None, Some("low"))?;
-    let ids = text.encode(&rendered)?;
+    let mut ids = text.encode(&rendered)?;
+    if let Some(n) = arg(&args, "--random-prompt").map(|v| v.parse::<usize>()).transpose()? {
+        // bench.py's random workload: n tokens drawn uniformly from a fixed seed
+        let mut x = 0x9e3779b97f4a7c15u64;
+        ids = (0..n).map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (1000 + x % 100000) as u32
+        }).collect();
+    }
     let max_tokens: usize = arg(&args, "--max-tokens").map(|s| s.parse()).transpose()?.unwrap_or(64);
     let depth: usize = arg(&args, "--depth").map(|s| s.parse()).transpose()?.unwrap_or(0);
     let stop = cfg.eos.clone();
@@ -180,6 +191,41 @@ fn main() -> Result<()> {
         }
         log(&format!("prefill:       {}  (from row 16)", score(&pre, 16)));
         log(&format!("decode 1 row:  {}  (from row 16)", score(&one, 16)));
+        eng.stop_follower()?;
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--bench-rows") {
+        // a pass's cost by its rows after a prompt: verify widths 1..8 and a one-row MTP draft
+        let first = eng.forward(&ids, true)?;
+        eng.keep_hidden(eng.last_rows - 1)?;
+        let p = eng.pos;
+        let filler: Vec<u32> = (0..8).map(|i| ids[(i * 7) % ids.len()]).collect();
+        let _ = first;
+        let mut line = String::new();
+        let tmax: usize = std::env::var("GLM_BENCH_T").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        for t in 1..=tmax {
+            let mut ts = vec![];
+            for i in 0..13 {
+                let a = Instant::now();
+                eng.forward(&filler[..t], false)?;
+                if i >= 3 {
+                    ts.push(a.elapsed().as_secs_f64() * 1e3);
+                }
+                eng.set_pos(p)?;
+            }
+            ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            line += &format!(" T{t} {:.1}", ts[ts.len() / 2]);
+        }
+        let mut ts = vec![];
+        for i in 0..13 {
+            let a = Instant::now();
+            eng.mtp(&filler[..1], Hidden::Last, p - 1, true)?;
+            if i >= 3 {
+                ts.push(a.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        log(&format!("pass ms (median of 10):{line}  mtp draft {:.2}", ts[ts.len() / 2]));
         eng.stop_follower()?;
         return Ok(());
     }

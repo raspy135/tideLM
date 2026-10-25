@@ -45,8 +45,10 @@ mkdir -p "$STATE"
 # (a native EXL3 checkpoint), GLM_HEAD=exl3, GLM_KVB_FP8=1, GLM_EMBED_8BIT=int8,
 # GLM_MISS=substitute, no prefill prefetch (GLM_PF), no async hot reads, no index buckets.
 # Fixed at the profile's values: GLM_HOT_MIN=0.2, GLM_HOT_MAX=16, GLM_HOT_PACE=1,
-# GLM_ADAPT_DECAY=0.9, GLM_ADAPT_MARGIN=1.5, GLM_BG_READS=0. Not ported yet: GLM_PREFIX_DISK
-# (the live sequence's prefix is reused; nothing is kept on disk).
+# GLM_ADAPT_DECAY=0.9, GLM_ADAPT_MARGIN=1.5, GLM_BG_READS=0. GLM_PREFIX_DISK=1 keeps prompts'
+# rows on disk under its own directory (GLM_PREFIX_DISK_GB a node, GLM_PREFIX_DISK_MIN new tokens
+# to save or restore; never the Python store's files, whose layout differs).
+#   RUST_GLM_PREFIX_DIR=~/tidelm-rust-state/glm-prefix   the disk prefix store
 #   RUST_GLM_STATE_DB=~/tidelm-rust-state/glm-stats-rust.npz   the routing history the engine
 #       writes (read at boot when present, else GLM_STATS_DB: the Python server's db.pt is
 #       written by its container as root and is never touched)
@@ -63,7 +65,6 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
     want GLM_PF 0 0
     want GLM_HOT_ASYNC 0 0
     want GLM_INDEX_BUCKETS 0 0
-    [[ "${GLM_PREFIX_DISK:-0}" == 1 ]] && echo "--- note: GLM_PREFIX_DISK is not ported to the Rust engine; only the live sequence's prefix is reused"
     pack=${GLM_EXL3_PACK:-}
     [[ -n "$pack" ]] || err "$f sets no GLM_EXL3_PACK"
     pack=${pack/#\/packs/${GLM_EXL3_DIR:-/packs}}
@@ -86,6 +87,8 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
           --adapt-decode "${GLM_ADAPT_DECODE_SWAPS:-256}" --bg-every "$bg" --loop-break "${GLM_LOOP_BREAK:-0}"
           --two-pass "${GLM_PREFILL_TWO_PASS:-0}" --two-pass-miss "${GLM_PREFILL_TWO_PASS_MISS:-0}")
     [[ "${GLM_GRAPHS:-1}" == 1 ]] && args+=(--graphs)
+    [[ "${GLM_PREFIX_DISK:-0}" == 1 ]] && args+=(--prefix-disk "${RUST_GLM_PREFIX_DIR:-$STATE/glm-prefix}"
+                                                 --prefix-disk-gb "${GLM_PREFIX_DISK_GB:-20}" --prefix-min "${GLM_PREFIX_DISK_MIN:-256}")
     envs=(NCCL_PROTO=Simple GLM_REASONING_EFFORT="${GLM_REASONING_EFFORT:-medium}"
           GLM_DEFAULT_MAX_TOKENS="${GLM_DEFAULT_MAX_TOKENS:-4096}")
     for v in NCCL_SOCKET_IFNAME NCCL_IB_HCA NCCL_IB_ADDR_FAMILY NCCL_IB_ADDR_RANGE NCCL_IB_ROCE_VERSION_NUM \

@@ -34,11 +34,12 @@ pub fn is_glm(model_dir: &std::path::Path) -> bool {
 }
 
 pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
-    const VALUED: [&str; 31] = ["--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
+    const VALUED: [&str; 34] = ["--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
                                 "--max-seq", "--chunk", "--hot", "--hot-keep", "--depth", "--cal", "--dyn", "--lookup",
                                 "--adapt", "--adapt-every", "--adapt-prefill", "--adapt-decode", "--bg-every", "--loop-break",
                                 "--two-pass", "--two-pass-miss", "--host", "--port", "--served-model-name", "--moe-rows",
-                                "--kv-split", "--reduce", "--warmup"];
+                                "--kv-split", "--reduce", "--warmup", "--prefix-disk", "--prefix-disk-gb",
+                                "--prefix-min"];
     const FLAGS: [&str; 1] = ["--graphs"];
     let mut i = 1;
     while i < args.len() {
@@ -66,6 +67,9 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         prefill_reduce_bf16: arg(args, "--reduce").as_deref() != Some("fp32"),
         moe_rows: num("--moe-rows", 2048.0)? as usize,
         pack: PathBuf::from(&pack),
+        guard_extra: format!("graphs {} hot {} prefix {} gb {}", args.iter().any(|a| a == "--graphs"),
+                             arg(args, "--hot").unwrap_or_else(|| "1".into()), arg(args, "--prefix-disk").is_some(),
+                             arg(args, "--prefix-disk-gb").unwrap_or_default()),
     };
     tidelm_cuda::set_device(0)?;
     let cfg = tidelm_glm::config::GlmConfig::load(&model_dir)?;
@@ -136,11 +140,28 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         two_pass: num("--two-pass", 512.0)? as usize,
         two_pass_miss: num("--two-pass-miss", 0.15)?,
     };
+    // the disk prefix store: its namespace is everything that changes what a cached row means
+    let mut store = None;
+    if let Some(root) = arg(args, "--prefix-disk").map(PathBuf::from) {
+        use sha2::Digest;
+        let cfg_bytes = std::fs::read(model_dir.join("config.json"))?;
+        let key = format!("glm-rust-kv v1 {:x} {} {} {} {}", sha2::Sha256::digest(&cfg_bytes), eng.pack.source_sha256,
+                          eng.opt.max_seq, eng.opt.kv_split, world);
+        let ns = format!("{:x}", sha2::Sha256::digest(key.as_bytes()))[..16].to_string();
+        let gb = num("--prefix-disk-gb", 20.0)?;
+        let st = tidelm_glm::prefix::Store::open(&root, &ns, rank, (gb * 1e9) as u64, num("--prefix-min", 256.0)? as usize)?;
+        eng.prefix_dir = Some(st.dir.clone());
+        if rank == 0 {
+            eprintln!("boot: prefix store {} ({} segments, {gb} GB)", st.dir.display(), st.index.segs.len());
+            store = Some(st);
+        }
+    }
     if rank == 1 {
         eng.follow()?;
         return Ok(());
     }
     let mut srv = Server::new(eng, sopt, Box::new(|s: &str| eprintln!("{s}")));
+    srv.store = store;
     if num("--warmup", 1.0)? > 0.0 {
         let tw = Instant::now();
         srv.warmup()?;

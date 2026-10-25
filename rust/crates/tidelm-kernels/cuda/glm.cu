@@ -170,28 +170,39 @@ __global__ void unshard_kernel(const T* __restrict__ src, int64_t rank_stride, T
 // tp.rms / norm_kernel._rms_kernel: y = bf16(w * bf16(x * (1 / sqrt(mean(x^2) + eps)))), fp32
 // statistics. ADD: h = bf16(h + a) first (the residual add before the next norm), stored back.
 template <bool ADD>
-__global__ void __launch_bounds__(256) rmsnorm_kernel(__nv_bfloat16* __restrict__ h, int64_t ldh,
-                                                      const __nv_bfloat16* __restrict__ a, int64_t lda,
-                                                      const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ y,
-                                                      int64_t ldy, int N, float eps) {
+__global__ void __launch_bounds__(1024) rmsnorm_kernel(__nv_bfloat16* __restrict__ h, int64_t ldh,
+                                                       const __nv_bfloat16* __restrict__ a, int64_t lda,
+                                                       const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ y,
+                                                       int64_t ldy, int N, float eps) {
+    // the row in registers (N <= 12 x 1024): one read of h (and a), one write of each output
     __shared__ float red[32];
+    constexpr int kPer = 12;
     const int t = blockIdx.x;
     __nv_bfloat16* hr = h + (int64_t)t * ldh;
+    float v[kPer];
     float ss = 0.f;
-    for (int c = threadIdx.x; c < N; c += blockDim.x) {
-        float v;
-        if (ADD) {
-            v = rbf(bf(hr[c]) + bf(a[(int64_t)t * lda + c]));
-            hr[c] = to_bf(v);
-        } else {
-            v = bf(hr[c]);
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+        const int c = threadIdx.x + i * blockDim.x;
+        v[i] = 0.f;
+        if (c < N) {
+            if (ADD) {
+                v[i] = rbf(bf(hr[c]) + bf(a[(int64_t)t * lda + c]));
+                hr[c] = to_bf(v[i]);
+            } else {
+                v[i] = bf(hr[c]);
+            }
         }
-        ss += v * v;
+        ss += v[i] * v[i];
     }
     ss = block_sum(ss, red);
     const float r = 1.f / sqrtf(ss / N + eps);
     __nv_bfloat16* yr = y + (int64_t)t * ldy;
-    for (int c = threadIdx.x; c < N; c += blockDim.x) yr[c] = to_bf(bf(w[c]) * rbf(bf(hr[c]) * r));
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+        const int c = threadIdx.x + i * blockDim.x;
+        if (c < N) yr[c] = to_bf(bf(w[c]) * rbf(v[i] * r));
+    }
 }
 
 // ------------------------------------------------------------------ RoPE
@@ -578,35 +589,66 @@ __global__ void __launch_bounds__(256) absorb_q_kernel(const __nv_bfloat16* __re
                                                        int64_t ldq_h, const uint8_t* __restrict__ w,
                                                        const float* __restrict__ ws, __nv_bfloat16* __restrict__ out,
                                                        int64_t ldo_t, int64_t ldo_h, int T) {
-    __shared__ float xs[16][kNope];
-    __shared__ float part[16][128];
+    // a block: one head's 128 output columns over up to 8 rows; a thread 4 adjacent columns (one
+    // u32 of FP8) over a 24-row slice of n, its loads unrolled to keep them in flight; the 8
+    // slices summed in shared memory
+    constexpr int TM = 8;
+    __shared__ float xs[TM][kNope];
+    __shared__ float part[8][TM][128];
     const int h = blockIdx.x, cb = blockIdx.y, tid = threadIdx.x;
     for (int i = tid; i < T * kNope; i += blockDim.x) {
         const int t = i / kNope, n = i % kNope;
         xs[t][n] = bf(q[(int64_t)t * ldq_t + (int64_t)h * ldq_h + n]);
     }
     __syncthreads();
-    const int c = tid & 127, half = tid >> 7;
-    const int col = cb * 128 + c;
-    float acc[16];
+    const int cg = tid & 31, sl = tid >> 5;
+    const int col = cb * 128 + cg * 4;
+    float acc[TM][4];
 #pragma unroll
-    for (int t = 0; t < 16; ++t) acc[t] = 0.f;
-    for (int n = half * 96; n < half * 96 + 96; ++n) {
-        const int64_t r = (int64_t)h * kKvRows + n;
-        const float wv = rbf(e4m3(w[r * kLat + col]) * ws[r * 4 + cb]);
+    for (int t = 0; t < TM; ++t)
 #pragma unroll
-        for (int t = 0; t < 16; ++t)
-            if (t < T) acc[t] = fmaf(xs[t][n], wv, acc[t]);
+        for (int c = 0; c < 4; ++c) acc[t][c] = 0.f;
+    uint32_t wd[24];
+    float sc[24];
+#pragma unroll
+    for (int i = 0; i < 24; ++i) {
+        const int64_t r = (int64_t)h * kKvRows + sl * 24 + i;
+        wd[i] = *reinterpret_cast<const uint32_t*>(w + r * kLat + col);
+        sc[i] = ws[r * 4 + cb];
     }
-    if (half == 1)
-        for (int t = 0; t < T; ++t) part[t][c] = acc[t];
+#pragma unroll
+    for (int i = 0; i < 24; ++i) {
+        const int n = sl * 24 + i;
+        float wv[4];
+#pragma unroll
+        for (int c = 0; c < 4; ++c) wv[c] = rbf(e4m3((wd[i] >> (8 * c)) & 0xff) * sc[i]);
+#pragma unroll
+        for (int t = 0; t < TM; ++t)
+            if (t < T) {
+                const float x = xs[t][n];
+#pragma unroll
+                for (int c = 0; c < 4; ++c) acc[t][c] = fmaf(x, wv[c], acc[t][c]);
+            }
+    }
+#pragma unroll
+    for (int t = 0; t < TM; ++t)
+        if (t < T)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) part[sl][t][cg * 4 + c] = acc[t][c];
     __syncthreads();
-    if (half == 0)
-        for (int t = 0; t < T; ++t) out[(int64_t)t * ldo_t + (int64_t)h * ldo_h + col] = to_bf(acc[t] + part[t][c]);
+    for (int i = tid; i < T * 128; i += blockDim.x) {
+        const int t = i / 128, c = i % 128;
+        float a = 0.f;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) a += part[k][t][c];
+        out[(int64_t)t * ldo_t + (int64_t)h * ldo_h + cb * 128 + c] = to_bf(a);
+    }
 }
 
 // kvb_fp8.absorb_o for decode rows: o[t, h, v] = sum_c o_lat[t, h, c] * Wuv[h, v, c] (kv_b rows
-// h * 448 + 192 + v), bf16 out. A warp per output column v, lanes over c in 16-value pieces.
+// h * 448 + 192 + v), bf16 out. A warp per output column v, lanes over c in 16-value pieces; a
+// block kAbsV columns, so each block stages the rows' latents once for them.
+constexpr int kAbsV = 64;
 __global__ void __launch_bounds__(256) absorb_o_kernel(const __nv_bfloat16* __restrict__ o, int64_t ldo_t,
                                                        int64_t ldo_h, const uint8_t* __restrict__ w,
                                                        const float* __restrict__ ws, __nv_bfloat16* __restrict__ out,
@@ -618,20 +660,22 @@ __global__ void __launch_bounds__(256) absorb_o_kernel(const __nv_bfloat16* __re
         xs[t][c] = bf(o[(int64_t)t * ldo_t + (int64_t)h * ldo_h + c]);
     }
     __syncthreads();
-    const int v = blockIdx.y * 8 + warp;
-    const int64_t r = (int64_t)h * kKvRows + kNope + v;
-    const uint4 raw = *reinterpret_cast<const uint4*>(w + r * kLat + l * 16);
-    const float s = ws[r * 4 + (l * 16) / 128];
-    const uint32_t wd[4] = {raw.x, raw.y, raw.z, raw.w};
-    float wv[16];
+    for (int vi = 0; vi < kAbsV / 8; ++vi) {
+        const int v = blockIdx.y * kAbsV + vi * 8 + warp;
+        const int64_t r = (int64_t)h * kKvRows + kNope + v;
+        const uint4 raw = *reinterpret_cast<const uint4*>(w + r * kLat + l * 16);
+        const float s = ws[r * 4 + (l * 16) / 128];
+        const uint32_t wd[4] = {raw.x, raw.y, raw.z, raw.w};
+        float wv[16];
 #pragma unroll
-    for (int i = 0; i < 16; ++i) wv[i] = rbf(e4m3((wd[i / 4] >> (8 * (i % 4))) & 0xff) * s);
-    for (int t = 0; t < T; ++t) {
-        float a = 0.f;
+        for (int i = 0; i < 16; ++i) wv[i] = rbf(e4m3((wd[i / 4] >> (8 * (i % 4))) & 0xff) * s);
+        for (int t = 0; t < T; ++t) {
+            float a = 0.f;
 #pragma unroll
-        for (int i = 0; i < 16; ++i) a = fmaf(xs[t][l * 16 + i], wv[i], a);
-        a = warp_sum(a);
-        if (l == 0) out[(int64_t)t * ld_out + (int64_t)h * kVd + v] = to_bf(a);
+            for (int i = 0; i < 16; ++i) a = fmaf(xs[t][l * 16 + i], wv[i], a);
+            a = warp_sum(a);
+            if (l == 0) out[(int64_t)t * ld_out + (int64_t)h * kVd + v] = to_bf(a);
+        }
     }
 }
 
@@ -665,8 +709,8 @@ template <int MT>
 __global__ void __launch_bounds__(256) mla_kernel(
     const __nv_bfloat16* __restrict__ q, int64_t q_ldg, int64_t q_ldt, int64_t q_ldh, int hg,
     const uint8_t* __restrict__ cq, const float* __restrict__ cs, const __nv_bfloat16* __restrict__ cr, int split_n,
-    const int* __restrict__ idx, int64_t ld_idx, int K, const int* __restrict__ bound, int H, float scale, int chunk,
-    float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,
+    const int* __restrict__ idx, int64_t ld_idx, int K, int ascending, const int* __restrict__ bound, int H, float scale,
+    int chunk, float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,
     __nv_bfloat16* __restrict__ out, int64_t o_ldt, int64_t o_ldh) {
     constexpr int HB = 16 * MT;
     extern __shared__ __align__(16) unsigned char mla_smem_raw[];
@@ -677,12 +721,13 @@ __global__ void __launch_bounds__(256) mla_kernel(
     float* l_run = m_run + HB;
     float* alpha = l_run + HB;
     int* valid = reinterpret_cast<int*>(alpha + HB);
-    int* krow = valid + kMNT;
     const int t = blockIdx.y, h0 = blockIdx.x * HB, sp = blockIdx.z, NS = gridDim.z;
     const int nh = min(HB, H - h0);
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, r = lane >> 2, qd = lane & 3;
     const int bnd = bound[t];
-    const int kmax = idx ? K : min(K, bnd + 1);
+    // picks in ascending position order with -1 after them (the indexer's top-k, unmasked):
+    // a row has at most min(K, bound + 1) of them, so the tiles past that are skipped
+    const int kmax = idx && !ascending ? K : min(K, bnd + 1);
     const int k_lo = sp * chunk, k_hi = min(kmax, k_lo + chunk);
 
     for (int i = tid; i < HB * (kMD / 8); i += blockDim.x) {
@@ -707,37 +752,53 @@ __global__ void __launch_bounds__(256) mla_kernel(
 #pragma unroll
             for (int i = 0; i < 4; ++i) acc[mt][nt][i] = 0.f;
 
-    for (int n0 = k_lo; n0 < k_hi; n0 += kMNT) {
-        __syncthreads();  // the previous tile's PV is done with Ks / Ps
-        if (tid < kMNT) {
-            const int n = n0 + tid;
+    // A thread's 5 of a tile's 32 x 40 pieces (32 latent pieces of 16 FP8 values and 8 RoPE
+    // pieces of 8 BF16 values a key), fetched into registers a tile ahead: the next tile's two
+    // dependent loads (its pick, then its key) are in flight while this one is scored.
+    constexpr int kPieces = kMNT * 40 / 256;
+    uint4 pre_raw[kPieces];
+    float pre_s[kPieces];
+    bool pre_ok[kPieces];
+    auto prefetch = [&](int n0) {
+#pragma unroll
+        for (int u = 0; u < kPieces; ++u) {
+            const int i = tid + 256 * u, j = i / 40, c = i % 40;
+            const int n = n0 + j;
             int key = -1;
             if (n < k_hi) key = idx ? idx[(int64_t)t * ld_idx + n] : n;
             const bool ok = key >= 0 && key <= bnd;
-            valid[tid] = ok;
-            krow[tid] = ok ? (int)key_row(key, split_n) : -1;
+            pre_ok[u] = ok;
+            pre_raw[u] = make_uint4(0, 0, 0, 0);
+            pre_s[u] = 0.f;
+            if (ok) {
+                const int64_t kr = key_row(key, split_n);
+                if (c < 32) {
+                    pre_raw[u] = *reinterpret_cast<const uint4*>(cq + kr * kLat + c * 16);
+                    pre_s[u] = rbf(cs[kr * 4 + c / 8]);
+                } else {
+                    pre_raw[u] = reinterpret_cast<const uint4*>(cr + kr * 64)[c - 32];
+                }
+            }
         }
-        __syncthreads();
-        // keys: 32 latent pieces of 16 FP8 values and 8 RoPE pieces of 8 BF16 values a key
-        for (int i = tid; i < kMNT * 40; i += blockDim.x) {
-            const int j = i / 40, c = i % 40;
-            const int kr = krow[j];
+    };
+    if (k_lo < k_hi) prefetch(k_lo);
+    for (int n0 = k_lo; n0 < k_hi; n0 += kMNT) {
+        __syncthreads();  // the previous tile's PV is done with Ks / Ps
+#pragma unroll
+        for (int u = 0; u < kPieces; ++u) {
+            const int i = tid + 256 * u, j = i / 40, c = i % 40;
             if (c < 32) {
                 uint4 o[2] = {make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0)};
-                if (kr >= 0) {
-                    const uint4 raw = *reinterpret_cast<const uint4*>(cq + (int64_t)kr * kLat + c * 16);
-                    fp8x16_bf16(raw, rbf(cs[(int64_t)kr * 4 + c / 8]), true, o);
-                }
+                if (pre_ok[u]) fp8x16_bf16(pre_raw[u], pre_s[u], true, o);
                 *reinterpret_cast<uint4*>(Ks + j * kMLD + c * 16) = o[0];
                 *reinterpret_cast<uint4*>(Ks + j * kMLD + c * 16 + 8) = o[1];
             } else {
-                const int cc = c - 32;
-                uint4 v = make_uint4(0, 0, 0, 0);
-                if (kr >= 0) v = reinterpret_cast<const uint4*>(cr + (int64_t)kr * 64)[cc];
-                *reinterpret_cast<uint4*>(Ks + j * kMLD + kLat + cc * 8) = v;
+                *reinterpret_cast<uint4*>(Ks + j * kMLD + kLat + (c - 32) * 8) = pre_raw[u];
             }
+            if (c == 0) valid[j] = pre_ok[u];
         }
         __syncthreads();
+        if (n0 + kMNT < k_hi) prefetch(n0 + kMNT);
         // scores: (m tile, 8 keys) jobs over the warps
         for (int job = warp; job < MT * (kMNT / 8); job += 8) {
             const int mt = job / (kMNT / 8), kb = job % (kMNT / 8);
@@ -1289,12 +1350,15 @@ int glm_unshard(void* stream, const void* src, int64_t rank_stride, void* dst, i
 
 int glm_rmsnorm(void* stream, void* h, int64_t ldh, const void* a, int64_t lda, const void* w, void* y, int64_t ldy,
                 int T, int N, float eps) {
+    if (N > 12 * 1024) return (int)cudaErrorInvalidValue;
+    const int nt = N >= 4096 ? 1024 : N >= 1024 ? 256 : 128;
+    if (N > 12 * nt) return (int)cudaErrorInvalidValue;
     if (a)
-        rmsnorm_kernel<true><<<T, 256, 0, GST>>>(static_cast<__nv_bfloat16*>(h), ldh, static_cast<const __nv_bfloat16*>(a),
+        rmsnorm_kernel<true><<<T, nt, 0, GST>>>(static_cast<__nv_bfloat16*>(h), ldh, static_cast<const __nv_bfloat16*>(a),
                                                  lda, static_cast<const __nv_bfloat16*>(w), static_cast<__nv_bfloat16*>(y),
                                                  ldy, N, eps);
     else
-        rmsnorm_kernel<false><<<T, 256, 0, GST>>>(static_cast<__nv_bfloat16*>(h), ldh, nullptr, 0,
+        rmsnorm_kernel<false><<<T, nt, 0, GST>>>(static_cast<__nv_bfloat16*>(h), ldh, nullptr, 0,
                                                   static_cast<const __nv_bfloat16*>(w), static_cast<__nv_bfloat16*>(y),
                                                   ldy, N, eps);
     GRET;
@@ -1367,16 +1431,18 @@ int glm_split_share(void* stream, const void* g, int64_t rank_stride, int64_t ro
 int glm_absorb_q(void* stream, const void* q, int64_t ldq_t, int64_t ldq_h, const void* w, const void* ws, void* out,
                  int64_t ldo_t, int64_t ldo_h, int T, int hl) {
     if (T < 1 || T > 16) return (int)cudaErrorInvalidValue;
-    absorb_q_kernel<<<dim3(hl, kLat / 128), 256, 0, GST>>>(static_cast<const __nv_bfloat16*>(q), ldq_t, ldq_h,
-                                                           static_cast<const uint8_t*>(w), static_cast<const float*>(ws),
-                                                           static_cast<__nv_bfloat16*>(out), ldo_t, ldo_h, T);
+    for (int t0 = 0; t0 < T; t0 += 8)
+        absorb_q_kernel<<<dim3(hl, kLat / 128), 256, 0, GST>>>(static_cast<const __nv_bfloat16*>(q) + t0 * ldq_t, ldq_t, ldq_h,
+                                                               static_cast<const uint8_t*>(w), static_cast<const float*>(ws),
+                                                               static_cast<__nv_bfloat16*>(out) + t0 * ldo_t, ldo_t, ldo_h,
+                                                               T - t0 < 8 ? T - t0 : 8);
     GRET;
 }
 
 int glm_absorb_o(void* stream, const void* o, int64_t ldo_t, int64_t ldo_h, const void* w, const void* ws, void* out,
                  int64_t ld_out, int T, int hl) {
     if (T < 1 || T > 16) return (int)cudaErrorInvalidValue;
-    absorb_o_kernel<<<dim3(hl, kVd / 8), 256, 0, GST>>>(static_cast<const __nv_bfloat16*>(o), ldo_t, ldo_h,
+    absorb_o_kernel<<<dim3(hl, kVd / kAbsV), 256, 0, GST>>>(static_cast<const __nv_bfloat16*>(o), ldo_t, ldo_h,
                                                         static_cast<const uint8_t*>(w), static_cast<const float*>(ws),
                                                         static_cast<__nv_bfloat16*>(out), ld_out, T);
     GRET;
@@ -1393,7 +1459,7 @@ int glm_kvb_dequant(void* stream, const void* w, const void* ws, void* out, int6
 int glm_mla_smem(int mt) { return mt == 2 ? mla_smem<2>() : mla_smem<1>(); }
 
 int glm_mla(void* stream, int mt, const void* q, int64_t q_ldg, int64_t q_ldt, int64_t q_ldh, int hg, const void* cq,
-            const void* cs, const void* cr, int split_n, const void* idx, int64_t ld_idx, int K, const void* bound, int T,
+            const void* cs, const void* cr, int split_n, const void* idx, int64_t ld_idx, int K, int ascending, const void* bound, int T,
             int H, float scale, int nsplit, int chunk, void* part_m, void* part_l, void* part_acc, void* out,
             int64_t o_ldt, int64_t o_ldh) {
     if (mt != 1 && mt != 2) return (int)cudaErrorInvalidValue;
@@ -1410,7 +1476,7 @@ int glm_mla(void* stream, int mt, const void* q, int64_t q_ldg, int64_t q_ldt, i
         kernel<<<grid, 256, smem, GST>>>(static_cast<const __nv_bfloat16*>(q), q_ldg, q_ldt, q_ldh, hg,
                                          static_cast<const uint8_t*>(cq), static_cast<const float*>(cs),
                                          static_cast<const __nv_bfloat16*>(cr), split_n, static_cast<const int*>(idx),
-                                         ld_idx, K, static_cast<const int*>(bound), H, scale, chunk,
+                                         ld_idx, K, ascending, static_cast<const int*>(bound), H, scale, chunk,
                                          static_cast<float*>(part_m), static_cast<float*>(part_l),
                                          static_cast<float*>(part_acc), static_cast<__nv_bfloat16*>(out), o_ldt, o_ldh);
     };

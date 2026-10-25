@@ -29,6 +29,9 @@ use crate::{ck, Result};
 
 /// Decode rows a graph or a verify step carries at most (MTP depth 7 + the anchor).
 pub const VERIFY_ROWS: usize = 8;
+/// Up to this many rows an EXL3 matrix runs the decode GEMV in 16-row blocks (gate/up then come
+/// back interleaved [rows][2N]); more unpack the trellis for cuBLAS ([2][rows][N]).
+const GEMV_ROWS: usize = 64;
 /// The indexer keeps this many picks a row.
 const TOPK: usize = 2048;
 /// Prefill row blocks of the indexer's [rows, S] fp32 scores stay within this many values
@@ -66,6 +69,9 @@ pub struct Options {
     /// MoE prefill in sub-chunks of this many rows (bounds the per-pair scratch)
     pub moe_rows: usize,
     pub pack: std::path::PathBuf,
+    /// the serving flags both ranks act on (hot reads split the pass on both, graphs, the disk
+    /// store's mirrored calls): compared at boot with the rest
+    pub guard_extra: String,
 }
 
 impl Options {
@@ -76,11 +82,11 @@ impl Options {
         let exe = std::fs::read(std::env::current_exe()?)?;
         let s = format!(
             "glm-boot v1\nconfig {:x}\nexe {:x}\nmax_seq {}\nchunk {}\nslots {}\nkv_split {}\nreduce_bf16 {}\nmoe_rows {}\n\
-             pack_source {}\nenv {}\n",
+             pack_source {}\nenv {}\nflags {}\n",
             sha2::Sha256::digest(&cfg), sha2::Sha256::digest(&exe), self.max_seq, self.chunk, self.slots, self.kv_split,
             self.prefill_reduce_bf16, self.moe_rows, pack.source_sha256,
             ["TIDELM_GLM_HOT", "NCCL_PROTO"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
-                .collect::<Vec<_>>().join(" "));
+                .collect::<Vec<_>>().join(" "), self.guard_extra);
         Ok(s.into_bytes())
     }
 }
@@ -93,17 +99,17 @@ pub struct Pair {
     pub roce: tidelm_comm::roce::Roce,
 }
 
-struct LayerKv {
+pub(crate) struct LayerKv {
     /// latent FP8 [rows][512] + fp32 [rows][4]
-    cq: DeviceBuffer<u8>,
-    cs: DeviceBuffer<f32>,
+    pub(crate) cq: DeviceBuffer<u8>,
+    pub(crate) cs: DeviceBuffer<f32>,
     /// RoPE key BF16 [rows][64]
-    cr: DeviceBuffer<u16>,
+    pub(crate) cr: DeviceBuffer<u16>,
     /// indexer key FP8 [rows][128] + fp32 [rows] (full layers)
-    iq: Option<DeviceBuffer<u8>>,
-    is: Option<DeviceBuffer<f32>>,
+    pub(crate) iq: Option<DeviceBuffer<u8>>,
+    pub(crate) is: Option<DeviceBuffer<f32>>,
     /// split by position across the pair (decoder layers under kv_split)
-    split: bool,
+    pub(crate) split: bool,
 }
 
 /// Activations and scratch, sized for a prefill chunk.
@@ -186,6 +192,9 @@ struct Act {
     ehin: DeviceBuffer<u16>,
     ehout: DeviceBuffer<u16>,
     x3s: Exl3Scratch,
+    /// the side stream's EXL3 scratch and split-K partials (decode rows)
+    x3s2: Exl3Scratch,
+    split_part2: DeviceBuffer<f32>,
 }
 
 /// Where the MTP layer's previous hidden comes from.
@@ -209,6 +218,10 @@ pub struct Engine {
     /// cache rows a split layer holds (ceil(max_seq / world)); its spare row follows
     s_loc: usize,
     pub(crate) st: Stream,
+    /// the side stream of a decode pass's independent pieces, and its fork / join events
+    st2: Stream,
+    ev_fork: tidelm_cuda::Event,
+    ev_join: tidelm_cuda::Event,
     blas: Blas,
     pub w: Weights,
     members: Members,
@@ -226,7 +239,7 @@ pub struct Engine {
     /// mass, missed mass]
     pub demand: DeviceBuffer<f32>,
     pub miss: DeviceBuffer<f64>,
-    kv: Vec<LayerKv>,
+    pub(crate) kv: Vec<LayerKv>,
     act: Act,
     pub pair: Option<Pair>,
     pub pack: Pack,
@@ -251,6 +264,9 @@ pub struct Engine {
     h_ids: tidelm_cuda::PinnedBuffer<i32>,
     h_pos: tidelm_cuda::PinnedBuffer<i32>,
     h_tok: tidelm_cuda::PinnedBuffer<i32>,
+    /// the disk prefix store's directory for this rank (None: off) and its pinned staging
+    pub prefix_dir: Option<std::path::PathBuf>,
+    pub(crate) stage: Option<tidelm_cuda::PinnedBuffer<u8>>,
     /// passes also return each row's sampling candidates (set_sampling)
     pub sampled: bool,
     temp: DeviceBuffer<f32>,
@@ -353,6 +369,9 @@ impl Engine {
             vl,
             s_loc,
             st,
+            st2: Stream::new()?,
+            ev_fork: tidelm_cuda::Event::new()?,
+            ev_join: tidelm_cuda::Event::new()?,
             blas,
             w,
             arena,
@@ -375,6 +394,8 @@ impl Engine {
             h_ids: tidelm_cuda::PinnedBuffer::zeroed(opt_chunk.max(MAX_ROWS))?,
             h_pos: tidelm_cuda::PinnedBuffer::zeroed(2)?,
             h_tok: tidelm_cuda::PinnedBuffer::zeroed(MAX_ROWS)?,
+            prefix_dir: None,
+            stage: None,
             sampled: false,
             temp: DeviceBuffer::from_slice(&[1.0f32])?,
             h_temp: tidelm_cuda::PinnedBuffer::zeroed(1)?,
@@ -458,8 +479,26 @@ impl Engine {
     // ------------------------------------------------------------------ matrices
     /// x [rows][ldx] bf16 -> out [rows][N] through an EXL3 matrix's decode or prefill path.
     fn exl3(&self, m: &Exl3Mat, x: *const c_void, ldx: usize, rows: usize, out: *mut c_void, out_bf16: bool) -> Result<()> {
+        self.exl3_on(&self.st, &self.act.x3s, m, x, ldx, rows, out, out_bf16)
+    }
+
+    /// exl3 on a given stream with its own scratch (decode rows only off the main stream).
+    #[allow(clippy::too_many_arguments)]
+    fn exl3_on(&self, st: &Stream, x3: &Exl3Scratch, m: &Exl3Mat, x: *const c_void, ldx: usize, rows: usize, out: *mut c_void,
+               out_bf16: bool) -> Result<()> {
         if rows <= MAX_ROWS {
-            m.decode(&self.st, &self.members, &self.act.x3s, x, ldx, rows, out, out_bf16)
+            m.decode(st, &self.members, x3, x, ldx, rows, out, out_bf16)
+        } else if rows <= GEMV_ROWS {
+            // a short prompt: the decode GEMV over 16-row blocks reads each trellis rows / 16
+            // times, where unpacking it writes and rereads 2 bytes a weight (16 bits against 3-5)
+            let esz = if out_bf16 { 2 } else { 4 };
+            for r0 in (0..rows).step_by(MAX_ROWS) {
+                let n = MAX_ROWS.min(rows - r0);
+                let xi = unsafe { (x as *const u16).add(r0 * ldx) } as *const c_void;
+                let oi = unsafe { (out as *mut u8).add(r0 * m.g * m.n * esz) } as *mut c_void;
+                m.decode(st, &self.members, x3, xi, ldx, n, oi, out_bf16)?;
+            }
+            Ok(())
         } else {
             for g in 0..m.g {
                 let o = unsafe { (out as *mut u8).add(g * rows * m.n * if out_bf16 { 2 } else { 4 }) } as *mut c_void;
@@ -472,13 +511,32 @@ impl Engine {
     /// y fp32 [rows][n] = x bf16 [rows][k] . W^T, W fp32 [n][k] (F.linear(x.float(), w)).
     fn linear_f32w(&self, x: *const c_void, ldx: usize, w: &DeviceBuffer<f32>, rows: usize, n: usize, k: usize,
                    y: *mut c_void, splits: usize) -> Result<()> {
-        let part = np(&self.act.split_part);
-        ck(unsafe { ds_linear_f32w(self.st.raw(), x, ldx as i64, np(w), rows as i32, n as i32, k as i32, splits as i32,
+        self.linear_f32w_on(&self.st, np(&self.act.split_part), x, ldx, w, rows, n, k, y, splits)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_f32w_on(&self, st: &Stream, part: *mut c_void, x: *const c_void, ldx: usize, w: &DeviceBuffer<f32>, rows: usize,
+                      n: usize, k: usize, y: *mut c_void, splits: usize) -> Result<()> {
+        ck(unsafe { ds_linear_f32w(st.raw(), x, ldx as i64, np(w), rows as i32, n as i32, k as i32, splits as i32,
                                    if splits > 1 { part } else { y }, n as i64, part) }, "linear f32w")?;
         if splits > 1 {
-            ck(unsafe { ds_splits_reduce(self.st.raw(), part, splits as i32, rows as i32, n as i32, std::ptr::null_mut(), y,
+            ck(unsafe { ds_splits_reduce(st.raw(), part, splits as i32, rows as i32, n as i32, std::ptr::null_mut(), y,
                                          n as i64) }, "splits reduce")?;
         }
+        Ok(())
+    }
+
+    /// The side stream starts after the main one's work so far.
+    fn fork(&self) -> Result<()> {
+        self.ev_fork.record(&self.st)?;
+        self.st2.wait_event(&self.ev_fork)?;
+        Ok(())
+    }
+
+    /// The main stream continues after the side one's work.
+    fn join(&self) -> Result<()> {
+        self.ev_join.record(&self.st2)?;
+        self.st.wait_event(&self.ev_join)?;
         Ok(())
     }
 
@@ -497,21 +555,43 @@ impl Engine {
         let (posb, rowsb, bound) = if mtp { (np(&a.mpos), np(&a.mpos), np(&a.mpos)) } else { (np(&a.pos), np(&a.rows), np(&a.bound)) };
         let p0 = if mtp { self.mtp_pos } else { self.pos };
         let full = cfg.index_full[l];
-        // q_a, its norm; kv_a: the latent (normed, FP8 cache row) and the RoPE key
+        let decode = !prefill;
+        // decode: the latent / RoPE key / indexer key chain runs on the side stream while this
+        // one does the queries (independent until the indexer scores: small GEMVs alone are
+        // latency-bound, 55-90 GB/s for q_a / kv_a); prefill keeps one stream (cuBLAS is on it)
+        let (sst, x3, part2) = if decode { (&self.st2, &a.x3s2, np(&a.split_part2)) } else { (&self.st, &a.x3s, np(&a.split_part)) };
+        let s2 = sst.raw();
+        if decode {
+            self.fork()?;
+        }
+        self.exl3_on(sst, x3, &lw.kv_a, np(&a.xn), h, t, np(&a.ckv), true)?;
+        let ldk = lw.kv_a.n;
+        ck(unsafe { glm_rmsnorm(s2, np(&a.ckv), ldk as i64, std::ptr::null(), 0, np(&lw.kv_norm), np(&a.c), 512, t as i32, 512,
+                                1e-6) }, "kv norm")?;
+        ck(unsafe { glm_kv_fp8(s2, np(&a.c), 512, rowsb, np(&kv.cq), np(&kv.cs), t as i32, 512) }, "latent cache")?;
+        ck(unsafe { glm_rope(s2, at(&a.ckv, 512), ldk as i64, 64, np(&a.kr), 64, 64, t as i32, 1, np(&self.w.cos), np(&self.w.sin),
+                             posb) }, "rope key")?;
+        ck(unsafe { glm_rows_copy(s2, np(&a.kr), 64, rowsb, np(&kv.cr), t as i32, 64) }, "rope cache")?;
+        if full {
+            let ix = lw.index.as_ref().unwrap();
+            if prefill {
+                self.blas.gemm_rm(t, 128, h, Mat { ptr: np(&a.xn), ty: R_16BF, ld: h as i64 }, Mat { ptr: np(&ix.wk), ty: R_16BF, ld: h as i64 },
+                                  true, np(&a.ki), R_16BF, 128)?;
+            } else {
+                // 128 outputs: split K 12 ways (4 blocks of output rows alone left the GPU idle)
+                ck(unsafe { ds_linear_bf16(s2, np(&a.xn), h as i64, np(&ix.wk), t as i32, 128, h as i32, 12, part2,
+                                           std::ptr::null_mut(), 128, part2) }, "index wk")?;
+                ck(unsafe { ds_splits_reduce(s2, part2, 12, t as i32, 128, np(&a.ki), std::ptr::null_mut(), 128) }, "wk reduce")?;
+            }
+            ck(unsafe { glm_index_key(s2, np(&a.ki), 128, np(&ix.kn_w), np(&ix.kn_b), np(&self.w.cos), np(&self.w.sin), posb,
+                                      rowsb, np(kv.iq.as_ref().unwrap()), np(kv.is.as_ref().unwrap()), t as i32) }, "index key")?;
+            self.linear_f32w_on(sst, part2, np(&a.xn), h, &ix.wp, t, 32, h, np(&a.iw), if prefill { 1 } else { 24 })?;
+        }
+        // q_a, its norm, q_b (this rank's heads), RoPE on its last 64 dims, the absorbed query
         self.exl3(&lw.q_a, np(&a.xn), h, t, np(&a.qa), true)?;
         ck(unsafe { glm_rmsnorm(st, np(&a.qa), cfg.q_lora as i64, std::ptr::null(), 0, np(&lw.q_norm), np(&a.qr),
                                 cfg.q_lora as i64, t as i32, cfg.q_lora as i32, 1e-6) }, "q norm")?;
-        self.exl3(&lw.kv_a, np(&a.xn), h, t, np(&a.ckv), true)?;
-        let ldk = lw.kv_a.n;
-        ck(unsafe { glm_rmsnorm(st, np(&a.ckv), ldk as i64, std::ptr::null(), 0, np(&lw.kv_norm), np(&a.c), 512, t as i32, 512,
-                                1e-6) }, "kv norm")?;
-        ck(unsafe { glm_kv_fp8(st, np(&a.c), 512, rowsb, np(&kv.cq), np(&kv.cs), t as i32, 512) }, "latent cache")?;
-        ck(unsafe { glm_rope(st, at(&a.ckv, 512), ldk as i64, 64, np(&a.kr), 64, 64, t as i32, 1, np(&self.w.cos), np(&self.w.sin),
-                             posb) }, "rope key")?;
-        ck(unsafe { glm_rows_copy(st, np(&a.kr), 64, rowsb, np(&kv.cr), t as i32, 64) }, "rope cache")?;
-        // q_b (this rank's heads), RoPE on its last 64 dims, the absorbed latent query
         self.exl3(&lw.q_b, np(&a.qr), cfg.q_lora, t, np(&a.qb), true)?;
-        let decode = !prefill;
         let qrow = if decode { self.qrow / 2 } else { hl * 576 };
         let qbase = if decode { np(&a.qsend) } else { np(&a.qf) };
         let qrope = unsafe { (qbase as *mut u16).add(512) } as *mut c_void;
@@ -527,7 +607,6 @@ impl Engine {
                                       Mat { ptr: np(&a.kvb_bf), ty: R_16BF, ld: 512 }, 448 * 512, false, qbase, R_16BF,
                                       qrow as i64, 576, hl)?;
         }
-        // the indexer on full layers: queries, this step's keys, head weights; scores and top-k
         let s_all = p0 + t; // positions [0, S) once this step's rows are written
         let dense_causal = prefill && s_all <= TOPK;
         if full {
@@ -535,16 +614,9 @@ impl Engine {
             self.exl3(&ix.wq_b, np(&a.qr), cfg.q_lora, t, np(&a.qi), true)?;
             ck(unsafe { glm_rope(st, np(&a.qi), 4096, 128, np(&a.qi), 4096, 128, t as i32, 32, np(&self.w.cos), np(&self.w.sin),
                                  posb) }, "rope index q")?;
-            if prefill {
-                self.blas.gemm_rm(t, 128, h, Mat { ptr: np(&a.xn), ty: R_16BF, ld: h as i64 }, Mat { ptr: np(&ix.wk), ty: R_16BF, ld: h as i64 },
-                                  true, np(&a.ki), R_16BF, 128)?;
-            } else {
-                ck(unsafe { ds_linear_bf16(st, np(&a.xn), h as i64, np(&ix.wk), t as i32, 128, h as i32, 1, np(&a.ki),
-                                           std::ptr::null_mut(), 128, std::ptr::null_mut()) }, "index wk")?;
-            }
-            ck(unsafe { glm_index_key(st, np(&a.ki), 128, np(&ix.kn_w), np(&ix.kn_b), np(&self.w.cos), np(&self.w.sin), posb,
-                                      rowsb, np(kv.iq.as_ref().unwrap()), np(kv.is.as_ref().unwrap()), t as i32) }, "index key")?;
-            self.linear_f32w(np(&a.xn), h, &ix.wp, t, 32, h, np(&a.iw), if prefill { 1 } else { 4 })?;
+        }
+        if decode {
+            self.join()?;
         }
         let scale = (cfg.qk_dim() as f32).powf(-0.5);
         let inv_d = (cfg.index_dim as f32).powf(-0.5);
@@ -571,7 +643,7 @@ impl Engine {
             let hh = cfg.heads;
             let (ns, chunk) = decode_split(TOPK, hh, t);
             ck(unsafe { glm_mla(st, 2, np(&a.gs), (nbytes / 2) as i64, (self.qrow / 2) as i64, 576, hl as i32, np(&kv.cq), np(&kv.cs),
-                                np(&kv.cr), 0, np(&a.idx), TOPK as i64, TOPK as i32, bound, t as i32, hh as i32, scale,
+                                np(&kv.cr), 0, np(&a.idx), TOPK as i64, TOPK as i32, 0, bound, t as i32, hh as i32, scale,
                                 ns as i32, chunk as i32, np(&a.pm), np(&a.pl), np(&a.pacc), std::ptr::null_mut(), 0, 0) },
                "mla (split)")?;
             ck(unsafe { glm_mla_combine(st, np(&a.pm), np(&a.pl), np(&a.pacc), t as i32, hh as i32, ns as i32,
@@ -595,7 +667,7 @@ impl Engine {
             }
             let (ns, chunk) = decode_split(TOPK, hl, t);
             ck(unsafe { glm_mla(st, 2, qbase, 0, qrow as i64, 576, hl as i32, np(&kv.cq), np(&kv.cs), np(&kv.cr), 0,
-                                np(&a.idx), TOPK as i64, TOPK as i32, bound, t as i32, hl as i32, scale, ns as i32, chunk as i32,
+                                np(&a.idx), TOPK as i64, TOPK as i32, 1, bound, t as i32, hl as i32, scale, ns as i32, chunk as i32,
                                 np(&a.pm), np(&a.pl), np(&a.pacc), std::ptr::null_mut(), 0, 0) }, "mla")?;
             ck(unsafe { glm_mla_combine(st, np(&a.pm), np(&a.pl), np(&a.pacc), t as i32, hl as i32, ns as i32, np(&a.olat),
                                         (hl * 512) as i64, 512, std::ptr::null_mut(), std::ptr::null_mut(),
@@ -636,7 +708,7 @@ impl Engine {
             let posp = posb;
             let chunk = k.div_ceil(32) * 32;
             ck(unsafe { glm_mla(st, 2, qbase, 0, qrow as i64, 576, hl as i32, cq, cs, cr, split_n as i32, idx, TOPK as i64,
-                                k as i32, posp, t as i32, hl as i32, scale, 1, chunk as i32, std::ptr::null_mut(),
+                                k as i32, 1, posp, t as i32, hl as i32, scale, 1, chunk as i32, std::ptr::null_mut(),
                                 std::ptr::null_mut(), std::ptr::null_mut(), np(&a.olat), (hl * 512) as i64, 512) }, "mla (prefill)")?;
         }
         // the latent output through kv_b's value half, o_proj (this rank's head columns), summed
@@ -664,7 +736,7 @@ impl Engine {
             Mlp::Dense { gate_up, down } => {
                 let n = gate_up.n;
                 self.exl3(gate_up, np(&a.xn), h, t, np(&a.gu), true)?;
-                let (g, u, ld) = if t <= MAX_ROWS { (np(&a.gu), at(&a.gu, n), 2 * n) } else { (np(&a.gu), at(&a.gu, t * n), n) };
+                let (g, u, ld) = if t <= GEMV_ROWS { (np(&a.gu), at(&a.gu, n), 2 * n) } else { (np(&a.gu), at(&a.gu, t * n), n) };
                 ck(unsafe { glm_swiglu(st, g, ld as i64, u, ld as i64, np(&a.dact), n as i64, t as i32, n as i32) }, "swiglu")?;
                 self.gather_cols(np(&a.dact), t, n, 2, np(&a.dfull), prefill)?;
                 self.exl3(down, np(&a.dfull), n * w, t, np(&a.shout), false)?;
@@ -731,12 +803,17 @@ impl Engine {
         let dn = arena.down_n;
         let w = self.world;
         // the shared expert's gate/up -> its activation, into the pair buffer after the routed rows
-        self.exl3(sh_gate_up, x, h, n, np(&a.gu), true)?;
-        let hsh = at(&a.pair, p * il * 2);
-        let (g, u, ld) = if n <= MAX_ROWS { (np(&a.gu), at(&a.gu, il), 2 * il) } else { (np(&a.gu), at(&a.gu, n * il), il) };
-        ck(unsafe { glm_swiglu(st, g, ld as i64, u, ld as i64, hsh, il as i64, n as i32, il as i32) }, "shared swiglu")?;
-        // routed: grouping, rotation, gate/up, the down projection's input rotation
+        // (decode: on the side stream, next to the routed experts)
         let decode = p <= 64;
+        let (sst, x3) = if decode { (&self.st2, &a.x3s2) } else { (&self.st, &a.x3s) };
+        if decode {
+            self.fork()?;
+        }
+        self.exl3_on(sst, x3, sh_gate_up, x, h, n, np(&a.gu), true)?;
+        let hsh = at(&a.pair, p * il * 2);
+        let (g, u, ld) = if n <= GEMV_ROWS { (np(&a.gu), at(&a.gu, il), 2 * il) } else { (np(&a.gu), at(&a.gu, n * il), il) };
+        ck(unsafe { glm_swiglu(sst.raw(), g, ld as i64, u, ld as i64, hsh, il as i64, n as i32, il as i32) }, "shared swiglu")?;
+        // routed: grouping, rotation, gate/up, the down projection's input rotation
         let slots = arena.slots as i32;
         let (maxm, nexp) = if decode {
             unsafe { exl3m_group(np(&a.pick), np(&a.uids), np(&a.ucount), np(&a.members), n as i32, k as i32, slots, MAX_MEMBERS, st) };
@@ -768,6 +845,9 @@ impl Engine {
                          1, k as i32, slots, cfg.moe_inter as i32, f32::INFINITY, 1, st);
         }
         ck(unsafe { tidelm_cuda::ffi::cudaGetLastError() }, "routed up")?;
+        if decode {
+            self.join()?;
+        }
         // one gather: both ranks' [routed xd | shared act]
         let per = p * il * 2 + n * il * 2;
         if w > 1 {
@@ -781,8 +861,12 @@ impl Engine {
                 tidelm_cuda::memcpy_async(np(&a.hf), hsh, n * il * 2, tidelm_cuda::ffi::MEMCPY_DEVICE_TO_DEVICE, &self.st)?;
             }
         }
-        // routed down + the weighted combine over picks; the shared down; summed, gathered
+        // routed down + the weighted combine over picks; the shared down (side stream); summed, gathered
         let kd = il * w;
+        if decode {
+            self.fork()?;
+        }
+        self.exl3_on(sst, x3, sh_down, np(&a.hf), kd, n, np(&a.shout), false)?;
         unsafe {
             if up_tiled {
                 exl3m_prefill_smem_mode(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2), np(&arena.k2),
@@ -797,7 +881,9 @@ impl Engine {
                                k as i32, slots, st);
         }
         ck(unsafe { tidelm_cuda::ffi::cudaGetLastError() }, "routed down")?;
-        self.exl3(sh_down, np(&a.hf), kd, n, np(&a.shout), false)?;
+        if decode {
+            self.join()?;
+        }
         ck(unsafe { glm_moe_out(st, np(&a.local), np(&a.shout), np(&a.mout), (n * dn) as i64) }, "moe out")?;
         self.gather_cols(np(&a.mout), n, dn, 2, out, prefill)
     }
@@ -1108,11 +1194,13 @@ fn row2_bytes(hl: usize) -> usize {
     hl * 512 * 2 + hl * 4
 }
 
-/// Flash-decoding splits for `heads` heads over `k` picks at `t` rows (sparse_attn.sparse_mla's
-/// rule, ~32 programs a launch): (splits, picks a split, a multiple of 32).
+/// Flash-decoding splits for `heads` heads over `k` picks at `t` rows: (splits, picks a split, a
+/// multiple of 32). ~128 programs a launch, where sparse_attn.sparse_mla's ~32 left a verify
+/// step's rows walking 32 tiles each one after another (132 us a layer, nsys); at most 16
+/// splits, so the fp32 partials stay a few MB.
 fn decode_split(k: usize, heads: usize, t: usize) -> (usize, usize) {
     let hb = heads.div_ceil(32);
-    let want = 32usize.div_ceil(hb * t).next_power_of_two().clamp(1, 16);
+    let want = 128usize.div_ceil(hb * t).next_power_of_two().clamp(1, 16);
     let chunk = k.div_ceil(want).div_ceil(32) * 32;
     (k.div_ceil(chunk), chunk)
 }
@@ -1223,6 +1311,8 @@ impl Act {
             ehin: z(r * 2 * h)?,
             ehout: z(r * h / world)?,
             x3s: Exl3Scratch::new(r, max_k, max_kn, max_zn)?,
+            x3s2: Exl3Scratch::new(GEMV_ROWS, max_k, 8, 8 * 2 * MAX_ROWS * 6144)?,
+            split_part2: DeviceBuffer::new(24 * d * 128)?,
         })
     }
 }
@@ -1463,6 +1553,7 @@ impl Engine {
                     self.full_row_local(row)?;
                 }
                 crate::adapt::OP_ADAPT => self.follow_adapt(&mut r)?,
+                op @ (crate::prefix::OP_DISK_SAVE | crate::prefix::OP_DISK_LOAD) => self.follow_disk(op, &mut r)?,
                 crate::adapt::OP_BG => self.follow_bg(&mut r)?,
                 OP_ZERO_DEMAND => {
                     self.demand.zero_async(&self.st)?;

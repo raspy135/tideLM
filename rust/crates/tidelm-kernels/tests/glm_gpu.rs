@@ -513,7 +513,7 @@ fn mla_attention_direct_split_and_cross_rank_merge() {
         let d_o = DeviceBuffer::<u16>::zeroed(t * hh * 512).unwrap();
         ok(unsafe {
             glm_mla(st.raw(), mt, p(&d_q), 0, (hh * 576) as i64, 576, hh as i32, p(&d_cq), p(&d_cs), p(&d_cr), 0, p(&d_idx),
-                    kk as i64, kk as i32, p(&d_b), t as i32, hh as i32, scale as f32, 1, 320, null(), null(), null(), p(&d_o),
+                    kk as i64, kk as i32, 0, p(&d_b), t as i32, hh as i32, scale as f32, 1, 320, null(), null(), null(), p(&d_o),
                     (hh * 512) as i64, 512)
         });
         last_ok();
@@ -530,7 +530,7 @@ fn mla_attention_direct_split_and_cross_rank_merge() {
     let d_pa = DeviceBuffer::<f32>::zeroed(t * hh * ns * 512).unwrap();
     ok(unsafe {
         glm_mla(st.raw(), 2, p(&d_q), 0, (hh * 576) as i64, 576, hh as i32, p(&d_cq), p(&d_cs), p(&d_cr), 0, p(&d_idx), kk as i64,
-                kk as i32, p(&d_b), t as i32, hh as i32, scale as f32, ns as i32, chunk, p(&d_pm), p(&d_pl), p(&d_pa), null(), 0, 0)
+                kk as i32, 0, p(&d_b), t as i32, hh as i32, scale as f32, ns as i32, chunk, p(&d_pm), p(&d_pl), p(&d_pa), null(), 0, 0)
     });
     let d_o = DeviceBuffer::<u16>::zeroed(t * hh * 512).unwrap();
     ok(unsafe { glm_mla_combine(st.raw(), p(&d_pm), p(&d_pl), p(&d_pa), t as i32, hh as i32, ns as i32, p(&d_o), (hh * 512) as i64, 512, null(), null(), null(), 0, 0, 0) });
@@ -551,7 +551,7 @@ fn mla_attention_direct_split_and_cross_rank_merge() {
         let d_i = dev(&mine);
         ok(unsafe {
             glm_mla(st.raw(), 2, p(&d_q), 0, (hh * 576) as i64, 576, hh as i32, p(&d_cq), p(&d_cs), p(&d_cr), 0, p(&d_i),
-                    kk as i64, kk as i32, p(&d_b), t as i32, hh as i32, scale as f32, ns as i32, chunk, p(&d_pm), p(&d_pl),
+                    kk as i64, kk as i32, 0, p(&d_b), t as i32, hh as i32, scale as f32, ns as i32, chunk, p(&d_pm), p(&d_pl),
                     p(&d_pa), null(), 0, 0)
         });
         let d_oo = DeviceBuffer::<f32>::zeroed(t * hl * 512).unwrap();
@@ -581,7 +581,7 @@ fn mla_attention_direct_split_and_cross_rank_merge() {
     let bound2 = [40i32, 7];
     let d_b2 = dev(&bound2);
     ok(unsafe {
-        glm_mla(st.raw(), 2, p(&d_q), 0, (hh * 576) as i64, 576, hh as i32, p(&d_cq), p(&d_cs), p(&d_cr), 0, null(), 0, 4096,
+        glm_mla(st.raw(), 2, p(&d_q), 0, (hh * 576) as i64, 576, hh as i32, p(&d_cq), p(&d_cs), p(&d_cr), 0, null(), 0, 4096, 1,
                 p(&d_b2), t as i32, hh as i32, scale as f32, 1, 4096, null(), null(), null(), p(&d_o), (hh * 512) as i64, 512)
     });
     last_ok();

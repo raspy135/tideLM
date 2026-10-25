@@ -39,7 +39,7 @@ extern "C" {
     pub fn glm_mla_smem(mt: c_int) -> c_int;
     pub fn glm_mla(stream: CudaStream, mt: c_int, q: *const c_void, q_ldg: i64, q_ldt: i64, q_ldh: i64, hg: c_int,
                    cq: *const c_void, cs: *const c_void, cr: *const c_void, split_n: c_int, idx: *const c_void,
-                   ld_idx: i64, k: c_int, bound: *const c_void, t: c_int, h: c_int, scale: f32, nsplit: c_int,
+                   ld_idx: i64, k: c_int, ascending: c_int, bound: *const c_void, t: c_int, h: c_int, scale: f32, nsplit: c_int,
                    chunk: c_int, part_m: *mut c_void, part_l: *mut c_void, part_acc: *mut c_void, out: *mut c_void,
                    o_ldt: i64, o_ldh: i64) -> c_int;
     pub fn glm_mla_combine(stream: CudaStream, pm: *const c_void, pl: *const c_void, pacc: *const c_void, t: c_int,

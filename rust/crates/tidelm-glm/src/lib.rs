@@ -6,6 +6,7 @@ pub mod adapt;
 pub mod arena;
 pub mod config;
 pub mod forward;
+pub mod prefix;
 pub mod residency;
 pub mod serve;
 pub mod weights;

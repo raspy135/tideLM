@@ -178,6 +178,20 @@ impl Event {
         Ok(Event(e))
     }
 
+    /// A timing event (benchmarks: cudaEventElapsedTime between two of them).
+    pub fn timing() -> Result<Self> {
+        let mut e: ffi::cudaEvent_t = std::ptr::null_mut();
+        check(unsafe { ffi::cudaEventCreateWithFlags(&mut e, 0) }, "cudaEventCreateWithFlags")?;
+        Ok(Event(e))
+    }
+
+    /// Milliseconds from `start` to this event (both recorded and complete).
+    pub fn elapsed_ms(&self, start: &Event) -> Result<f32> {
+        let mut ms = 0f32;
+        check(unsafe { ffi::cudaEventElapsedTime(&mut ms, start.0, self.0) }, "cudaEventElapsedTime")?;
+        Ok(ms)
+    }
+
     pub fn record(&self, stream: &Stream) -> Result<()> {
         check(unsafe { ffi::cudaEventRecord(self.0, stream.raw()) }, "cudaEventRecord")
     }

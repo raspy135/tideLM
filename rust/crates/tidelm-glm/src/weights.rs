@@ -90,6 +90,13 @@ pub struct Exl3Mat {
     pub bits: Vec<usize>,
     /// split-K of decode calls: it fixes their summation order (docs/gotchas.md)
     pub split: usize,
+    /// rows above which decode calls take `split_wide` (0: always `split`)
+    pub wide_rows: usize,
+    /// the grouped kernel's trellis prefetch depth in decode calls (1 or 2) and n-tiles a warp
+    /// (8, or 4 with pf 2: half the reduction buffer, more blocks)
+    pub pf: usize,
+    pub nt: usize,
+    pub split_wide: usize,
     tr: DeviceBuffer<u8>,
     tr_bytes: usize,
     suh: DeviceBuffer<u16>,
@@ -113,6 +120,7 @@ impl Exl3Mat {
         }
         let (k, n, g) = (self.k, self.n, self.g);
         let r = rows * g;
+        let split = if self.wide_rows > 0 && rows > self.wide_rows { self.split_wide } else { self.split };
         let (xin, xs) = if g > 1 {
             ck(unsafe { glm_dup_rows(st.raw(), x, ldx as i64, s.xg.raw(), rows as i32, k as i32, g as i32) }, "dup rows")?;
             (s.xg.raw() as *const c_void, k)
@@ -123,9 +131,9 @@ impl Exl3Mat {
             exl3m_dense_rot(xin, xs as i32, self.suh.raw(), s.xh.raw(), r as i32, k as i32, g as i32, 1, st.raw());
             let (uids, count, members) = m.get(g, rows);
             exl3m_grouped(s.xh.raw(), s.xh.raw(), self.ptr.raw(), self.ptr.raw(), self.k2.raw(), self.k2.raw(), uids,
-                          count, members, s.z.raw(), k as i32, n as i32, r as i32, self.split as i32, MAX_MEMBERS,
-                          g as i32, g as i32, 1, 8, 4, 1, 2, self.hi, CB_MUL1, st.raw());
-            exl3m_dense_out(s.z.raw(), self.svh.raw(), out, r as i32, n as i32, self.split as i32, g as i32,
+                          count, members, s.z.raw(), k as i32, n as i32, r as i32, split as i32, MAX_MEMBERS,
+                          g as i32, g as i32, 1, self.nt as i32, 4, self.pf as i32, 2, self.hi, CB_MUL1, st.raw());
+            exl3m_dense_out(s.z.raw(), self.svh.raw(), out, r as i32, n as i32, split as i32, g as i32,
                             out_bf16 as i32, st.raw());
         }
         ck(unsafe { tidelm_cuda::ffi::cudaGetLastError() }, "exl3 decode")
@@ -289,7 +297,8 @@ impl<'a> Loader<'a> {
         let ptr = DeviceBuffer::from_slice(&(0..g).map(|i| base + (i * tr_bytes) as i64).collect::<Vec<_>>())?;
         let k2 = DeviceBuffer::from_slice(&bits.iter().map(|&b| 2 * b as i32).collect::<Vec<_>>())?;
         let hi = if bits.iter().all(|&b| b <= 5) { 10 } else { 16 };
-        Ok(Exl3Mat { k, n, n_out: n_out.unwrap_or(n), g, bits, split, tr, tr_bytes, suh: DeviceBuffer::from_slice(&suh_all)?,
+        Ok(Exl3Mat { k, n, n_out: n_out.unwrap_or(n), g, bits, split, wide_rows: 0, split_wide: split, pf: 1, nt: 8, tr, tr_bytes,
+                     suh: DeviceBuffer::from_slice(&suh_all)?,
                      svh: DeviceBuffer::from_slice(&svh_all)?, ptr, k2, hi })
     }
 
