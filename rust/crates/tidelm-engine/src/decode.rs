@@ -59,6 +59,10 @@ pub struct Generation {
     /// when the scheduler took the request into a lane: what it waited in the queue before,
     /// and its prefill after (the server's request log line)
     pub admitted: Option<std::time::Instant>,
+    /// summed over the steps the request decoded in: the step's live rows, then its seconds
+    /// drafting, in the backbone step (host prep, device, read-back), accepting, and rolling
+    /// back + seeding (the server prints them with TIDELM_STEP_SPLIT)
+    pub split: [f64; 5],
 }
 
 fn digest(h: u64, logits: &[u16]) -> u64 {
@@ -1164,7 +1168,8 @@ impl Scheduler {
             segs.push(Seg { lane, ids: &p[s.fed..s.fed + c], want, decode: false, next, hashes: None });
         }
         self.stats.steps += 1;
-        self.stats.rows += segs.iter().map(|s| s.ids.len()).sum::<usize>();
+        let step_rows = segs.iter().map(|s| s.ids.len()).sum::<usize>();
+        self.stats.rows += step_rows;
         if std::env::var_os("TIDELM_TRACE_STEPS").is_some() {
             let free = tidelm_cuda::mem_get_info().map(|m| m.0 >> 20).unwrap_or(0);
             eprintln!("step {}: segments {:?}, {} MiB free", self.stats.steps,
@@ -1300,6 +1305,11 @@ impl Scheduler {
         engine.rollback_batch(&rollbacks)?;
         engine.seed_draft_batch(&seeds)?;
         self.stats.cache_s += tc.elapsed().as_secs_f64();
+        let split = [step_rows as f64, (tf - td).as_secs_f64(), (tp - tf).as_secs_f64(), (tc - tp).as_secs_f64(), tc.elapsed().as_secs_f64()];
+        for &(lane, _) in &decode {
+            let g = &mut self.slots[lane].as_mut().unwrap().gen;
+            g.split.iter_mut().zip(split).for_each(|(a, b)| *a += b);
+        }
         // a step that captured a graph is not timed for the depth policies
         let step_s = (engine.graph_captures == caps).then(|| t0.elapsed().as_secs_f64());
         for (lane, mut emitted, verify, prompt_end) in emits {

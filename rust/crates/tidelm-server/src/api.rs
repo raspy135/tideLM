@@ -92,6 +92,13 @@ pub fn sink(id: u64, prompt: usize, tx: mpsc::Sender<Event>) -> Box<dyn FnMut(Ev
             }
             Event::Done(f, g) => {
                 eprintln!("{}", request_line(id, prompt, n, [t0, first.unwrap_or(t0), Instant::now()], first.is_some(), f, g));
+                if std::env::var_os("TIDELM_STEP_SPLIT").is_some() && g.steps > 0 {
+                    let (k, sp) = (g.steps as f64, &g.split);
+                    let depth = g.depths.iter().sum::<usize>() as f64 / g.depths.len().max(1) as f64;
+                    eprintln!("request {id} a decode step: {:.2} rows (depth {depth:.2}), draft {:.1} ms, forward {:.1} ms, accept {:.1} ms, \
+                               rollback + seed {:.1} ms",
+                              sp[0] / k, sp[1] / k * 1e3, sp[2] / k * 1e3, sp[3] / k * 1e3, sp[4] / k * 1e3);
+                }
                 eprintln!("memory: {}", tidelm_cuda::mem::report());
                 if let Some(top) = crate::heap_live_top(6) {
                     eprintln!("memory: heap still live since launch: {top}");

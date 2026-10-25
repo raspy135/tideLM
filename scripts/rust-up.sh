@@ -206,8 +206,9 @@ else
 (image $have, checkout $want): scripts/tide.sh build $f rebuilds and ships it"
 fi
 # TIDELM_MEM_LOG_MB: log every allocation of at least that many MB made after launch (default 8);
-# TIDELM_GRAPH_CACHE: how many step graphs the engine keeps (default 128, ~4-8 MB each)
-for v in TIDELM_MEM_LOG_MB TIDELM_GRAPH_CACHE; do [[ -n "${!v:-}" ]] && envs+=("$v=${!v}"); done
+# TIDELM_GRAPH_CACHE: how many step graphs the engine keeps (default 128, ~4-8 MB each);
+# TIDELM_STEP_SPLIT: a line per request splitting its decode step's time
+for v in TIDELM_MEM_LOG_MB TIDELM_GRAPH_CACHE TIDELM_STEP_SPLIT; do [[ -n "${!v:-}" ]] && envs+=("$v=${!v}"); done
 for e in "${envs[@]}"; do envf+=(-e "$e"); done
 vols=() seen=" "
 for p in "${rw[@]}"; do [[ $seen == *" $p "* ]] && continue; seen+="$p "; vols+=(-v "$p:$p"); done
