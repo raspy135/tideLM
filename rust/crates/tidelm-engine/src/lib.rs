@@ -14,6 +14,7 @@ pub mod forward;
 pub mod hot;
 pub mod keep;
 pub mod pair;
+pub mod prefix_disk;
 pub mod rope;
 pub mod weights;
 

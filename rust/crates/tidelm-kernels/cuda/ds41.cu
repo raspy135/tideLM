@@ -1249,6 +1249,8 @@ struct RouterRec {
     int lanes;
     const int* phase;
     float* hot;
+    // the step's live pairs (rows x K) or null: rows past them are filler and ask for nothing
+    const int* live;
 };
 
 __global__ void router_kernel(const float* __restrict__ z, const float* __restrict__ bias,
@@ -1304,7 +1306,8 @@ __global__ void router_kernel(const float* __restrict__ z, const float* __restri
         }
     }
     const int ln = rec.lane ? rec.lane[m] : 0;
-    const bool record = rec.counts && ln < rec.lanes;
+    const bool filler = ln >= rec.lanes || (rec.live && m * K >= *rec.live);
+    const bool record = rec.counts && !filler;
     if (!record && !rec.hot) return;
     // the unmasked choices: the same selection over every expert
     __syncthreads();
@@ -1353,7 +1356,7 @@ __global__ void router_kernel(const float* __restrict__ z, const float* __restri
         }
         if (rec.hot) {
             // a filler row asks for nothing
-            rec.hot[((int64_t)m * K + k) * 2] = miss && ln < rec.lanes ? score[e] / (ssum + 1e-20f) : 0.f;
+            rec.hot[((int64_t)m * K + k) * 2] = miss && !filler ? score[e] / (ssum + 1e-20f) : 0.f;
             rec.hot[((int64_t)m * K + k) * 2 + 1] = (float)e;
         }
     }
@@ -3152,6 +3155,35 @@ __global__ void pending_update_kernel(const float* __restrict__ kv, const float*
     }
 }
 
+// A ratio-2 source's pending state at length n of lane L (model.py::Caches.rollback): even n
+// has none; odd n's is position n - 1's input, from the last chunk's memory, or the state
+// before that chunk if n - 1 precedes it. Written to (pk, ps, flag) - the lane's own state
+// for a rollback, a snapshot's for the prefix cache. One block a call.
+__device__ __forceinline__ void pending_at(int n, int L, const float* __restrict__ mem_kv, const float* __restrict__ mem_sc,
+                                           const int* __restrict__ mem_start, const float* __restrict__ before_kv,
+                                           const float* __restrict__ before_sc, const int* __restrict__ before_flag,
+                                           float* pk, float* ps, int* flag, int D, int mem_rows) {
+    if (n % 2 == 0) {
+        if (threadIdx.x == 0) *flag = 0;
+        return;
+    }
+    const int p = n - 1, start = mem_start[L];
+    // a rollback reaches at most into the last chunk; anything else is a caller bug and
+    // must not read past the chunk memory
+    if (p - start >= mem_rows || p + 1 < start) return;
+    if (p >= start) {
+        const int64_t row = (int64_t)L * mem_rows * D + (int64_t)(p - start) * D;
+        for (int d = threadIdx.x; d < D; d += blockDim.x) { pk[d] = mem_kv[row + d]; ps[d] = mem_sc[row + d]; }
+        if (threadIdx.x == 0) *flag = 1;
+    } else {
+        for (int d = threadIdx.x; d < D; d += blockDim.x) {
+            pk[d] = before_kv[(int64_t)L * D + d];
+            ps[d] = before_sc[(int64_t)L * D + d];
+        }
+        if (threadIdx.x == 0) *flag = before_flag[L];
+    }
+}
+
 // model.py::Caches.rollback for a ratio-2 source, per lane: block b restores lane lanes[b]
 // to length n_dev[b] (read from the device: the accepted length of its verify block).
 __global__ void rollback_pending_kernel(const int* __restrict__ n_dev, const int* __restrict__ lanes,
@@ -3159,29 +3191,27 @@ __global__ void rollback_pending_kernel(const int* __restrict__ n_dev, const int
                                         const int* __restrict__ mem_start, const float* __restrict__ before_kv,
                                         const float* __restrict__ before_sc, const int* __restrict__ before_flag,
                                         float* pkv, float* psc, int* flag, int D, int mem_rows) {
-    const int n = n_dev[blockIdx.x];
     const int L = lanes ? lanes[blockIdx.x] : 0;
-    if (n % 2 == 0) {
-        if (threadIdx.x == 0) flag[L] = 0;
-        return;
-    }
-    const int p = n - 1, start = mem_start[L];
-    // a rollback reaches at most into the last chunk; anything else is a caller bug and
-    // must not read past the chunk memory
-    if (p - start >= mem_rows || p + 1 < start) return;
-    float* pk = pkv + (int64_t)L * D;
-    float* ps = psc + (int64_t)L * D;
-    if (p >= start) {
-        const int64_t row = (int64_t)L * mem_rows * D + (int64_t)(p - start) * D;
-        for (int d = threadIdx.x; d < D; d += blockDim.x) { pk[d] = mem_kv[row + d]; ps[d] = mem_sc[row + d]; }
-        if (threadIdx.x == 0) flag[L] = 1;
-    } else {
-        for (int d = threadIdx.x; d < D; d += blockDim.x) {
-            pk[d] = before_kv[(int64_t)L * D + d];
-            ps[d] = before_sc[(int64_t)L * D + d];
-        }
-        if (threadIdx.x == 0) flag[L] = before_flag[L];
-    }
+    pending_at(n_dev[blockIdx.x], L, mem_kv, mem_sc, mem_start, before_kv, before_sc, before_flag, pkv + (int64_t)L * D,
+               psc + (int64_t)L * D, flag + L, D, mem_rows);
+}
+
+// The prefix cache's copy of lane L's pending state at length n: out [2][D] (kv, score) and
+// *out_flag; the lane's own state is untouched.
+__global__ void pending_snapshot_kernel(int n, int L, const float* __restrict__ mem_kv, const float* __restrict__ mem_sc,
+                                        const int* __restrict__ mem_start, const float* __restrict__ before_kv,
+                                        const float* __restrict__ before_sc, const int* __restrict__ before_flag,
+                                        float* out, int* out_flag, int D, int mem_rows) {
+    pending_at(n, L, mem_kv, mem_sc, mem_start, before_kv, before_sc, before_flag, out, out + D, out_flag, D, mem_rows);
+}
+
+// out[idx[m]] = src[m] for rows of D 16-bit values (the prefix cache's ring rows back into
+// their slots).
+__global__ void scatter_rows_u16_kernel(const uint16_t* __restrict__ src, const int* __restrict__ idx, uint16_t* __restrict__ out,
+                                        int D) {
+    const int m = blockIdx.y;
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d < D) out[(int64_t)idx[m] * D + d] = src[(int64_t)m * D + d];
 }
 
 // Routed expert ids -> arena slots through the device LUT (model.py: lut[L][indices]).
@@ -3368,10 +3398,11 @@ int ds_router(void* stream, const void* z, const void* bias, const void* keep, i
 
 int ds_router_rec(void* stream, const void* z, const void* bias, const void* keep, int M, int E, int K,
                   float route_scale, void* idx, void* weights, void* counts, void* mass, void* miss,
-                  int64_t lane_stride, const void* lane, int lanes, const void* phase, void* hot) {
+                  int64_t lane_stride, const void* lane, int lanes, const void* phase, void* hot, const void* live) {
     if (K > 8) return cudaErrorInvalidValue;
     RouterRec rec{static_cast<double*>(counts), static_cast<double*>(mass), static_cast<double*>(miss), lane_stride,
-                  static_cast<const int*>(lane), lanes, static_cast<const int*>(phase), static_cast<float*>(hot)};
+                  static_cast<const int*>(lane), lanes, static_cast<const int*>(phase), static_cast<float*>(hot),
+                  static_cast<const int*>(live)};
     if (rec.counts && (!rec.mass || !rec.miss)) return cudaErrorInvalidValue;
     router_kernel<<<M, 128, 2 * E * sizeof(float), static_cast<cudaStream_t>(stream)>>>(
         static_cast<const float*>(z), static_cast<const float*>(bias), static_cast<const uint8_t*>(keep), E, K,
@@ -3524,6 +3555,23 @@ int ds_unpack_fp4_rows(void* stream, const void* src, void* dst, int rows) {
     const int64_t n = (int64_t)rows * 64;
     unpack_fp4_rows_kernel<<<(unsigned)((n + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
         static_cast<const uint8_t*>(src), static_cast<__nv_bfloat16*>(dst), rows);
+    return static_cast<int>(cudaGetLastError());
+}
+
+int ds_pending_snapshot(void* stream, int n, int lane, const void* mem_kv, const void* mem_sc, const void* mem_start,
+                        const void* before_kv, const void* before_sc, const void* before_flag, void* out, void* out_flag, int D,
+                        int mem_rows) {
+    pending_snapshot_kernel<<<1, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        n, lane, static_cast<const float*>(mem_kv), static_cast<const float*>(mem_sc), static_cast<const int*>(mem_start),
+        static_cast<const float*>(before_kv), static_cast<const float*>(before_sc), static_cast<const int*>(before_flag),
+        static_cast<float*>(out), static_cast<int*>(out_flag), D, mem_rows);
+    return static_cast<int>(cudaGetLastError());
+}
+
+int ds_scatter_rows_u16(void* stream, const void* src, const void* idx, void* out, int M, int D) {
+    if (M < 1) return cudaSuccess;
+    scatter_rows_u16_kernel<<<dim3((D + 255) / 256, M), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const uint16_t*>(src), static_cast<const int*>(idx), static_cast<uint16_t*>(out), D);
     return static_cast<int>(cudaGetLastError());
 }
 

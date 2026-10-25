@@ -50,6 +50,8 @@ pub struct Generation {
     /// with adaptive residency, the request's routed picks the residents missed, per phase
     /// (0 prompt, 1 decode): [missed, picks, missed score, score] (forward::LaneDemand::miss)
     pub miss: [f64; 8],
+    /// prompt tokens restored from the prefix cache rather than prefilled
+    pub cached: usize,
 }
 
 fn digest(h: u64, logits: &[u16]) -> u64 {
@@ -404,6 +406,9 @@ pub struct BatchStats {
     /// probes run before prefills, and the rows they fed
     pub probes: usize,
     pub probe_rows: usize,
+    /// prefix cache: requests that restored a prefix, and the tokens they did not prefill
+    pub prefix_hits: usize,
+    pub prefix_tokens: usize,
 }
 
 /// How the scheduler picks each decoding lane's verify depth.
@@ -473,15 +478,42 @@ struct Slot {
     mark: (usize, f64, f64),
     /// the probe this request runs before its prefill (adapt::ProbeConfig)
     probe: Option<ProbeRun>,
+    /// prompt tokens restored from the prefix cache
+    restored: usize,
 }
 
-/// A request's probe: the prompt rows it feeds (positions 0.. of its lane), their engram
-/// hashes from their places in the prompt, how many have been fed, and its kind.
+/// A request's probe: the prompt rows it feeds and the lane they go to - the request's own
+/// from its restored length for a two-pass probe, the engine's probe lane from position 0 for
+/// an excerpt - their engram hashes from their places in the prompt, how many have been fed,
+/// from which row on they vote (an excerpt's rows in the cached prefix do not), and for a
+/// two-pass probe the snapshot that puts its lane back afterwards (None: reset to 0).
 struct ProbeRun {
     ids: Vec<u32>,
     hashes: Vec<i64>,
     fed: usize,
     kind: &'static str,
+    lane: usize,
+    vote_from: usize,
+    restore: Option<u64>,
+}
+
+/// The prompt tokens a restore of `restored` of `len` already computed: all of them for an exact
+/// re-send - the prefix cache keeps prompts one short, so their last token runs again for its
+/// logits alone - else `restored`. The probe and the boundary pass count new tokens from here,
+/// as the Python engine's full hit (new == 0) does.
+fn known(restored: usize, len: usize) -> usize {
+    if restored > 0 && restored + 1 == len { len } else { restored }
+}
+
+/// A lane's part of the RAM prefix cache (v41_engine's _prefix_cache / _prefix_snapshots): the
+/// prompt whose rows its caches hold, snapshots at its prefill boundaries, and the one at its
+/// length - 1 (the next prompt re-runs at least one token; Rust has no tail replay to recompute
+/// the last row's logits from).
+#[derive(Default)]
+struct LanePrefix {
+    tokens: Vec<u32>,
+    bounds: std::collections::BTreeMap<usize, u64>,
+    full: Option<(usize, u64)>,
 }
 
 /// A lane's depth policy, kept across the requests the lane serves (its step-time estimates
@@ -513,6 +545,10 @@ pub struct Scheduler {
     /// decode_tokens output tokens, and at the end of each request (set_adapt)
     adapt: Option<crate::adapt::Adapt>,
     probe: Option<crate::adapt::ProbeConfig>,
+    /// the RAM prefix cache: boundary snapshots kept a lane (None: off)
+    prefix_snaps: Option<usize>,
+    prefix: Vec<LanePrefix>,
+    next_snap: u64,
 }
 
 impl Scheduler {
@@ -555,7 +591,136 @@ impl Scheduler {
             stats: BatchStats::default(),
             adapt: None,
             probe: None,
+            prefix_snaps: None,
+            prefix: (0..lanes).map(|_| LanePrefix::default()).collect(),
+            next_snap: 1,
         })
+    }
+
+    /// The RAM prefix cache (DSV41_PREFIX_CACHE=1, DSV41_PREFIX_SNAPSHOTS=`snapshots`): a
+    /// request admitted to a lane resumes from the longest snapshot of the lane's last prompt
+    /// that it shares, at least its last token short of its own end.
+    pub fn set_prefix_cache(&mut self, snapshots: usize) {
+        self.prefix_snaps = Some(snapshots);
+    }
+
+    fn new_snap(&mut self) -> u64 {
+        self.next_snap += 1;
+        self.next_snap
+    }
+
+    /// Restore `lane` (just reset) from the longest snapshot `prompt` shares with the lane's
+    /// last prompt: its length and id (0, None: a miss, and every snapshot of the lane goes).
+    /// Snapshots past it are of rows this prompt rewrites, so they go too (v41_engine
+    /// _restore_prefix); the prompt's own snapshot at its length - 1 becomes a boundary.
+    fn prefix_admit(&mut self, engine: &mut Engine, lane: usize, prompt: &[u32]) -> Result<(usize, Option<u64>)> {
+        if self.prefix_snaps.is_none() {
+            return Ok((0, None));
+        }
+        let lp = &self.prefix[lane];
+        let common = lp.tokens.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+        let limit = common.min(prompt.len().saturating_sub(1));
+        let best = lp.full.iter().copied().chain(lp.bounds.iter().map(|(&n, &id)| (n, id))).filter(|&(n, _)| n <= limit).max();
+        // the disk tier, when it restores more than the lane's RAM snapshots do (ties: RAM)
+        let ram_n = best.map(|b| b.0).unwrap_or(0);
+        let disk = engine.prefix_disk_candidates(prompt, prompt.len().saturating_sub(1));
+        if let Some((n, id)) = disk.into_iter().find(|&(n, _)| n > ram_n) {
+            let snap = self.new_snap();
+            let lp = &mut self.prefix[lane];
+            let old: Vec<u64> = lp.bounds.values().copied().chain(lp.full.map(|(_, id)| id)).collect();
+            lp.bounds.clear();
+            lp.full = None;
+            lp.tokens = prompt.to_vec();
+            // the bundle's rows replace the lane's: its RAM snapshots are of another history
+            engine.prefix_drop(lane, &old)?;
+            if engine.prefix_disk_load(lane, &id, n, snap, prompt)? {
+                self.prefix[lane].bounds.insert(n, snap);
+                self.stats.prefix_hits += 1;
+                self.stats.prefix_tokens += n;
+                eprintln!("prefix disk: restored {n} of {} tokens from bundle {id}", prompt.len());
+                return Ok((n, Some(snap)));
+            }
+            return Ok((0, None));
+        }
+        let lp = &mut self.prefix[lane];
+        let mut stale: Vec<u64> = Vec::new();
+        let out = match best {
+            Some((n, id)) => {
+                engine.prefix_restore(lane, id)?;
+                stale.extend(lp.bounds.range(n + 1..).map(|(_, &id)| id));
+                lp.bounds.retain(|&k, _| k <= n);
+                match lp.full.take() {
+                    Some((fnn, fid)) if fnn == n => {
+                        lp.bounds.insert(fnn, fid);
+                    }
+                    Some((_, fid)) => stale.push(fid),
+                    None => {}
+                }
+                (n, Some(id))
+            }
+            None => {
+                stale.extend(lp.bounds.values().copied());
+                stale.extend(lp.full.map(|(_, id)| id));
+                lp.bounds.clear();
+                lp.full = None;
+                (0, None)
+            }
+        };
+        lp.tokens = prompt.to_vec();
+        engine.prefix_drop(lane, &stale)?;
+        if out.0 > 0 {
+            self.stats.prefix_hits += 1;
+            self.stats.prefix_tokens += out.0;
+        }
+        Ok(out)
+    }
+
+    /// A boundary snapshot of `lane` at its fed length `n` before its next prompt chunk (the
+    /// Python engine's span starts), the shortest dropped past the limit.
+    fn prefix_boundary(&mut self, engine: &mut Engine, lane: usize, n: usize) -> Result<()> {
+        let Some(keep) = self.prefix_snaps else { return Ok(()) };
+        if n == 0 || keep == 0 || self.prefix[lane].bounds.contains_key(&n) {
+            return Ok(());
+        }
+        let id = self.new_snap();
+        engine.prefix_snapshot(lane, n, id)?;
+        let lp = &mut self.prefix[lane];
+        lp.bounds.insert(n, id);
+        let mut gone = Vec::new();
+        while lp.bounds.len() > keep {
+            let (&k, &v) = lp.bounds.iter().next().unwrap();
+            lp.bounds.remove(&k);
+            gone.push(v);
+        }
+        engine.prefix_drop(lane, &gone)
+    }
+
+    /// The prompt's own snapshot, at its length - 1, after its last chunk (before decode
+    /// writes past it).
+    fn prefix_full(&mut self, engine: &mut Engine, lane: usize, p: usize) -> Result<()> {
+        if self.prefix_snaps.is_none() || p < 2 {
+            return Ok(());
+        }
+        let id = self.new_snap();
+        engine.prefix_snapshot(lane, p - 1, id)?;
+        let old = self.prefix[lane].full.replace((p - 1, id));
+        engine.prefix_drop(lane, &old.map(|(_, id)| vec![id]).unwrap_or_default())?;
+        // the disk tier (prefix_persistence.save): a prompt that prefilled anything, at most
+        // once an interval, nothing written when a bundle already restores all its prefixes
+        let restored = self.slots[lane].as_ref().map(|s| s.restored).unwrap_or(0);
+        if p > restored + 1 && engine.prefix_disk_due() {
+            let lp = &self.prefix[lane];
+            let snaps: Vec<(usize, u64)> = lp.bounds.iter().map(|(&n, &id)| (n, id)).chain(lp.full).collect();
+            let ns: Vec<usize> = snaps.iter().map(|s| s.0).collect();
+            if !engine.prefix_disk_duplicate(&lp.tokens, &ns) {
+                let bid = format!("{:016x}{:08x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0),
+                                  self.next_snap as u32);
+                let tokens = lp.tokens.clone();
+                let ids: Vec<u64> = snaps.iter().map(|s| s.1).collect();
+                engine.prefix_disk_save(lane, &bid, &tokens, &ids)?;
+            }
+        }
+        Ok(())
     }
 
     /// Adaptive residency for this scheduler's engine, which must record demand
@@ -571,8 +736,16 @@ impl Scheduler {
     /// re-fitted to the history previewed with it. Then the lane starts the real prefill.
     fn probe_finish(&mut self, engine: &mut Engine, lane: usize) -> Result<()> {
         let pr = self.slots[lane].as_mut().unwrap().probe.take().unwrap();
-        let d = engine.lane_demand(lane, true)?;
-        engine.reset_lane(lane)?;
+        let d = engine.lane_demand(pr.lane, true)?;
+        // a two-pass probe ran in the request's lane: put it back where the prefill starts
+        if pr.lane == lane {
+            match pr.restore {
+                Some(id) => {
+                    engine.prefix_restore(lane, id)?;
+                }
+                None => engine.reset_lane(lane)?,
+            }
+        }
         let Some(adapt) = self.adapt.as_ref() else { return Ok(()) };
         let keep = engine.resident_mask().ok_or("adaptive residency needs resident mode")?;
         let predicted = adapt.predicted_miss(&keep, &d);
@@ -622,7 +795,7 @@ impl Scheduler {
         }
         s.mark = (s.gen.tokens.len().max(1), 0.0, 0.0);
         let (rate, _) = crate::adapt::miss_rate(&d);
-        let (picks, new) = (d.miss[1] + d.miss[5], s.job.prompt.len());
+        let (picks, new) = (d.miss[1] + d.miss[5], s.job.prompt.len() - known(s.restored, s.job.prompt.len()));
         if new >= adapt.cfg.min_new && picks > 0.0 && rate >= adapt.cfg.gate {
             self.adapt_pass(engine, None, &format!("prompt of {new} tokens, miss rate {rate:.4}"))?;
         }
@@ -729,17 +902,34 @@ impl Scheduler {
                         LanePolicy::None => {}
                     }
                     let rng = Pcg64::from_seed(job.seed as u128);
+                    let (restored, snap) = self.prefix_admit(engine, lane, &job.prompt)?;
+                    // one excerpt at a time in the probe lane
+                    let probe_lane = engine.probe_lane();
+                    let lane_busy = self.slots.iter().flatten().any(|s| s.probe.as_ref().is_some_and(|p| p.lane == probe_lane));
                     let probe = match (&self.adapt, &self.probe) {
-                        (Some(a), Some(pc)) => pc.positions(job.prompt.len(), a.cfg.min_new).map(|(pos, kind)| ProbeRun {
-                            ids: pos.iter().map(|&p| job.prompt[p]).collect(),
-                            hashes: engine.prompt_hashes(&job.prompt, &pos),
-                            fed: 0,
-                            kind,
+                        (Some(a), Some(pc)) => pc.positions(job.prompt.len(), known(restored, job.prompt.len()), a.cfg.min_new).and_then(|(pos, kind)| {
+                            let excerpt = kind == "excerpt";
+                            if excerpt && lane_busy {
+                                return None;
+                            }
+                            Some(ProbeRun {
+                                ids: pos.iter().map(|&p| job.prompt[p]).collect(),
+                                hashes: engine.prompt_hashes(&job.prompt, &pos),
+                                fed: 0,
+                                kind,
+                                lane: if excerpt { probe_lane } else { lane },
+                                vote_from: if excerpt { pos.iter().take_while(|&&p| p < restored).count() } else { 0 },
+                                restore: if excerpt { None } else { snap },
+                            })
                         }),
                         _ => None,
                     };
+                    if probe.as_ref().is_some_and(|p| p.lane == probe_lane) {
+                        engine.reset_lane(probe_lane)?;
+                    }
+                    let gen = Generation { cached: restored, ..Default::default() };
                     self.slots[lane] = Some(Slot {
-                        job, fed: 0, tok: None, gen: Generation::default(), rng, q: Vec::new(), mark: (1, 0.0, 0.0), probe,
+                        job, fed: restored, tok: None, gen, rng, q: Vec::new(), mark: (1, 0.0, 0.0), probe, restored,
                     });
                 }
             }
@@ -790,12 +980,22 @@ impl Scheduler {
             if let Some(s) = slot {
                 if s.tok.is_none() && room > 0 {
                     let c = match &s.probe {
+                        // an excerpt's non-voting rows run as a step of their own
+                        Some(pr) if pr.fed < pr.vote_from => (pr.vote_from - pr.fed).min(room),
                         Some(pr) => (pr.ids.len() - pr.fed).min(room),
                         None => (s.job.prompt.len() - s.fed).min(room),
                     };
                     prefill.push((lane, c, s.probe.is_some()));
                     room -= c;
                 }
+            }
+        }
+        // the prefix cache's boundary snapshots: a prompt chunk past position 0 starts where
+        // its lane stands now
+        for &(lane, _, probing) in &prefill {
+            if !probing {
+                let fed = self.slots[lane].as_ref().unwrap().fed;
+                self.prefix_boundary(engine, lane, fed)?;
             }
         }
         let td = std::time::Instant::now();
@@ -861,7 +1061,7 @@ impl Scheduler {
                 let pr = s.probe.as_ref().unwrap();
                 let per = pr.hashes.len() / pr.ids.len();
                 segs.push(Seg {
-                    lane, ids: &pr.ids[pr.fed..pr.fed + c], want: Want::Nothing, decode: false, next: &[],
+                    lane: pr.lane, ids: &pr.ids[pr.fed..pr.fed + c], want: Want::Nothing, decode: false, next: &[],
                     hashes: Some(&pr.hashes[pr.fed * per..(pr.fed + c) * per]),
                 });
                 continue;
@@ -884,7 +1084,10 @@ impl Scheduler {
         self.stats.draft_s += (tf - td).as_secs_f64();
         // per segment, the argmax of each wanted row (and with logits, the rows' logits); with
         // sampled lanes, every row's nucleus (a greedy row's is its argmax alone)
-        let seg_sampling: Vec<Sampling> = segs.iter().map(|sg| self.slots[sg.lane].as_ref().unwrap().job.sampling).collect();
+        // by the request each segment serves (a probe's segment may be in the probe lane): the
+        // decoding lanes', then the prefill entries', in segment order
+        let owners = decode.iter().map(|d| d.0).chain(prefill.iter().map(|p| p.0));
+        let seg_sampling: Vec<Sampling> = owners.map(|l| self.slots[l].as_ref().unwrap().job.sampling).collect();
         let (am, logits, nuc): (Vec<Vec<u32>>, Vec<Vec<u16>>, Vec<Vec<Nucleus>>) = if self.opt.logits {
             let lg = engine.forward_batch(&segs)?;
             (lg.iter().map(|l| l.chunks(v).map(argmax_bf16).collect()).collect(), lg, Vec::new())
@@ -938,6 +1141,10 @@ impl Scheduler {
             if probing {
                 let pr = s.probe.as_mut().unwrap();
                 pr.fed += c;
+                // the cached head's rows gave the excerpt context; their demand is no vote
+                if pr.fed == pr.vote_from && pr.vote_from > 0 {
+                    engine.lane_demand(pr.lane, true)?;
+                }
                 if pr.fed == pr.ids.len() {
                     probed.push(lane);
                 }
@@ -984,6 +1191,8 @@ impl Scheduler {
             (s.job.sink)(Event::Tokens(emitted));
             // the first token came from the pre-adaptation step, as model.py's does
             if prompt_end {
+                let p = s.job.prompt.len();
+                self.prefix_full(engine, lane, p)?;
                 self.adapt_boundary(engine, lane)?;
             }
             if stopped || full {

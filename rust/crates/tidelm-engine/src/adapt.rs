@@ -320,21 +320,24 @@ impl Default for ProbeConfig {
 
 impl ProbeConfig {
     /// The prompt positions a `len`-token prompt's probe feeds and its kind, or None for no
-    /// probe (probe_prefill.SmallProbe.predict with no cached prefix): the whole prompt below
-    /// two_pass_below tokens; nothing below `min_new`; else an excerpt of min(max_tokens,
-    /// len x fraction) tokens, none if that is under min_tokens.
-    pub fn positions(&self, len: usize, min_new: usize) -> Option<(Vec<usize>, &'static str)> {
-        if len > 0 && len < self.two_pass_below {
-            return Some(((0..len).collect(), "two-pass"));
+    /// probe (probe_prefill.SmallProbe.predict), with `prefix` tokens restored from the prefix
+    /// cache - every threshold is on the `len - prefix` new tokens: below two_pass_below the
+    /// new suffix whole (on the restored context); none below `min_new`; else an excerpt of
+    /// min(max_tokens, new x fraction) tokens, none under min_tokens. An excerpt's positions
+    /// below `prefix` (its head, in the cached part) give context but do not vote.
+    pub fn positions(&self, len: usize, prefix: usize, min_new: usize) -> Option<(Vec<usize>, &'static str)> {
+        let new = len.saturating_sub(prefix);
+        if new > 0 && new < self.two_pass_below {
+            return Some(((prefix..len).collect(), "two-pass"));
         }
-        if len < min_new {
+        if new < min_new {
             return None;
         }
-        let limit = self.max_tokens.min((len as f64 * self.fraction) as usize);
+        let limit = self.max_tokens.min((new as f64 * self.fraction) as usize);
         if limit < self.min_tokens {
             return None;
         }
-        let spans = select_spans(len, 0, limit);
+        let spans = select_spans(len, prefix, limit);
         (!spans.is_empty()).then(|| (spans.iter().flat_map(|&(a, b)| a..b).collect(), "excerpt"))
     }
 }
@@ -446,11 +449,16 @@ mod tests {
         assert_eq!(select_spans(5, 0, 64), vec![(0, 2), (3, 5)]);
         assert!(select_spans(4, 0, 64).is_empty());
         let p = ProbeConfig::default();
-        assert_eq!(p.positions(499, 32).unwrap().1, "two-pass");
-        assert_eq!(p.positions(499, 32).unwrap().0.len(), 499);
-        let (pos, kind) = p.positions(500, 32).unwrap();
+        assert_eq!(p.positions(499, 0, 32).unwrap().1, "two-pass");
+        assert_eq!(p.positions(499, 0, 32).unwrap().0.len(), 499);
+        let (pos, kind) = p.positions(500, 0, 32).unwrap();
         assert_eq!((kind, pos.len()), ("excerpt", 50));
-        assert_eq!(p.positions(10000, 32).unwrap().0.len(), 64);
+        assert_eq!(p.positions(10000, 0, 32).unwrap().0.len(), 64);
+        // a cached prefix: the new suffix decides; a short one is probed whole, from the prefix
+        assert_eq!(p.positions(10100, 10000, 32).unwrap(), ((10000..10100).collect(), "two-pass"));
+        assert!(p.positions(10000, 10000, 32).is_none());
+        let (pos, kind) = p.positions(11774, 10810, 32).unwrap();
+        assert_eq!((kind, pos.len(), pos[..8].to_vec()), ("excerpt", 64, (0..8).collect::<Vec<_>>()));
     }
 
     #[test]

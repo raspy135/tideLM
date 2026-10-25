@@ -409,6 +409,11 @@ const OP_GRAPHS: u32 = 6;
 const OP_SHUTDOWN: u32 = 7;
 const OP_DRAFT_SAMPLED: u32 = 8;
 const OP_MOVE_EXPERTS: u32 = 9;
+const OP_SNAPSHOT: u32 = 10;
+const OP_RESTORE: u32 = 11;
+const OP_SNAP_DROP: u32 = 12;
+const OP_DISK_SAVE: u32 = 13;
+const OP_DISK_LOAD: u32 = 14;
 
 /// This engine's half of a tensor-parallel pair: the RoCE one-shot gather every sharded
 /// output goes through, the NCCL communicator, and the control channel. Rank 0 (the
@@ -1116,6 +1121,22 @@ impl Hot {
     }
 }
 
+/// A lane's state at length `n` that positions past n overwrite - the RAM prefix cache's entry
+/// (v41_engine._snapshot_prefix). The compressed rows and index keys below n stay in the
+/// lane's caches, which only ever append, so a snapshot holds the rest: every backbone
+/// layer's and DSpark block's window rows of positions n - w .. n (w = min(n, window)), and
+/// each ratio-2 compressor's pending (unpaired) input. Restoring it and prefilling on from n
+/// continues the lane as if it had stopped there.
+struct LaneSnap {
+    n: usize,
+    w: usize,
+    /// [ring][w][hd]: the backbone's rings, then the DSpark blocks', rows in position order
+    rows: DeviceBuffer<u16>,
+    /// per ratio-2 source (kv-source order): [2][hd] f32 (kv, score) and its flag
+    pending: DeviceBuffer<f32>,
+    flags: DeviceBuffer<i32>,
+}
+
 /// Everything the resident mode keeps on the device besides the per-step activations.
 struct Resident {
     /// lent out (taken) for the duration of each block
@@ -1180,6 +1201,12 @@ pub struct Engine {
     hot: Option<Hot>,
     /// rank 1: rank 0's hot-read state digest for the step being replayed
     peer_hot: Option<u64>,
+    /// the RAM prefix cache's snapshots, by (lane, id) (decode.rs decides; both ranks hold
+    /// the same ones)
+    snaps: HashMap<(usize, u64), LaneSnap>,
+    /// the prefix cache's disk tier (enable_prefix_disk) and its namespace
+    disk: Option<crate::prefix_disk::Disk>,
+    disk_ns: u64,
     /// the same for the DSpark blocks
     dspark_keep: Option<DeviceBuffer<u8>>,
     /// per (drafting lanes, sampled)
@@ -1679,7 +1706,8 @@ impl Engine {
         let eg_raw = (0..n_eng).map(|_| DeviceBuffer::zeroed(t * eng_cols * 264)).collect::<std::result::Result<_, _>>()?;
         let eg_inv = (0..n_eng).map(|_| DeviceBuffer::zeroed(t * eng_cols)).collect::<std::result::Result<_, _>>()?;
         let eg_host = (0..n_eng).map(|_| PinnedBuffer::zeroed(t * eng_cols * ENGRAM_ROW)).collect::<std::result::Result<_, _>>()?;
-        let lanes_v = (0..max_lanes).map(|_| Lane { len: 0, hash: hash.fresh(), last: (0, 0, 0), step: u64::MAX }).collect();
+        // and the probe lane, the scratch lane's caches (Engine::probe_lane)
+        let lanes_v = (0..=max_lanes).map(|_| Lane { len: 0, hash: hash.fresh(), last: (0, 0, 0), step: u64::MAX }).collect();
         // async hot reads: the backbone arena's spare slots are the ring
         let hot = match (&resident, opts.hot_ring) {
             (_, 0) => None,
@@ -1703,7 +1731,8 @@ impl Engine {
         // per lane, both halves (counts, mass) of every backbone layer's experts
         let (demand, miss) = if opts.record_demand && opts.resident {
             let n = 2 * n_layers * cfg.n_routed_experts;
-            (Some(DeviceBuffer::<f64>::zeroed(max_lanes * n)?), Some(DeviceBuffer::<f64>::zeroed(max_lanes * 8)?))
+            // and the probe lane's (Engine::probe_lane)
+            (Some(DeviceBuffer::<f64>::zeroed((max_lanes + 1) * n)?), Some(DeviceBuffer::<f64>::zeroed((max_lanes + 1) * 8)?))
         } else {
             (None, None)
         };
@@ -1738,6 +1767,9 @@ impl Engine {
             miss,
             hot,
             peer_hot: None,
+            snaps: HashMap::new(),
+            disk: None,
+            disk_ns: 0,
             dspark_keep,
             draft_graphs: HashMap::new(),
             draft_cols: draft_vocab.len(),
@@ -1783,6 +1815,10 @@ impl Engine {
         self.leader = pair.comm.rank == 0;
         self.pair = Some(pair);
         Ok(())
+    }
+
+    pub fn is_paired(&self) -> bool {
+        self.pair.is_some()
     }
 
     pub fn rank(&self) -> usize {
@@ -1883,6 +1919,43 @@ impl Engine {
                         .collect::<Result<_>>()?;
                     self.move_experts(&moves)?;
                 }
+                OP_SNAPSHOT => {
+                    let (lane, n, id) = (r.u32()? as usize, r.u64()? as usize, r.u64()?);
+                    self.prefix_snapshot(lane, n, id)?;
+                }
+                OP_RESTORE => {
+                    let (lane, id) = (r.u32()? as usize, r.u64()?);
+                    self.prefix_restore(lane, id)?;
+                }
+                OP_DISK_SAVE => {
+                    let lane = r.u32()? as usize;
+                    let id = String::from_utf8(r.u32s()?.iter().map(|&b| b as u8).collect()).map_err(|_| "disk save: bad id")?;
+                    let tokens = r.u32s()?;
+                    let n = r.u32()? as usize;
+                    let snaps: Vec<u64> = (0..n).map(|_| r.u64()).collect::<std::result::Result<_, _>>()?;
+                    self.prefix_disk_save(lane, &id, &tokens, &snaps)?;
+                }
+                OP_DISK_LOAD => {
+                    let lane = r.u32()? as usize;
+                    let id = String::from_utf8(r.u32s()?.iter().map(|&b| b as u8).collect()).map_err(|_| "disk load: bad id")?;
+                    let (n, snap) = (r.u64()? as usize, r.u64()?);
+                    let ok = match self.disk_load_inner(lane, &id, n, snap) {
+                        Ok(_) => 1,
+                        Err(e) => {
+                            eprintln!("rank 1: prefix disk load {id}: {e}");
+                            0
+                        }
+                    };
+                    let mut m = tidelm_comm::Msg::default();
+                    m.u32(ok);
+                    self.pair.as_mut().ok_or("follow needs a pair")?.ctl.send(&m.0)?;
+                }
+                OP_SNAP_DROP => {
+                    let lane = r.u32()? as usize;
+                    let n = r.u32()? as usize;
+                    let ids: Vec<u64> = (0..n).map(|_| r.u64()).collect::<std::result::Result<_, _>>()?;
+                    self.prefix_drop(lane, &ids)?;
+                }
                 OP_SHUTDOWN => return Ok(()),
                 op => return Err(format!("rank 1: unknown control op {op}").into()),
             }
@@ -1957,7 +2030,7 @@ impl Engine {
         let (Some(dm), Some(ms)) = (&self.demand, &self.miss) else {
             return Err("demand is recorded only with Options::record_demand (resident)".into());
         };
-        if lane >= self.max_lanes {
+        if lane > self.max_lanes {
             return Err(format!("lane {lane} of {}", self.max_lanes).into());
         }
         let n = self.n_layers * self.cfg.n_routed_experts;
@@ -1983,6 +2056,278 @@ impl Engine {
         let all = h.hash(prompt, 0, None);
         let per = all.len() / prompt.len().max(1);
         positions.iter().flat_map(|&p| all[p * per..(p + 1) * per].iter().copied()).collect()
+    }
+
+    /// The lane prompts may use to probe before their prefill (decode.rs): the scratch lane's
+    /// caches (filler rows sit far past any probe's positions), its own demand slot.
+    pub fn probe_lane(&self) -> usize {
+        self.max_lanes
+    }
+
+    /// Snapshot lane `lane` at length `n` as `id` (the RAM prefix cache): n is the lane's
+    /// length, or lies within its last step's segment (the pending state there is rollback's).
+    /// Rank 0 mirrors it; both ranks keep the same snapshots.
+    pub fn prefix_snapshot(&mut self, lane: usize, n: usize, id: u64) -> Result<()> {
+        self.mirror(|m| {
+            m.u32(OP_SNAPSHOT).u32(lane as u32).u64(n as u64).u64(id);
+        })?;
+        if lane >= self.max_lanes {
+            return Err(format!("snapshot: lane {lane} of {}", self.max_lanes).into());
+        }
+        let l = &self.lanes[lane];
+        if n == 0 || n > l.len || (n < l.len && n < l.last.0) {
+            return Err(format!("snapshot({n}) of lane {lane}: its length is {}, its last segment from {}", l.len, l.last.0).into());
+        }
+        let (hd, w) = (self.cfg.head_dim, n.min(self.cfg.window_size));
+        let st = &self.stream;
+        let sr = st.raw();
+        let ring = self.ring;
+        let rings: Vec<*mut c_void> = self.caches.ring.iter().chain(self.caches.mtp_ring.iter()).map(np).collect();
+        let idx = DeviceBuffer::from_slice(&(n - w..n).map(|p| (lane * ring + p % ring) as i32).collect::<Vec<_>>())?;
+        let rows = DeviceBuffer::<u16>::new((rings.len() * w * hd).max(1))?;
+        for (k, &rg) in rings.iter().enumerate() {
+            ck(unsafe { ds_gather_rows_u16(sr, rg, np(&idx), rows.ptr_at(k * w * hd), w as i32, hd as i32) }, "snapshot rows")?;
+        }
+        let nr = self.caches.r2.len().max(1);
+        let pending = DeviceBuffer::<f32>::zeroed(nr * 2 * hd)?;
+        let flags = DeviceBuffer::<i32>::zeroed(nr)?;
+        for (i, r2) in self.caches.r2.values().enumerate() {
+            if n == l.len {
+                pending.copy_from(i * 2 * hd, &r2.pkv, lane * hd, hd, st)?;
+                pending.copy_from(i * 2 * hd + hd, &r2.psc, lane * hd, hd, st)?;
+                flags.copy_from(i, &r2.flag, lane, 1, st)?;
+            } else {
+                ck(unsafe {
+                    ds_pending_snapshot(sr, n as i32, lane as i32, np(&r2.mem_kv), np(&r2.mem_sc), np(&r2.mem_start), np(&r2.before_kv),
+                                        np(&r2.before_sc), np(&r2.before_flag), pending.ptr_at(i * 2 * hd), flags.ptr_at(i),
+                                        hd as i32, TMAX as i32)
+                }, "snapshot pending")?;
+            }
+        }
+        // `idx` is freed at the end of this call: the gathers must be done with it
+        st.synchronize()?;
+        self.snaps.insert((lane, id), LaneSnap { n, w, rows, pending, flags });
+        Ok(())
+    }
+
+    /// Restore lane `lane` to snapshot `id`: its window rows and pending state back, its length
+    /// the snapshot's. The compressed rows below it must still be the lane's (the caller's
+    /// match: the lane has run nothing but this prefix's continuations since).
+    pub fn prefix_restore(&mut self, lane: usize, id: u64) -> Result<usize> {
+        self.mirror(|m| {
+            m.u32(OP_RESTORE).u32(lane as u32).u64(id);
+        })?;
+        self.restore_inner(lane, id)
+    }
+
+    fn restore_inner(&mut self, lane: usize, id: u64) -> Result<usize> {
+        let snap = self.snaps.get(&(lane, id)).ok_or_else(|| format!("restore: lane {lane} has no snapshot {id}"))?;
+        let (n, w, hd) = (snap.n, snap.w, self.cfg.head_dim);
+        let st = &self.stream;
+        let sr = st.raw();
+        let ring = self.ring;
+        let rings: Vec<*mut c_void> = self.caches.ring.iter().chain(self.caches.mtp_ring.iter()).map(np).collect();
+        let idx = DeviceBuffer::from_slice(&(n - w..n).map(|p| (lane * ring + p % ring) as i32).collect::<Vec<_>>())?;
+        for (k, &rg) in rings.iter().enumerate() {
+            ck(unsafe { ds_scatter_rows_u16(sr, snap.rows.ptr_at(k * w * hd), np(&idx), rg, w as i32, hd as i32) }, "restore rows")?;
+        }
+        for (i, r2) in self.caches.r2.values().enumerate() {
+            r2.pkv.copy_from(lane * hd, &snap.pending, i * 2 * hd, hd, st)?;
+            r2.psc.copy_from(lane * hd, &snap.pending, i * 2 * hd + hd, hd, st)?;
+            r2.flag.copy_from(lane, &snap.flags, i, 1, st)?;
+        }
+        st.synchronize()?;
+        let l = &mut self.lanes[lane];
+        l.len = n;
+        l.last = (n, 0, 0);
+        l.step = u64::MAX;
+        Ok(n)
+    }
+
+    /// The prefix cache's disk tier in `cfg.dir/rank-R` (both ranks of a pair, after the join):
+    /// its namespace is this executable, the model's config and the settings that change what
+    /// a bundle holds.
+    pub fn enable_prefix_disk(&mut self, cfg: crate::prefix_disk::DiskConfig) -> Result<()> {
+        let fnv = |h: u64, bytes: &[u8]| bytes.iter().fold(h, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+        let exe = std::fs::read("/proc/self/exe")?;
+        let mut h = fnv(0xcbf29ce484222325, &exe);
+        let cfg_json = std::fs::read(self.ckpt.model_dir().join("inference/config.json")).or_else(|_| std::fs::read(self.ckpt.model_dir().join("config.json")))?;
+        h = fnv(h, &cfg_json);
+        let settings = format!("layers {} spec {} packed {} qdq {} ring {} window {} rank {}", self.n_layers, self.dspark.is_some(),
+                               self.packed_kv, !self.no_qdq, self.ring, self.cfg.window_size, self.rank());
+        h = fnv(h, settings.as_bytes());
+        self.disk_ns = h;
+        self.disk = Some(crate::prefix_disk::Disk::open(cfg, self.rank())?);
+        Ok(())
+    }
+
+    /// The disk tier's bundles that restore a prefix of `prompt` of at most `max_n` tokens.
+    pub fn prefix_disk_candidates(&self, prompt: &[u32], max_n: usize) -> Vec<(usize, String)> {
+        self.disk.as_ref().map(|d| d.candidates(prompt, self.disk_ns, max_n)).unwrap_or_default()
+    }
+
+    /// Whether a save is due (DSV41_PREFIX_DISK_MIN_INTERVAL_S since the last one), and a
+    /// bundle that already restores all of `prefixes` (dedup; touched, so it stays).
+    pub fn prefix_disk_due(&self) -> bool {
+        self.disk.as_ref().is_some_and(|d| d.last_save.is_none_or(|t| t.elapsed().as_secs_f64() >= d.cfg.min_interval_s))
+    }
+
+    pub fn prefix_disk_duplicate(&self, tokens: &[u32], ns: &[usize]) -> bool {
+        let Some(d) = self.disk.as_ref() else { return false };
+        if !d.cfg.dedup {
+            return false;
+        }
+        let hs = crate::prefix_disk::prefix_hashes(tokens);
+        let want: Vec<(usize, u64)> = ns.iter().map(|&n| (n, hs[n])).collect();
+        match d.duplicate(self.disk_ns, &want) {
+            Some(id) => {
+                d.touch(&id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Save lane `lane`'s prompt `tokens` with its snapshots `snap_ids` as bundle `id`: the
+    /// snapshots and the compressed rows below the longest are copied to the host now (the
+    /// lane must not have moved past them), the write happens on the disk tier's thread.
+    /// Mirrored: each rank saves its own copy.
+    pub fn prefix_disk_save(&mut self, lane: usize, id: &str, tokens: &[u32], snap_ids: &[u64]) -> Result<()> {
+        self.mirror(|m| {
+            m.u32(OP_DISK_SAVE).u32(lane as u32).u32s(&id.bytes().map(|b| b as u32).collect::<Vec<_>>()).u32s(tokens)
+                .u32(snap_ids.len() as u32);
+            for &s in snap_ids {
+                m.u64(s);
+            }
+        })?;
+        if self.disk.is_none() {
+            return Ok(());
+        }
+        let st = &self.stream;
+        let mut snaps = Vec::new();
+        for &sid in snap_ids {
+            let sn = self.snaps.get(&(lane, sid)).ok_or_else(|| format!("disk save: lane {lane} has no snapshot {sid}"))?;
+            let mut h = crate::prefix_disk::SnapHost { n: sn.n, w: sn.w, rows: vec![0; sn.rows.len()], pending: vec![0.0; sn.pending.len()],
+                                                       flags: vec![0; sn.flags.len()] };
+            sn.rows.download_async(0, &mut h.rows, st)?;
+            sn.pending.download_async(0, &mut h.pending, st)?;
+            sn.flags.download_async(0, &mut h.flags, st)?;
+            snaps.push(h);
+        }
+        let n_max = snaps.iter().map(|s| s.n).max().unwrap_or(0);
+        let (hd, ihd) = (self.cfg.head_dim, self.cfg.index_head_dim);
+        let row = if self.packed_kv { PACKED_ROW / 2 } else { hd };
+        let (mut ckv, mut ik) = (Vec::new(), Vec::new());
+        for (&l, buf) in &self.caches.ckv {
+            let (r, rows) = (self.cfg.compress_ratios[l], self.caches.crows[&l]);
+            let k = n_max / r;
+            let mut v = vec![0u16; k * row];
+            buf.download_async(lane * rows * row, &mut v, st)?;
+            let mut iv = vec![0u16; k * ihd];
+            self.caches.ik[&l].download_async(lane * rows * ihd, &mut iv, st)?;
+            ckv.push((l, v.iter().flat_map(|x| x.to_le_bytes()).collect()));
+            ik.push((l, iv.iter().flat_map(|x| x.to_le_bytes()).collect()));
+        }
+        st.synchronize()?;
+        let b = crate::prefix_disk::Bundle { id: id.to_string(), namespace: self.disk_ns, tokens: tokens.to_vec(), snaps, ckv, ik };
+        let d = self.disk.as_mut().unwrap();
+        d.save(b);
+        d.last_save = Some(Instant::now());
+        Ok(())
+    }
+
+    /// Restore lane `lane` (reset) to length `n` from bundle `id` as snapshot `snap`: its rows
+    /// into the lane's caches, the snapshot restored, the n-gram history re-hashed. Rank 0
+    /// checks the bundle's tokens against `prompt` and both ranks must succeed: on any failure
+    /// the lane is reset on both and the call returns false (a miss).
+    pub fn prefix_disk_load(&mut self, lane: usize, id: &str, n: usize, snap: u64, prompt: &[u32]) -> Result<bool> {
+        self.mirror(|m| {
+            m.u32(OP_DISK_LOAD).u32(lane as u32).u32s(&id.bytes().map(|b| b as u32).collect::<Vec<_>>()).u64(n as u64).u64(snap);
+        })?;
+        let mine = self.disk_load_inner(lane, id, n, snap);
+        let mine = match mine {
+            Ok(tokens) if tokens.len() >= n && prompt.len() >= n && tokens[..n] == prompt[..n] => true,
+            Ok(_) => {
+                eprintln!("prefix disk: bundle {id}'s tokens are not this prompt's");
+                false
+            }
+            Err(e) => {
+                eprintln!("prefix disk: load {id}: {e}");
+                false
+            }
+        };
+        let theirs = match self.pair.as_mut() {
+            Some(p) if self.leader => {
+                let msg = p.ctl.recv()?;
+                tidelm_comm::Reader::new(&msg).u32()? == 1
+            }
+            _ => true,
+        };
+        if mine && theirs {
+            return Ok(true);
+        }
+        self.reset_lane(lane)?;
+        self.prefix_drop(lane, &[snap])?;
+        Ok(false)
+    }
+
+    fn disk_load_inner(&mut self, lane: usize, id: &str, n: usize, snap: u64) -> Result<Vec<u32>> {
+        let ns = self.disk_ns;
+        let b = self.disk.as_mut().ok_or("no prefix disk tier")?.load(id, ns)?;
+        let sh = b.snaps.iter().find(|s| s.n == n).ok_or_else(|| format!("bundle {id} has no snapshot at {n}"))?;
+        if n > b.tokens.len() || lane >= self.max_lanes {
+            return Err(format!("bundle {id}: snapshot {n} past its {} tokens", b.tokens.len()).into());
+        }
+        let (hd, ihd) = (self.cfg.head_dim, self.cfg.index_head_dim);
+        let row = if self.packed_kv { PACKED_ROW / 2 } else { hd };
+        let st = &self.stream;
+        let words = |v: &[u8]| -> Vec<u16> { v.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect() };
+        for (&l, buf) in &self.caches.ckv {
+            let (r, rows) = (self.cfg.compress_ratios[l], self.caches.crows[&l]);
+            let k = n / r;
+            let cv = b.ckv.iter().find(|x| x.0 == l).map(|x| words(&x.1)).ok_or_else(|| format!("bundle {id} has no layer {l}"))?;
+            let iv = b.ik.iter().find(|x| x.0 == l).map(|x| words(&x.1)).ok_or_else(|| format!("bundle {id} has no layer {l} keys"))?;
+            if cv.len() < k * row || iv.len() < k * ihd {
+                return Err(format!("bundle {id}: layer {l} holds fewer rows than {n} tokens need").into());
+            }
+            buf.upload_async(lane * rows * row, &cv[..k * row], st)?;
+            self.caches.ik[&l].upload_async(lane * rows * ihd, &iv[..k * ihd], st)?;
+        }
+        let rings = self.caches.ring.len() + self.caches.mtp_ring.len();
+        if sh.rows.len() != rings * sh.w * hd {
+            return Err(format!("bundle {id}: snapshot rows for another model shape").into());
+        }
+        let snapv = LaneSnap {
+            n: sh.n,
+            w: sh.w,
+            rows: DeviceBuffer::from_slice(&sh.rows)?,
+            pending: DeviceBuffer::from_slice(if sh.pending.is_empty() { &[0f32][..] } else { &sh.pending })?,
+            flags: DeviceBuffer::from_slice(if sh.flags.is_empty() { &[0i32][..] } else { &sh.flags })?,
+        };
+        st.synchronize()?;
+        self.snaps.insert((lane, snap), snapv);
+        self.restore_inner(lane, snap)?;
+        // the n-gram history of the restored prefix, as the hashing would have written it
+        let l = &mut self.lanes[lane];
+        l.hash.hash(&b.tokens[..n], 0, None);
+        Ok(b.tokens)
+    }
+
+    /// Forget lane `lane`'s snapshots `ids`.
+    pub fn prefix_drop(&mut self, lane: usize, ids: &[u64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.mirror(|m| {
+            m.u32(OP_SNAP_DROP).u32(lane as u32).u32(ids.len() as u32);
+            for &id in ids {
+                m.u64(id);
+            }
+        })?;
+        for id in ids {
+            self.snaps.remove(&(lane, *id));
+        }
+        Ok(())
     }
 
     /// The backbone's resident experts, [layer][expert] (resident mode).
@@ -2085,13 +2430,17 @@ impl Engine {
     /// position, the hash cache from position 0), so only the length and the pending flag
     /// reset.
     pub fn reset_lane(&mut self, lane: usize) -> Result<()> {
-        if lane >= self.max_lanes {
+        if lane > self.max_lanes {
             return Err(format!("lane {lane} of {}", self.max_lanes).into());
         }
         self.mirror(|m| {
             m.u32(OP_RESET_LANE).u32(lane as u32);
         })?;
-        self.lanes[lane] = Lane { len: 0, hash: self.hash.fresh(), last: (0, 0, 0), step: u64::MAX };
+        // the n-gram history stays: it is by position and rewritten before it is read, and a
+        // prefix restored after this reset reads the matched prefix's entries from it
+        // (re-hashing the prompt on every hit, as the Python engine does, finds the same ids)
+        let l = &mut self.lanes[lane];
+        (l.len, l.last, l.step) = (0, (0, 0, 0), u64::MAX);
         for st in self.caches.r2.values() {
             st.flag.upload_async(lane, &[0], &self.stream)?;
         }
@@ -2397,10 +2746,11 @@ impl Engine {
         if segs.is_empty() {
             return Err("a step needs at least one segment".into());
         }
-        let mut seen = vec![false; self.max_lanes];
+        let mut seen = vec![false; self.max_lanes + 1];
         let mut rows = 0;
         for sg in segs {
-            if sg.lane >= self.max_lanes || std::mem::replace(&mut seen[sg.lane], true) {
+            // the probe lane takes prompt rows only (its demand is a probe's, never a request's)
+            if sg.lane > self.max_lanes || (sg.lane == self.max_lanes && sg.decode) || std::mem::replace(&mut seen[sg.lane], true) {
                 return Err(format!("lane {} out of range or repeated in one step", sg.lane).into());
             }
             if sg.ids.is_empty() {
@@ -2429,7 +2779,10 @@ impl Engine {
         let tw = Instant::now();
         let tb = row_bucket(rows);
         let scratch = self.max_lanes as i32;
-        let (mut pos, mut lane, mut ids, mut dec) = (vec![0i32; tb], vec![scratch; tb], vec![0u32; tb], vec![0i32; tb]);
+        // filler rows sit in the scratch lane at its ring's last slot, clear of a probe's
+        // positions (Engine::probe_lane uses the same lane from position 0)
+        let filler = (self.ring - 1).min(self.max_seq.saturating_sub(1)) as i32;
+        let (mut pos, mut lane, mut ids, mut dec) = (vec![filler; tb], vec![scratch; tb], vec![0u32; tb], vec![0i32; tb]);
         let nseg = self.max_lanes + 1;
         let (mut sf, mut sn, mut sl) = (vec![0i32; nseg], vec![0i32; nseg], vec![scratch; nseg]);
         let (mut head_rows, mut heads, mut firsts) = (Vec::new(), Vec::new(), Vec::new());
@@ -3389,8 +3742,8 @@ impl Engine {
             } else {
                 ck(unsafe {
                     ds_router_rec(sr, np(&a.z), np(&w.gate_bias), keep, ti, e as i32, k as i32, cfg.route_scale, np(&a.idx),
-                                  np(&a.rw), counts, mass, ms, (2 * nl * e) as i64, np(&a.lane), self.max_lanes as i32,
-                                  np(&a.decode_rows), hot.map(|h| np(&h.rows)).unwrap_or(nul()))
+                                  np(&a.rw), counts, mass, ms, (2 * nl * e) as i64, np(&a.lane), self.max_lanes as i32 + 1,
+                                  np(&a.decode_rows), hot.map(|h| np(&h.rows)).unwrap_or(nul()), np(&a.live_pairs))
                 }, "router (recording)")?;
             }
             if let (Some(h), Some(l)) = (hot, layer) {

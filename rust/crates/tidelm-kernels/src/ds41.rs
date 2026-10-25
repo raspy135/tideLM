@@ -91,11 +91,13 @@ extern "C" {
     /// (phase from `phase` [m], 1 decode / 0 prompt; null 0). Rows whose lane (`lane` [m], null
     /// 0) is >= `lanes` record nothing. `hot` (or null): [m][k][2] (share of the row's top-k
     /// score if `keep` masks the pick and the row is not filler, else 0; expert id as f32).
-    /// counts null: hot only.
+    /// counts null: hot only. `live` (or null): the step's live pairs (rows x k) - rows past
+    /// them are filler, whatever their lane.
     pub fn ds_router_rec(
         stream: CudaStream, z: *const c_void, bias: *const c_void, keep: *const c_void, m: c_int, e: c_int, k: c_int,
         route_scale: f32, idx: *mut c_void, weights: *mut c_void, counts: *mut c_void, mass: *mut c_void,
         miss: *mut c_void, lane_stride: i64, lane: *const c_void, lanes: c_int, phase: *const c_void, hot: *mut c_void,
+        live: *const c_void,
     ) -> c_int;
 
     /// Hot reads' marks: `marks` [n][3] (LUT index, keep index, slot); apply (1) saves each
@@ -151,6 +153,16 @@ extern "C" {
                                      r: c_int, t: c_int, d: c_int, lane: *const c_void, lstride_bytes: i64) -> c_int;
     /// Packed 512-value KV rows back to bf16 rows.
     pub fn ds_unpack_fp4_rows(stream: CudaStream, src: *const c_void, dst: *mut c_void, rows: c_int) -> c_int;
+
+    /// A ratio-2 source's pending state of lane `lane` at length `n` (rollback's rule) into
+    /// `out` [2][d] f32 and `out_flag` (the prefix cache's snapshot; the lane is untouched).
+    pub fn ds_pending_snapshot(stream: CudaStream, n: c_int, lane: c_int, mem_kv: *const c_void, mem_sc: *const c_void,
+                               mem_start: *const c_void, before_kv: *const c_void, before_sc: *const c_void,
+                               before_flag: *const c_void, out: *mut c_void, out_flag: *mut c_void, d: c_int, mem_rows: c_int)
+                               -> c_int;
+    /// out[idx[m]] = src[m], rows of d u16 (m rows).
+    pub fn ds_scatter_rows_u16(stream: CudaStream, src: *const c_void, idx: *const c_void, out: *mut c_void, m: c_int, d: c_int)
+                               -> c_int;
 
     pub fn ds_fp4_qdq_e4m3(stream: CudaStream, x: *mut c_void, n_values: i64) -> c_int;
 

@@ -399,6 +399,7 @@ pub fn chat(stream: &mut TcpStream, body: &[u8], ctx: &Ctx) -> Result<(), Failur
         "completion_tokens": n,
         "total_tokens": ids.len() + n,
         "completion_tokens_details": {"reasoning_tokens": reasoning_tokens},
+        "prompt_tokens_details": {"cached_tokens": gen.cached},
     });
     if req.stream {
         let mut last: Value = serde_json::from_str(&chunk(json!({}), Value::String(finish_reason.into()))).unwrap();

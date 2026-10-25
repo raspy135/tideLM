@@ -574,7 +574,7 @@ fn router_records_unmasked_demand_misses_and_hot_shares() {
     ok(unsafe { ds_router(st.raw(), p(&dz), p(&db), p(&dk), m as i32, e as i32, k as i32, 1.5, p(&di0), p(&dw0)) });
     ok(unsafe {
         ds_router_rec(st.raw(), p(&dz), p(&db), p(&dk), m as i32, e as i32, k as i32, 1.5, p(&di), p(&dw), p(&rec),
-                      rec.ptr_at(e), p(&miss), stride as i64, p(&dl), lanes as i32, p(&dp), p(&hot))
+                      rec.ptr_at(e), p(&miss), stride as i64, p(&dl), lanes as i32, p(&dp), p(&hot), null())
     });
     ok(unsafe { ds_hot_candidates(st.raw(), p(&hot), (m * k) as i32, 12, p(&cand)) });
     st.synchronize().unwrap();

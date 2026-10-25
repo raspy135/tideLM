@@ -57,9 +57,11 @@ fn main() -> tidelm_engine::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     // an unknown flag is an error: a test flag the server ignores (--keep-first once) loaded
     // every expert and ran the box out of memory
-    const VALUED: [&str; 22] = ["--model-dir", "--max-seq", "--lanes", "--depth", "--step-rows", "--keep-db", "--budget",
+    const VALUED: [&str; 28] = ["--model-dir", "--max-seq", "--lanes", "--depth", "--step-rows", "--keep-db", "--budget",
                                 "--keep-first", "--layers", "--served-model-name", "--effort", "--host", "--port", "--world",
-                                "--rank", "--adapt-db", "--trace", "--adapt-sensitivity", "--adapt-prior", "--adapt-decode-tokens", "--adapt-probe", "--hot-ring"];
+                                "--rank", "--adapt-db", "--trace", "--adapt-sensitivity", "--adapt-prior", "--adapt-decode-tokens", "--adapt-probe", "--hot-ring", "--prefix-cache",
+                                "--prefix-snapshots", "--prefix-disk", "--prefix-disk-gb", "--prefix-disk-interval",
+                                "--prefix-disk-dedup"];
     const FLAGS: [&str; 3] = ["--resident", "--graphs", "--thinking"];
     let mut i = 1;
     while i < args.len() {
@@ -163,6 +165,18 @@ fn main() -> tidelm_engine::Result<()> {
     eprintln!("boot: engine {:.1} s", t0.elapsed().as_secs_f64());
     if let Some(p) = pair {
         engine.attach_pair(p.join().map_err(|_| "pair join thread panicked")??)?;
+    }
+    // the prefix cache's disk tier (DSV41_PREFIX_DISK=1, _GB=20, _MIN_INTERVAL_S=300, _DEDUP=1):
+    // --prefix-disk DIR, each rank its own DIR/rank-R
+    if let Some(dir) = arg(&args, "--prefix-disk") {
+        engine.enable_prefix_disk(tidelm_engine::prefix_disk::DiskConfig {
+            dir: PathBuf::from(dir),
+            budget: (arg(&args, "--prefix-disk-gb").map(|v| v.parse::<f64>()).transpose()?.unwrap_or(20.0) * 1e9) as u64,
+            min_interval_s: arg(&args, "--prefix-disk-interval").map(|v| v.parse()).transpose()?.unwrap_or(300.0),
+            dedup: arg(&args, "--prefix-disk-dedup").as_deref() != Some("0"),
+        })?;
+    }
+    if engine.is_paired() {
         if engine.rank() == 1 {
             eprintln!("rank 1: engine up in {:.1}s, following rank 0", t0.elapsed().as_secs_f64());
             engine.follow()?;
@@ -171,6 +185,10 @@ fn main() -> tidelm_engine::Result<()> {
     }
     // a step no lane decodes in prefills up to the engine's prefill rows (TIDELM_PREFILL_ROWS)
     let mut sched = Scheduler::new(&engine, SchedOptions { depth, step_rows, prefill_rows: Some(engine.pmax), logits: false })?;
+    // the RAM prefix cache (DSV41_PREFIX_CACHE=1, DSV41_PREFIX_SNAPSHOTS=16): --prefix-cache 0 off
+    if arg(&args, "--prefix-cache").as_deref() != Some("0") {
+        sched.set_prefix_cache(arg(&args, "--prefix-snapshots").map(|v| v.parse()).transpose()?.unwrap_or(16));
+    }
     // the probe before each prefill (DSV41_PROBE_PREFILL=1 in the serving profile): --adapt-probe 0 skips it
     if let Some(a) = adapt {
         let probe = arg(&args, "--adapt-probe").as_deref() != Some("0");

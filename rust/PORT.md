@@ -356,6 +356,26 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
   with them and 32.37 without, in back-to-back runs. Rust's layers 21-39 vote with every prompt
   row (it computes them all; Python's SWA decoder replay routes only the last 128 there).
 
+  The prefix cache is in (2026-10-24), both tiers as the serving profile runs them
+  (`--prefix-cache 1`, 16 snapshots, `--prefix-disk DIR`, 20 GB, a save at most every 300 s,
+  dedup). A lane's ckv / ik rows stay where they are; a snapshot holds what a later step
+  overwrites: the last min(n, 128) positions' window rows of all 40 layers and the drafter's
+  3 rings (Rust has no SWA replay to rebuild them, nor a prefill -> decode replay to reseed the
+  drafter), and the ratio-2 compressors' unpaired row. Boundaries are taken before each 2,048-row
+  chunk, the full one at P - 1 (the last prompt token runs again for its logits); a restore
+  scatters the rows back to their ring slots and prefills the rest. Disk bundles (rank-R dirs,
+  one id across the pair, ckv / ik rows once, FNV checksum, namespace = binary + model + layout)
+  load on both ranks or neither. A request's probe and boundary pass count new tokens from the
+  restore, an exact re-send as none (the Python engine's full hit). The pair, max-seq 524,288:
+  a 9,019-token prompt 13.09 s cold, a follow-up 2.65 s with 8,192 restored; a 3,288-token
+  re-send 4.44 -> 0.37 s (Python: 14,336 tokens 20.43 -> 0.35 s); a boundary restore and a disk
+  restore after a restart give the cold answer. Bundles: 15.8 MB at 3,288 tokens, 40.5 MB at
+  9,019. Two changes it needed: reset_lane keeps the lane's engram n-gram history (replacing it
+  left a restored prefix's entries empty, and the suffix's tokens differed from a cold run's),
+  and the probe's excerpt runs in a scratch lane past the request lanes, where a ragged step's
+  filler rows also sit (its ring's last slot), so an excerpt never touches a lane's restored
+  rows.
+
   Still missing, in order of what the numbers above say (prefill at large chunks is in: M5,
   8K first token 27.3 -> 6.76 s):
   1. With speculation the pair's logits digest no longer equals one box's (4 layers, prose
