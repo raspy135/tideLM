@@ -55,7 +55,8 @@ args=(--resident --graphs --model-dir "$MODEL_DIR" --served-model-name "${SERVED
       --prefix-cache "${DSV41_PREFIX_CACHE:-1}" --prefix-snapshots "${DSV41_PREFIX_SNAPSHOTS:-16}"
       --copy-draft "${RUST_COPY_DRAFT:-1}")
 if [[ "${SPEC:-1}" == 0 ]]; then args+=(--depth plain); else args+=(--depth "${RUST_DEPTH:-confidence}"); fi
-if [[ "${DSV41_HOT_READS:-1}" == 1 && "${DSV41_HOT_ASYNC:-1}" == 1 ]]; then
+# async hot reads plan from one lane's verify rows: on only with one lane
+if [[ "${DSV41_HOT_READS:-1}" == 1 && "${DSV41_HOT_ASYNC:-1}" == 1 && "${DSV41_MAX_CONCURRENCY:-1}" == 1 ]]; then
     args+=(--hot-ring "${DSV41_HOT_RING:-128}")
 else
     args+=(--hot-ring 0)

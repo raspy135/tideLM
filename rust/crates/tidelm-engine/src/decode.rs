@@ -995,9 +995,15 @@ impl Scheduler {
         let mut decode: Vec<(usize, usize)> = Vec::new(); // (lane, depth: decided now, or the reserve)
         // per decoding lane, the copy it verifies instead of a DSpark draft (copy.rs)
         let mut copies: Vec<Option<Vec<u32>>> = Vec::new();
+        // a lane with prompt rows left prefills alone, in prefill-sized steps, while the decoding
+        // lanes wait (server/concurrency.py: admission runs its whole prefill at once). Sharing
+        // the decode steps' leftover rows instead gave a 10K prompt beside a decoding lane a 31 s
+        // first token (alone ~8-9 s) in ~60-row pieces, each step also slowing the other lane
+        // (11.6 tok/s against ~23).
+        let prefilling = self.slots.iter().flatten().any(|s| s.tok.is_none());
         for i in 0..lanes {
             let lane = (self.rr + i) % lanes;
-            if !matches!(&self.slots[lane], Some(s) if s.tok.is_some()) {
+            if prefilling || !matches!(&self.slots[lane], Some(s) if s.tok.is_some()) {
                 continue;
             }
             let d = match (self.opt.depth, &mut self.policies[lane]) {
