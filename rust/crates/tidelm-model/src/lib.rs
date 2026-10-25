@@ -213,6 +213,49 @@ impl<'a> ExpertReader<'a> {
         Ok(views)
     }
 
+    /// Rank `rank`'s share of one expert out of `world`: the scale run whole (~1.1 MB, one
+    /// request) and the rank's contiguous 1/world of each weight tensor (w1/w3 intermediate
+    /// rows, w2 output rows - the tensor-parallel slot layout), one request each: ~10 MB
+    /// read instead of 18.8. `views[i]` is where tensor i's rank slice landed and its bytes.
+    pub fn read_expert_share_into(&self, staging: &mut [u8], prefix: &str, rank: usize, world: usize)
+                                  -> io::Result<ExpertViews> {
+        let shard = self.ckpt.shard(&format!("{prefix}w1.weight"))?;
+        let runs = shard.expert_runs(prefix)?;
+        let mut views: ExpertViews = [(0, 0); 6];
+        let mut cur = 0usize;
+        let read = |lo: u64, hi: u64, staging: &mut [u8], cur: &mut usize| -> io::Result<usize> {
+            let n = aligned_len(lo, hi);
+            if *cur + n > staging.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "staging buffer too small"));
+            }
+            let off = read_span(shard, lo, hi, &mut staging[*cur..*cur + n], self.ckpt.read_chunk)?;
+            let at = *cur + off;
+            *cur += n;
+            Ok(at)
+        };
+        for run in &runs {
+            let scales = run.members.iter().all(|&(i, _, _)| i % 2 == 1);
+            if scales || world == 1 {
+                let at = read(run.lo, run.hi, staging, &mut cur)?;
+                for &(i, o, nb) in &run.members {
+                    if nb % world != 0 {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{prefix}: {nb} bytes do not split {world} ways")));
+                    }
+                    views[i] = (at + o + rank * nb / world, nb / world);
+                }
+            } else {
+                for &(i, o, nb) in &run.members {
+                    if nb % world != 0 {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{prefix}: {nb} bytes do not split {world} ways")));
+                    }
+                    let (lo, part) = (run.lo + o as u64 + (rank * nb / world) as u64, nb / world);
+                    views[i] = (read(lo, lo + part as u64, staging, &mut cur)?, part);
+                }
+            }
+        }
+        Ok(views)
+    }
+
     /// The six tensors of one expert as owned byte vectors (tests and cold paths).
     pub fn read_expert(&self, layer: usize, expert: usize, prefix: Option<&str>) -> io::Result<Vec<Vec<u8>>> {
         let p = prefix.map(str::to_string).unwrap_or_else(|| Self::expert_prefix(layer, expert));
@@ -240,6 +283,23 @@ mod tests {
             PathBuf::from(std::env::var("HOME").unwrap()).join("models/DeepSeek-V4.1-Flash-1017")
         });
         dir.join("model.safetensors.index.json").exists().then(|| Checkpoint::open(&dir).unwrap())
+    }
+
+    #[test]
+    fn expert_shares_are_the_full_reads_slices() {
+        let Some(ckpt) = checkpoint() else { return };
+        let reader = ExpertReader::new(&ckpt);
+        let mut staging = AlignedBuf::new(STAGE_BYTES).unwrap();
+        for (layer, expert) in [(0usize, 7usize), (39, 383)] {
+            let full = reader.read_expert(layer, expert, None).unwrap();
+            for rank in 0..2 {
+                let views = reader.read_expert_share_into(&mut staging, &ExpertReader::expert_prefix(layer, expert), rank, 2).unwrap();
+                for (i, &(off, n)) in views.iter().enumerate() {
+                    assert_eq!(n, full[i].len() / 2);
+                    assert_eq!(&staging[off..off + n], &full[i][rank * n..(rank + 1) * n], "{layer}/{expert} tensor {i} rank {rank}");
+                }
+            }
+        }
     }
 
     #[test]

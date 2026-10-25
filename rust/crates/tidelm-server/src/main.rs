@@ -90,6 +90,7 @@ fn main() -> tidelm_engine::Result<()> {
     let t0 = Instant::now();
     let text = Text::load(&model_dir)?;
     let (token_map, _) = text.compressed_token_map()?;
+    eprintln!("boot: tokenizer {:.1} s", t0.elapsed().as_secs_f64());
     tidelm_cuda::set_device(0)?;
     let scores = match arg(&args, "--keep-db") {
         Some(db) => Some(tidelm_engine::keep::load_demand(std::path::Path::new(&db), 40, 384)?),
@@ -114,12 +115,14 @@ fn main() -> tidelm_engine::Result<()> {
     };
     let pair_args = tidelm_engine::pair::pair_args(&args)?;
     let pair = match &pair_args {
-        Some(pa) => Some(tidelm_engine::pair::join(&mut opts, &model_dir, pa)?),
+        Some(pa) => Some(tidelm_engine::pair::join_in_background(&mut opts, &model_dir, pa)?),
         None => None,
     };
+    eprintln!("boot: demand, residency, pair {:.1} s", t0.elapsed().as_secs_f64());
     let mut engine = Engine::new(&model_dir, token_map, opts)?;
+    eprintln!("boot: engine {:.1} s", t0.elapsed().as_secs_f64());
     if let Some(p) = pair {
-        engine.attach_pair(p)?;
+        engine.attach_pair(p.join().map_err(|_| "pair join thread panicked")??)?;
         if engine.rank() == 1 {
             eprintln!("rank 1: engine up in {:.1}s, following rank 0", t0.elapsed().as_secs_f64());
             engine.follow()?;

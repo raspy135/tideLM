@@ -6,6 +6,7 @@ use crate::forward::{tp_max_gather, Options, Pair};
 use crate::weights::Tp;
 use crate::Result;
 
+#[derive(Clone)]
 pub struct PairArgs {
     pub rank: usize,
     pub addr: String,
@@ -26,6 +27,20 @@ pub fn pair_args(args: &[String]) -> Result<Option<PairArgs>> {
 
 /// Agree on the boot config with the peer, bring up RoCE (on the HCAs NCCL_IB_HCA names, all
 /// active ones otherwise), and make `opts` this rank's tensor-parallel shard.
+/// `join` on its own thread, so the engine loads while the pair handshakes (boot config, NCCL,
+/// RoCE: ~1-2 s, before the engine load began): `opts.tp` is set at once, the Pair comes from
+/// the handle. A boot-config mismatch then surfaces when the handle is joined, after the load.
+pub fn join_in_background(opts: &mut Options, model_dir: &std::path::Path, pa: &PairArgs)
+                          -> Result<std::thread::JoinHandle<Result<Pair>>> {
+    let mut o = opts.clone();
+    let (dir, pa) = (model_dir.to_path_buf(), pa.clone());
+    opts.tp = Some(Tp { rank: pa.rank, world: 2 });
+    Ok(std::thread::spawn(move || {
+        tidelm_cuda::set_device(0)?;
+        join(&mut o, &dir, &pa)
+    }))
+}
+
 pub fn join(opts: &mut Options, model_dir: &std::path::Path, pa: &PairArgs) -> Result<Pair> {
     let boot = opts.boot_config(model_dir)?;
     let (comm, mut ctl) = tidelm_comm::join(pa.rank, &pa.addr, &boot, Duration::from_secs(300))?;

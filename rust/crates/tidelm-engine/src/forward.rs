@@ -387,6 +387,7 @@ const OP_RESET_LANE: u32 = 5;
 const OP_GRAPHS: u32 = 6;
 const OP_SHUTDOWN: u32 = 7;
 const OP_DRAFT_SAMPLED: u32 = 8;
+const OP_MOVE_EXPERTS: u32 = 9;
 
 /// This engine's half of a tensor-parallel pair: the RoCE one-shot gather every sharded
 /// output goes through, the NCCL communicator, and the control channel. Rank 0 (the
@@ -851,13 +852,23 @@ struct Lane {
 }
 
 /// The routable experts of one family of blocks (backbone layers, or DSpark blocks) on the
-/// device: an arena holding exactly those experts and the [block][expert] -> slot LUT
-/// (model.py's slot_lut; -1 for an expert that is not routable).
+/// device: an arena holding those experts (and `ring` free slots past them, for experts read
+/// in while serving) and the [block][expert] -> slot LUT (model.py's slot_lut; -1 for an
+/// expert that is not routable). Slots are global across blocks, so moving residency from
+/// one layer to another is a read into the freed slot and two LUT entries.
 struct ExpertSet {
     arena: Arena,
     /// per block, expert -> slot, plus a last column (the expert id `n_experts`) at the null
     /// slot: a pick TIDELM_EXPERT_TOPP drops routes there and its output is an exact 0
     lut: DeviceBuffer<i32>,
+    /// the LUT's host copy, the one every change is made to before it is uploaded
+    lut_host: Vec<i32>,
+    /// per slot, the (block, expert) it holds; None for a free slot
+    owner: Vec<Option<(usize, usize)>>,
+    n_experts: usize,
+    /// tensor names: `{base}{block}.ffn.experts.{expert}.`
+    base: &'static str,
+    tp: Option<Tp>,
     /// one past the arena's slots: the FP4 kernels read no weights for it
     null_slot: i32,
 }
@@ -865,40 +876,101 @@ struct ExpertSet {
 impl ExpertSet {
     /// `tp`: hold this rank's half of every routable expert (w1/w3 intermediate rows, w2
     /// output rows), so the pair's memory holds twice the experts and each rank does half of
-    /// every routed pair.
+    /// every routed pair. `spare`: free slots past the routable experts.
     #[allow(clippy::too_many_arguments)]
-    fn load(ckpt: &Checkpoint, stream: &Stream, prefix: &dyn Fn(usize) -> String, blocks: usize, n_experts: usize,
-            keep: Option<&[Vec<bool>]>, tp: Option<Tp>) -> Result<Self> {
+    fn load(ckpt: &Checkpoint, base: &'static str, blocks: usize, n_experts: usize, keep: Option<&[Vec<bool>]>,
+            tp: Option<Tp>, spare: usize) -> Result<Self> {
         let routable = |b: usize, x: usize| keep.map(|k| k[b][x]).unwrap_or(true);
-        let n_slots: usize = (0..blocks).map(|b| (0..n_experts).filter(|&x| routable(b, x)).count()).sum();
+        let n_res: usize = (0..blocks).map(|b| (0..n_experts).filter(|&x| routable(b, x)).count()).sum();
+        let n_slots = n_res + spare;
         let arena = Arena::new(n_slots.max(1), tp)?;
-        let rank = tp.map(|t| t.rank).unwrap_or(0);
-        let world = tp.map(|t| t.world).unwrap_or(1);
-        let mut lut = vec![-1i32; blocks * (n_experts + 1)];
-        let mut stage = PinnedBuffer::uninit(STAGE_BYTES)?;
-        let reader = ExpertReader::new(ckpt);
-        let mut slot = 0usize;
+        let mut set = ExpertSet {
+            arena,
+            lut: DeviceBuffer::zeroed(1)?,
+            lut_host: vec![-1i32; blocks * (n_experts + 1)],
+            owner: vec![None; n_slots],
+            n_experts,
+            base,
+            tp,
+            null_slot: n_slots as i32,
+        };
+        let mut jobs = Vec::with_capacity(n_res);
         for b in 0..blocks {
             for x in 0..n_experts {
-                if !routable(b, x) {
-                    continue;
+                if routable(b, x) {
+                    let slot = jobs.len();
+                    jobs.push((slot, b, x));
+                    set.lut_host[b * (n_experts + 1) + x] = slot as i32;
+                    set.owner[slot] = Some((b, x));
                 }
-                let views = reader.read_expert_into(&mut stage, &format!("{}ffn.experts.{x}.", prefix(b)))?;
-                for (&(off, len), &(dst, src_off, n)) in views.iter().zip(arena.slot_dsts(slot, rank).iter()) {
-                    if len != n * world {
-                        return Err(format!("{}expert {x}: tensor of {len} bytes, arena expects {}", prefix(b), n * world).into());
-                    }
-                    let src = unsafe { stage.as_ptr().add(off + src_off) } as *const c_void;
-                    unsafe { memcpy_async(dst, src, n, MEMCPY_HOST_TO_DEVICE, stream)? };
-                }
-                stream.synchronize()?;
-                lut[b * (n_experts + 1) + x] = slot as i32;
-                slot += 1;
             }
-            lut[b * (n_experts + 1) + n_experts] = n_slots as i32;
+            set.lut_host[b * (n_experts + 1) + n_experts] = n_slots as i32;
         }
-        Ok(ExpertSet { arena, lut: DeviceBuffer::from_slice(&lut)?, null_slot: n_slots as i32 })
+        set.read_many(ckpt, &jobs)?;
+        set.lut = DeviceBuffer::from_slice(&set.lut_host)?;
+        Ok(set)
     }
+
+    /// Experts `(slot, block, expert)` from the checkpoint into their slots on io_threads()
+    /// workers, each with its own staging buffer and stream; under tensor parallel a rank reads
+    /// only its share of each (ExpertReader::read_expert_share_into). Returns once every copy
+    /// is done. The LUT is the caller's. One whole expert at a time, the boot load took 31.8 s
+    /// for 10,000 (314 a second); examples/bench_expert_read.rs reads 966 shares a second on
+    /// 8 threads (whole experts peak at 542 on 4).
+    fn read_many(&self, ckpt: &Checkpoint, jobs: &[(usize, usize, usize)]) -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (rank, world) = self.tp.map(|t| (t.rank, t.world)).unwrap_or((0, 1));
+        // destinations as plain addresses: the workers never touch the arena itself
+        let dsts: Vec<[(usize, usize); 6]> =
+            jobs.iter().map(|&(slot, _, _)| self.arena.slot_dsts(slot, rank).map(|(d, _, n)| (d as usize, n))).collect();
+        let base = self.base;
+        let next = AtomicUsize::new(0);
+        let failed: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        let threads = io_threads().min(jobs.len()).max(1);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    let work = || -> Result<()> {
+                        tidelm_cuda::set_device(0)?;
+                        let stream = Stream::new()?;
+                        let mut stage = PinnedBuffer::<u8>::uninit(STAGE_BYTES)?;
+                        let reader = ExpertReader::new(ckpt);
+                        loop {
+                            if failed.lock().unwrap().is_some() {
+                                return Ok(());
+                            }
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(&(_, b, x)) = jobs.get(i) else { return Ok(()) };
+                            let prefix = format!("{base}{b}.ffn.experts.{x}.");
+                            let views = reader.read_expert_share_into(&mut stage, &prefix, rank, world)?;
+                            for (&(off, len), &(dst, n)) in views.iter().zip(dsts[i].iter()) {
+                                if len != n {
+                                    return Err(format!("{prefix}: a share of {len} bytes, the arena expects {n}").into());
+                                }
+                                let src = unsafe { stage.as_ptr().add(off) } as *const c_void;
+                                unsafe { memcpy_async(dst as *mut c_void, src, n, MEMCPY_HOST_TO_DEVICE, &stream)? };
+                            }
+                            // the staging buffer is reused by this worker's next expert
+                            stream.synchronize()?;
+                        }
+                    };
+                    if let Err(e) = work() {
+                        failed.lock().unwrap().get_or_insert(e.to_string());
+                    }
+                });
+            }
+        });
+        match failed.into_inner().unwrap() {
+            Some(e) => Err(e.into()),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Expert-read workers (TIDELM_IO_THREADS, default 8): GB10's NVMe gives 966 expert shares a
+/// second on 8 against 898 on 4 and 821 on 16 (examples/bench_expert_read.rs).
+fn io_threads() -> usize {
+    std::env::var("TIDELM_IO_THREADS").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n >= 1).unwrap_or(8)
 }
 
 /// Everything the resident mode keeps on the device besides the per-step activations.
@@ -1028,11 +1100,21 @@ impl Resident {
     fn load(ckpt: &Checkpoint, stream: &Stream, cfg: &Config, n_layers: usize, opts: &Options, draft_rows: &[u32],
             draft_tp: Option<Tp>) -> Result<Self> {
         let (d, v) = (cfg.dim, cfg.vocab_size);
+        let t0 = Instant::now();
+        // the routed experts (most of the bytes) stream in on their own workers while this
+        // thread loads the dense weights: the two waited on each other, 1.7 s of dense first
+        std::thread::scope(|sc| -> Result<Self> {
+        let experts_h = sc.spawn(|| -> Result<(ExpertSet, f64)> {
+            tidelm_cuda::set_device(0)?;
+            let set = ExpertSet::load(ckpt, "layers.", n_layers, cfg.n_routed_experts, opts.keep.as_deref(), opts.tp, 0)?;
+            Ok((set, t0.elapsed().as_secs_f64()))
+        });
         let mut ld = Loader::new(ckpt, stream)?;
         let mut layers = Vec::with_capacity(n_layers);
         for l in 0..n_layers {
             layers.push(Some(Layer::load(&mut ld, cfg, l, opts.tp)?));
         }
+        let t_layers = t0.elapsed().as_secs_f64();
         let embed = ld.bf16("embed.weight", &[v, d])?;
         let full_head = ld.bf16("head.weight", &[v, d])?;
         let draft_head = if opts.spec && std::env::var("TIDELM_DRAFT_HEAD_FMT").as_deref() != Ok("bf16") {
@@ -1073,22 +1155,27 @@ impl Resident {
             }
             None => full_head,
         };
-        let experts = ExpertSet::load(ckpt, stream, &|l| format!("layers.{l}."), n_layers, cfg.n_routed_experts,
-                                      opts.keep.as_deref(), opts.tp)?;
+        let t_head = t0.elapsed().as_secs_f64();
         // the drafter's experts split like the backbone's under a split drafter, whole otherwise
         let dspark_experts = if opts.spec {
-            Some(ExpertSet::load(ckpt, stream, &|k| format!("mtp.{k}."), cfg.n_mtp_layers, cfg.dspark_n_routed_experts,
-                                 opts.dspark_keep.as_deref(), draft_tp)?)
+            Some(ExpertSet::load(ckpt, "mtp.", cfg.n_mtp_layers, cfg.dspark_n_routed_experts, opts.dspark_keep.as_deref(),
+                                 draft_tp, 0)?)
         } else {
             None
         };
+        let t_draft = t0.elapsed().as_secs_f64();
+        let (experts, t_experts) = experts_h.join().map_err(|_| "expert load thread panicked")??;
+        eprintln!("resident load: layers {t_layers:.1} s, embed + head by {t_head:.1} s, drafter experts by {t_draft:.1} s; \
+                   {} experts by {t_experts:.1} s (in parallel)", experts.owner.len());
         Ok(Resident { layers, embed, head, draft_head, experts, dspark_experts, ids: DeviceBuffer::zeroed(prefill_rows())? })
+        })
     }
 }
 
 impl Engine {
     /// `opts.spec` loads the DSpark drafter (three blocks + its heads, ~0.8 GB resident).
     pub fn new(model_dir: &std::path::Path, token_map: Vec<i64>, opts: Options) -> Result<Self> {
+        let t_new = Instant::now();
         let (max_seq, spec) = (opts.max_seq, opts.spec);
         let max_lanes = opts.max_lanes.max(1);
         let cfg = Config::load(model_dir)?;
@@ -1388,6 +1475,7 @@ impl Engine {
             return Err("TIDELM_EXPERT_TOPP needs resident mode (its dropped picks route to the arena's null slot)".into());
         }
         let resident = if opts.resident {
+            eprintln!("engine: {:.1} s before the resident load", t_new.elapsed().as_secs_f64());
             Some(Resident::load(&ckpt, &stream, &cfg, n_layers, &opts, &draft_run, draft_tp)?)
         } else {
             None
@@ -1583,6 +1671,13 @@ impl Engine {
                     let on = r.u32()? != 0;
                     self.set_graphs(on);
                 }
+                OP_MOVE_EXPERTS => {
+                    let n = r.u32()? as usize;
+                    let moves: Vec<[usize; 4]> = (0..n)
+                        .map(|_| Ok([r.u32()? as usize, r.u32()? as usize, r.u32()? as usize, r.u32()? as usize]))
+                        .collect::<Result<_>>()?;
+                    self.move_experts(&moves)?;
+                }
                 OP_SHUTDOWN => return Ok(()),
                 op => return Err(format!("rank 1: unknown control op {op}").into()),
             }
@@ -1591,6 +1686,68 @@ impl Engine {
 
     pub fn max_lanes(&self) -> usize {
         self.max_lanes
+    }
+
+    /// The backbone's resident experts, [layer][expert] (resident mode).
+    pub fn resident_mask(&self) -> Option<Vec<Vec<bool>>> {
+        let set = &self.resident.as_ref()?.experts;
+        let e = set.n_experts;
+        Some((0..self.n_layers).map(|l| (0..e).map(|x| set.lut_host[l * (e + 1) + x] >= 0).collect()).collect())
+    }
+
+    /// Residency moves between steps: each `[from_layer, from_expert, to_layer, to_expert]`
+    /// gives a resident expert's arena slot to an absent one (global_residency's swap pairs:
+    /// a layer may hand its slot to another), read from NVMe into it; then the slot LUT and
+    /// the router's keep mask change in place, so captured graphs route by the new set from
+    /// their next replay. Rank 0 mirrors the moves and rank 1 makes the same ones - its
+    /// half of each expert - so the pair's routing stays one box's. Returns the seconds taken.
+    pub fn move_experts(&mut self, moves: &[[usize; 4]]) -> Result<f64> {
+        if moves.is_empty() {
+            return Ok(0.0);
+        }
+        self.mirror(|m| {
+            m.u32(OP_MOVE_EXPERTS).u32(moves.len() as u32);
+            for mv in moves {
+                for &v in mv {
+                    m.u32(v as u32);
+                }
+            }
+        })?;
+        let t0 = Instant::now();
+        let n_layers = self.n_layers;
+        let res = self.resident.as_mut().ok_or("moving experts needs resident mode")?;
+        let set = &mut res.experts;
+        let e = set.n_experts;
+        let at = |l: usize, x: usize| l * (e + 1) + x;
+        // the whole plan is checked before any read: a source resident and leaving once, a
+        // target absent and arriving once
+        let mut jobs = Vec::with_capacity(moves.len());
+        let (mut leaving, mut arriving) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+        for &[lf, xf, lt, xt] in moves {
+            if lf >= n_layers || lt >= n_layers || xf >= e || xt >= e {
+                return Err(format!("expert move ({lf}, {xf}) -> ({lt}, {xt}) out of range").into());
+            }
+            let slot = set.lut_host[at(lf, xf)];
+            if slot < 0 || set.lut_host[at(lt, xt)] >= 0 || !leaving.insert((lf, xf)) || !arriving.insert((lt, xt)) {
+                return Err(format!("expert move ({lf}, {xf}) -> ({lt}, {xt}): the source must be resident, the target not").into());
+            }
+            jobs.push((slot as usize, lt, xt));
+        }
+        // nothing queued may still read a slot about to be overwritten
+        self.stream.synchronize()?;
+        set.read_many(&self.ckpt, &jobs)?;
+        for (&[lf, xf, lt, xt], &(slot, _, _)) in moves.iter().zip(&jobs) {
+            set.lut_host[at(lf, xf)] = -1;
+            set.lut_host[at(lt, xt)] = slot as i32;
+            set.owner[slot] = Some((lt, xt));
+        }
+        set.lut.upload_async(0, &set.lut_host, &self.stream)?;
+        if let Some(keep) = &self.keep {
+            let flat: Vec<u8> = (0..n_layers).flat_map(|l| (0..e).map(move |x| (l, x))).map(|(l, x)| (set.lut_host[at(l, x)] >= 0) as u8).collect();
+            keep.upload_async(0, &flat, &self.stream)?;
+        }
+        self.stream.synchronize()?;
+        Ok(t0.elapsed().as_secs_f64())
     }
 
     /// Lanes a single draft call can take (TMAX rows of draft blocks).
