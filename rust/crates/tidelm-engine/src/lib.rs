@@ -8,6 +8,7 @@
 
 pub mod adapt;
 pub mod config;
+pub mod copy;
 pub mod decode;
 pub mod draft_vocab;
 pub mod forward;

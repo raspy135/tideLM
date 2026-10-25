@@ -61,7 +61,7 @@ fn main() -> tidelm_engine::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     // an unknown flag is an error: a test flag the server ignores (--keep-first once) loaded
     // every expert and ran the box out of memory
-    const VALUED: [&str; 30] = ["--bench-width", "--vision", "--model-dir", "--max-seq", "--lanes", "--depth", "--step-rows", "--keep-db", "--budget",
+    const VALUED: [&str; 31] = ["--copy-draft", "--bench-width", "--vision", "--model-dir", "--max-seq", "--lanes", "--depth", "--step-rows", "--keep-db", "--budget",
                                 "--keep-first", "--layers", "--served-model-name", "--effort", "--host", "--port", "--world",
                                 "--rank", "--adapt-db", "--trace", "--adapt-sensitivity", "--adapt-prior", "--adapt-decode-tokens", "--adapt-probe", "--hot-ring", "--prefix-cache",
                                 "--prefix-snapshots", "--prefix-disk", "--prefix-disk-gb", "--prefix-disk-interval",
@@ -201,6 +201,10 @@ fn main() -> tidelm_engine::Result<()> {
     // the RAM prefix cache (DSV41_PREFIX_CACHE=1, DSV41_PREFIX_SNAPSHOTS=16): --prefix-cache 0 off
     if arg(&args, "--prefix-cache").as_deref() != Some("0") {
         sched.set_prefix_cache(arg(&args, "--prefix-snapshots").map(|v| v.parse()).transpose()?.unwrap_or(16));
+    }
+    // the copy drafter (copy.rs; TIDELM_COPY_* tune it): --copy-draft 0 drafts with DSpark alone
+    if arg(&args, "--copy-draft").as_deref() != Some("0") {
+        sched.set_copy_draft(tidelm_engine::copy::CopyConfig::from_env()?);
     }
     // the probe before each prefill (DSV41_PROBE_PREFILL=1 in the serving profile): --adapt-probe 0 skips it
     if let Some(a) = adapt {

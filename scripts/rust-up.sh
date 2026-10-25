@@ -20,6 +20,7 @@
 #   RUST_TRACE=results/trace-union/stats/coverage.json   the routing trace the history blends with
 #   RUST_PREFIX_DIR=~/tidelm-rust-state/prefix-cache     the prefix cache's disk tier
 #   RUST_EXPERT_TOPP         unset: off (DSV41_EXPERT_TOPP=0.90 measured slower in Rust, rust/PORT.md)
+#   RUST_COPY_DRAFT=1        the copy drafter (CPU prompt lookup in front of DSpark; 0 off)
 # Logs: ~/tidelm-rust-state/server.log here, ~/tidelm-rust-bin/server_rank1.log on the peer.
 # ---------------------------------------------------------------------------------------
 set -euo pipefail
@@ -51,7 +52,8 @@ args=(--resident --graphs --model-dir "$MODEL_DIR" --served-model-name "${SERVED
       --budget "${RUST_BUDGET:-10000}" --adapt-sensitivity "${DSV41_ADAPT_SENSITIVITY:-high}"
       --adapt-prior "${DSV41_ADAPT_PRIOR:-4}" --adapt-decode-tokens "${DSV41_ADAPT_DECODE_TOKENS:-600}"
       --adapt-probe "${DSV41_PROBE_PREFILL:-1}"
-      --prefix-cache "${DSV41_PREFIX_CACHE:-1}" --prefix-snapshots "${DSV41_PREFIX_SNAPSHOTS:-16}")
+      --prefix-cache "${DSV41_PREFIX_CACHE:-1}" --prefix-snapshots "${DSV41_PREFIX_SNAPSHOTS:-16}"
+      --copy-draft "${RUST_COPY_DRAFT:-1}")
 if [[ "${SPEC:-1}" == 0 ]]; then args+=(--depth plain); else args+=(--depth "${RUST_DEPTH:-confidence}"); fi
 if [[ "${DSV41_HOT_READS:-1}" == 1 && "${DSV41_HOT_ASYNC:-1}" == 1 ]]; then
     args+=(--hot-ring "${DSV41_HOT_RING:-128}")

@@ -60,6 +60,8 @@ struct ChatReq {
     /// x_debug: the stats also carry the prompt and output ids and each speculative step's
     /// depth and accepted drafts (offline drafter replays)
     debug: bool,
+    /// x_copy_draft (default true): false drafts this request with DSpark alone (A/B runs)
+    copy_draft: bool,
 }
 
 fn num(body: &Value, key: &'static str, default: f64, lo: f64, hi: f64) -> Result<f64, ApiError> {
@@ -277,6 +279,7 @@ fn parse(body: &[u8], ctx: &Ctx) -> Result<ChatReq, ApiError> {
         stream: flag("stream")?,
         include_usage: body.get("stream_options").and_then(|o| o.get("include_usage")).and_then(|b| b.as_bool()).unwrap_or(false),
         debug: flag("x_debug")?,
+        copy_draft: !matches!(body.get("x_copy_draft"), Some(Value::Bool(false))),
     })
 }
 
@@ -379,6 +382,7 @@ pub fn chat(stream: &mut TcpStream, body: &[u8], ctx: &Ctx) -> Result<(), Failur
         }),
         images,
         key,
+        copy_draft: req.copy_draft,
     };
     ctx.engine.send(Cmd::Submit(job)).map_err(|_| ApiError { status: 503, message: "the engine is not running".into(), param: None })?;
     let cid = format!("chatcmpl-{id:x}{:x}", seed & 0xffff_ffff);
@@ -467,6 +471,8 @@ pub fn chat(stream: &mut TcpStream, body: &[u8], ctx: &Ctx) -> Result<(), Failur
         "decode_tok_s": (n.saturating_sub(1)) as f64 / decode_s,
         "ttft_s": first_token_s.unwrap_or(0.0),
         "engine": "tidelm-rust",
+        "copy_steps": gen.copy_steps,
+        "copy_accepted": gen.copy_accepted,
     });
     if req.debug {
         stats["prompt_ids"] = json!(ids);

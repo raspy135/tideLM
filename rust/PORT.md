@@ -418,6 +418,15 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
   53.3 -> 67.6 / 74.1, fresh code 55.5 -> 53.8 / 53.5 (a few early-failing copies), prose
   unchanged (no copy fires). The pricing reproduces the logged DSpark runs within ~5%.
 
+  The copy drafter is in (copy.rs, --copy-draft 1 by default, x_copy_draft per request): the rule
+  the replay chose - copy only from the prompt (files, tool results, earlier turns), after a
+  6-token match, at least 6 tokens, the next copy 2 x the last one's accepted + 2 within 8..32.
+  Its first rule (copies from anywhere, fixed 32) lost 3% on fresh code: repeats inside the answer
+  diverge part way at 30 rows of verify. Measured on the pair, greedy: a file rewrite 58.6 ->
+  131.9 tok/s (50 copy steps accepting 1,482 of 1,536 tokens; the output equal to the copy-off
+  run's), a re-run tool call 60.9 -> 100.4 (equal), quoting code 50.6 -> 75.1; back to back on one
+  boot, fresh code 57.4 -> 58.9 and prose 32.3 -> 32.5 tok/s, no copy step firing on either.
+
   Still missing, in order of what the numbers above say (prefill at large chunks is in: M5,
   8K first token 27.3 -> 6.76 s):
   1. With speculation the pair's logits digest no longer equals one box's (4 layers, prose

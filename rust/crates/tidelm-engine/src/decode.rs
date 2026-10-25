@@ -52,6 +52,10 @@ pub struct Generation {
     pub miss: [f64; 8],
     /// prompt tokens restored from the prefix cache rather than prefilled
     pub cached: usize,
+    /// steps that verified a copy of the prompt (copy.rs) instead of a DSpark draft, and the
+    /// copied tokens they accepted
+    pub copy_steps: usize,
+    pub copy_accepted: usize,
 }
 
 fn digest(h: u64, logits: &[u16]) -> u64 {
@@ -409,6 +413,9 @@ pub struct BatchStats {
     /// prefix cache: requests that restored a prefix, and the tokens they did not prefill
     pub prefix_hits: usize,
     pub prefix_tokens: usize,
+    /// the copy drafter: steps it drafted, and the copied tokens they accepted
+    pub copy_steps: usize,
+    pub copy_accepted: usize,
 }
 
 /// How the scheduler picks each decoding lane's verify depth.
@@ -469,6 +476,8 @@ pub struct Job {
     /// the prefix cache's key for `prompt` (vision::span_keys at image positions, so a prompt
     /// shares a span only with one that shows the same image); None: the prompt itself
     pub key: Option<Vec<u32>>,
+    /// the copy drafter may draft for it (when the scheduler has one)
+    pub copy_draft: bool,
 }
 
 struct Slot {
@@ -488,6 +497,8 @@ struct Slot {
     probe: Option<ProbeRun>,
     /// prompt tokens restored from the prefix cache
     restored: usize,
+    /// the copy drafter's index of the prompt and the output (set_copy_draft)
+    copy: Option<crate::copy::CopyDraft>,
 }
 
 /// A request's probe: the prompt rows it feeds and the lane they go to - the request's own
@@ -557,6 +568,8 @@ pub struct Scheduler {
     prefix_snaps: Option<usize>,
     prefix: Vec<LanePrefix>,
     next_snap: u64,
+    /// the copy drafter's rule (None: DSpark drafts every step)
+    copy: Option<crate::copy::CopyConfig>,
 }
 
 impl Scheduler {
@@ -602,7 +615,16 @@ impl Scheduler {
             prefix_snaps: None,
             prefix: (0..lanes).map(|_| LanePrefix::default()).collect(),
             next_snap: 1,
+            copy: None,
         })
+    }
+
+    /// The copy drafter (copy.rs): a decoding lane whose output's tail occurs in its prompt
+    /// verifies what followed it there instead of a DSpark draft. Speculative modes only.
+    pub fn set_copy_draft(&mut self, cfg: crate::copy::CopyConfig) {
+        if self.opt.depth != DepthMode::Plain {
+            self.copy = Some(cfg);
+        }
     }
 
     /// The RAM prefix cache (DSV41_PREFIX_CACHE=1, DSV41_PREFIX_SNAPSHOTS=`snapshots`): a
@@ -943,8 +965,11 @@ impl Scheduler {
                         engine.reset_lane(probe_lane)?;
                     }
                     let gen = Generation { cached: restored, ..Default::default() };
+                    // an image span's positions all carry its placeholder id: never copied
+                    let skip = (!job.images.is_empty()).then_some(engine.cfg.image_token_id);
+                    let copy = self.copy.clone().filter(|_| job.copy_draft).map(|c| crate::copy::CopyDraft::new(&job.prompt, c, skip));
                     self.slots[lane] = Some(Slot {
-                        job, fed: restored, tok: None, gen, rng, q: Vec::new(), mark: (1, 0.0, 0.0), probe, restored,
+                        job, fed: restored, tok: None, gen, rng, q: Vec::new(), mark: (1, 0.0, 0.0), probe, restored, copy,
                     });
                 }
             }
@@ -968,6 +993,8 @@ impl Scheduler {
         // then waits for room changes nothing.
         let mut room = budget;
         let mut decode: Vec<(usize, usize)> = Vec::new(); // (lane, depth: decided now, or the reserve)
+        // per decoding lane, the copy it verifies instead of a DSpark draft (copy.rs)
+        let mut copies: Vec<Option<Vec<u32>>> = Vec::new();
         for i in 0..lanes {
             let lane = (self.rr + i) % lanes;
             if !matches!(&self.slots[lane], Some(s) if s.tok.is_some()) {
@@ -979,8 +1006,11 @@ impl Scheduler {
                 (_, LanePolicy::Window(w)) => w.decide(),
                 _ => b,
             };
+            let copy = self.slots[lane].as_ref().unwrap().copy.as_ref().map(|c| c.propose()).filter(|p| !p.is_empty() && room > p.len());
+            let d = copy.as_ref().map_or(d, |p| p.len());
             if room > d && decode.len() < max_decode {
                 decode.push((lane, d));
+                copies.push(copy);
                 room -= 1 + d;
             }
         }
@@ -1014,25 +1044,28 @@ impl Scheduler {
             }
         }
         let td = std::time::Instant::now();
-        let drafts: Vec<Vec<u32>> = if spec && !decode.is_empty() {
+        // DSpark drafts for the lanes that copy nothing; a copying lane's q is a delta at each
+        // copied token, so a sampled verification keeps the target's distribution
+        let drafting: Vec<(usize, usize)> = decode.iter().zip(&copies).filter(|(_, c)| c.is_none()).map(|(&x, _)| x).collect();
+        let dspark: Vec<Vec<u32>> = if spec && !drafting.is_empty() {
             self.stats.drafts += 1;
-            let dreq: Vec<(usize, u32, usize)> = decode
+            let dreq: Vec<(usize, u32, usize)> = drafting
                 .iter()
                 .map(|&(l, _)| (l, self.slots[l].as_ref().unwrap().tok.unwrap(), engine.lane_len(l) - 1))
                 .collect();
-            let sm: Vec<Sampling> = decode.iter().map(|&(l, _)| self.slots[l].as_ref().unwrap().job.sampling).collect();
+            let sm: Vec<Sampling> = drafting.iter().map(|&(l, _)| self.slots[l].as_ref().unwrap().job.sampling).collect();
             if sm.iter().all(|s| s.is_greedy()) {
                 engine.draft_batch(&dreq)?
             } else {
                 // a greedy lane draws nothing (its uniforms are placeholders)
-                let mut u = Vec::with_capacity(decode.len() * b);
-                for (&(l, _), x) in decode.iter().zip(&sm) {
+                let mut u = Vec::with_capacity(drafting.len() * b);
+                for (&(l, _), x) in drafting.iter().zip(&sm) {
                     let s = self.slots[l].as_mut().unwrap();
                     u.extend((0..b).map(|_| if x.is_greedy() { 0.0 } else { unif(&mut s.rng) }));
                 }
                 let out = engine.draft_batch_sampled(&dreq, &sm, &u)?;
                 out.into_iter()
-                    .zip(&decode)
+                    .zip(&drafting)
                     .map(|((d, q), &(l, _))| {
                         self.slots[l].as_mut().unwrap().q = q;
                         d
@@ -1042,15 +1075,32 @@ impl Scheduler {
         } else {
             Vec::new()
         };
-        // the confidence policy picks each lane's depth from its draft's confidences
+        let mut next_dspark = dspark.into_iter();
+        let drafts: Vec<Vec<u32>> = decode
+            .iter()
+            .zip(&copies)
+            .map(|(&(l, _), c)| match c {
+                Some(p) => {
+                    self.slots[l].as_mut().unwrap().q = p.iter().map(|&t| Nucleus { ids: vec![t], probs: vec![1.0] }).collect();
+                    p.clone()
+                }
+                None => next_dspark.next().unwrap_or_default(),
+            })
+            .collect();
+        // the confidence policy picks each DSpark lane's depth from its draft's confidences
         if spec {
+            let mut j = 0;
             for (i, (lane, d)) in decode.iter_mut().enumerate() {
+                if copies[i].is_some() {
+                    continue;
+                }
                 if let LanePolicy::Confidence(p) = &mut self.policies[*lane] {
-                    let conf: Vec<f64> = engine.draft_conf()[i].iter().map(|&x| x as f64).collect();
+                    let conf: Vec<f64> = engine.draft_conf()[j].iter().map(|&x| x as f64).collect();
                     let greedy = self.slots[*lane].as_ref().unwrap().job.sampling.is_greedy();
                     *d = if greedy { p.choose(&conf) } else { p.choose_sampled(&conf) }.map_err(|e| e.0)?;
                 }
                 *d = (*d).min(drafts[i].len());
+                j += 1;
             }
         }
         let blocks: Vec<Vec<u32>> = decode
@@ -1144,7 +1194,15 @@ impl Scheduler {
                 seeds.push((lane, a + 1));
                 s.gen.accepted.push(a);
                 s.gen.depths.push(d);
-                emits.push((lane, emitted, Some((d, a)), false));
+                if copies[i].is_some() {
+                    // the depth policies model DSpark's drafts: a copy step is not theirs to see
+                    s.copy.as_mut().unwrap().observe(a);
+                    (s.gen.copy_steps, s.gen.copy_accepted) = (s.gen.copy_steps + 1, s.gen.copy_accepted + a);
+                    (self.stats.copy_steps, self.stats.copy_accepted) = (self.stats.copy_steps + 1, self.stats.copy_accepted + a);
+                    emits.push((lane, emitted, None, false));
+                } else {
+                    emits.push((lane, emitted, Some((d, a)), false));
+                }
             } else {
                 let t = if sampled { draw(&nuc[i][0], unif(&mut s.rng)) } else { am[i][0] };
                 emits.push((lane, vec![t], None, false));
@@ -1201,6 +1259,9 @@ impl Scheduler {
                 s.tok = Some(last);
             }
             s.gen.tokens.extend_from_slice(&emitted);
+            if let Some(c) = s.copy.as_mut() {
+                c.push(&emitted);
+            }
             let stopped = emitted.iter().any(|t| s.job.stop.contains(t));
             let full = s.gen.tokens.len() >= s.job.max_tokens;
             (s.job.sink)(Event::Tokens(emitted));
@@ -1248,6 +1309,7 @@ pub fn generate_batch(engine: &mut Engine, reqs: &[Request], opt: &BatchOptions)
             }),
             images: Vec::new(),
             key: None,
+            copy_draft: true,
         })?;
     }
     while !sched.idle() {
