@@ -62,7 +62,8 @@ experts. TideLM decides which share, keeps deciding, and cheaply covers the rest
      128 slots of their own while the next step runs, and are routable from the step after until
      the ring wraps. No measured decode cost (41.21 vs 41.08 tok/s on the generation gate), and
      held-out loss improves by 0.007 nats on code and 0.138 on prose
-     ([measurements](docs/hot-reads.md)).
+     ([measurements](docs/hot-reads.md)). They plan from one lane's verify rows, so the
+     two-lane profile (`RUST_LANES=2`) runs without them; `RUST_LANES=1` turns them back on.
    - GLM-5.3 (`GLM_HOT`): a layer's heaviest miss (≥ 0.2 of the routing weight, at most 16 a
      step, paced over the layers) is read before that layer's MoE runs, computed exactly, and
      kept resident in place of the coldest expert.
@@ -108,29 +109,16 @@ docker run --rm --gpus all -v <exl3 dir>:/models-exl3:ro -v <packs dir>:/packs -
   --source /models-exl3 --out /packs/glm-exl3-experts-r0of2.bin --rank 0
 ```
 
-**3. Build the image** on the head; it is copied to the worker, and every profile runs from it:
+**3. Build** the engine on the head, with a Rust toolchain and the CUDA toolkit
+(`scripts/rust-up.sh` copies the binary to the worker at every start):
 
 ```bash
-scripts/dual-build.sh .env.ds41-mxfp4    # any of your profiles: its image, shipped to its PEER
+(cd rust && cargo build --release)
 ```
 
-The example profiles all name `tidelm:local` (`IMAGE` for DeepSeek, `GLM_IMAGE` for GLM-5.3), so
-one build serves every profile. DeepSeek runs the code baked into the image and refuses to boot
-from an image older than the checkout: after `git pull`, run the same command again. GLM-5.3
-mounts the checkout itself.
-
-The DeepSeek profile uses lossless scales. Pack the checkpoint once on the head (CPU only):
-
-```bash
-docker run --rm --entrypoint python -v /home/you/models:/models tidelm:local \
-  /app/tools/pack_expert_scales.py --model-dir /models/DeepSeek-V4.1-Flash-1017 \
-  --out-dir /models/dsv41-scale-packs
-```
-
-Copy `ds41-scales-r1of2.bin` to the same directory on the worker (about 5.2 GB per node). The
-example profile's `DSV41_SCALE_PACK` points there; the same arena then holds more experts. Keep
-the native checkpoint, and repack if its weights change. Empty `DSV41_SCALE_PACK` serves native
-scales. [Setup and rollback details](docs/lossless-scales.md).
+The EXL3 pack tool (step 2) runs from the image, which `scripts/dual-build.sh .env.glm53-exl3`
+builds as `tidelm:local` and ships to the worker. The Rust engine serves DeepSeek's native scales;
+the lossless scale pack ([details](docs/lossless-scales.md)) is the Python engine's.
 
 **4. Start and stop:**
 
@@ -139,19 +127,19 @@ scripts/tide-up.sh .env.glm53-exl3     # stops whatever is serving, starts this 
 scripts/tide-down.sh
 ```
 
-The model follows from the profile (`GLM_MODEL_DIR` → GLM-5.3, `MODEL_DIR` → DeepSeek). Both
-run on the Rust engine by default; `TIDE_ENGINE=python` in the profile (or the environment)
-selects the Python containers, and a profile the Rust engine does not serve (MXFP4 GLM experts,
-FP4 KV) falls back to them with a note. The Rust engine runs from the checkout rather than the
-image: build it once with `(cd rust && cargo build --release)` on the head (`scripts/rust-up.sh`
-copies the binary to the worker), and see the profile's `RUST_*` settings. It serves the OpenAI
-API with tool calls (and images, DeepSeek) and the Anthropic route for Claude Code. Boot
-takes 1-5 minutes; the first requests after a boot are slower while adaptation catches up with
-your traffic. One profile serves at a time: each fills both boxes.
+The model follows from the profile (`GLM_MODEL_DIR` → GLM-5.3, `MODEL_DIR` → DeepSeek), and
+the Rust engine serves both; the profiles carry only the settings it reads. It serves the OpenAI
+API with tool calls (and images, DeepSeek) and the Anthropic route for Claude Code. It is up 15 s
+(DeepSeek) to 40 s (GLM-5.3) after the previous pair has stopped; the first requests after a boot
+are slower while adaptation catches up with your traffic. One profile serves at a time: each
+fills both boxes. `TIDE_ENGINE=python` still starts the Python containers, from a profile with
+their settings (the examples as of `a6ec917`), and a profile the Rust engine does not serve
+(MXFP4 GLM experts, FP4 KV) goes to them with a note.
 
-## Abliterated overlay (DeepSeek V4.1 only)
+## Abliterated overlay (DeepSeek V4.1, Python engine only)
 
-Abliterated overlay is supported for DeepSeek v4.1 flash.
+Abliterated overlay is supported for DeepSeek v4.1 flash on the Python engine; the Rust engine
+does not load it yet.
 
 https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated
 
@@ -166,7 +154,8 @@ hf download drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated \
 echo '88324ceaa2c0754a2bdb4ef6bb388a088438e352358343e6c2c882009cdde864  '"$HOME/models/dsv41-1017-wo-b-ablit/wo_b_l10_35_1017.safetensors" | sha256sum -c -
 ```
 
-Set this **container path** in `.env.ds41-mxfp4`, then start that profile normally:
+Set this **container path** in a Python DeepSeek profile (`TIDE_ENGINE=python`, the example as
+of `a6ec917`), then start that profile:
 
 ```bash
 DSV41_ABLIT_WOB=/models/dsv41-1017-wo-b-ablit/wo_b_l10_35_1017.safetensors
@@ -176,12 +165,11 @@ DSV41_ABLIT_WOB=/models/dsv41-1017-wo-b-ablit/wo_b_l10_35_1017.safetensors
 
 - API: `http://<head>:8000/v1` (OpenAI-compatible chat completions, streaming included). Model
   names: `deepseek` and `glm-5.3` (`SERVED_MODEL_NAME`). No authentication: bind it to a trusted
-  interface (`HOST` / `BIND_HOST`).
+  interface (`HOST`).
 - Works with Open WebUI and other OpenAI clients; streamed responses end with `usage` and the
   engine's own statistics (`x_engine_stats`).
-- `/health` shows the serving configuration; on DeepSeek, `/expert-map` draws which experts are
-  resident, by layer.
-- Logs: `docker logs -f deepseek-v41-ep2-rank0` or `glm-serve-rank0`.
+- Logs: `~/tidelm-rust-state/server.log` on the head, `~/tidelm-rust-bin/server_rank1.log` on
+  the worker.
 
 Thinking, reasoning effort, tool calls and images: [API reference](server/README.md).
 
@@ -190,17 +178,17 @@ Thinking, reasoning effort, tool calls and images: [API reference](server/README
 Edit the profile, then `scripts/tide-up.sh` it again. The examples in `configs/` are commented
 with what each setting measured.
 
-| DeepSeek (`DSV41_*`) | GLM-5.3 (`GLM_*`) | What it controls |
+| DeepSeek | GLM-5.3 | What it controls |
 | --- | --- | --- |
-| `ARENA_GB=97.4` | `GLM_SLOTS=12500` | Expert memory per node, and so how many experts stay resident. |
-| `MAX_SEQ=524288` | `GLM_MAX_SEQ=262144` | Context allocation, generated tokens included. Less context, more experts. |
+| `RUST_BUDGET=10000` | `GLM_SLOTS=12500` | How many experts stay resident (GLM: slots a rank). Fewer, more memory for context. |
+| `MAX_SEQ=524288` | `GLM_MAX_SEQ=262144` | Context allocation (DeepSeek: a lane), generated tokens included. Less context, more experts. |
 | `DSV41_ADAPT_SENSITIVITY=high` | `GLM_ADAPT=1`, `GLM_ADAPT_EVERY=200` | How fast the resident set follows new traffic. |
-| `DSV41_EXPERT_SEED=1` | `GLM_STATS_SEED=1` | With no local history yet, start from the bundled one in `profiles/` (`0`: from scratch; or a seed file's path). |
-| `DSV41_HOT_READS=1`, `DSV41_HOT_ASYNC=1`, `DSV41_HOT_RING=128` | `GLM_HOT=1`, `GLM_HOT_MIN=0.2`, `GLM_HOT_MAX=16` | Hot reads (above). |
-| `DSV41_MAX_CONCURRENCY=1` | — | Concurrent requests; async hot reads need 1. |
-| `SPEC=1` | `GLM_MTP=1`, `GLM_MTP_DEPTH=7` | Speculative decoding. |
+| `RUST_ADAPT_DB` | `RUST_GLM_STATE_DB` | The learned history, under `~/tidelm-rust-state`. With none yet, the first boot starts from the bundled one in `profiles/`. |
+| `DSV41_HOT_READS=1`, `DSV41_HOT_ASYNC=1`, `DSV41_HOT_RING=128` | `GLM_HOT=1`, `GLM_HOT_KEEP=32` | Hot reads (above). |
+| `RUST_LANES=2` | — | Concurrent requests. Past one lane DeepSeek's async hot reads are off. |
+| `SPEC=1`, `RUST_DEPTH=confidence` | `GLM_MTP=1`, `GLM_MTP_DEPTH=7`, `GLM_MTP_CAL=0.36` | Speculative decoding and its depth policy. |
 | `DSV41_PREFIX_CACHE=1`, `DSV41_PREFIX_DISK=1` | `GLM_PREFIX_DISK=1`, `GLM_KV_SPLIT=1` | Prompt caching; GLM's KV cache split across the ranks. |
-| — | `GLM_KV=fp8` (or `fp4` with `GLM_KV_FP8_LAYERS=0-9,68-77`) | GLM's KV cache format. Both profiles serve FP8 at 256K. The 4-bit latent with the first and last ten layers in FP8 fits 320K in less memory and measured KL +0.004 against FP8 on the long eval, but in use the model's recall of its context was visibly worse, so it is off by default ([gotchas](docs/gotchas.md)). |
+| — | `GLM_KV=fp8` | GLM's KV cache format, the one the Rust engine serves. The Python engine's 4-bit latent with the first and last ten layers in FP8 fits 320K in less memory and measured KL +0.004 against FP8 on the long eval, but in use the model's recall of its context was visibly worse ([gotchas](docs/gotchas.md)). |
 | — | `GLM_LOOP_BREAK=12` | Stops a short cycle of tokens from repeating a 12th time (repetition loops start where experts are substituted). |
 
 ## Documentation

@@ -51,9 +51,10 @@ mkdir -p "$STATE"
 # profile leaves one out). The Rust engine implements the shipped profile's choices only and
 # refuses the others rather than serving something else: GLM_KV=fp8, GLM_EXPERT_FORMAT=exl3
 # (a native EXL3 checkpoint), GLM_HEAD=exl3, GLM_KVB_FP8=1, GLM_EMBED_8BIT=int8,
-# GLM_MISS=substitute, no prefill prefetch (GLM_PF), no async hot reads, no index buckets.
-# Fixed at the profile's values: GLM_HOT_MIN=0.2, GLM_HOT_MAX=16, GLM_HOT_PACE=1,
-# GLM_ADAPT_DECAY=0.9, GLM_ADAPT_MARGIN=1.5, GLM_BG_READS=0. GLM_PREFIX_DISK=1 keeps prompts'
+# GLM_MISS=substitute, no prefill prefetch (GLM_PF), no async hot reads, no index buckets, and
+# GLM_PREFILL_REDUCE bf16 or fp32. Fixed, and not read: GLM_HOT_MIN=0.2, GLM_HOT_MAX=16,
+# GLM_HOT_PACE=1, GLM_ADAPT_DECAY=0.9, GLM_ADAPT_MARGIN=1.5, GLM_BG_READS=0 (the Python engine's
+# keys, at its shipped values). GLM_PREFIX_DISK=1 keeps prompts'
 # rows on disk under its own directory (GLM_PREFIX_DISK_GB a node, GLM_PREFIX_DISK_MIN new tokens
 # to save or restore; never the Python store's files, whose layout differs).
 #   RUST_GLM_PREFIX_DIR=~/tidelm-rust-state/glm-prefix   the disk prefix store
@@ -73,6 +74,8 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
     want GLM_PF 0 0
     want GLM_HOT_ASYNC 0 0
     want GLM_INDEX_BUCKETS 0 0
+    [[ "${GLM_PREFILL_REDUCE:-fp32}" == bf16 || "${GLM_PREFILL_REDUCE:-fp32}" == fp32 ]] \
+        || err "the Rust GLM engine sums prefill partials in bf16 or fp32 only (profile: GLM_PREFILL_REDUCE=$GLM_PREFILL_REDUCE)"
     pack=${GLM_EXL3_PACK:-}
     [[ -n "$pack" ]] || err "$f sets no GLM_EXL3_PACK"
     [[ $check == 1 ]] && exit 0
