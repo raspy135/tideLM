@@ -202,6 +202,37 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
   Python TP2 profile; the `bench_accept_ab_tp.py` workload.*
 - **M5 — prefill.** Chunked eager prefill, Triton prefill MoE AOT, indexed attention,
   engram read-ahead, prefix restore. *Gate: prefill tok/s vs Python; secondary.*
+
+  Status 2026-10-24: a step with no decoding lane takes up to TIDELM_PREFILL_ROWS = 2,048
+  prompt rows, run eager (TMAX = 64 still bounds graphed steps and head rows). The 8K-token
+  first token on the pair, bench.py's random8k workload (same labels and seed as the README
+  row, median of three after a warmup), as each piece went in:
+
+  | change | 8K first token |
+  |---|---:|
+  | 64-row steps (M7's row below) | 27.3 s |
+  | 2,048-row steps: M-tiled dense GEMMs, ds_route_large, one-pass prompt-row attention | 12.76 s |
+  | NCCL all-gather for an eager step's > 1 MB shards (the RoCE one-shot moved them at ~5 GB/s) | 12.41 s |
+  | grouped-GEMM routed experts (64-pair blocks, FP4 decoded to bf16 in shared memory) | 10.20 s |
+  | HC mixes in one FMA launch, tensor-core indexer scores, engram next-chunk prefetch | 8.24 s |
+  | grouped GEMM's weights fetched 64 bytes a row, 32-head attention blocks, key prefetch | **6.76 s** (6.71 / 6.76 / 6.76) |
+  | Python, README row | 7.3 s |
+
+  Decode after the prompt is unchanged throughout (66-68 ms a step in every run). Rank 0's
+  GPU time at the last row was 96.7% busy. The bounds that set the numbers: the grouped GEMM
+  streams FP4 weights (2.4 GB a layer a step), and 32-byte runs a row read at 124 GB/s on
+  this bus against 215-228 for 64-128 (a read-only walk of the same layout), so it fetches
+  two K steps at once (19.4 -> 13.9 ms a layer at 2,048 rows; its tensor-core work alone is
+  6.7 ms); attention's gathered keys were loaded between barriers, one block an SM (14.7 ->
+  6.87 ms with 32 heads a block and the next tile's keys in registers; Python's kernel 7.35).
+
+  Numerics: a prompt row's bits no longer match a 64-row step's once its step reaches 512 rows
+  (the grouped GEMM's dots are bf16 x bf16, the decode kernels' f16 x f16) or runs eager (the
+  indexer's per-head dots accumulate in the mma's order; its head sum keeps warp_sum's tree).
+  Every prefill kernel is pair-invariant and the pair still equals one box bit for bit
+  (4 layers, 2,048 + 1,211 rows). Two facts in a 9,019-token prompt (start, middle) come back
+  exactly. Not comparable in one respect: Python's prefill can read missing experts (hot
+  reads); here the 10,000 residents are all there is, so no prefill pays for a miss.
 - **M6 — concurrency** (user goal). Continuous batching: admission at step boundaries,
   per-lane KV/compressor/penalties/depth state, decode graphs keyed additionally by
   batch bucket {1, 2, 4, 8}, swaps only at scheduler boundaries (the
@@ -283,13 +314,12 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
   confidence), and code's acceptance fell from 3.79 / 3.72 / 3.37 to 3.45 / 3.61 / 3.29 tokens
   a step under the window policy - the drafter predicts the unpruned target.
 
-  Still missing, in order of what the numbers above say:
-  1. Prefill at large chunks (M5): the 8K first token is 27.3 s against Python's 7.3. Needs
-     steps past 64 rows - a large-M dense GEMM that reads each weight once per M tile, MoE
-     routing past 512 pairs, a ring that holds a chunk's keys - for prompt rows only.
-  2. Hot reads and adaptation (the resident set re-planned from demand, misses read from
-     NVMe): today the resident set is fixed at boot and the rest is pruned.
-  3. The lossless packed verify head (DSV41_HEAD_KERNEL=packed, 2.94 -> 2.25 ms/step in
+  Still missing, in order of what the numbers above say (prefill at large chunks is in: M5,
+  8K first token 27.3 -> 6.76 s):
+  1. Hot reads and adaptation (the resident set re-planned from demand before and after
+     prefill and during long answers, misses read from NVMe): today the resident set is
+     fixed at boot and the rest is pruned.
+  2. The lossless packed verify head (DSV41_HEAD_KERNEL=packed, 2.94 -> 2.25 ms/step in
      Python), the sharded head's argmax without gathering logits (`ds_argmax_bf16_pairs` /
      `_combine` are in, unused), the server's tool calls, images and Anthropic routes.
 

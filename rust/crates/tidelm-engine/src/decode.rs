@@ -157,13 +157,13 @@ fn next_token(rows: Rows, rng: &mut Pcg64) -> u32 {
 /// Prefill `prompt` into lane 0 (seeding the drafter when `seed`) and pick the first token.
 fn prefill_first(engine: &mut Engine, prompt: &[u32], seed: bool, opt: &DecodeOptions, rng: &mut Pcg64,
                  g: &mut Generation) -> Result<u32> {
-    let chunks: Vec<&[u32]> = prompt.chunks(TMAX).collect();
+    let chunks: Vec<&[u32]> = prompt.chunks(engine.pmax).collect();
     let mut first = None;
     for (i, chunk) in chunks.iter().enumerate() {
         if i + 1 == chunks.len() {
-            first = Some(next_token(step_rows(engine, Seg { lane: 0, ids: chunk, want: Want::Last, decode: false }, opt, g)?, rng));
+            first = Some(next_token(step_rows(engine, Seg { lane: 0, ids: chunk, want: Want::Last, decode: false, next: &[] }, opt, g)?, rng));
         } else {
-            engine.forward(chunk, Want::Nothing)?;
+            engine.forward_next(chunk, chunks[i + 1], Want::Nothing)?;
         }
         if seed {
             engine.seed_draft(chunk.len())?;
@@ -198,7 +198,7 @@ pub fn generate(engine: &mut Engine, prompt: &[u32], max_tokens: usize, stop: &[
     let mut pos = prompt.len(); // position of `tok`, not yet forwarded
     while g.tokens.len() < max_tokens && !stop.contains(&tok) {
         if !spec {
-            tok = next_token(step_rows(engine, Seg { lane: 0, ids: &[tok], want: Want::Last, decode: true }, opt, &mut g)?, &mut rng);
+            tok = next_token(step_rows(engine, Seg { lane: 0, ids: &[tok], want: Want::Last, decode: true, next: &[] }, opt, &mut g)?, &mut rng);
             pos += 1;
             g.tokens.push(tok);
             g.steps += 1;
@@ -229,7 +229,7 @@ pub fn generate(engine: &mut Engine, prompt: &[u32], max_tokens: usize, stop: &[
         .min(drafts.len());
         let mut block = vec![tok];
         block.extend_from_slice(&drafts[..d]);
-        let (a, mut emitted) = match step_rows(engine, Seg { lane: 0, ids: &block, want: Want::All, decode: true }, opt, &mut g)? {
+        let (a, mut emitted) = match step_rows(engine, Seg { lane: 0, ids: &block, want: Want::All, decode: true, next: &[] }, opt, &mut g)? {
             Rows::Greedy(am) => accept(&block, &am, stop),
             Rows::Sampled(p) => {
                 let pr: Vec<SparseRow> = p.iter().map(|n| n.row()).collect();
@@ -284,11 +284,12 @@ pub fn generate(engine: &mut Engine, prompt: &[u32], max_tokens: usize, stop: &[
 }
 
 fn prefill(engine: &mut Engine, prompt: &[u32], seed: bool, g: &mut Generation) -> Result<u32> {
-    let chunks: Vec<&[u32]> = prompt.chunks(TMAX).collect();
+    let chunks: Vec<&[u32]> = prompt.chunks(engine.pmax).collect();
     let mut logits = Vec::new();
     for (i, chunk) in chunks.iter().enumerate() {
         let last = i + 1 == chunks.len();
-        logits = engine.forward(chunk, if last { Want::Last } else { Want::Nothing })?;
+        let next: &[u32] = if last { &[] } else { chunks[i + 1] };
+        logits = engine.forward_next(chunk, next, if last { Want::Last } else { Want::Nothing })?;
         if seed {
             engine.seed_draft(chunk.len())?;
         }
@@ -411,6 +412,9 @@ pub struct SchedOptions {
     pub depth: DepthMode,
     /// rows per backbone step (<= TMAX): decode rows first, prefill chunks fill the rest
     pub step_rows: usize,
+    /// rows a step with no decoding lane gives its prompt chunks (<= the engine's pmax); None:
+    /// step_rows
+    pub prefill_rows: Option<usize>,
     /// read back full logits and hash them into each Generation's digest (greedy checks)
     pub logits: bool,
 }
@@ -624,6 +628,10 @@ impl Scheduler {
             }
         }
         self.rr = (self.rr + 1) % lanes;
+        // a step no lane decodes in is the prompts': it may be a prefill-sized step
+        if decode.is_empty() {
+            room = self.opt.prefill_rows.unwrap_or(budget).clamp(1, engine.pmax);
+        }
         let mut prefill = Vec::new();
         for (lane, slot) in self.slots.iter().enumerate() {
             if let Some(s) = slot {
@@ -688,16 +696,24 @@ impl Scheduler {
         let mut segs: Vec<Seg> = decode
             .iter()
             .zip(&blocks)
-            .map(|(&(lane, _), blk)| Seg { lane, ids: blk, want: if spec { Want::All } else { Want::Last }, decode: true })
+            .map(|(&(lane, _), blk)| Seg { lane, ids: blk, want: if spec { Want::All } else { Want::Last }, decode: true, next: &[] })
             .collect();
         for &(lane, c) in &prefill {
             let s = self.slots[lane].as_ref().unwrap();
             let p = &s.job.prompt;
             let want = if s.fed + c == p.len() { Want::Last } else { Want::Nothing };
-            segs.push(Seg { lane, ids: &p[s.fed..s.fed + c], want, decode: false });
+            // the next chunk, as wide as this one: prefetched engram rows past what the next
+            // step takes stay cached for the one after
+            let next = &p[s.fed + c..p.len().min(s.fed + 2 * c)];
+            segs.push(Seg { lane, ids: &p[s.fed..s.fed + c], want, decode: false, next });
         }
         self.stats.steps += 1;
         self.stats.rows += segs.iter().map(|s| s.ids.len()).sum::<usize>();
+        if std::env::var_os("TIDELM_TRACE_STEPS").is_some() {
+            let free = tidelm_cuda::mem_get_info().map(|m| m.0 >> 20).unwrap_or(0);
+            eprintln!("step {}: segments {:?}, {} MiB free", self.stats.steps,
+                      segs.iter().map(|s| (s.lane, s.ids.len(), s.decode)).collect::<Vec<_>>(), free);
+        }
         let tf = std::time::Instant::now();
         self.stats.draft_s += (tf - td).as_secs_f64();
         // per segment, the argmax of each wanted row (and with logits, the rows' logits); with
@@ -806,7 +822,7 @@ pub fn generate_batch(engine: &mut Engine, reqs: &[Request], opt: &BatchOptions)
         None => DepthMode::Plain,
         Some(d) => DepthMode::Fixed(d),
     };
-    let mut sched = Scheduler::new(engine, SchedOptions { depth, step_rows: opt.step_rows, logits: opt.logits })?;
+    let mut sched = Scheduler::new(engine, SchedOptions { depth, step_rows: opt.step_rows, prefill_rows: None, logits: opt.logits })?;
     let out: std::sync::Arc<std::sync::Mutex<Vec<Option<Generation>>>> = std::sync::Arc::new(std::sync::Mutex::new(vec![None; reqs.len()]));
     for (i, r) in reqs.iter().enumerate() {
         let out = out.clone();

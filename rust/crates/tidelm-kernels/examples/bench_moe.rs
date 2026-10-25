@@ -110,12 +110,12 @@ fn main() {
         });
         let mma = time_graph(&stream, |s| unsafe {
             let rc = ds_moe_up_mma(s.raw(), x.raw(), DIM as i64, w1.raw(), s1.raw(), w3.raw(), s3.raw(), h.raw(), INTER as i64,
-                                   rw.raw(), r(&bs), r(&br), p as i32, INTER as i32, DIM as i32, 10.0, -1);
+                                   rw.raw(), r(&bs), r(&br), p as i32, INTER as i32, DIM as i32, 10.0, -1, 16);
             if rc != 0 {
                 return rc;
             }
             ds_moe_down_mma(s.raw(), h.raw(), INTER as i64, w2.raw(), s2.raw(), parts.raw(), DIM as i64, r(&bs), r(&bp),
-                            p as i32, DIM as i32, INTER as i32, TOPK as i32, t as i32, -1, 0, 1)
+                            p as i32, DIM as i32, INTER as i32, TOPK as i32, t as i32, -1, 0, 1, 16)
         });
         let bytes = uniq.len() * 3 * INTER * DIM / 2;
         println!("{t:5} {p:6} {:8}  {:10.1} {:10.1}  {:7.0}", uniq.len(), bm16 * 1e6, mma * 1e6, bytes as f64 / mma / 1e9);

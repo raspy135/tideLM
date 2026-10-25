@@ -280,6 +280,55 @@ fn linear_bf16_and_f32_weights() {
     assert_f32_close(&dyf.download().unwrap(), &want, 1e-5, "f32 weights");
 }
 
+/// Past 16 rows one FMA launch tiles M by 16 (gridDim.z): each row keeps the bits of its
+/// 16-row slice launched alone - the HC mixes' split-K fp32 GEMM, and fp8 without split-K.
+#[test]
+fn linear_past_16_rows_is_its_16_row_slices() {
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(19);
+    let (m, n, k, splits) = (300usize, 24usize, 4096usize, 16usize);
+    let x = rng.bf16_vec(m * k, 1.0);
+    let wf: Vec<f32> = (0..n * k).map(|_| rng.normal() * 0.05).collect();
+    let (dx, dwf) = (dev(&x), dev(&wf));
+    let part = DeviceBuffer::<f32>::zeroed(splits * m * n).unwrap();
+    let (whole, sliced) = (DeviceBuffer::<f32>::zeroed(m * n).unwrap(), DeviceBuffer::<f32>::zeroed(m * n).unwrap());
+    ok(unsafe { ds_linear_f32w(st.raw(), p(&dx), k as i64, p(&dwf), m as i32, n as i32, k as i32, splits as i32, null(), n as i64, p(&part)) });
+    ok(unsafe { ds_splits_reduce(st.raw(), p(&part), splits as i32, m as i32, n as i32, null(), p(&whole), n as i64) });
+    for r0 in (0..m).step_by(16) {
+        let mt = 16.min(m - r0);
+        ok(unsafe {
+            ds_linear_f32w(st.raw(), dx.ptr_at(r0 * k), k as i64, p(&dwf), mt as i32, n as i32, k as i32, splits as i32, null(),
+                           n as i64, p(&part))
+        });
+        ok(unsafe { ds_splits_reduce(st.raw(), p(&part), splits as i32, mt as i32, n as i32, null(), sliced.ptr_at(r0 * n), n as i64) });
+    }
+    st.synchronize().unwrap();
+    let got = whole.download().unwrap();
+    assert_eq!(got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+               sliced.download().unwrap().iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "f32w split-K, M={m}");
+    assert_f32_close(&got, &ref_linear(&x, |j, kk| wf[j * k + kk] as f64, m, n, k), 1e-5, "f32w M=300");
+
+    let (n, k) = (96usize, 1280usize);
+    let w = rng.fp8_vec(n * k);
+    let lds = k / 32;
+    let s: Vec<u8> = (0..n.div_ceil(32) * lds).map(|_| 118 + (rng.next() % 12) as u8).collect();
+    let (dw, ds) = (dev(&w), dev(&s));
+    let m = 37;
+    let x = rng.bf16_vec(m * k, 1.0);
+    let dx = dev(&x);
+    let (whole, sliced) = (DeviceBuffer::<u16>::zeroed(m * n).unwrap(), DeviceBuffer::<u16>::zeroed(m * n).unwrap());
+    ok(unsafe { ds_linear_fp8(st.raw(), p(&dx), k as i64, p(&dw), p(&ds), lds as i64, m as i32, n as i32, k as i32, 1, p(&whole), null(), n as i64, null()) });
+    for r0 in (0..m).step_by(16) {
+        let mt = 16.min(m - r0);
+        ok(unsafe {
+            ds_linear_fp8(st.raw(), dx.ptr_at(r0 * k), k as i64, p(&dw), p(&ds), lds as i64, mt as i32, n as i32, k as i32, 1,
+                          sliced.ptr_at(r0 * n), null(), n as i64, null())
+        });
+    }
+    st.synchronize().unwrap();
+    assert_eq!(whole.download().unwrap(), sliced.download().unwrap(), "fp8, M={m}");
+}
+
 // ------------------------------------------------------------------ norms / HC
 fn ref_rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
     let d = x.len();
@@ -543,7 +592,8 @@ fn swiglu_and_moe_combine() {
 fn attention_decode_matches_the_sinked_softmax_reference() {
     let Some(st) = setup() else { return };
     let mut rng = Rng(41);
-    let (m, h, d, ring_size, w, c) = (2usize, 8usize, 512usize, 256usize, 128usize, 40usize);
+    // 40 heads: a full and a partial block of 32 / of 16 heads
+    let (m, h, d, ring_size, w, c) = (2usize, 40usize, 512usize, 256usize, 128usize, 40usize);
     let q = rng.bf16_vec(m * h * d, 0.2);
     let ring = rng.bf16_vec(ring_size * d, 1.0);
     let n_ckv = 64usize;
@@ -561,13 +611,28 @@ fn attention_decode_matches_the_sinked_softmax_reference() {
     // both kernels: the per-head one (no workspace) and the split-key one
     let wb = unsafe { ds_attn_work_bytes(m as i32, h as i32, (w + c) as i32) } as usize;
     let work = DeviceBuffer::<u8>::zeroed(wb).unwrap();
-    for split in [false, true] {
+    // 0 per-head, 1 split-key, 2 the one-pass prompt-row kernel, 3 a mixed step: row 0 a
+    // decode row (split-key), row 1 a prompt row (one-pass), each kernel skipping the other's,
+    // 4 the one-pass kernel at 32 heads a block (32-key tiles)
+    let decode_rows = dev(&[1i32, 0]);
+    for mode in 0..5 {
+    let split = mode > 0;
     let dout = DeviceBuffer::<u16>::zeroed(m * h * d).unwrap();
-    let (wp, wl) = if split { (p(&work), wb as i64) } else { (null(), 0) };
-    ok(unsafe {
-        ds_attn_decode(st.raw(), p(&dq), p(&dring), ring_size as i32, p(&dpos), w as i32, 0, p(&dckv), p(&dcidx),
-                       c as i32, p(&dsink), scale, p(&dout), m as i32, h as i32, null(), 0, 0, wp, wl)
-    });
+    let (wp, wl) = if mode == 1 || mode == 3 { (p(&work), wb as i64) } else { (null(), 0) };
+    if mode != 2 && mode != 4 {
+        ok(unsafe {
+            ds_attn_decode(st.raw(), p(&dq), p(&dring), ring_size as i32, p(&dpos), w as i32, 0, p(&dckv), p(&dcidx),
+                           c as i32, p(&dsink), scale, p(&dout), m as i32, h as i32, null(), 0, 0, wp, wl,
+                           if mode == 3 { p(&decode_rows) } else { null() })
+        });
+    }
+    if mode >= 2 {
+        ok(unsafe {
+            ds_attn_prefill(st.raw(), p(&dq), p(&dring), ring_size as i32, p(&dpos), w as i32, 0, p(&dckv), p(&dcidx),
+                            c as i32, p(&dsink), scale, p(&dout), m as i32, h as i32, null(), 0, 0,
+                            if mode == 3 { p(&decode_rows) } else { null() }, if mode == 4 { 32 } else { 16 })
+        });
+    }
     st.synchronize().unwrap();
     let got = dout.download().unwrap();
     for r in 0..m {
@@ -600,20 +665,18 @@ fn attention_decode_matches_the_sinked_softmax_reference() {
                 .map(|dd| keys.iter().zip(&e).map(|(k, &p)| p / denom * f32_from_bf16(k[dd]) as f64).sum())
                 .collect();
             let row = &got[(r * h + hh) * d..(r * h + hh + 1) * d];
-            if split {
-                // PV on the tensor cores takes p as a bf16 high part + remainder (~16 bits): its
-                // error scales with sum |p v|, which a cancelling output can sit far below
-                let mag: Vec<f64> = (0..d)
-                    .map(|dd| keys.iter().zip(&e).map(|(k, &p)| p / denom * (f32_from_bf16(k[dd]) as f64).abs()).sum())
-                    .collect();
-                for (i, ((&g, &w), &a)) in row.iter().zip(&want).zip(&mag).enumerate() {
-                    let g = f32_from_bf16(g) as f64;
-                    let ulp = 2f64.powf((w.abs().max(1e-30)).log2().floor() - 7.0);
-                    let tol = 0.51 * ulp + 2f64.powi(-15) * a + 1e-30;
-                    assert!((g - w).abs() <= tol, "attn (split) r{r} h{hh}[{i}]: got {g}, want {w} (tol {tol})");
-                }
-            } else {
-                assert_bf16_close(row, &want, &format!("attn r{r} h{hh}"));
+            // a sum's error scales with sum |p v|, which a cancelling output can sit far below:
+            // PV on the tensor cores takes p as a bf16 high part + remainder (~16 bits), the
+            // per-head kernel's is fp32
+            let mag: Vec<f64> = (0..d)
+                .map(|dd| keys.iter().zip(&e).map(|(k, &p)| p / denom * (f32_from_bf16(k[dd]) as f64).abs()).sum())
+                .collect();
+            let rel = if split { 2f64.powi(-15) } else { 2f64.powi(-20) };
+            for (i, ((&g, &w), &a)) in row.iter().zip(&want).zip(&mag).enumerate() {
+                let g = f32_from_bf16(g) as f64;
+                let ulp = 2f64.powf((w.abs().max(1e-30)).log2().floor() - 7.0);
+                let tol = 0.51 * ulp + rel * a + 1e-30;
+                assert!((g - w).abs() <= tol, "attn (mode {mode}) r{r} h{hh}[{i}]: got {g}, want {w} (tol {tol})");
             }
         }
     }
@@ -790,6 +853,56 @@ fn index_scores_match_the_bf16_einsum_reference() {
                 assert!((g as f64 - sum).abs() <= mag * 2f64.powi(-7) + 1e-6, "score[{r}][{j}] {g} vs {sum}");
             }
         }
+    }
+}
+
+/// The tensor-core scores against index_scores_kernel: masks exact, values within the dots'
+/// rounding (a dot that crosses a bf16 boundary moves one head's term by an ulp), rows of two
+/// lanes sharing a block, causal clen over a prefill-like step.
+#[test]
+fn index_scores_mma_matches_the_fma_kernel() {
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(61);
+    let (t, n, h, dd) = (45usize, 700usize, 32usize, 128usize);
+    let q = rng.bf16_vec(t * h * dd, 0.3);
+    let k = rng.bf16_vec(2 * n * dd, 0.3);
+    let w: Vec<f32> = (0..t * h).map(|_| rng.unif()).collect();
+    let clen: Vec<i32> = (0..t).map(|r| (100 + 13 * r as i32).min(n as i32)).collect();
+    // rows 20..30 read lane 1's keys
+    let lanes: Vec<i32> = (0..t).map(|r| (20..30).contains(&r) as i32).collect();
+    let cand: Vec<u8> = (0..t * n).map(|i| ((i / 8) % 3 != 1) as u8).collect();
+    let (dq, dk, dw, dc, dl, dcand) = (dev(&q), dev(&k), dev(&w), dev(&clen), dev(&lanes), dev(&cand));
+    for masked in [false, true] {
+        let run = |mma: bool| -> Vec<u16> {
+            let dout = DeviceBuffer::<u16>::zeroed(t * n).unwrap();
+            let cm = if masked { p(&dcand) } else { null() };
+            ok(unsafe {
+                if mma {
+                    ds_index_scores_mma(st.raw(), p(&dq), p(&dk), p(&dw), p(&dc), cm, n as i64, n as i32, p(&dout), n as i64,
+                                        t as i32, p(&dl), (n * dd) as i64)
+                } else {
+                    ds_index_scores(st.raw(), p(&dq), p(&dk), p(&dw), p(&dc), cm, n as i64, n as i32, p(&dout), n as i64,
+                                    t as i32, p(&dl), (n * dd) as i64)
+                }
+            });
+            st.synchronize().unwrap();
+            dout.download().unwrap()
+        };
+        let (want, got) = (run(false), run(true));
+        let mut differ = 0;
+        for (i, (&a, &b)) in want.iter().zip(&got).enumerate() {
+            let (fa, fb) = (f32_from_bf16(a), f32_from_bf16(b));
+            if fa.is_infinite() || fb.is_infinite() {
+                assert_eq!(a, b, "mask differs at row {} key {}", i / n, i % n);
+                continue;
+            }
+            if a != b {
+                differ += 1;
+                assert!((fa - fb).abs() <= 2f32.powi(-6) * fa.abs().max(fb.abs()) + 1e-4, "[{}][{}] {fa} vs {fb}", i / n, i % n);
+            }
+        }
+        let live = want.iter().filter(|&&a| !f32_from_bf16(a).is_infinite()).count();
+        assert!(live > 1000 && differ * 20 < live, "{differ} of {live} live scores differ");
     }
 }
 
@@ -996,10 +1109,12 @@ fn mma_gemm_matches_reference_and_is_row_invariant_across_m() {
     let s: Vec<u8> = (0..n.div_ceil(32) * lds).map(|_| 118 + (rng.next() % 12) as u8).collect();
     let wb = rng.bf16_vec(n * k, 0.05);
     let (dw, ds, dwb) = (dev(&w), dev(&s), dev(&wb));
-    let x = rng.bf16_vec(64 * k, 1.0);
+    // past 64 rows (prefill) the grid tiles M: every row must still be computed alike
+    let x = rng.bf16_vec(300 * k, 1.0);
     let dx = dev(&x);
     let mut first_rows: Option<(Vec<u16>, Vec<u16>)> = None;
-    for m in [1usize, 6, 17, 24, 33, 64] {
+    let mut rows64: Option<(Vec<u16>, Vec<u16>)> = None;
+    for m in [1usize, 6, 17, 24, 33, 64, 65, 200, 300] {
         let wf8 = |j: usize, kk: usize| e4m3(w[j * k + kk]) as f64 * e8m0_lin(s[(j / 32) * lds + kk / 32]) as f64;
         let wf16 = |j: usize, kk: usize| f32_from_bf16(wb[j * k + kk]) as f64;
         let (want8, mag8) = ref_linear_mag(&x[..m * k], wf8, m, n, k);
@@ -1021,6 +1136,14 @@ fn mma_gemm_matches_reference_and_is_row_invariant_across_m() {
                 assert_eq!(&g8[..n], &a[..], "fp8 row 0 differs at M={m}");
                 assert_eq!(&g16[..n], &b[..], "bf16 row 0 differs at M={m}");
             }
+        }
+        // nor rows 0..64 on whether 64 or 300 rows share it (one 128-row tile spans them)
+        if m == 64 {
+            rows64 = Some((g8.clone(), g16.clone()));
+        } else if m > 64 {
+            let (a, b) = rows64.as_ref().unwrap();
+            assert_eq!(&g8[..64 * n], &a[..], "fp8 rows 0..64 differ at M={m}");
+            assert_eq!(&g16[..64 * n], &b[..], "bf16 rows 0..64 differ at M={m}");
         }
     }
     // split-K into fp32 partials
@@ -1095,7 +1218,7 @@ fn lane_rows_read_and_write_only_their_own_caches() {
     let work = DeviceBuffer::<u8>::zeroed(wb).unwrap();
     ok(unsafe {
         ds_attn_decode(st.raw(), p(&dq), p(&drings), ring as i32, p(&dp), w as i32, 0, p(&dckvs), p(&dc), c as i32, p(&dsink),
-                       scale, p(&both), 3, h as i32, p(&dl), (ring * d) as i64, (n_ckv * d) as i64, p(&work), wb as i64)
+                       scale, p(&both), 3, h as i32, p(&dl), (ring * d) as i64, (n_ckv * d) as i64, p(&work), wb as i64, null())
     });
     st.synchronize().unwrap();
     let both = both.download().unwrap();
@@ -1106,7 +1229,7 @@ fn lane_rows_read_and_write_only_their_own_caches() {
         let one = DeviceBuffer::<u16>::zeroed(h * d).unwrap();
         ok(unsafe {
             ds_attn_decode(st.raw(), p(&dq1), p(&dr1), ring as i32, p(&dp1), w as i32, 0, p(&dk1), p(&dc1), c as i32, p(&dsink),
-                           scale, p(&one), 1, h as i32, null(), 0, 0, p(&work), wb as i64)
+                           scale, p(&one), 1, h as i32, null(), 0, 0, p(&work), wb as i64, null())
         });
         st.synchronize().unwrap();
         assert_eq!(&both[row * h * d..(row + 1) * h * d], &one.download().unwrap()[..], "attention row {row} (lane {ln})");
@@ -1255,12 +1378,12 @@ fn moe_mma_matches_bm16_and_is_row_invariant() {
         if mma {
             ok(unsafe {
                 ds_moe_up_mma(st.raw(), p(&dx), dim as i64, p(&dw1), p(&ds1), p(&dw3), p(&ds3), p(&h), inter as i64, p(&drw),
-                              p(&bs), p(&br), pairs as i32, inter as i32, dim as i32, limit, -1)
+                              p(&bs), p(&br), pairs as i32, inter as i32, dim as i32, limit, -1, 16)
             });
             let hd = if h_in.is_some() { &h_down } else { &h };
             ok(unsafe {
                 ds_moe_down_mma(st.raw(), p(hd), inter as i64, p(&dw2), p(&ds2), p(&parts), dim as i64, p(&bs), p(&bp),
-                                pairs as i32, dim as i32, inter as i32, topk as i32, tt as i32, -1, 0, 1)
+                                pairs as i32, dim as i32, inter as i32, topk as i32, tt as i32, -1, 0, 1, 16)
             });
         } else {
             ok(unsafe {
@@ -1478,4 +1601,193 @@ fn expert_topp_drops_the_low_share_tail_of_decode_rows() {
     assert!(dropped > 0, "the test drops nothing");
     // row 2: the dominant pick holds > 0.9 alone, min_k still keeps three
     assert_eq!(gw[2 * k + 3..3 * k], [0.0, 0.0, 0.0]);
+}
+
+/// ds_route_large over a prefill-sized step: the tensor-core MoE through its blocks gives every
+/// pair the bits it gets in a decode-sized step routed by route_small (40-pair slices), and the
+/// blocks cover each kept pair once.
+#[test]
+fn route_large_blocks_give_each_pair_its_small_step_bits() {
+    use tidelm_kernels::fp4;
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(131);
+    let (slots, inter, dim, topk) = (24usize, 256usize, 512usize, 4usize);
+    let t = 300usize;
+    let p_all = t * topk;
+    let bytes = |rng: &mut Rng, n: usize| -> Vec<u8> { (0..n).map(|_| (rng.next() & 0xff) as u8).collect() };
+    let scales = |rng: &mut Rng, n: usize| -> Vec<u8> { (0..n).map(|_| 119 + (rng.next() % 6) as u8).collect() };
+    let (w1, w3) = (bytes(&mut rng, slots * inter * dim / 2), bytes(&mut rng, slots * inter * dim / 2));
+    let (s1, s3) = (scales(&mut rng, slots * inter * dim / 32), scales(&mut rng, slots * inter * dim / 32));
+    let w2 = bytes(&mut rng, slots * dim * inter / 2);
+    let s2 = scales(&mut rng, slots * dim * inter / 32);
+    let x = rng.bf16_vec(t * dim, 1.0);
+    let mut keys = Vec::new();
+    for tok in 0..t {
+        let mut picked: Vec<i32> = Vec::new();
+        while picked.len() < topk {
+            let e = (rng.next() % slots as u64) as i32;
+            if !picked.contains(&e) {
+                picked.push(e);
+            }
+        }
+        // a few filler pairs (slot -1) are dropped
+        if tok % 37 == 5 {
+            picked[1] = -1;
+        }
+        keys.extend(picked);
+    }
+    let rw: Vec<f32> = (0..p_all).map(|_| 0.2 + (rng.next() % 1000) as f32 / 1000.0).collect();
+    let (dw1, dw3, ds1, ds3, dw2, ds2) = (dev(&w1), dev(&w3), dev(&s1), dev(&s3), dev(&w2), dev(&s2));
+    // pairs [p0, p0 + n) of tokens [p0 / topk ..) through the mma MoE, routed small or large
+    let run = |p0: usize, n: usize, large: bool, bm: usize| -> (Vec<u16>, Vec<f32>) {
+        let tt = n / topk;
+        let (dk, dx, drw) = (dev(&keys[p0..p0 + n]), dev(&x[p0 / topk * dim..(p0 / topk + tt) * dim]), dev(&rw[p0..p0 + n]));
+        // exactly the bound's entries: an undersized bound shows as an illegal access here
+        let blocks = if large { (unsafe { ds_route_blocks(n as i32, slots as i32, bm as i32) }) as usize } else { n };
+        let (bs, bp, br) = (DeviceBuffer::<i32>::zeroed(blocks).unwrap(), DeviceBuffer::<i32>::zeroed(blocks * bm.max(16)).unwrap(),
+                            DeviceBuffer::<i32>::zeroed(blocks * bm.max(16)).unwrap());
+        let work = DeviceBuffer::<i32>::zeroed(3 * slots).unwrap();
+        let h = DeviceBuffer::<u16>::zeroed(n * inter).unwrap();
+        let parts = DeviceBuffer::<f32>::zeroed(n * dim).unwrap();
+        if large {
+            ok(unsafe { ds_route_large(st.raw(), p(&dk), n as i32, topk as i32, slots as i32, p(&work), p(&bs), p(&bp), p(&br), bm as i32) });
+        } else {
+            ok(unsafe { fp4::fp4_moe_cuda_route_small(st.raw(), p(&dk), p(&bs), p(&bp), p(&br), n as i32, topk as i32) });
+        }
+        ok(unsafe {
+            ds_moe_up_mma(st.raw(), p(&dx), dim as i64, p(&dw1), p(&ds1), p(&dw3), p(&ds3), p(&h), inter as i64, p(&drw),
+                          p(&bs), p(&br), blocks as i32, inter as i32, dim as i32, 10.0, -1, bm as i32)
+        });
+        ok(unsafe {
+            ds_moe_down_mma(st.raw(), p(&h), inter as i64, p(&dw2), p(&ds2), p(&parts), dim as i64, p(&bs), p(&bp),
+                            blocks as i32, dim as i32, inter as i32, topk as i32, tt as i32, -1, 0, 1, bm as i32)
+        });
+        st.synchronize().unwrap();
+        // the blocks the kernels run (slot >= 0; route_small keeps slot -1 pairs in a block of
+        // their own, which every kernel skips) name each kept pair exactly once
+        let (bsv, bpv) = (bs.download().unwrap(), bp.download().unwrap());
+        let mut seen = vec![0; n];
+        for (b, &slot) in bsv.iter().enumerate() {
+            if slot < 0 {
+                continue;
+            }
+            for &q in bpv[b * bm..(b + 1) * bm].iter().filter(|&&q| q >= 0) {
+                seen[q as usize] += 1;
+            }
+        }
+        for (i, &c) in seen.iter().enumerate() {
+            assert_eq!(c, (keys[p0 + i] >= 0) as i32, "pair {} covered {c} times", p0 + i);
+        }
+        (h.download().unwrap(), parts.download().unwrap())
+    };
+    let (h_all, parts_all) = run(0, p_all, true, 16);
+    // prefill's 64-pair blocks: every weight decoded once for 64 pairs, the same bits
+    let (h64, parts64) = run(0, p_all, true, 64);
+    assert!(h64 == h_all && parts64 == parts_all, "64-pair blocks change the bits");
+    // parts rows are (k, token) over the call's tokens: compare per pair against 10-token slices
+    for c in 0..t / 10 {
+        let (p0, n, tt) = (c * 10 * topk, 10 * topk, 10);
+        let (h, parts) = run(p0, n, false, 16);
+        for i in 0..n {
+            if keys[p0 + i] < 0 {
+                continue;
+            }
+            assert_eq!(&h[i * inter..(i + 1) * inter], &h_all[(p0 + i) * inter..(p0 + i + 1) * inter], "h of pair {}", p0 + i);
+            let (tok, k) = (i / topk, i % topk);
+            let (small, large) = ((k * tt + tok) * dim, (k * t + c * 10 + tok) * dim);
+            assert_eq!(&parts[small..small + dim], &parts_all[large..large + dim], "parts of pair {}", p0 + i);
+        }
+    }
+}
+
+/// The prefill MoE (grouped GEMM over 64-pair blocks) against the decode-path tensor-core MoE
+/// on the same pairs - within the bf16 accumulation tolerance (its dot products are bf16 x
+/// bf16, the decode kernels' f16 x f16) - and to itself: a pair's bits do not depend on the
+/// pairs sharing its call.
+#[test]
+fn moe_prefill_matches_the_decode_kernels_and_is_pair_invariant() {
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(151);
+    let (slots, inter, dim, topk) = (24usize, 256usize, 512usize, 4usize);
+    let t = 300usize;
+    let p_all = t * topk;
+    let bytes = |rng: &mut Rng, n: usize| -> Vec<u8> { (0..n).map(|_| (rng.next() & 0xff) as u8).collect() };
+    let scales = |rng: &mut Rng, n: usize| -> Vec<u8> { (0..n).map(|_| 119 + (rng.next() % 6) as u8).collect() };
+    let (w1, w3) = (bytes(&mut rng, slots * inter * dim / 2), bytes(&mut rng, slots * inter * dim / 2));
+    let (s1, s3) = (scales(&mut rng, slots * inter * dim / 32), scales(&mut rng, slots * inter * dim / 32));
+    let w2 = bytes(&mut rng, slots * dim * inter / 2);
+    let s2 = scales(&mut rng, slots * dim * inter / 32);
+    let x = rng.bf16_vec(t * dim, 1.0);
+    let mut keys = Vec::new();
+    for _ in 0..t {
+        let mut picked: Vec<i32> = Vec::new();
+        while picked.len() < topk {
+            let e = (rng.next() % slots as u64) as i32;
+            if !picked.contains(&e) {
+                picked.push(e);
+            }
+        }
+        keys.extend(picked);
+    }
+    let rw: Vec<f32> = (0..p_all).map(|_| 0.2 + (rng.next() % 1000) as f32 / 1000.0).collect();
+    let (dw1, dw3, ds1, ds3, dw2, ds2) = (dev(&w1), dev(&w3), dev(&s1), dev(&s3), dev(&w2), dev(&s2));
+    // tokens [t0, t0 + tt): prefill kernels (64-pair blocks) or the decode ones (route_small)
+    let run = |t0: usize, tt: usize, prefill: bool| -> (Vec<u16>, Vec<f32>) {
+        let n = tt * topk;
+        let (dk, dx, drw) = (dev(&keys[t0 * topk..(t0 + tt) * topk]), dev(&x[t0 * dim..(t0 + tt) * dim]), dev(&rw[t0 * topk..(t0 + tt) * topk]));
+        let blocks = if prefill { (unsafe { ds_route_blocks(n as i32, slots as i32, 64) }) as usize } else { n };
+        let (bs, bp, br) = (DeviceBuffer::<i32>::zeroed(blocks).unwrap(), DeviceBuffer::<i32>::zeroed(blocks * 64).unwrap(),
+                            DeviceBuffer::<i32>::zeroed(blocks * 64).unwrap());
+        let work = DeviceBuffer::<i32>::zeroed(3 * slots).unwrap();
+        let h = DeviceBuffer::<u16>::zeroed(n * inter).unwrap();
+        let parts = DeviceBuffer::<f32>::zeroed(n * dim).unwrap();
+        if prefill {
+            ok(unsafe { ds_route_large(st.raw(), p(&dk), n as i32, topk as i32, slots as i32, p(&work), p(&bs), p(&bp), p(&br), 64) });
+            ok(unsafe {
+                ds_moe_prefill_up(st.raw(), p(&dx), dim as i64, p(&dw1), p(&ds1), p(&dw3), p(&ds3), p(&h), inter as i64, p(&drw),
+                                  p(&bs), p(&br), blocks as i32, inter as i32, dim as i32, 10.0, -1)
+            });
+            ok(unsafe {
+                ds_moe_prefill_down(st.raw(), p(&h), inter as i64, p(&dw2), p(&ds2), p(&parts), dim as i64, p(&bs), p(&br),
+                                    blocks as i32, dim as i32, inter as i32, topk as i32, tt as i32, -1, 0, 1)
+            });
+        } else {
+            ok(unsafe { tidelm_kernels::fp4::fp4_moe_cuda_route_small(st.raw(), p(&dk), p(&bs), p(&bp), p(&br), n as i32, topk as i32) });
+            ok(unsafe {
+                ds_moe_up_mma(st.raw(), p(&dx), dim as i64, p(&dw1), p(&ds1), p(&dw3), p(&ds3), p(&h), inter as i64, p(&drw),
+                              p(&bs), p(&br), n as i32, inter as i32, dim as i32, 10.0, -1, 16)
+            });
+            ok(unsafe {
+                ds_moe_down_mma(st.raw(), p(&h), inter as i64, p(&dw2), p(&ds2), p(&parts), dim as i64, p(&bs), p(&bp), n as i32,
+                                dim as i32, inter as i32, topk as i32, tt as i32, -1, 0, 1, 16)
+            });
+        }
+        st.synchronize().unwrap();
+        (h.download().unwrap(), parts.download().unwrap())
+    };
+    let (h_all, parts_all) = run(0, t, true);
+    let close = |a: f32, b: f32, scale: f32| (a - b).abs() <= 2f32.powi(-6) * a.abs().max(b.abs()) + 1e-3 * scale;
+    for c in 0..t / 10 {
+        let (t0, tt) = (c * 10, 10);
+        let (hd, pd) = run(t0, tt, false);
+        let (hp, pp) = run(t0, tt, true);
+        let hmax = hd.iter().map(|&v| f32_from_bf16(v).abs()).fold(0f32, f32::max);
+        let pmax = pd.iter().map(|v| v.abs()).fold(0f32, f32::max);
+        for i in 0..tt * topk {
+            let pair = t0 * topk + i;
+            // to itself: the same pair's bits in a 1,200-pair call and a 40-pair one
+            assert_eq!(&hp[i * inter..(i + 1) * inter], &h_all[pair * inter..(pair + 1) * inter], "h of pair {pair}");
+            let (tok, k) = (i / topk, i % topk);
+            let (small, large) = ((k * tt + tok) * dim, (k * t + t0 + tok) * dim);
+            assert_eq!(&pp[small..small + dim], &parts_all[large..large + dim], "parts of pair {pair}");
+            // to the decode kernels: within bf16 accumulation
+            for n in 0..inter {
+                let (a, b) = (f32_from_bf16(hd[i * inter + n]), f32_from_bf16(hp[i * inter + n]));
+                assert!(close(a, b, hmax), "h pair {pair} [{n}]: decode {a}, prefill {b}");
+            }
+        }
+        for (j, (&a, &b)) in pd.iter().zip(&pp).enumerate() {
+            assert!(close(a, b, pmax), "parts [{j}] of tokens {t0}..: decode {a}, prefill {b}");
+        }
+    }
 }

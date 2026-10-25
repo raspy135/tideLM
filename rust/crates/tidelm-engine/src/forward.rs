@@ -44,14 +44,23 @@ use crate::rope;
 use crate::weights::{DsparkW, Fp8, Layer, Loader, Tp};
 use crate::Result;
 
-/// Rows per step, all lanes together (64 rows x top-6 = 384 routed pairs; the router's
-/// wide path takes 512).
+/// Rows per decode step, all lanes together (64 rows x top-6 = 384 routed pairs; the router's
+/// wide path takes 512): the graphed steps, the head's rows, the drafter's lanes.
 pub const TMAX: usize = 64;
+/// Rows a prompt-only step may carry (TIDELM_PREFILL_ROWS; Python's DSV41_PREFILL_CHUNK=2048):
+/// a step reads each weight its rows touch once, so a prompt of 8K tokens is 4 steps, not 128.
+/// Such steps run eager, their GEMMs M-tiled and their pairs routed by ds_route_large.
+pub fn prefill_rows() -> usize {
+    std::env::var("TIDELM_PREFILL_ROWS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(2048).max(TMAX)
+        .div_ceil(TMAX) * TMAX
+}
 /// The FMA GEMM's row limit; steps with more rows take the tensor-core kernel.
 pub const FMA_ROWS: usize = 16;
 /// Window-ring slots per lane and layer: a step writes its rows before attending, so the
-/// ring must hold a step's rows plus the window behind its first row (checked at boot).
-const RING: usize = 256;
+/// ring holds a step's rows plus the window behind its first row - the prefill step's.
+fn ring_slots(window: usize) -> usize {
+    (window + prefill_rows()).div_ceil(64) * 64
+}
 const ARENA_SLOTS: usize = 16;
 const HEAD_ROWS: usize = 8192;
 const HC_SPLITS: usize = 16;
@@ -125,6 +134,11 @@ fn off(p: *mut c_void, bytes: usize) -> *mut c_void {
     }
 }
 
+fn no_splitk() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TIDELM_NO_SPLITK").as_deref() == Ok("1"))
+}
+
 /// TIDELM_EXPERT_TOPP (unset, 0 or off: none) and TIDELM_EXPERT_TOPP_MIN_K (default 3), as
 /// engine/expert_topp.py::config. Off by default: on the README protocol (pair, drafter split
 /// and listed, same prompts and seed) 0.90 moved the medians by +1.6 / -1.0% on prose and -2.1 /
@@ -146,6 +160,56 @@ fn expert_topp_from_env() -> Result<Option<(f32, i32)>> {
         return Err("TIDELM_EXPERT_TOPP_MIN_K must be 1..6".into());
     }
     Ok(Some((topp, min_k)))
+}
+
+/// A routing's blocks in act.block_*: `bm` pairs each, `nb` of them at most (the grid the MoE
+/// kernels launch; blocks past the real ones are slot -1 and exit), and whether the prefill
+/// kernels (64-pair grouped GEMM) take them.
+#[derive(Clone, Copy)]
+struct Blocks {
+    bm: i32,
+    nb: i32,
+    prefill: bool,
+}
+
+/// Rows from which a prefill step's routed experts take the grouped-GEMM kernels: below, the
+/// decode kernels' 16-pair blocks are ~5% faster (10.3 / 11.1 ms against 10.9 / 11.6 at 128 /
+/// 256 rows), from 512 the grouped GEMM is (12.1 against 14.2 ms; 13.9 against 29.4 at 2,048;
+/// examples/bench_moe_prefill.rs, a layer's 250 residents, this rank's shard).
+const PREFILL_MOE_ROWS: usize = 512;
+
+/// The routing blocks of `p` pairs (act.keys, slot values < `slots`, at most `distinct` of them
+/// in one call: a layer's experts and the null slot) into act.block_*. A prefill step's
+/// (`prefill`: eager, PREFILL_MOE_ROWS rows or more) go to the grouped-GEMM kernels in 64-pair
+/// blocks; otherwise
+/// the decode kernel's 16-pair blocks, by route_small up to its 512 pairs and the counting sort
+/// past them. The decode kernels stay at 16-pair blocks: 32- and 64-pair ones decode each
+/// expert's weights half / a quarter as often but ran slower (examples/bench_moe_prefill.rs,
+/// 2,048 rows over 250 experts, this rank's shard: 31.8 / 36.5 / 44.9 ms up + down) - those
+/// kernels are bound by their activation fragments' shared-memory reads, one per mma at any
+/// block size, not by the decode; the grouped GEMM reuses each fragment over 2-4 mma (13.9 ms).
+fn route(sr: *mut c_void, a: &Act, p: usize, k: usize, slots: usize, distinct: usize, prefill: bool) -> Result<Blocks> {
+    if p <= 512 && !prefill {
+        ck(unsafe {
+            fp4::fp4_moe_cuda_route_small(sr, np(&a.keys), np(&a.block_slot), np(&a.block_pair), np(&a.block_route), p as i32, k as i32)
+        }, "route")?;
+        return Ok(Blocks { bm: 16, nb: p as i32, prefill: false });
+    }
+    if a.route_work.len() < 3 * slots {
+        return Err(format!("route: {slots} slots outgrow the work buffer").into());
+    }
+    let bm = if prefill { 64 } else { 16 };
+    // the buffers hold the bound over every slot; the grid, the bound over the slots one call
+    // can reach
+    let cap = unsafe { ds_route_blocks(p as i32, slots as i32, bm) } as usize;
+    if a.block_slot.len() < cap || a.block_route.len() < cap * bm as usize {
+        return Err(format!("route: {p} pairs in {bm}-pair blocks outgrow the block buffers").into());
+    }
+    ck(unsafe {
+        ds_route_large(sr, np(&a.keys), p as i32, k as i32, slots as i32, np(&a.route_work), np(&a.block_slot), np(&a.block_pair),
+                       np(&a.block_route), bm)
+    }, "route (large)")?;
+    Ok(Blocks { bm, nb: unsafe { ds_route_blocks(p as i32, slots.min(distinct) as i32, bm) }, prefill })
 }
 
 /// ds_gather_rows_u16 over any number of rows (one launch takes at most 65,535): out[m] =
@@ -212,19 +276,15 @@ fn gemm(sr: *mut c_void, part: &DeviceBuffer<f32>, x: *mut c_void, ldx: usize, w
         }
         return Ok(());
     }
-    let esz = if f32_out { 4 } else { 2 };
-    for r0 in (0..m).step_by(FMA_ROWS) {
-        let mt = FMA_ROWS.min(m - r0) as i32;
-        let (xr, ybr, yfr) = (off(x, r0 * ldx * 2), off(yb, r0 * ldy * esz), off(yf, r0 * ldy * esz));
-        ck(unsafe {
-            match w {
-                Wt::Fp8(f) => ds_linear_fp8(sr, xr, ldx as i64, np(&f.w), np(&f.s), f.lds() as i64, mt, n as i32, k as i32, 1,
-                                            ybr, yfr, ldy as i64, nul()),
-                Wt::Bf16 { w, .. } => ds_linear_bf16(sr, xr, ldx as i64, w, mt, n as i32, k as i32, 1, ybr, yfr, ldy as i64, nul()),
-            }
-        }, "gemm")?;
-    }
-    Ok(())
+    // the FMA kernel tiles rows past 16 in one launch, each row with its 16-row slice's bits
+    let mi = m as i32;
+    ck(unsafe {
+        match w {
+            Wt::Fp8(f) => ds_linear_fp8(sr, x, ldx as i64, np(&f.w), np(&f.s), f.lds() as i64, mi, n as i32, k as i32, 1, yb, yf,
+                                        ldy as i64, nul()),
+            Wt::Bf16 { w, .. } => ds_linear_bf16(sr, x, ldx as i64, w, mi, n as i32, k as i32, 1, yb, yf, ldy as i64, nul()),
+        }
+    }, "gemm")
 }
 
 /// The grouped wo_a GEMM (output rows of group g read x + g * gstride), dispatched as `gemm`.
@@ -245,20 +305,23 @@ fn gemm_grouped(sr: *mut c_void, part: &DeviceBuffer<f32>, x: *mut c_void, ldx: 
         }
         return Ok(());
     }
-    for r0 in (0..m).step_by(FMA_ROWS) {
-        let mt = FMA_ROWS.min(m - r0) as i32;
-        ck(unsafe {
-            ds_linear_fp8_grouped(sr, off(x, r0 * ldx * 2), ldx as i64, gstride as i64, rpg as i32, np(&w.w), np(&w.s),
-                                  w.lds() as i64, mt, n as i32, k as i32, off(y, r0 * ldy * 2), ldy as i64)
-        }, "grouped gemm")?;
-    }
-    Ok(())
+    ck(unsafe {
+        ds_linear_fp8_grouped(sr, x, ldx as i64, gstride as i64, rpg as i32, np(&w.w), np(&w.s), w.lds() as i64, m as i32,
+                              n as i32, k as i32, y, ldy as i64)
+    }, "grouped gemm")
 }
 
 /// Split-K for the tensor-core kernel: at least two blocks per SM (48 SMs on GB10), K slices
 /// of at least 512 (examples/tune_mma.rs), bounded by the partials buffer.
 fn mma_splits(m: usize, n: usize, k: usize, part_len: usize) -> usize {
-    let blocks = n.div_ceil(unsafe { ds_mma_rows_per_block(m as i32) } as usize);
+    // TIDELM_NO_SPLITK=1 (tests): one pass over K at every M, so a row's bits do not depend
+    // on how many rows share its step
+    if no_splitk() {
+        return 1;
+    }
+    // past 64 rows the grid also tiles M by 128
+    let mtiles = if m > 64 { m.div_ceil(128) } else { 1 };
+    let blocks = n.div_ceil(unsafe { ds_mma_rows_per_block(m as i32) } as usize) * mtiles;
     96usize.div_ceil(blocks).min(k / 512).min(part_len / (m * n)).max(1)
 }
 
@@ -306,12 +369,13 @@ impl Options {
         let listed = crate::draft_vocab::from_env(vocab)?.map(|ids| crate::draft_vocab::digest(&ids)).unwrap_or(0);
         Ok(format!("tidelm-pair v3 tp | max_seq {} lanes {} spec {} resident {} graphs {} layers {:?} | keep {:x} \
                     dspark_keep {:x} | exe {:x} | config {:x} | draft vocab {listed:x} | env NO_QDQ={:?} ENGRAM_CACHE_MB={:?} \
-                    DRAFT_HEAD_FMT={:?} TP_DRAFT={:?} EXPERT_TOPP={:?}/{:?}",
+                    DRAFT_HEAD_FMT={:?} TP_DRAFT={:?} EXPERT_TOPP={:?}/{:?} PREFILL_ROWS={} NO_SPLITK={:?}",
                    self.max_seq, self.max_lanes, self.spec, self.resident, self.graphs, self.n_layers, mask(&self.keep),
                    mask(&self.dspark_keep), fnv(&exe), fnv(&cfg), std::env::var("TIDELM_NO_QDQ").ok(),
                    std::env::var("TIDELM_ENGRAM_CACHE_MB").ok(), std::env::var("TIDELM_DRAFT_HEAD_FMT").ok(),
                    std::env::var("TIDELM_TP_DRAFT").ok(), std::env::var("TIDELM_EXPERT_TOPP").ok(),
-                   std::env::var("TIDELM_EXPERT_TOPP_MIN_K").ok()).into_bytes())
+                   std::env::var("TIDELM_EXPERT_TOPP_MIN_K").ok(), prefill_rows(), std::env::var("TIDELM_NO_SPLITK").ok())
+                   .into_bytes())
     }
 }
 
@@ -334,8 +398,13 @@ pub struct Pair {
     pub roce: tidelm_comm::roce::Roce,
 }
 
-/// The largest shard a step gathers: the head's logits, 64 rows x half the vocabulary.
-pub const TP_MAX_GATHER: usize = TMAX * 129_280 / 2 * 2;
+/// The largest shard a step gathers, in bytes: the head's logits (64 rows x half the
+/// vocabulary), or a prefill step's engram projection (its rows x half of (hc + 1) x dim) or
+/// MoE intermediates (its rows and their top-6 pairs x half of moe_inter_dim).
+pub fn tp_max_gather() -> usize {
+    let p = prefill_rows();
+    (TMAX * 129_280 / 2).max(p * 5 * 5120 / 2).max(p * 7 * 2304 / 2) * 2
+}
 
 /// Which logits a segment of a step returns.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -349,13 +418,16 @@ pub enum Want {
 
 /// One lane's rows in a step: tokens `ids` at that lane's next positions. `decode`: the rows
 /// are generated tokens (a decode step or a verify block), not prompt - only those take
-/// TIDELM_EXPERT_TOPP.
+/// TIDELM_EXPERT_TOPP. `next`: the rows the lane's next step will likely feed after these (a
+/// prompt's next chunk), whose engram rows are read from NVMe while this step computes - a
+/// hint only: what the next step really feeds is gathered as always, hits or not.
 #[derive(Clone, Copy, Debug)]
 pub struct Seg<'a> {
     pub lane: usize,
     pub ids: &'a [u32],
     pub want: Want,
     pub decode: bool,
+    pub next: &'a [u32],
 }
 
 /// Per-call wall-clock split, printed by the CLI: where a streaming step's time goes.
@@ -401,6 +473,15 @@ impl EngramTable {
     fn gather(&mut self, ids: &[i64], out: &mut [u8]) -> i32 {
         let (mapped, direct) = (self.mapped, self.direct);
         self.cache.gather(ids, out, &mut |miss: &[i64], buf: &mut [u8]| {
+            let ctx = if miss.len() <= ENGRAM_MAPPED_MAX { mapped } else { direct };
+            unsafe { eg::engram_gather_run(ctx, miss.as_ptr(), miss.len(), buf.as_mut_ptr()) }
+        })
+    }
+
+    /// The rows of unique ids `ids` into the cache only (a next step's prefetch).
+    fn warm(&mut self, ids: &[i64]) -> i32 {
+        let (mapped, direct) = (self.mapped, self.direct);
+        self.cache.warm(ids, &mut |miss: &[i64], buf: &mut [u8]| {
             let ctx = if miss.len() <= ENGRAM_MAPPED_MAX { mapped } else { direct };
             unsafe { eg::engram_gather_run(ctx, miss.as_ptr(), miss.len(), buf.as_mut_ptr()) }
         })
@@ -457,6 +538,26 @@ impl RowCache {
             let slot = id.rem_euclid(cap) as usize;
             self.keys[slot] = id;
             self.data[slot * ENGRAM_ROW..(slot + 1) * ENGRAM_ROW].copy_from_slice(row);
+        }
+        0
+    }
+
+    /// Reads the rows of `ids` (unique) the cache misses into it, nothing out: a prefetch.
+    fn warm(&mut self, ids: &[i64], read: &mut dyn FnMut(&[i64], &mut [u8]) -> i32) -> i32 {
+        let cap = self.keys.len() as i64;
+        let miss: Vec<i64> = ids.iter().copied().filter(|&id| self.keys[id.rem_euclid(cap) as usize] != id).collect();
+        if miss.is_empty() {
+            return 0;
+        }
+        let mut buf = vec![0u8; miss.len() * ENGRAM_ROW];
+        let rc = read(&miss, &mut buf);
+        if rc != 0 {
+            return rc;
+        }
+        for (j, &id) in miss.iter().enumerate() {
+            let slot = id.rem_euclid(cap) as usize;
+            self.keys[slot] = id;
+            self.data[slot * ENGRAM_ROW..(slot + 1) * ENGRAM_ROW].copy_from_slice(&buf[j * ENGRAM_ROW..(j + 1) * ENGRAM_ROW]);
         }
         0
     }
@@ -552,8 +653,9 @@ struct Act {
     seg_lane: DeviceBuffer<i32>,
     /// routed pairs of the step's live rows (filler rows' pairs route nowhere)
     live_pairs: DeviceBuffer<i32>,
-    /// per row: a generated token's row (Seg::decode), the rows TIDELM_EXPERT_TOPP applies to
-    topp_rows: DeviceBuffer<i32>,
+    /// per row: a generated token's row (Seg::decode) - the split-key attention's rows and
+    /// TIDELM_EXPERT_TOPP's; prompt (and filler) rows take attn_prefill_kernel
+    decode_rows: DeviceBuffer<i32>,
     cidx1: DeviceBuffer<i32>,
     cidx2: DeviceBuffer<i32>,
     z: DeviceBuffer<f32>,
@@ -563,6 +665,8 @@ struct Act {
     block_slot: DeviceBuffer<i32>,
     block_pair: DeviceBuffer<i32>,
     block_route: DeviceBuffer<i32>,
+    /// ds_route_large's counts, cursors and block bases (3 x slots)
+    route_work: DeviceBuffer<i32>,
     hm: DeviceBuffer<u16>,
     parts: DeviceBuffer<f32>,
     g: DeviceBuffer<u16>,
@@ -675,6 +779,9 @@ struct StepShape {
     cand: bool,
     /// head rows (bucketed); 0 for none
     head: usize,
+    /// the step has prompt rows / decode rows: which attention kernels it launches
+    prompt: bool,
+    decode: bool,
 }
 
 fn bucket(n: usize, lo: usize, hi: usize) -> usize {
@@ -876,6 +983,8 @@ pub struct Engine {
     eg_host: Vec<PinnedBuffer<u8>>,
     /// this step's pending gathers: (engram layer index, unique row ids)
     eg_jobs: Vec<(usize, Vec<i64>)>,
+    /// the rows its segments' `next` hints will read, warmed into the caches after them
+    eg_prefetch: Vec<(usize, Vec<i64>)>,
     /// the step being issued (select() reads its indexer ranges)
     shape: Option<StepShape>,
     /// live rows of the step being issued (the rest are filler)
@@ -903,6 +1012,12 @@ pub struct Engine {
     /// TIDELM_EXPERT_TOPP (Python's DSV41_EXPERT_TOPP) and its MIN_K: decode rows keep their
     /// routed picks up to this share of their weight, at least MIN_K of them
     expert_topp: Option<(f32, i32)>,
+    /// window-ring slots per lane and layer (ring_slots)
+    ring: usize,
+    /// rows a prompt-only step may carry (prefill_rows)
+    pub pmax: usize,
+    /// a prefill-sized (eager, never captured) step's device work is being issued
+    eager_step: bool,
 }
 
 impl Resident {
@@ -967,7 +1082,7 @@ impl Resident {
         } else {
             None
         };
-        Ok(Resident { layers, embed, head, draft_head, experts, dspark_experts, ids: DeviceBuffer::zeroed(TMAX)? })
+        Ok(Resident { layers, embed, head, draft_head, experts, dspark_experts, ids: DeviceBuffer::zeroed(prefill_rows())? })
     }
 }
 
@@ -977,9 +1092,8 @@ impl Engine {
         let (max_seq, spec) = (opts.max_seq, opts.spec);
         let max_lanes = opts.max_lanes.max(1);
         let cfg = Config::load(model_dir)?;
-        if cfg.window_size + TMAX - 1 > RING {
-            return Err(format!("window {} + {TMAX} rows per step overflow the {RING}-slot ring", cfg.window_size).into());
-        }
+        let ring = ring_slots(cfg.window_size);
+        let pmax = prefill_rows();
         let n_layers = opts.n_layers.unwrap_or(cfg.n_layers).min(cfg.n_layers);
         let ckpt = Checkpoint::open(model_dir)?;
         let stream = Stream::new()?;
@@ -1079,7 +1193,10 @@ impl Engine {
         if unsafe { ds_nucleus_cap() } as usize != NUC_CAP {
             return Err("ds41.cu's nucleus capacity is not the engine's NUC_CAP".into());
         }
-        let t = TMAX;
+        // row buffers hold a prefill step; the head's rows, the read-backs, the split attention's
+        // workspace and the drafter's buffers hold a decode step's TMAX
+        let t = pmax;
+        let tm = TMAX;
         let lanes = max_lanes + 1; // + the scratch lane
         let p = t * cfg.n_activated_experts.max(cfg.dspark_n_activated_experts);
         let hdq = cfg.n_heads * cfg.head_dim;
@@ -1091,6 +1208,15 @@ impl Engine {
         let a = |n: usize| -> Result<DeviceBuffer<u16>> { Ok(DeviceBuffer::zeroed(n)?) };
         let f = |n: usize| -> Result<DeviceBuffer<f32>> { Ok(DeviceBuffer::zeroed(n)?) };
         let i = |n: usize| -> Result<DeviceBuffer<i32>> { Ok(DeviceBuffer::zeroed(n)?) };
+        // the slots an expert set can route to: every routable backbone expert (or the drafter's
+        // 3 x 128, or the streaming arena), for ds_route_large's work buffer
+        let route_slots = match &opts.keep {
+            Some(k) => k.iter().take(n_layers).map(|row| row.iter().filter(|&&b| b).count()).sum::<usize>(),
+            None => n_layers * cfg.n_routed_experts,
+        }
+        .max(cfg.n_mtp_layers * cfg.dspark_n_routed_experts)
+        .max(ARENA_SLOTS);
+        let route_entries = (unsafe { ds_route_blocks(p as i32, route_slots as i32 + 1, 64) } as usize * 64).max(p * 16);
         let act = Act {
             h: a(t * hc * d)?,
             pre: f(t * hc)?,
@@ -1102,7 +1228,7 @@ impl Engine {
             fcomb: f(t * hc * hc)?,
             rsq: f(t)?,
             mixes: f(t * cfg.hc_mix_width())?,
-            partial: f(HC_SPLITS * FMA_ROWS * cfg.hc_mix_width())?,
+            partial: f(HC_SPLITS * t * cfg.hc_mix_width())?,
             mma_part: f(MMA_PART)?,
             y: a(t * d)?,
             qa: a(t * cfg.q_lora_rank)?,
@@ -1119,7 +1245,7 @@ impl Engine {
             seg_count: i(lanes)?,
             seg_lane: i(lanes)?,
             live_pairs: i(1)?,
-            topp_rows: i(t)?,
+            decode_rows: i(t)?,
             cidx1: i(t * cfg.index_topk)?,
             cidx2: i(t * cfg.index_topk)?,
             z: f(t * cfg.n_routed_experts)?,
@@ -1127,8 +1253,11 @@ impl Engine {
             rw: f(p)?,
             keys: i(p)?,
             block_slot: i(p)?,
-            block_pair: i(p * 16)?,
-            block_route: i(p * 16)?,
+            // ds_route_large's 64-pair blocks (prefill) over every slot: up to p of them
+            block_pair: i(route_entries)?,
+            block_route: i(route_entries)?,
+            // every slot of the larger expert set, and the null slot
+            route_work: i(3 * (route_slots + 1))?,
             hm: a(p * cfg.moe_inter_dim)?,
             parts: f(p * d)?,
             g: a(t * cfg.moe_inter_dim)?,
@@ -1142,10 +1271,10 @@ impl Engine {
             hcat_full: a(if opts.tp.is_some() { (t + p) * cfg.moe_inter_dim } else { 1 })?,
             moe_local: a(if opts.tp.is_some() { t * d } else { 1 })?,
             ekv_local: a(if opts.tp.is_some() { t * (hc + 1) * d } else { 1 })?,
-            tp_logits: a(if opts.tp.is_some() { t * cfg.vocab_size } else { 1 })?,
-            tp_scratch: DeviceBuffer::zeroed(if opts.tp.is_some() { 2 * TP_MAX_GATHER } else { 1 })?,
+            tp_logits: a(if opts.tp.is_some() { tm * cfg.vocab_size } else { 1 })?,
+            tp_scratch: DeviceBuffer::zeroed(if opts.tp.is_some() { 2 * tp_max_gather() } else { 1 })?,
             attn_work: DeviceBuffer::zeroed(unsafe {
-                ds_attn_work_bytes(t as i32, cfg.n_heads as i32, (cfg.window_size + cfg.index_topk.max(bsz)) as i32)
+                ds_attn_work_bytes(tm as i32, cfg.n_heads as i32, (cfg.window_size + cfg.index_topk.max(bsz)) as i32)
             } as usize)?,
             kvl: f(t * hd)?,
             sc: f(t * hd)?,
@@ -1158,11 +1287,11 @@ impl Engine {
             emb: a(t * d)?,
             row_ids: DeviceBuffer::from_slice(&(0..t as i32).collect::<Vec<_>>())?,
             head_all: a(t * d)?,
-            head_x: a(t * d)?,
-            head_rows: i(t)?,
+            head_x: a(tm * d)?,
+            head_rows: i(tm)?,
             head_w: a(HEAD_ROWS * d)?,
-            logits: a(t * cfg.vocab_size)?,
-            am: i(t)?,
+            logits: a(tm * cfg.vocab_size)?,
+            am: i(tm)?,
             iq: a(t * cfg.index_n_heads * cfg.index_head_dim)?,
             iwb: a(t * cfg.index_n_heads)?,
             iwf: f(t * cfg.index_n_heads)?,
@@ -1187,11 +1316,11 @@ impl Engine {
             xpre: a(t * d)?,
             conf_x: f(t)?,
             conf_m: f(bsz * draft_lanes)?,
-            s_temp: f(t)?,
-            s_topp: f(t)?,
-            nuc_ids: i(t * NUC_CAP)?,
-            nuc_p: f(t * NUC_CAP)?,
-            nuc_cnt: i(t)?,
+            s_temp: f(tm)?,
+            s_topp: f(tm)?,
+            nuc_ids: i(tm * NUC_CAP)?,
+            nuc_p: f(tm * NUC_CAP)?,
+            nuc_cnt: i(tm)?,
             d_temp: f(draft_lanes)?,
             d_topp: f(draft_lanes)?,
             d_u: f(bsz * draft_lanes)?,
@@ -1211,11 +1340,11 @@ impl Engine {
             rb_lane: i(lanes)?,
         };
         for _ in 0..n_layers {
-            caches.ring.push(a(lanes * RING * hd)?);
+            caches.ring.push(a(lanes * ring * hd)?);
         }
         if spec {
             for _ in 0..cfg.n_mtp_layers {
-                caches.mtp_ring.push(a(lanes * RING * hd)?);
+                caches.mtp_ring.push(a(lanes * ring * hd)?);
             }
         }
         // only the compressors this engine runs: a state for a layer past a truncation would
@@ -1231,8 +1360,8 @@ impl Engine {
                     pkv: f(lanes * hd)?,
                     psc: f(lanes * hd)?,
                     flag: i(lanes)?,
-                    mem_kv: f(lanes * t * hd)?,
-                    mem_sc: f(lanes * t * hd)?,
+                    mem_kv: f(lanes * tm * hd)?,
+                    mem_sc: f(lanes * tm * hd)?,
                     before_kv: f(lanes * hd)?,
                     before_sc: f(lanes * hd)?,
                     before_flag: i(lanes)?,
@@ -1300,11 +1429,11 @@ impl Engine {
         Ok(Engine {
             arena: Arena::new(ARENA_SLOTS + 1, None)?,
             expert_stage: PinnedBuffer::uninit(STAGE_BYTES)?,
-            logits_host: PinnedBuffer::zeroed(t * cfg.vocab_size)?,
-            am_host: PinnedBuffer::zeroed(t)?,
-            nuc_cnt_host: PinnedBuffer::zeroed(t)?,
-            nuc_ids_host: PinnedBuffer::zeroed(t * NUC_CAP)?,
-            nuc_p_host: PinnedBuffer::zeroed(t * NUC_CAP)?,
+            logits_host: PinnedBuffer::zeroed(tm * cfg.vocab_size)?,
+            am_host: PinnedBuffer::zeroed(tm)?,
+            nuc_cnt_host: PinnedBuffer::zeroed(tm)?,
+            nuc_ids_host: PinnedBuffer::zeroed(tm * NUC_CAP)?,
+            nuc_p_host: PinnedBuffer::zeroed(tm * NUC_CAP)?,
             cfg,
             ckpt,
             stream,
@@ -1338,6 +1467,7 @@ impl Engine {
             eg_inv,
             eg_host,
             eg_jobs: Vec::new(),
+            eg_prefetch: Vec::new(),
             shape: None,
             live_rows: 0,
             use_graphs: opts.graphs && opts.resident,
@@ -1353,6 +1483,9 @@ impl Engine {
             indexed_layers: 0,
             nucleus_fallbacks: 0,
             expert_topp,
+            ring,
+            pmax,
+            eager_step: false,
         })
     }
 
@@ -1397,7 +1530,7 @@ impl Engine {
                 OP_FORWARD => {
                     let _logits = r.u32()?;
                     let n = r.u32()? as usize;
-                    let mut owned: Vec<(usize, Want, bool, Vec<u32>)> = Vec::with_capacity(n);
+                    let mut owned: Vec<(usize, Want, bool, Vec<u32>, Vec<u32>)> = Vec::with_capacity(n);
                     for _ in 0..n {
                         let lane = r.u32()? as usize;
                         let want = match r.u32()? {
@@ -1406,10 +1539,13 @@ impl Engine {
                             _ => Want::All,
                         };
                         let decode = r.u32()? != 0;
-                        owned.push((lane, want, decode, r.u32s()?));
+                        let ids = r.u32s()?;
+                        owned.push((lane, want, decode, ids, r.u32s()?));
                     }
-                    let segs: Vec<Seg> =
-                        owned.iter().map(|(lane, want, decode, ids)| Seg { lane: *lane, ids, want: *want, decode: *decode }).collect();
+                    let segs: Vec<Seg> = owned
+                        .iter()
+                        .map(|(lane, want, decode, ids, next)| Seg { lane: *lane, ids, want: *want, decode: *decode, next })
+                        .collect();
                     // what comes back is rank 0's business: the cheapest read-back
                     self.run_step(&segs, Readback::Argmax)?;
                 }
@@ -1537,6 +1673,11 @@ impl Engine {
             if n > l.len || n < l.last.0 {
                 return Err(format!("rollback({n}) of lane {lane}: outside its last segment {}..={}", l.last.0, l.len).into());
             }
+            // the compressors keep a segment's last TMAX rows: a longer (prompt) segment cannot
+            // be undone, only kept
+            if l.last.2 > TMAX && n != l.len {
+                return Err(format!("rollback({n}) of lane {lane}: into a {}-row prompt segment", l.last.2).into());
+            }
         }
         let st = &self.stream;
         let ns: Vec<i32> = reqs.iter().map(|r| r.1 as i32).collect();
@@ -1593,7 +1734,13 @@ impl Engine {
     /// Lane 0: prompt tokens `ids` at its next positions; returns the bf16 logits `want` asks
     /// for.
     pub fn forward(&mut self, ids: &[u32], want: Want) -> Result<Vec<u16>> {
-        Ok(self.forward_batch(&[Seg { lane: 0, ids, want, decode: false }])?.remove(0))
+        self.forward_next(ids, &[], want)
+    }
+
+    /// `forward` with the rows the next call will feed (Seg::next), whose engram rows are
+    /// read while this one computes.
+    pub fn forward_next(&mut self, ids: &[u32], next: &[u32], want: Want) -> Result<Vec<u16>> {
+        Ok(self.forward_batch(&[Seg { lane: 0, ids, want, decode: false, next }])?.remove(0))
     }
 
     /// One backbone step over every segment's rows (at most TMAX together, each lane at most
@@ -1676,36 +1823,49 @@ impl Engine {
                     Want::Last => 1,
                     Want::All => 2,
                 };
-                m.u32(sg.lane as u32).u32(want).u32(sg.decode as u32).u32s(sg.ids);
+                m.u32(sg.lane as u32).u32(want).u32(sg.decode as u32).u32s(sg.ids).u32s(sg.next);
             }
         })?;
         let tp = Instant::now();
         let plan = self.prepare(segs)?;
         let shape = plan.shape;
+        self.eager_step = shape.t > TMAX;
         let td = Instant::now();
         self.times.prepare_s += (td - tp).as_secs_f64();
         let mut tables = std::mem::take(&mut self.engram_tables);
         let jobs = std::mem::take(&mut self.eg_jobs);
+        let prefetch = std::mem::take(&mut self.eg_prefetch);
         let cfg_layers = self.cfg.engram_layer_ids.clone();
         let res = std::thread::scope(|sc| -> Result<()> {
             let mut pending = HashMap::new();
+            let mut threads = Vec::new();
             for (l, table) in tables.iter_mut() {
                 let Some(li) = cfg_layers.iter().position(|x| x == l) else { continue };
                 let Some((_, ids)) = jobs.iter().find(|j| j.0 == li) else { continue };
-                // the gather thread is the only user of eg_host[li] until it is joined below
+                let warm = prefetch.iter().find(|j| j.0 == li).map(|j| &j.1);
+                // the gather thread is the only user of eg_host[li] until it reports below
                 let out = SendPtr(self.eg_host[li].as_mut_ptr());
                 let n = ids.len();
-                pending.insert(*l, (li, n, sc.spawn(move || {
+                let (tx, rx) = std::sync::mpsc::channel();
+                pending.insert(*l, (li, n, rx));
+                // this step's rows first, reported as soon as they are in; then the next
+                // step's into the cache, behind the GPU's work on this one
+                threads.push(sc.spawn(move || -> i32 {
                     let out = out;
                     let buf = unsafe { std::slice::from_raw_parts_mut(out.0, n * ENGRAM_ROW) };
-                    table.gather(ids, buf)
-                })));
+                    let rc = table.gather(ids, buf);
+                    let _ = tx.send(rc);
+                    match warm {
+                        Some(w) if rc == 0 => table.warm(w),
+                        _ => 0,
+                    }
+                }));
             }
             let mut first_err = None;
             for (k, (l0, l1)) in self.segments().into_iter().enumerate() {
-                if let Some((li, n, h)) = pending.remove(&l0) {
+                if let Some((li, n, rx)) = pending.remove(&l0) {
                     let te = Instant::now();
-                    let rc = h.join().unwrap_or(-1);
+                    let rc = rx.recv().unwrap_or(-1);
                     self.times.engram_s += te.elapsed().as_secs_f64();
                     if rc != 0 {
                         first_err.get_or_insert(format!("layer {l0}: engram gather failed ({rc})"));
@@ -1715,8 +1875,9 @@ impl Engine {
                 }
                 self.run_segment(shape, k, l0, l1)?;
             }
-            // a gather whose segment never ran (an error above) must still be joined
-            for (_, (_, _, h)) in pending.drain() {
+            // every thread is joined here (its prefetch done) - also one whose segment never
+            // ran (an error above); a failed prefetch only costs the next step its hits
+            for h in threads {
                 let _ = h.join();
             }
             match first_err {
@@ -1725,6 +1886,7 @@ impl Engine {
             }
         });
         self.engram_tables = tables;
+        self.eager_step = false;
         res?;
         self.collect(segs, &plan, readback)?;
         self.times.device_s += td.elapsed().as_secs_f64();
@@ -1732,7 +1894,9 @@ impl Engine {
     }
 
     fn run_segment(&mut self, shape: StepShape, k: usize, l0: usize, l1: usize) -> Result<()> {
-        if !self.use_graphs {
+        // prefill-sized steps run eager: their work dwarfs the launches, and a graph per row
+        // count would pin memory for shapes seen once
+        if !self.use_graphs || shape.t > TMAX {
             return self.device_step(shape, l0, l1);
         }
         let key = (shape, k);
@@ -1773,8 +1937,18 @@ impl Engine {
             }
             rows += sg.ids.len();
         }
-        if rows > TMAX {
-            return Err(format!("a step takes at most {TMAX} rows, got {rows}").into());
+        // past TMAX only prompt rows: a step that large runs eager, and its head rows (the
+        // segments' wanted rows) still fit the decode step's head
+        if rows > self.pmax {
+            return Err(format!("a step takes at most {} rows, got {rows}", self.pmax).into());
+        }
+        let wanted: usize = segs.iter().map(|sg| match sg.want {
+            Want::Nothing => 0,
+            Want::Last => 1,
+            Want::All => sg.ids.len(),
+        }).sum();
+        if wanted > TMAX {
+            return Err(format!("a step reads at most {TMAX} head rows, got {wanted}").into());
         }
         let cfg = self.cfg.clone();
         let tw = Instant::now();
@@ -1823,9 +1997,7 @@ impl Engine {
             a.seg_lane.upload_async(0, &sl, st)?;
             a.head_rows.upload_async(0, &head_rows, st)?;
             a.live_pairs.upload_async(0, &[(rows * cfg.n_activated_experts) as i32], st)?;
-            if self.expert_topp.is_some() {
-                a.topp_rows.upload_async(0, &dec, st)?;
-            }
+            a.decode_rows.upload_async(0, &dec, st)?;
         }
         self.live_rows = rows;
         self.embed_host(&ids, rows)?;
@@ -1856,6 +2028,27 @@ impl Engine {
             self.eg_inv[li].upload_async(0, &inv, st)?;
             self.eg_jobs.push((li, uniq));
         }
+        // the segments' next rows: hashing ahead writes the lanes' compressed-id caches at
+        // positions their next step rewrites before it hashes (NgramHashState::hash)
+        self.eg_prefetch.clear();
+        let mut ahead: Vec<i64> = Vec::new();
+        for sg in segs.iter().filter(|sg| !sg.next.is_empty()) {
+            let l = &mut self.lanes[sg.lane];
+            ahead.extend(l.hash.hash(sg.next, l.len + sg.ids.len(), None));
+        }
+        if !ahead.is_empty() {
+            let n_ahead = ahead.len() / (n_eng * cols);
+            for li in 0..n_eng {
+                if cfg.engram_layer_ids[li] >= self.n_layers {
+                    continue;
+                }
+                let mut uniq: Vec<i64> =
+                    (0..n_ahead).flat_map(|ti| ahead[(ti * n_eng + li) * cols..(ti * n_eng + li + 1) * cols].iter().copied()).collect();
+                uniq.sort_unstable();
+                uniq.dedup();
+                self.eg_prefetch.push((li, uniq));
+            }
+        }
 
         let topk = cfg.index_topk;
         let indexed = |nc: usize, r: usize| -> Option<usize> { (nc > topk).then(|| bucket(nc, 2048, self.max_seq / r + 1)) };
@@ -1872,6 +2065,8 @@ impl Engine {
             n2: indexed(nc2, 2),
             cand,
             head: hb,
+            prompt: segs.iter().any(|sg| !sg.decode),
+            decode: segs.iter().any(|sg| sg.decode),
         };
         Ok(Plan { shape, firsts, heads })
     }
@@ -2121,8 +2316,8 @@ impl Engine {
             ck(unsafe { ds_rmsnorm(sr, np(&a.kv0), hd as i64, np(&blk.kv_norm), np(&a.kv), hd as i64, mi, hd as i32, cfg.norm_eps) }, "draft seed kv_norm")?;
             ck(unsafe { ds_rope(sr, np(&a.kv), hd as i64, mi, 1, hd as i64, (hd - rd) as i32, rd as i32, np(&a.pos), np(&self.rope_w), 0) }, "draft seed rope")?;
             ck(unsafe {
-                ds_scatter_ring(sr, np(&a.kv), np(&self.caches.mtp_ring[k]), RING as i32, np(&a.pos), mi, hd as i32, np(&a.lane),
-                                (RING * hd) as i64)
+                ds_scatter_ring(sr, np(&a.kv), np(&self.caches.mtp_ring[k]), self.ring as i32, np(&a.pos), mi, hd as i32,
+                                np(&a.lane), (self.ring * hd) as i64)
             }, "draft seed ring")?;
         }
         st.synchronize()?;
@@ -2308,12 +2503,7 @@ impl Engine {
         // confidence, hc_pre half: the reference feeds the head the UN-normed hc_pre output
         // (inference/model.py::DSparkBlock.forward_head)
         ck(unsafe { ds_hc_pre_norm(sr, np(&a.h), np(&a.pre), nul(), np(&a.xpre), rows as i32, d as i32, hc as i32, cfg.norm_eps) }, "conf hc_pre")?;
-        for r0 in (0..rows).step_by(FMA_ROWS) {
-            let mt = FMA_ROWS.min(rows - r0) as i32;
-            ck(unsafe {
-                ds_linear_f32w(sr, a.xpre.ptr_at(r0 * d), d as i64, np(&ds.w.conf_w), mt, 1, d as i32, 1, a.conf_x.ptr_at(r0), 1, nul())
-            }, "conf x")?;
-        }
+        ck(unsafe { ds_linear_f32w(sr, np(&a.xpre), d as i64, np(&ds.w.conf_w), rows as i32, 1, d as i32, 1, np(&a.conf_x), 1, nul()) }, "conf x")?;
         // logits row j * b + i is lane j's draft step i, over the draft vocabulary's l columns
         let l = self.draft_cols;
         for i in 0..b {
@@ -2364,16 +2554,14 @@ impl Engine {
         let k = cfg.hc_mult * cfg.dim;
         let n = cfg.hc_mix_width();
         ck(unsafe { ds_row_rsqrt(sr, np(&a.h), k as i64, t as i32, k as i32, cfg.norm_eps, np(&a.rsq)) }, "hc rsqrt")?;
-        // fp32 weights have no tensor-core path: 16-row slices of the FMA kernel (the 2 MB
-        // weight stays in L2 across slices)
-        for r0 in (0..t).step_by(FMA_ROWS) {
-            let mt = FMA_ROWS.min(t - r0) as i32;
-            ck(unsafe {
-                ds_linear_f32w(sr, a.h.ptr_at(r0 * k), k as i64, np(fn_w), mt, n as i32, k as i32, HC_SPLITS as i32, nul(),
-                               n as i64, np(&a.partial))
-            }, "hc mix")?;
-            ck(unsafe { ds_splits_reduce(sr, np(&a.partial), HC_SPLITS as i32, mt, n as i32, nul(), a.mixes.ptr_at(r0 * n), n as i64) }, "hc reduce")?;
-        }
+        // fp32 weights have no tensor-core path: the FMA kernel, its 16-row tiles in one
+        // launch (the 2 MB weight stays in L2 across them; launched slice by slice, an 8K
+        // prefill took 44,800 launches here, 0.74 s of rank 0's GPU time)
+        ck(unsafe {
+            ds_linear_f32w(sr, np(&a.h), k as i64, np(fn_w), t as i32, n as i32, k as i32, HC_SPLITS as i32, nul(), n as i64,
+                           np(&a.partial))
+        }, "hc mix")?;
+        ck(unsafe { ds_splits_reduce(sr, np(&a.partial), HC_SPLITS as i32, t as i32, n as i32, nul(), np(&a.mixes), n as i64) }, "hc reduce")?;
         ck(unsafe {
             ds_hc_sinkhorn(sr, np(&a.mixes), np(&a.rsq), np(scale), np(base), t as i32, cfg.hc_sinkhorn_iters as i32,
                            cfg.hc_eps, np(pre), np(post), np(comb))
@@ -2444,8 +2632,8 @@ impl Engine {
             ck(unsafe { ds_rope(sr, np(&a.kv), hd as i64, ti, 1, hd as i64, (hd - rd) as i32, rd as i32, np(&a.pos), np(table), 0) }, "kv rope")?;
             match ctx {
                 Ctx::Main { l, .. } => ck(unsafe {
-                    ds_scatter_ring(sr, np(&a.kv), np(&self.caches.ring[l]), RING as i32, np(&a.pos), ti, hd as i32, np(&a.lane),
-                                    (RING * hd) as i64)
+                    ds_scatter_ring(sr, np(&a.kv), np(&self.caches.ring[l]), self.ring as i32, np(&a.pos), ti, hd as i32,
+                                    np(&a.lane), (self.ring * hd) as i64)
                 }, "ring write")?,
                 // the draft block's own keys go to its lane's block keys, never to the ring:
                 // row r of a lane's block is key slot r % block
@@ -2483,11 +2671,37 @@ impl Engine {
             // draft key of the lane's block (no causal mask among them)
             Ctx::Draft { k } => (&self.caches.mtp_ring[k], &a.dwin, np(&self.caches.dkv), np(&a.dcidx), bsz, bsz * hd),
         };
-        ck(unsafe {
-            ds_attn_decode(sr, np(&a.q), np(ring), RING as i32, np(win_pos), cfg.window_size as i32, 0, ckv_ptr, cidx_ptr,
-                           c as i32, np(&w.attn_sink), (hd as f64).powf(-0.5) as f32, np(&a.o), ti, h as i32, np(&a.lane),
-                           (RING * hd) as i64, ckv_ls as i64, np(&a.attn_work), a.attn_work.len() as i64)
-        }, "attention")?;
+        // decode rows take the split-key kernel, prompt rows the one-pass one (a row's kernel
+        // depends on what the row is, never on what shares its step); a decode-only step is
+        // the split-key launch alone, a prompt-only one the one-pass launch alone
+        let scale = (hd as f64).powf(-0.5) as f32;
+        // the drafter's rows are always the split-key kernel's
+        let (prompt, decode) = match ctx {
+            Ctx::Main { .. } => {
+                let shape = self.shape.expect("attention runs inside a step");
+                (shape.prompt, shape.decode)
+            }
+            Ctx::Draft { .. } => (false, true),
+        };
+        let (split_rows, prompt_rows) = (decode || !prompt, prompt);
+        let flags = if split_rows && prompt_rows { np(&a.decode_rows) } else { nul() };
+        if split_rows {
+            ck(unsafe {
+                ds_attn_decode(sr, np(&a.q), np(ring), self.ring as i32, np(win_pos), cfg.window_size as i32, 0, ckv_ptr, cidx_ptr,
+                               c as i32, np(&w.attn_sink), scale, np(&a.o), ti, h as i32, np(&a.lane), (self.ring * hd) as i64,
+                               ckv_ls as i64, np(&a.attn_work), a.attn_work.len() as i64, flags)
+            }, "attention")?;
+        }
+        if prompt_rows {
+            // a block takes all 32 of this rank's heads, so each key loads once a row: 6.87 ms
+            // against 7.39 at 16 heads (2,048 rows over 128 + 1,024 keys, examples/bench_attn.rs
+            // --prefill; Python's tools/prefill_attn.py at 32 heads, 7.35)
+            ck(unsafe {
+                ds_attn_prefill(sr, np(&a.q), np(ring), self.ring as i32, np(win_pos), cfg.window_size as i32, 0, ckv_ptr, cidx_ptr,
+                                c as i32, np(&w.attn_sink), scale, np(&a.o), ti, h as i32, np(&a.lane), (self.ring * hd) as i64,
+                                ckv_ls as i64, flags, 32)
+            }, "attention (prompt rows)")?;
+        }
         ck(unsafe { ds_rope(sr, np(&a.o), (h * hd) as i64, ti, h as i32, hd as i64, (hd - rd) as i32, rd as i32, np(&a.pos), np(table), 1) }, "o rope")?;
         let og = cfg.o_groups;
         let gk = cfg.n_heads * hd / og;
@@ -2531,10 +2745,13 @@ impl Engine {
         let clen = if r == 1 { &a.clen1 } else { &a.clen2 };
         let cand_src = cfg.candidate_source_layer;
         let use_cand = self.cand_live && cand_src >= 0 && (l as i64) > cand_src;
+        // prefill steps score on the tensor cores (0.69 ms against the FMA kernel's 12.45 at
+        // 2,048 rows over 2,240 keys, examples/bench_index.rs; the head sum's order kept, each
+        // dot accumulated in the mma's order); decode keeps the FMA kernel's bits
+        let scores = if self.eager_step { ds_index_scores_mma } else { ds_index_scores };
         ck(unsafe {
-            ds_index_scores(sr, np(&a.iq), np(&self.caches.ik[&src]), np(&a.iwf), np(clen),
-                            if use_cand { np(&a.cand) } else { nul() }, nmax as i64, n_c as i32, np(&a.scores),
-                            n_c as i64, ti, np(&a.lane), (self.caches.crows[&src] * ihd) as i64)
+            scores(sr, np(&a.iq), np(&self.caches.ik[&src]), np(&a.iwf), np(clen), if use_cand { np(&a.cand) } else { nul() },
+                   nmax as i64, n_c as i32, np(&a.scores), n_c as i64, ti, np(&a.lane), (self.caches.crows[&src] * ihd) as i64)
         }, "index scores")?;
         let block = 8usize;
         let topk_blocks = 2048usize;
@@ -2650,7 +2867,7 @@ impl Engine {
             ck(unsafe { ds_router(sr, np(&a.z), np(&w.gate_bias), keep, ti, e as i32, k as i32, cfg.route_scale, np(&a.idx), np(&a.rw)) }, "router")?;
             // the backbone's decode rows only; the drafter's router is untouched
             if let (Some(_), Some((topp, min_k))) = (layer, self.expert_topp) {
-                ck(unsafe { ds_expert_topp(sr, np(&a.idx), np(&a.rw), ti, k as i32, topp, min_k, e as i32, np(&a.topp_rows)) }, "expert top-p")?;
+                ck(unsafe { ds_expert_topp(sr, np(&a.idx), np(&a.rw), ti, k as i32, topp, min_k, e as i32, np(&a.decode_rows)) }, "expert top-p")?;
             }
         }
         let set = match (&self.resident, layer, block) {
@@ -2665,11 +2882,11 @@ impl Engine {
             let ar = &set.arena;
             let live = if layer.is_some() { np(&a.live_pairs) } else { nul() };
             ck(unsafe { ds_lut_slots(sr, np(&a.idx), set.lut.ptr_at(bi * (e + 1)), p as i32, np(&a.keys), live) }, "lut slots")?;
-            ck(unsafe { fp4::fp4_moe_cuda_route_small(sr, np(&a.keys), np(&a.block_slot), np(&a.block_pair), np(&a.block_route), p as i32, k as i32) }, "route")?;
+            let blocks = route(sr, a, p, k, set.null_slot as usize + 1, e + 1, self.eager_step && t >= PREFILL_MOE_ROWS)?;
             if ar.inter < cfg.moe_inter_dim {
-                return self.moe_tp(w, ar, t, k, set.null_slot);
+                return self.moe_tp(w, ar, t, k, set.null_slot, blocks);
             }
-            self.routed_experts(ar, t, k, set.null_slot)?;
+            self.routed_experts(ar, t, k, set.null_slot, blocks)?;
             return self.shared_and_combine(w, t);
         }
         let mut idx = vec![0i32; p];
@@ -2713,32 +2930,44 @@ impl Engine {
             let a = &self.act;
             a.keys.upload_async(0, &keys, st)?;
             let ar = &self.arena;
-            ck(unsafe { fp4::fp4_moe_cuda_route_small(sr, np(&a.keys), np(&a.block_slot), np(&a.block_pair), np(&a.block_route), p as i32, k as i32) }, "route")?;
-            self.routed_experts(ar, t, k, -1)?;
+            let blocks = route(sr, a, p, k, ARENA_SLOTS, ARENA_SLOTS, self.eager_step && t >= PREFILL_MOE_ROWS)?;
+            self.routed_experts(ar, t, k, -1, blocks)?;
         }
         self.shared_and_combine(w, t)
     }
 
-    /// The routed experts' up + down over the routing blocks in act (route_small's output),
-    /// with arena `ar`: the bm16 kernels up to FMA_ROWS rows (one-row bits), the tensor-core
-    /// kernels above, where bm16 goes compute-bound as pairs concentrate on experts.
-    /// `null_slot`: pairs routed there read no weights and write exact zeros (TIDELM_EXPERT_TOPP's
-    /// dropped picks); -1 for none.
-    fn routed_experts(&self, ar: &Arena, t: usize, k: usize, null_slot: i32) -> Result<()> {
+    /// The routed experts' up + down over the routing blocks in act, with arena `ar`: the
+    /// grouped-GEMM kernels for a prefill step's 64-pair blocks; else the bm16 kernels up to
+    /// FMA_ROWS rows (one-row bits), the tensor-core ones above, where bm16 goes compute-bound
+    /// as pairs concentrate on experts. `null_slot`: pairs routed there read no weights and
+    /// write exact zeros (TIDELM_EXPERT_TOPP's dropped picks); -1 for none.
+    fn routed_experts(&self, ar: &Arena, t: usize, k: usize, null_slot: i32, b: Blocks) -> Result<()> {
         let cfg = &self.cfg;
         let sr = self.stream.raw();
         let a = &self.act;
         let (d, inter) = (cfg.dim, cfg.moe_inter_dim);
         let (ti, p) = (t as i32, (t * k) as i32);
+        if b.prefill {
+            ck(unsafe {
+                ds_moe_prefill_up(sr, np(&a.y), d as i64, np(&ar.w1), np(&ar.s1), np(&ar.w3), np(&ar.s3), np(&a.hm), inter as i64,
+                                  np(&a.rw), np(&a.block_slot), np(&a.block_route), b.nb, inter as i32, d as i32,
+                                  cfg.swiglu_limit, null_slot)
+            }, "moe up (prefill)")?;
+            return ck(unsafe {
+                ds_moe_prefill_down(sr, np(&a.hm), inter as i64, np(&ar.w2), np(&ar.s2), np(&a.parts), d as i64,
+                                    np(&a.block_slot), np(&a.block_route), b.nb, d as i32, inter as i32, k as i32, ti, null_slot,
+                                    0, 1)
+            }, "moe down (prefill)");
+        }
         if t > FMA_ROWS {
             ck(unsafe {
                 ds_moe_up_mma(sr, np(&a.y), d as i64, np(&ar.w1), np(&ar.s1), np(&ar.w3), np(&ar.s3), np(&a.hm), inter as i64,
-                              np(&a.rw), np(&a.block_slot), np(&a.block_route), p, inter as i32, d as i32, cfg.swiglu_limit,
-                              null_slot)
+                              np(&a.rw), np(&a.block_slot), np(&a.block_route), b.nb, inter as i32, d as i32, cfg.swiglu_limit,
+                              null_slot, b.bm)
             }, "moe up (mma)")?;
             return ck(unsafe {
                 ds_moe_down_mma(sr, np(&a.hm), inter as i64, np(&ar.w2), np(&ar.s2), np(&a.parts), d as i64, np(&a.block_slot),
-                                np(&a.block_pair), p, d as i32, inter as i32, k as i32, ti, null_slot, 0, 1)
+                                np(&a.block_pair), b.nb, d as i32, inter as i32, k as i32, ti, null_slot, 0, 1, b.bm)
             }, "moe down (mma)");
         }
         ck(unsafe {
@@ -2773,7 +3002,7 @@ impl Engine {
     /// behind each other: shared rows, then the pairs), one gather makes them whole, then its
     /// half of every output row, and a second gather the layer's output. Each element is the
     /// one-box dot product: no partial sums cross the pair.
-    fn moe_tp(&self, w: &Layer, ar: &Arena, t: usize, k: usize, null_slot: i32) -> Result<()> {
+    fn moe_tp(&self, w: &Layer, ar: &Arena, t: usize, k: usize, null_slot: i32, b: Blocks) -> Result<()> {
         let cfg = &self.cfg;
         let sr = self.stream.raw();
         let a = &self.act;
@@ -2783,10 +3012,15 @@ impl Engine {
         let (ti, p) = (t as i32, t * k);
         let pi = p as i32;
         let hl = a.hcat.ptr_at(t * il);
-        if t > FMA_ROWS {
+        if b.prefill {
+            ck(unsafe {
+                ds_moe_prefill_up(sr, np(&a.y), d as i64, np(&ar.w1), np(&ar.s1), np(&ar.w3), np(&ar.s3), hl, il as i64, np(&a.rw),
+                                  np(&a.block_slot), np(&a.block_route), b.nb, il as i32, d as i32, cfg.swiglu_limit, null_slot)
+            }, "moe up (prefill, tp)")?;
+        } else if t > FMA_ROWS {
             ck(unsafe {
                 ds_moe_up_mma(sr, np(&a.y), d as i64, np(&ar.w1), np(&ar.s1), np(&ar.w3), np(&ar.s3), hl, il as i64, np(&a.rw),
-                              np(&a.block_slot), np(&a.block_route), pi, il as i32, d as i32, cfg.swiglu_limit, null_slot)
+                              np(&a.block_slot), np(&a.block_route), b.nb, il as i32, d as i32, cfg.swiglu_limit, null_slot, b.bm)
             }, "moe up (mma, tp)")?;
         } else {
             ck(unsafe {
@@ -2800,10 +3034,15 @@ impl Engine {
         ck(unsafe { ds_swiglu(sr, np(&a.g), il as i64, np(&a.u), il as i64, np(&a.hcat), il as i64, ti, il as i32, cfg.swiglu_limit) }, "shared swiglu (tp)")?;
         self.tp_gather(np(&a.hcat), t + p, il, np(&a.hcat_full))?;
         let hf = a.hcat_full.ptr_at(t * inter);
-        if t > FMA_ROWS {
+        if b.prefill {
+            ck(unsafe {
+                ds_moe_prefill_down(sr, hf, inter as i64, np(&ar.w2), np(&ar.s2), np(&a.parts), dl as i64, np(&a.block_slot),
+                                    np(&a.block_route), b.nb, dl as i32, inter as i32, k as i32, ti, null_slot, 0, 1)
+            }, "moe down (prefill, tp)")?;
+        } else if t > FMA_ROWS {
             ck(unsafe {
                 ds_moe_down_mma(sr, hf, inter as i64, np(&ar.w2), np(&ar.s2), np(&a.parts), dl as i64, np(&a.block_slot),
-                                np(&a.block_pair), pi, dl as i32, inter as i32, k as i32, ti, null_slot, 0, 1)
+                                np(&a.block_pair), b.nb, dl as i32, inter as i32, k as i32, ti, null_slot, 0, 1, b.bm)
             }, "moe down (mma, tp)")?;
         } else {
             ck(unsafe {
@@ -2821,7 +3060,15 @@ impl Engine {
     fn tp_gather(&self, local: *mut c_void, m: usize, n: usize, full: *mut c_void) -> Result<()> {
         let pair = self.pair.as_ref().ok_or("tensor parallel needs the pair")?;
         let world = self.tp.map(|t| t.world).unwrap_or(1);
-        pair.roce.gather(local, np(&self.act.tp_scratch), m * n * 2, &self.stream)?;
+        // a prefill-sized step (eager, both ranks alike) gathers through NCCL: the one-shot
+        // RoCE gather is built for decode's latency and moved its 10-50 MB shards at ~5 GB/s,
+        // 15% of an 8K prefill's GPU time (nsys, rank 0); Python sends > 256 KB through NCCL
+        let nbytes = m * n * 2;
+        if self.eager_step && nbytes > (1 << 20) {
+            pair.comm.allgather(local, np(&self.act.tp_scratch), nbytes, &self.stream)?;
+        } else {
+            pair.roce.gather(local, np(&self.act.tp_scratch), nbytes, &self.stream)?;
+        }
         ck(unsafe { ds_unshard_u16(self.stream.raw(), np(&self.act.tp_scratch), full, m as i32, n as i32, world as i32) }, "unshard")
     }
 }

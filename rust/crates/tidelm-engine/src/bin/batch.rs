@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use tidelm_engine::decode::{generate, generate_batch, generate_plain, generate_spec, BatchOptions, DecodeOptions, Depth,
                             Generation, Request};
-use tidelm_engine::forward::{Engine, Options, Sampling, FMA_ROWS, TMAX};
+use tidelm_engine::forward::{Engine, Options, Sampling, FMA_ROWS};
 use tidelm_text::Text;
 
 const PROMPTS: [&str; 8] = [
@@ -198,7 +198,9 @@ fn run(engine: &mut Engine, args: &[String], reqs: &[Request], lanes: usize, n_r
     }
     // the scheduler alone against the single-sequence loops, where their chunking agrees
     for (i, (r, a)) in reqs.iter().zip(&alone).enumerate() {
-        if !(r.prompt.len() <= step_rows || step_rows == TMAX) {
+        // the loops prefill a prompt in steps of the engine's pmax rows, the scheduler in
+        // step_rows: they agree on prompts of one chunk
+        if r.prompt.len() > step_rows.min(engine.pmax) {
             continue;
         }
         let g = if sampled {

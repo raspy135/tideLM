@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::forward::{Options, Pair, TP_MAX_GATHER};
+use crate::forward::{tp_max_gather, Options, Pair};
 use crate::weights::Tp;
 use crate::Result;
 
@@ -30,7 +30,7 @@ pub fn join(opts: &mut Options, model_dir: &std::path::Path, pa: &PairArgs) -> R
     let boot = opts.boot_config(model_dir)?;
     let (comm, mut ctl) = tidelm_comm::join(pa.rank, &pa.addr, &boot, Duration::from_secs(300))?;
     let hcas: Option<Vec<String>> = std::env::var("NCCL_IB_HCA").ok().map(|v| v.split(',').map(|s| s.to_string()).collect());
-    let roce = tidelm_comm::roce::Roce::setup(pa.rank, &mut ctl, TP_MAX_GATHER, hcas.as_deref())?;
+    let roce = tidelm_comm::roce::Roce::setup(pa.rank, &mut ctl, tp_max_gather(), hcas.as_deref())?;
     opts.tp = Some(Tp { rank: pa.rank, world: 2 });
     Ok(Pair { comm, ctl, roce })
 }

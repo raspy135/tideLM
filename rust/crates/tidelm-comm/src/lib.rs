@@ -23,6 +23,7 @@ pub struct NcclUniqueId {
 }
 
 type NcclComm = *mut c_void;
+const NCCL_UINT8: c_int = 1;
 const NCCL_FLOAT32: c_int = 7;
 const NCCL_SUM: c_int = 0;
 
@@ -30,6 +31,8 @@ extern "C" {
     fn ncclGetUniqueId(id: *mut NcclUniqueId) -> c_int;
     fn ncclCommInitRank(comm: *mut NcclComm, nranks: c_int, id: NcclUniqueId, rank: c_int) -> c_int;
     fn ncclAllReduce(send: *const c_void, recv: *mut c_void, count: usize, dtype: c_int, op: c_int, comm: NcclComm,
+                     stream: *mut c_void) -> c_int;
+    fn ncclAllGather(send: *const c_void, recv: *mut c_void, count: usize, dtype: c_int, comm: NcclComm,
                      stream: *mut c_void) -> c_int;
     fn ncclCommDestroy(comm: NcclComm) -> c_int;
     fn ncclGetErrorString(rc: c_int) -> *const c_char;
@@ -58,6 +61,12 @@ impl Comm {
     /// With two ranks every element is one a + b, the same bits on both.
     pub fn allreduce_f32(&self, buf: *mut c_void, count: usize, stream: &Stream) -> Result<()> {
         nccl(unsafe { ncclAllReduce(buf, buf, count, NCCL_FLOAT32, NCCL_SUM, self.comm, stream.raw()) }, "all-reduce")
+    }
+
+    /// out [world][nbytes] <- every rank's `nbytes` of `input`, in rank order, on `stream`: the
+    /// RoCE gather's layout, at NCCL's bandwidth for prefill-sized shards.
+    pub fn allgather(&self, input: *const c_void, out: *mut c_void, nbytes: usize, stream: &Stream) -> Result<()> {
+        nccl(unsafe { ncclAllGather(input, out, nbytes, NCCL_UINT8, self.comm, stream.raw()) }, "all-gather")
     }
 }
 

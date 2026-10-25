@@ -5,7 +5,7 @@
 //!                 [--lanes 1] [--depth window|confidence|plain|N] [--step-rows 64]
 //!                 [--thinking] [--effort 75]
 //!                 --resident --graphs [--keep-db FILE --budget N] [--max-seq 32768]
-//!                 [--world 2 --rank R --addr HOST:PORT]
+//!                 [--world 2 --rank R --addr HOST:PORT] [--layers N --keep-first K] (tests)
 //!
 //! Routes: GET /health, GET /v1/models, POST /v1/chat/completions (streamed or not, with
 //! usage), POST /v1/debug/prompt (the rendered prompt and its ids, no engine work - what
@@ -55,6 +55,23 @@ pub struct Ctx {
 
 fn main() -> tidelm_engine::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    // an unknown flag is an error: a test flag the server ignores (--keep-first once) loaded
+    // every expert and ran the box out of memory
+    const VALUED: [&str; 15] = ["--model-dir", "--max-seq", "--lanes", "--depth", "--step-rows", "--keep-db", "--budget",
+                                "--keep-first", "--layers", "--served-model-name", "--effort", "--host", "--port", "--world",
+                                "--rank"];
+    const FLAGS: [&str; 3] = ["--resident", "--graphs", "--thinking"];
+    let mut i = 1;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if VALUED.contains(&a) || a == "--addr" {
+            i += 2;
+        } else if FLAGS.contains(&a) {
+            i += 1;
+        } else {
+            return Err(format!("tidelm-server: unknown argument {a}").into());
+        }
+    }
     let flag = |name: &str| args.iter().any(|a| a == name);
     let model_dir = arg(&args, "--model-dir").map(PathBuf::from).unwrap_or_else(|| {
         PathBuf::from(std::env::var("HOME").unwrap()).join("models/DeepSeek-V4.1-Flash-1017")
@@ -78,9 +95,11 @@ fn main() -> tidelm_engine::Result<()> {
         Some(db) => Some(tidelm_engine::keep::load_demand(std::path::Path::new(&db), 40, 384)?),
         None => None,
     };
+    // --keep-first K (tests): the first K experts of every layer
+    let keep_first: Option<usize> = arg(&args, "--keep-first").map(|v| v.parse().unwrap());
     let keep = match (&scores, arg(&args, "--budget")) {
         (Some(s), Some(b)) => Some(tidelm_engine::keep::keep_from_scores(s, 6, b.parse().unwrap())?),
-        _ => None,
+        _ => keep_first.map(|k| vec![(0..384).map(|e| e < k).collect::<Vec<bool>>(); 40]),
     };
     let mut opts = Options {
         max_seq,
@@ -107,7 +126,8 @@ fn main() -> tidelm_engine::Result<()> {
             std::process::exit(0);
         }
     }
-    let sched = Scheduler::new(&engine, SchedOptions { depth, step_rows, logits: false })?;
+    // a step no lane decodes in prefills up to the engine's prefill rows (TIDELM_PREFILL_ROWS)
+    let sched = Scheduler::new(&engine, SchedOptions { depth, step_rows, prefill_rows: Some(engine.pmax), logits: false })?;
     let single = |s: &str| -> Option<u32> {
         match text.encode(s) {
             Ok(ids) if ids.len() == 1 => Some(ids[0]),

@@ -9,7 +9,8 @@ use crate::CudaStream;
 extern "C" {
     /// y[m, n] = bf16 or f32 of sum_k x[m, k] * W[n, k]; W fp8 e4m3 with UE8M0 32x32
     /// block scales (`lds` = scale row stride = ceil(K/32)). `splits` > 1 writes fp32
-    /// partials `[splits][M][N]` to `partial` (then call `ds_splits_reduce`). M <= 16.
+    /// partials `[splits][M][N]` to `partial` (then call `ds_splits_reduce`). Any M: past 16
+    /// rows one launch tiles them by 16, each row with the bits of its 16-row slice alone.
     pub fn ds_linear_fp8(
         stream: CudaStream, x: *const c_void, ldx: i64, w: *const c_void, s: *const c_void,
         lds: i64, m: c_int, n: c_int, k: c_int, splits: c_int, y_bf16: *mut c_void,
@@ -99,6 +100,15 @@ extern "C" {
         pos: *const c_void, w: c_int, win_lo: c_int, ckv: *const c_void, cidx: *const c_void,
         c: c_int, sink: *const c_void, scale: f32, out: *mut c_void, m: c_int, h: c_int,
         lane: *const c_void, ring_lstride: i64, ckv_lstride: i64, work: *mut c_void, work_bytes: i64,
+        decode_rows: *const c_void,
+    ) -> c_int;
+
+    /// ds_attn_decode's attention for prompt rows in one pass a row (no split, no workspace),
+    /// `heads_per_block` 16 or 32; rows with rows[m] != 0 are skipped (null: none).
+    pub fn ds_attn_prefill(
+        stream: CudaStream, q: *const c_void, ring: *const c_void, ring_size: c_int, pos: *const c_void, w: c_int, win_lo: c_int,
+        ckv: *const c_void, cidx: *const c_void, c: c_int, sink: *const c_void, scale: f32, out: *mut c_void, m: c_int, h: c_int,
+        lane: *const c_void, ring_lstride: i64, ckv_lstride: i64, rows: *const c_void, heads_per_block: c_int,
     ) -> c_int;
 
     /// Workspace ds_attn_decode's split-key kernel needs for m rows, h heads, at most nk keys
@@ -134,6 +144,14 @@ extern "C" {
     /// Indexer scores [T, n] bf16 (ld_out): q [T, 32, 128], k [n, 128], w [T, 32] f32,
     /// clen [T] visible counts, cand [T, ld_cand] u8 or null.
     pub fn ds_index_scores(
+        stream: CudaStream, q: *const c_void, k: *const c_void, w: *const c_void, clen: *const c_void,
+        cand: *const c_void, ld_cand: i64, n: c_int, out: *mut c_void, ld_out: i64, t: c_int,
+        lane: *const c_void, k_lstride: i64,
+    ) -> c_int;
+
+    /// ds_index_scores on the tensor cores (prefill steps): the same masks and head-sum
+    /// order, each head's dot accumulated in the mma's order.
+    pub fn ds_index_scores_mma(
         stream: CudaStream, q: *const c_void, k: *const c_void, w: *const c_void, clen: *const c_void,
         cand: *const c_void, ld_cand: i64, n: c_int, out: *mut c_void, ld_out: i64, t: c_int,
         lane: *const c_void, k_lstride: i64,
@@ -222,6 +240,14 @@ extern "C" {
         tok: *mut c_void,
     ) -> c_int;
     pub fn ds_nucleus_cap() -> c_int;
+    /// fp4_moe_cuda_route_small's blocks for any number of pairs (< 65,536), by a counting sort
+    /// over `s` slots (every slot value < s); `work` holds 3 * s ints.
+    /// `bm`: pairs a block (16, or 64 for the prefill MoE kernels); block_slot holds
+    /// ds_route_blocks(p, s, bm) entries, block_pair and block_route that many times bm.
+    pub fn ds_route_large(stream: CudaStream, slots: *const c_void, p: c_int, topk: c_int, s: c_int, work: *mut c_void,
+                          block_slot: *mut c_void, block_pair: *mut c_void, block_route: *mut c_void, bm: c_int) -> c_int;
+    /// The most blocks ds_route_large makes of `p` pairs over `s` slots at `bm` pairs a block.
+    pub fn ds_route_blocks(p: c_int, s: c_int, bm: c_int) -> c_int;
     /// x[i] = table[x[i]] (int32, on the device).
     pub fn ds_map_i32(stream: CudaStream, table: *const c_void, x: *mut c_void, n: c_int) -> c_int;
     /// [world][M][n] -> [M][world * n].
@@ -243,16 +269,31 @@ extern "C" {
     pub fn ds_moe_up_mma(
         stream: CudaStream, x: *const c_void, ldx: i64, w1: *const c_void, s1: *const c_void, w3: *const c_void,
         s3: *const c_void, h: *mut c_void, ldh: i64, route_weight: *const c_void, block_slot: *const c_void,
-        block_route: *const c_void, nb: c_int, n: c_int, k: c_int, limit: f32, null_slot: c_int,
+        block_route: *const c_void, nb: c_int, n: c_int, k: c_int, limit: f32, null_slot: c_int, bm: c_int,
     ) -> c_int;
 
     /// The FP4 MoE down GEMM on the tensor cores: fp4_moe_cuda_down_v2's contract.
     pub fn ds_moe_down_mma(
         stream: CudaStream, h: *const c_void, ldh: i64, w2: *const c_void, s2: *const c_void, y: *mut c_void, ldy: i64,
         block_slot: *const c_void, block_pair: *const c_void, nb: c_int, n: c_int, k: c_int, topk: c_int, ntok: c_int,
-        null_slot: c_int, partial: c_int, parts_world: c_int,
+        null_slot: c_int, partial: c_int, parts_world: c_int, bm: c_int,
     ) -> c_int;
 
+    /// The prefill MoE (grouped GEMM over ds_route_large's 64-pair blocks): up (w1/w3 + SwiGLU
+    /// into h) and down (w2 into parts), the decode kernels' contracts otherwise.
+    pub fn ds_moe_prefill_up(
+        stream: CudaStream, x: *const c_void, ldx: i64, w1: *const c_void, s1: *const c_void, w3: *const c_void,
+        s3: *const c_void, h: *mut c_void, ldh: i64, route_weight: *const c_void, block_slot: *const c_void,
+        block_route: *const c_void, nb: c_int, n: c_int, k: c_int, limit: f32, null_slot: c_int,
+    ) -> c_int;
+    pub fn ds_moe_prefill_down(
+        stream: CudaStream, h: *const c_void, ldh: i64, w2: *const c_void, s2: *const c_void, y: *mut c_void, ldy: i64,
+        block_slot: *const c_void, block_route: *const c_void, nb: c_int, n: c_int, k: c_int, topk: c_int, ntok: c_int,
+        null_slot: c_int, partial: c_int, parts_world: c_int,
+    ) -> c_int;
+    /// Benchmark-only: the M-tiled tensor-core fp8 GEMM in configuration `cfg` (ds41.cu).
+    pub fn ds_mma_fp8_big(stream: CudaStream, x: *const c_void, ldx: i64, w: *const c_void, s: *const c_void, lds: i64, m: c_int,
+                          n: c_int, k: c_int, y_bf16: *mut c_void, cfg: c_int) -> c_int;
     /// Benchmark-only: the tensor-core fp8 GEMM at an explicit (ng, depth).
     pub fn ds_mma_fp8_cfg(
         stream: CudaStream, x: *const c_void, ldx: i64, w: *const c_void, s: *const c_void, lds: i64, m: c_int, n: c_int,

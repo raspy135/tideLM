@@ -6,20 +6,20 @@
 use std::time::Instant;
 
 use tidelm_cuda::{check, set_device, DeviceBuffer, Stream};
-use tidelm_kernels::ds41::{ds_attn_decode, ds_attn_work_bytes};
+use tidelm_kernels::ds41::{ds_attn_decode, ds_attn_prefill, ds_attn_work_bytes};
 
-const REPS: usize = 64;
+const REPS: usize = 8;
 
 fn main() {
     set_device(0).unwrap();
     let stream = Stream::new().unwrap();
     let (d, ring, w) = (512usize, 256usize, 128usize);
     let ringb = DeviceBuffer::from_slice(&vec![0x3c00u16; ring * d]).unwrap();
-    let ckv = DeviceBuffer::from_slice(&vec![0x3c00u16; 2048 * d]).unwrap();
+    let ckv = DeviceBuffer::from_slice(&vec![0x3c00u16; 4096 * d]).unwrap();
     let sink = DeviceBuffer::from_slice(&vec![0f32; 64]).unwrap();
     println!("{:>4} {:>5} {:>6}  {:>8}", "rows", "heads", "ckeys", "us");
     for &(m, h, c) in &[(1usize, 32usize, 16usize), (1, 32, 256), (1, 32, 1024), (1, 64, 256), (6, 32, 256), (6, 32, 1024),
-                        (6, 64, 256), (24, 32, 256)] {
+                        (6, 64, 256), (24, 32, 256), (64, 32, 1024), (64, 64, 1024), (512, 32, 1024), (2048, 32, 1024), (2048, 32, 256)] {
         let q = DeviceBuffer::from_slice(&vec![0x3c00u16; m * h * d]).unwrap();
         let out = DeviceBuffer::<u16>::zeroed(m * h * d).unwrap();
         let pos = DeviceBuffer::from_slice(&vec![1000i32; m]).unwrap();
@@ -28,10 +28,17 @@ fn main() {
         let wb = unsafe { ds_attn_work_bytes(m as i32, h as i32, (w + c) as i32) };
         let work = DeviceBuffer::<u8>::zeroed(wb as usize).unwrap();
         let split = std::env::args().any(|a| a == "--per-head");
+        // --prefill 16|32: the one-pass prompt-row kernel at that many heads a block
+        let prefill: Option<i32> = std::env::args().skip_while(|a| a != "--prefill").nth(1).map(|v| v.parse().unwrap());
         let launch = |s: &Stream| unsafe {
+            if let Some(hb) = prefill {
+                return ds_attn_prefill(s.raw(), q.raw(), ringb.raw(), ring as i32, pos.raw(), w as i32, 0, ckv.raw(), cidx.raw(),
+                                       c as i32, sink.raw(), 0.04, out.raw(), m as i32, h as i32, std::ptr::null_mut(), 0, 0,
+                                       std::ptr::null_mut(), hb);
+            }
             ds_attn_decode(s.raw(), q.raw(), ringb.raw(), ring as i32, pos.raw(), w as i32, 0, ckv.raw(), cidx.raw(), c as i32,
                            sink.raw(), 0.04, out.raw(), m as i32, h as i32, std::ptr::null_mut(), 0, 0,
-                           if split { std::ptr::null_mut() } else { work.raw() }, if split { 0 } else { wb })
+                           if split { std::ptr::null_mut() } else { work.raw() }, if split { 0 } else { wb }, std::ptr::null_mut())
         };
         assert_eq!(launch(&stream), 0);
         stream.synchronize().unwrap();
