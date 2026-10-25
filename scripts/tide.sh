@@ -24,15 +24,19 @@ cmd=${1:-}
 shift
 follow=() lines=100 rank=0 local_only=() f=""
 while [[ $# -gt 0 ]]; do
-    case "$cmd/$1" in
-        logs/-f | logs/--follow) follow=(-f) ;;
-        logs/-n) [[ "${2:-}" =~ ^[0-9]+$ ]] || err "-n needs a number of lines"; lines=$2; shift ;;
-        logs/--rank) [[ "${2:-}" == 0 || "${2:-}" == 1 ]] || err "--rank is 0 or 1"; rank=$2; shift ;;
-        build/--local-only) local_only=(--local-only) ;;
-        */-h | */--help) usage 0 ;;
-        */-*) err "$cmd has no option $1 (scripts/tide.sh --help)" ;;
-        *) [[ -z "$f" ]] || err "one profile at a time ($f, $1)"; f=$1 ;;
-    esac
+    if [[ "$1" != -* ]]; then
+        [[ -z "$f" ]] || err "one profile at a time ($f, $1)"
+        f=$1
+    else
+        case "$cmd $1" in
+            "logs -f" | "logs --follow") follow=(-f) ;;
+            "logs -n") [[ "${2:-}" =~ ^[0-9]+$ ]] || err "-n needs a number of lines"; lines=$2; shift ;;
+            "logs --rank") [[ "${2:-}" == 0 || "${2:-}" == 1 ]] || err "--rank is 0 or 1"; rank=$2; shift ;;
+            "build --local-only") local_only=(--local-only) ;;
+            *" -h" | *" --help") usage 0 ;;
+            *) err "$cmd has no option $1 (scripts/tide.sh --help)" ;;
+        esac
+    fi
     shift
 done
 if [[ -z "$f" ]]; then
