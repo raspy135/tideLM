@@ -2396,13 +2396,16 @@ __global__ void __launch_bounds__(256) index_scores_kernel(
 // shuffles over lanes 16, 8, 4): the one difference from index_scores_kernel is each
 // 128-term dot's fp32 accumulation order inside the mma (the bf16 einsum's, not a sequential
 // chain), which moves a dot across a bf16 rounding boundary now and then. Keys no row of the
-// block sees (j >= clen) are written -inf without being computed.
+// block sees (j >= clen) are written -inf without being computed. A block takes `chunk` keys
+// (blockIdx.y's run of them): a prefill step's 8-row blocks fill the GPU with chunk = n, a
+// decode step's one or two need the keys split; every score is still one block's, so the
+// bits do not depend on the split.
 constexpr int kIsRows = 8, kIsLD = kIdxD + 8;
 
 __global__ void __launch_bounds__(256) index_scores_mma_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_base, const float* __restrict__ w,
     const int* __restrict__ clen, const uint8_t* __restrict__ cand, int64_t ld_cand, int n,
-    __nv_bfloat16* __restrict__ out, int64_t ld_out, const int* __restrict__ lane, int64_t k_lstride, int T) {
+    __nv_bfloat16* __restrict__ out, int64_t ld_out, const int* __restrict__ lane, int64_t k_lstride, int T, int chunk) {
     __shared__ __align__(16) __nv_bfloat16 ks[kIdxTile * kIsLD];
     __shared__ int lane_s[kIsRows], lim_s[kIsRows];
     const int warp = threadIdx.x >> 5, l = threadIdx.x & 31, g = l >> 2, c = l & 3;
@@ -2437,8 +2440,9 @@ __global__ void __launch_bounds__(256) index_scores_mma_kernel(
     }
     __nv_bfloat16* orow = out + (int64_t)t * ld_out;
     const __nv_bfloat16 ninf = to_bf(-INFINITY);
-    for (int j0 = 0; j0 < n; j0 += kIdxTile) {
-        const int j1 = min(n, j0 + kIdxTile);
+    const int jb = blockIdx.y * chunk, je = min(n, jb + chunk);
+    for (int j0 = jb; j0 < je; j0 += kIdxTile) {
+        const int j1 = min(je, j0 + kIdxTile);
         if (j0 >= max_lim) {
             if (row)
                 for (int j = j0 + l; j < j1; j += 32) orow[j] = ninf;
@@ -2512,12 +2516,16 @@ __device__ __forceinline__ bool bf16_key(uint16_t b, uint32_t& key) {
 // `width` columns (model.py: topk(k).indices.sort(), positions past clen -> -1, _pad_topk).
 // Ties at the threshold keep the lowest indices (torch.topk leaves tie order unspecified).
 // One block of 1024 threads per row: an 8+8-bit radix select for the threshold, then a stable
-// compaction that emits the selected indices already in ascending order.
+// compaction that emits the selected indices already in ascending order. The count and the
+// histograms read the row coalesced (thread t takes t, t + 1024, ...) into a histogram a warp
+// - most bf16 scores share their exponent byte, and one shared histogram serialized on it -
+// and only the ordered compaction walks a thread's contiguous run.
 constexpr int kSelThreads = 1024;
 
 __global__ void __launch_bounds__(kSelThreads) topk_select_kernel(
     const __nv_bfloat16* __restrict__ s, int64_t ld_s, int n, int K, int* __restrict__ out, int width) {
     __shared__ int hist[256];
+    __shared__ int whist[kSelThreads / 32][256];
     __shared__ int scan[kSelThreads];
     __shared__ uint32_t sh_thresh;
     __shared__ int sh_gt, sh_need, sh_all;
@@ -2529,7 +2537,7 @@ __global__ void __launch_bounds__(kSelThreads) topk_select_kernel(
 
     // pass 0: selectable count; pass 1/2: the K-th largest key, one byte at a time
     int finite = 0;
-    for (int i = lo; i < hi; ++i) { uint32_t key; finite += bf16_key(row[i], key); }
+    for (int i = tid; i < n; i += kSelThreads) { uint32_t key; finite += bf16_key(row[i], key); }
     scan[tid] = finite;
     __syncthreads();
     for (int o = kSelThreads / 2; o > 0; o >>= 1) {
@@ -2544,13 +2552,20 @@ __global__ void __launch_bounds__(kSelThreads) topk_select_kernel(
         int remaining = K, above = 0;
         for (int pass = 0; pass < 2; ++pass) {
             const int shift = pass == 0 ? 8 : 0;
-            for (int b = tid; b < 256; b += kSelThreads) hist[b] = 0;
+            for (int b = tid; b < (kSelThreads / 32) * 256; b += kSelThreads) (&whist[0][0])[b] = 0;
             __syncthreads();
-            for (int i = lo; i < hi; ++i) {
+            int* mine = whist[tid >> 5];
+            for (int i = tid; i < n; i += kSelThreads) {
                 uint32_t key;
                 if (!bf16_key(row[i], key)) continue;
                 if (pass == 1 && (key >> 8) != (prefix >> 8)) continue;
-                atomicAdd(&hist[(key >> shift) & 0xff], 1);
+                atomicAdd(&mine[(key >> shift) & 0xff], 1);
+            }
+            __syncthreads();
+            for (int b = tid; b < 256; b += kSelThreads) {
+                int sum = 0;
+                for (int wv = 0; wv < kSelThreads / 32; ++wv) sum += whist[wv][b];
+                hist[b] = sum;
             }
             __syncthreads();
             if (tid == 0) {
@@ -3665,14 +3680,23 @@ int ds_index_scores(void* stream, const void* q, const void* k, const void* w, c
     return static_cast<int>(cudaGetLastError());
 }
 
-int ds_index_scores_mma(void* stream, const void* q, const void* k, const void* w, const void* clen, const void* cand,
-                        int64_t ld_cand, int n, void* out, int64_t ld_out, int T, const void* lane, int64_t k_lstride) {
-    if (n < 1 || T < 1) return cudaErrorInvalidValue;
-    index_scores_mma_kernel<<<(T + kIsRows - 1) / kIsRows, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+int ds_index_scores_mma_chunked(void* stream, const void* q, const void* k, const void* w, const void* clen,
+                                const void* cand, int64_t ld_cand, int n, void* out, int64_t ld_out, int T,
+                                const void* lane, int64_t k_lstride, int chunk) {
+    if (n < 1 || T < 1 || chunk < kIdxTile || chunk % kIdxTile) return cudaErrorInvalidValue;
+    dim3 grid((T + kIsRows - 1) / kIsRows, (n + chunk - 1) / chunk);
+    index_scores_mma_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
         static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(k), static_cast<const float*>(w),
         static_cast<const int*>(clen), static_cast<const uint8_t*>(cand), ld_cand, n,
-        static_cast<__nv_bfloat16*>(out), ld_out, static_cast<const int*>(lane), k_lstride, T);
+        static_cast<__nv_bfloat16*>(out), ld_out, static_cast<const int*>(lane), k_lstride, T, chunk);
     return static_cast<int>(cudaGetLastError());
+}
+
+int ds_index_scores_mma(void* stream, const void* q, const void* k, const void* w, const void* clen, const void* cand,
+                        int64_t ld_cand, int n, void* out, int64_t ld_out, int T, const void* lane, int64_t k_lstride) {
+    const int whole = (n + kIdxTile - 1) / kIdxTile * kIdxTile;
+    return ds_index_scores_mma_chunked(stream, q, k, w, clen, cand, ld_cand, n, out, ld_out, T, lane, k_lstride,
+                                       whole < kIdxTile ? kIdxTile : whole);
 }
 
 int ds_topk_select(void* stream, const void* s, int64_t ld_s, int n, int K, void* out, int width, int T) {

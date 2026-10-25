@@ -632,6 +632,9 @@ impl RowCache {
     }
 }
 
+/// Keys a block of the decode indexer scores (ds_index_scores_mma_chunked): 64 blocks at 64K.
+const INDEX_DECODE_CHUNK: usize = 1024;
+
 /// A raw pointer handed to a step's gather thread (see run_step).
 struct SendPtr(*mut u8);
 unsafe impl Send for SendPtr {}
@@ -4339,10 +4342,13 @@ impl Engine {
         let clen = if r == 1 { &a.clen1 } else { &a.clen2 };
         let cand_src = cfg.candidate_source_layer;
         let use_cand = self.cand_live && cand_src >= 0 && (l as i64) > cand_src;
-        // prefill steps score on the tensor cores (0.69 ms against the FMA kernel's 12.45 at
-        // 2,048 rows over 2,240 keys, examples/bench_index.rs; the head sum's order kept, each
-        // dot accumulated in the mma's order); decode keeps the FMA kernel's bits
-        let scores = if self.eager_step { ds_index_scores_mma } else { ds_index_scores };
+        // scores on the tensor cores (0.69 ms against the FMA kernel's 12.45 at 2,048 rows over
+        // 2,240 keys, examples/bench_index.rs; the head sum's order kept, each dot accumulated
+        // in the mma's order). A decode step's rows fill one 8-row block, so its keys are split
+        // over blocks (examples/bench_index_decode.rs): the FMA kernel decode used before cost
+        // a step more with every compressed key the context added, as the Python engine's
+        // einsum (tensor cores) did not
+        let chunk = if self.eager_step { 0 } else { INDEX_DECODE_CHUNK };
         let block = 8usize;
         let topk_blocks = 2048usize;
         let cand_step = l as i64 == cand_src && shape.cand;
@@ -4356,10 +4362,17 @@ impl Engine {
         let rc = (index_scores_budget() / n_c.max(1)).min(t).max(8.min(t));
         for r0 in (0..t).step_by(rc) {
             let m = rc.min(t - r0) as i32;
+            let (q, keys, iw) = (a.iq.ptr_at(r0 * ih * ihd), np(&self.caches.ik[&src]), a.iwf.ptr_at(r0 * ih));
+            let cand = if use_cand { a.cand.ptr_at(r0 * nmax) } else { nul() };
+            let kstride = (self.caches.crows[&src] * ihd) as i64;
             ck(unsafe {
-                scores(sr, a.iq.ptr_at(r0 * ih * ihd), np(&self.caches.ik[&src]), a.iwf.ptr_at(r0 * ih), clen.ptr_at(r0),
-                       if use_cand { a.cand.ptr_at(r0 * nmax) } else { nul() }, nmax as i64, n_c as i32, np(&a.scores), n_c as i64, m,
-                       a.lane.ptr_at(r0), (self.caches.crows[&src] * ihd) as i64)
+                if chunk == 0 {
+                    ds_index_scores_mma(sr, q, keys, iw, clen.ptr_at(r0), cand, nmax as i64, n_c as i32, np(&a.scores), n_c as i64, m,
+                                        a.lane.ptr_at(r0), kstride)
+                } else {
+                    ds_index_scores_mma_chunked(sr, q, keys, iw, clen.ptr_at(r0), cand, nmax as i64, n_c as i32, np(&a.scores),
+                                                n_c as i64, m, a.lane.ptr_at(r0), kstride, chunk as i32)
+                }
             }, "index scores")?;
             if cand_step {
                 // model.py::_select_candidates: below topk_blocks blocks every block is kept,

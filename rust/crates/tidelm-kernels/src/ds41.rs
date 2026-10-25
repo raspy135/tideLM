@@ -208,6 +208,12 @@ extern "C" {
         cand: *const c_void, ld_cand: i64, n: c_int, out: *mut c_void, ld_out: i64, t: c_int,
         lane: *const c_void, k_lstride: i64,
     ) -> c_int;
+    /// ds_index_scores_mma with each block taking `chunk` keys (a multiple of 64): decode steps
+    pub fn ds_index_scores_mma_chunked(
+        stream: CudaStream, q: *const c_void, k: *const c_void, w: *const c_void, clen: *const c_void,
+        cand: *const c_void, ld_cand: i64, n: c_int, out: *mut c_void, ld_out: i64, t: c_int,
+        lane: *const c_void, k_lstride: i64, chunk: c_int,
+    ) -> c_int;
 
     /// Per row: the K largest selectable bf16 values' indices, ascending, -1 padded to
     /// `width`.
