@@ -1,22 +1,95 @@
 //! POST /v1/chat/completions and /v1/debug/prompt: server/app.py's request rules
 //! (parse_sampling, resolve_thinking, build_chat_prompt) over the Rust port of the checkpoint's
 //! encoder, the answer routed into reasoning, content and tool calls (output.rs) and streamed
-//! as OpenAI chunks with usage.
+//! as OpenAI chunks with usage. A GLM server's routes are glm.rs's ([`Family`]).
 
 use std::net::TcpStream;
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tidelm_engine::decode::{Event, Finish, Job};
 use tidelm_engine::forward::Sampling;
-use tidelm_text::chat::{encode_messages, py_json, IMAGE};
+use tidelm_engine::vision::ImageIn;
+use tidelm_text::chat::{encode_messages, py_json, py_loads, IMAGE};
+use tidelm_text::glm::truthy;
 use tidelm_text::Text;
 
+use crate::anthropic::{Prep, Prepared, Room};
 use crate::http::{send_event, send_json, start_events, ApiError};
-use crate::output::{OutputRouter, Phase};
+use crate::output::{Detok, DsAnswer, OutputRouter, Phase};
 use crate::{Cmd, Ctx};
+
+/// The chat format and response rules a server speaks.
+pub enum Family {
+    /// DeepSeek V4.1: the checkpoint's encoder and server/app.py's rules (this module)
+    Ds,
+    /// GLM-5.3: chat_template.jinja (tidelm_text::glm) and server/muse_app.py's rules (glm.rs)
+    Glm(crate::glm::GlmSettings),
+}
+
+impl Family {
+    /// GLM when the checkpoint's config.json has model_type glm_moe_dsa (muse_app.main's
+    /// test), else DeepSeek.
+    pub fn load(model_dir: &Path, text: &Text) -> Result<Family, tidelm_text::Error> {
+        let cfg: Value = serde_json::from_slice(&std::fs::read(model_dir.join("config.json"))?)?;
+        Ok(if cfg["model_type"].as_str() == Some("glm_moe_dsa") {
+            Family::Glm(crate::glm::GlmSettings::load(model_dir, text)?)
+        } else {
+            Family::Ds
+        })
+    }
+}
+
+/// A request for the engine thread, either family's: tidelm_engine::decode::Job less its id
+/// and sink.
+pub struct Request {
+    pub prompt: Vec<u32>,
+    pub images: Vec<ImageIn>,
+    pub key: Option<Vec<u32>>,
+    pub max_tokens: usize,
+    pub sampling: Sampling,
+    pub seed: u64,
+    pub stop: Vec<u32>,
+    pub copy_draft: bool,
+}
+
+/// Queue a request; its events arrive on the receiver, on the engine's thread's schedule.
+pub fn submit(ctx: &Ctx, r: Request) -> Result<(u64, mpsc::Receiver<Event>), ApiError> {
+    let id = ctx.next_id.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = mpsc::channel::<Event>();
+    let job = Job {
+        id,
+        prompt: r.prompt,
+        max_tokens: r.max_tokens,
+        sampling: r.sampling,
+        seed: r.seed,
+        stop: r.stop,
+        sink: Box::new(move |ev| {
+            let _ = tx.send(ev);
+        }),
+        images: r.images,
+        key: r.key,
+        copy_draft: r.copy_draft,
+    };
+    ctx.engine.send(Cmd::Submit(job)).map_err(|_| ApiError { status: 503, message: "the engine is not running".into(), param: None })?;
+    Ok((id, rx))
+}
+
+/// A request body as json.loads reads it (an empty body is `{}`)
+pub fn body_json(body: &[u8]) -> Result<Value, ApiError> {
+    if body.is_empty() {
+        return Ok(json!({}));
+    }
+    let s = std::str::from_utf8(body).map_err(|e| ApiError::bad(format!("invalid JSON: {e}"), None))?;
+    py_loads(s).map_err(|e| ApiError::bad(format!("invalid JSON: {e}"), None))
+}
+
+pub fn time_seed() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
+}
 
 /// A request that failed: with an answer for the client, or on the connection itself.
 pub enum Failure {
@@ -230,6 +303,10 @@ fn parse_messages(body: &Value, vision: bool) -> Result<Vec<Value>, ApiError> {
 
 fn parse(body: &[u8], ctx: &Ctx) -> Result<ChatReq, ApiError> {
     let body: Value = serde_json::from_slice(body).map_err(|e| ApiError::bad(format!("invalid JSON: {e}"), None))?;
+    parse_value(body, ctx)
+}
+
+fn parse_value(body: Value, ctx: &Ctx) -> Result<ChatReq, ApiError> {
     let messages = parse_messages(&body, ctx.vision.is_some())?;
     let (thinking, effort) = resolve_thinking(&body, ctx.default_thinking, ctx.default_effort)?;
     let mt = body.get("max_completion_tokens").filter(|v| !v.is_null()).or_else(|| body.get("max_tokens").filter(|v| !v.is_null()));
@@ -298,44 +375,14 @@ fn render(req: &ChatReq, ctx: &Ctx) -> Result<(String, crate::vision::Expanded),
 }
 
 pub fn debug_prompt(stream: &mut TcpStream, body: &[u8], ctx: &Ctx) -> Result<(), Failure> {
+    if let crate::Family::Glm(g) = &ctx.family {
+        return crate::glm::debug_prompt(stream, body, ctx, g);
+    }
     let req = parse(body, ctx)?;
     let (prompt, ex) = render(&req, ctx)?;
     send_json(stream, 200, &json!({"prompt": prompt, "prompt_tokens": ex.ids.len(), "ids": ex.ids, "thinking": req.thinking,
                                   "effort": req.effort, "images": ex.images.len()}))?;
     Ok(())
-}
-
-/// Incremental detokenization (the usual prefix/read offsets): text is released once it no
-/// longer ends in a partial UTF-8 character.
-#[derive(Default)]
-struct Detok {
-    ids: Vec<u32>,
-    prefix: usize,
-    read: usize,
-}
-
-impl Detok {
-    fn push(&mut self, text: &Text, t: u32) -> String {
-        self.ids.push(t);
-        let prev = text.decode(&self.ids[self.prefix..self.read]).unwrap_or_default();
-        let full = text.decode(&self.ids[self.prefix..]).unwrap_or_default();
-        if full.len() > prev.len() && !full.ends_with('\u{FFFD}') && full.starts_with(&prev) {
-            let delta = full[prev.len()..].to_string();
-            self.prefix = self.read;
-            self.read = self.ids.len();
-            delta
-        } else {
-            String::new()
-        }
-    }
-
-    /// The rest, even a partial character (the answer is over).
-    fn flush(&mut self, text: &Text) -> String {
-        let full = text.decode(&self.ids[self.prefix..]).unwrap_or_default();
-        let prev = text.decode(&self.ids[self.prefix..self.read]).unwrap_or_default();
-        (self.prefix, self.read) = (self.ids.len(), self.ids.len());
-        if full.len() > prev.len() { full.get(prev.len()..).unwrap_or("").to_string() } else { String::new() }
-    }
 }
 
 /// One chunk's delta per run of a phase: {"reasoning_content": ...} or {"content": ...}.
@@ -356,7 +403,46 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// /v1/messages on DeepSeek (server/app.py's _messages): the translated request as a chat
+/// body - its stop_sequences, max_tokens (or the default), temperature and top_p - under the
+/// server's thinking and effort, through this module's rules.
+pub fn anthropic_prepare(req: &Value, msgs: Vec<Value>, tools: Vec<Value>, ctx: &Ctx, count: bool) -> Result<Prep, ApiError> {
+    let mut chat = Map::new();
+    chat.insert("messages".into(), Value::Array(msgs));
+    chat.insert("tools".into(), if tools.is_empty() { Value::Null } else { Value::Array(tools) });
+    chat.insert("stop".into(), req.get("stop_sequences").cloned().unwrap_or(Value::Null));
+    chat.insert("max_tokens".into(), req.get("max_tokens").filter(|v| truthy(v)).cloned().unwrap_or(json!(DEFAULT_MAX_TOKENS)));
+    for k in ["temperature", "top_p"] {
+        if let Some(v) = req.get(k).filter(|v| !v.is_null()) {
+            chat.insert(k.into(), v.clone());
+        }
+    }
+    let r = parse_value(Value::Object(chat), ctx)?;
+    let (_, ex) = render(&r, ctx)?;
+    if count {
+        return Ok(Prep::Count(ex.ids.len()));
+    }
+    Ok(Prep::Run(Prepared {
+        request: Request {
+            prompt: ex.ids,
+            images: ex.images,
+            key: ex.key,
+            max_tokens: r.max_tokens,
+            sampling: Sampling { temperature: r.temperature, top_p: r.top_p },
+            seed: r.seed.unwrap_or_else(time_seed),
+            stop: vec![ctx.eos],
+            copy_draft: r.copy_draft,
+        },
+        answer: Box::new(DsAnswer::new(r.thinking, r.stop, ctx.eos)),
+        room: Room::Ds,
+        tools: Value::Null,
+    }))
+}
+
 pub fn chat(stream: &mut TcpStream, body: &[u8], ctx: &Ctx) -> Result<(), Failure> {
+    if let crate::Family::Glm(g) = &ctx.family {
+        return crate::glm::chat(stream, body, ctx, g);
+    }
     let t0 = Instant::now();
     let req = parse(body, ctx)?;
     let (_, ex) = render(&req, ctx)?;

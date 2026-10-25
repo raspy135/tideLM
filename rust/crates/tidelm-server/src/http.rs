@@ -4,7 +4,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 
-use crate::{api, Ctx};
+use crate::{anthropic, api, Ctx};
 
 pub struct Request {
     pub method: String,
@@ -56,6 +56,8 @@ fn reason(status: u16) -> &'static str {
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        413 => "Payload Too Large",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "Error",
@@ -94,14 +96,21 @@ pub fn serve(mut stream: TcpStream, ctx: &Ctx) {
         Ok(Some(r)) => r,
         _ => return,
     };
-    let res = match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/health") => send_json(&mut stream, 200, &serde_json::json!({"status": "ok", "engine": "tidelm-rust"})).map_err(Into::into),
+    // the query is gone already; a trailing "/" goes too (Claude Code posts /v1/messages?beta=true)
+    let path = req.path.trim_end_matches('/');
+    let res = match (req.method.as_str(), path) {
+        ("GET", "/health" | "") => send_json(&mut stream, 200, &serde_json::json!({"status": "ok", "engine": "tidelm-rust"})).map_err(Into::into),
         ("GET", "/v1/models") => send_json(&mut stream, 200, &serde_json::json!({
             "object": "list",
             "data": [{"id": ctx.model, "object": "model", "owned_by": "tidelm"}],
         })).map_err(Into::into),
+        ("POST", p) if p.starts_with("/v1/messages") => anthropic::serve(&mut stream, p, &req.body, ctx),
         ("POST", "/v1/chat/completions") => api::chat(&mut stream, &req.body, ctx),
         ("POST", "/v1/debug/prompt") => api::debug_prompt(&mut stream, &req.body, ctx),
+        ("POST", "/v1/completions") => match &ctx.family {
+            crate::Family::Glm(g) => crate::glm::completions(&mut stream, &req.body, ctx, g),
+            crate::Family::Ds => Err(api::Failure::Api(ApiError { status: 404, message: "no route for POST /v1/completions".into(), param: None })),
+        },
         (m, p) => Err(api::Failure::Api(ApiError { status: 404, message: format!("no route for {m} {p}"), param: None })),
     };
     match res {

@@ -9,17 +9,25 @@
 //!
 //! Routes: GET /health, GET /v1/models, POST /v1/chat/completions (streamed or not, with
 //! usage), POST /v1/debug/prompt (the rendered prompt and its ids, no engine work - what
-//! bench/bench.py's token_len calls). Requests run through the engine's continuous-batching
-//! scheduler, one lane each; with --world 2, rank 1 follows rank 0's engine calls and serves
-//! nothing.
+//! bench/bench.py's token_len calls), POST /v1/messages and /v1/messages/count_tokens (the
+//! Anthropic API, anthropic.rs), and for GLM POST /v1/completions. Requests run through the
+//! engine's continuous-batching scheduler, one lane each; with --world 2, rank 1 follows rank
+//! 0's engine calls and serves nothing. Ctx::family picks the chat format and response rules:
+//! DeepSeek V4.1 (api.rs, server/app.py's) or GLM-5.3 (glm.rs, server/muse_app.py's).
 //!
 //! Text messages only: tool definitions, tool calls and images are refused (400) rather than
 //! rendered differently from the Python server.
 
+mod anthropic;
 mod api;
+mod glm;
 mod http;
 mod output;
+#[cfg(test)]
+mod tests;
 mod vision;
+
+pub use api::Family;
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -55,6 +63,11 @@ pub struct Ctx {
     pub vision: Option<vision::VisionCtx>,
     pub engine: mpsc::Sender<Cmd>,
     pub next_id: AtomicU64,
+    /// the chat format and response rules (Family::load reads the checkpoint's config.json);
+    /// default_thinking, default_effort, eos, think_end and vision are DeepSeek's
+    pub family: Family,
+    /// /v1/messages: each answer's reasoning, put back when a client sends the turn again
+    pub memo: anthropic::ReasoningMemo,
 }
 
 fn main() -> tidelm_engine::Result<()> {
@@ -241,6 +254,8 @@ fn main() -> tidelm_engine::Result<()> {
         }),
         engine: tx,
         next_id: AtomicU64::new(1),
+        family: Family::Ds,
+        memo: anthropic::ReasoningMemo::default(),
     });
     let addr = format!("{}:{}", arg(&args, "--host").unwrap_or_else(|| "0.0.0.0".into()),
                        arg(&args, "--port").unwrap_or_else(|| "8000".into()));

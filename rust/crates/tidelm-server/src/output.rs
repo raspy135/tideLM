@@ -3,9 +3,15 @@
 //! which is held back whole and parsed once the answer is done. The request's stop strings
 //! end reasoning or content (not a tool block). Text that may still turn out to begin a marker
 //! is held until the next tokens decide it, so the "\n\n" before a block never reaches content.
+//!
+//! [`Answer`] is either family's router behind one face (GLM's routes and /v1/messages use
+//! it): DeepSeek's text router over the detokenized stream, or GLM's id router
+//! (tidelm_text::glm::GlmParser, server/glm_app.py).
 
 use serde_json::{json, Value};
 use tidelm_text::chat::{parse_completion, parse_tool_calls_tolerant, EOS, THINK_END, TOOL_CALLS_START};
+use tidelm_text::glm::{Channel, GlmIds, GlmParser};
+use tidelm_text::Text;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -159,6 +165,184 @@ impl OutputRouter {
                                             "function": {"name": name, "arguments": arguments}}))
             .collect();
         (calls, String::new())
+    }
+}
+
+/// Incremental detokenization (the usual prefix/read offsets): text is released once it no
+/// longer ends in a partial UTF-8 character.
+#[derive(Default)]
+pub struct Detok {
+    ids: Vec<u32>,
+    prefix: usize,
+    read: usize,
+}
+
+impl Detok {
+    pub fn push(&mut self, text: &Text, t: u32) -> String {
+        self.ids.push(t);
+        let prev = text.decode(&self.ids[self.prefix..self.read]).unwrap_or_default();
+        let full = text.decode(&self.ids[self.prefix..]).unwrap_or_default();
+        if full.len() > prev.len() && !full.ends_with('\u{FFFD}') && full.starts_with(&prev) {
+            let delta = full[prev.len()..].to_string();
+            self.prefix = self.read;
+            self.read = self.ids.len();
+            delta
+        } else {
+            String::new()
+        }
+    }
+
+    /// The rest, even a partial character (the answer is over).
+    pub fn flush(&mut self, text: &Text) -> String {
+        let full = text.decode(&self.ids[self.prefix..]).unwrap_or_default();
+        let prev = text.decode(&self.ids[self.prefix..self.read]).unwrap_or_default();
+        (self.prefix, self.read) = (self.ids.len(), self.ids.len());
+        if full.len() > prev.len() { full.get(prev.len()..).unwrap_or("").to_string() } else { String::new() }
+    }
+}
+
+/// One answer's tokens on their way to a client, whichever the family: the visible pieces as
+/// they become certain, then the tool calls.
+pub trait Answer: Send {
+    /// One step's tokens: the (phase, text) pieces now certain. Tokens past the answer's end
+    /// (a stop token or string; a step can emit accepted drafts after it) are ignored.
+    fn feed(&mut self, text: &Text, toks: &[u32]) -> Vec<(Phase, String)>;
+    /// The answer is over: what was held back.
+    fn finish(&mut self, text: &Text) -> Vec<(Phase, String)>;
+    /// a stop token or stop string ended it: the engine's later tokens are not the answer's
+    fn ended(&self) -> bool;
+    /// its tokens, through the stop token
+    fn tokens(&self) -> usize;
+    fn reasoning(&self) -> &str;
+    fn content(&self) -> &str;
+    /// The tool calls (OpenAI-shaped, `call_` ids), and the text of a block no parser could
+    /// read, which went back into content (a stream has not sent it).
+    fn tool_calls(&mut self, text: &Text, tools: Option<&Value>) -> (Vec<Value>, String);
+}
+
+/// GLM: server/glm_app.py's GlmParser on the ids, the stream cut after the first stop id (the
+/// Python engine yields nothing past it).
+pub struct GlmAnswer {
+    parser: GlmParser,
+    stop: Vec<u32>,
+    ended: bool,
+    n: usize,
+}
+
+impl GlmAnswer {
+    pub fn new(ids: &GlmIds) -> Self {
+        GlmAnswer { parser: GlmParser::new(ids), stop: ids.stop.clone(), ended: false, n: 0 }
+    }
+}
+
+fn phase(c: Channel) -> Phase {
+    match c {
+        Channel::Reasoning => Phase::Reasoning,
+        Channel::Content => Phase::Content,
+    }
+}
+
+impl Answer for GlmAnswer {
+    fn feed(&mut self, text: &Text, toks: &[u32]) -> Vec<(Phase, String)> {
+        let mut out = Vec::new();
+        for &t in toks {
+            if self.ended {
+                break;
+            }
+            self.n += 1;
+            out.extend(self.parser.feed(text, t).into_iter().map(|(c, s)| (phase(c), s)));
+            self.ended = self.stop.contains(&t);
+        }
+        out
+    }
+
+    fn finish(&mut self, text: &Text) -> Vec<(Phase, String)> {
+        self.parser.finish(text).into_iter().map(|(c, s)| (phase(c), s)).collect()
+    }
+
+    fn ended(&self) -> bool {
+        self.ended
+    }
+
+    fn tokens(&self) -> usize {
+        self.n
+    }
+
+    fn reasoning(&self) -> &str {
+        &self.parser.reasoning
+    }
+
+    fn content(&self) -> &str {
+        &self.parser.content
+    }
+
+    fn tool_calls(&mut self, text: &Text, tools: Option<&Value>) -> (Vec<Value>, String) {
+        let calls = self.parser.tool_calls(text, tools).into_iter()
+            .map(|(name, arguments)| json!({"id": format!("call_{}", hex24()), "type": "function",
+                                            "function": {"name": name, "arguments": arguments}}))
+            .collect();
+        (calls, String::new())
+    }
+}
+
+/// DeepSeek: the detokenized stream through OutputRouter, ending at the end-of-sentence id or
+/// a stop string (api.rs's chat loop).
+pub struct DsAnswer {
+    router: OutputRouter,
+    detok: Detok,
+    eos: u32,
+    thinking: bool,
+    hit_eos: bool,
+    n: usize,
+}
+
+impl DsAnswer {
+    pub fn new(thinking: bool, stops: Vec<String>, eos: u32) -> Self {
+        DsAnswer { router: OutputRouter::new(thinking, stops), detok: Detok::default(), eos, thinking, hit_eos: false, n: 0 }
+    }
+}
+
+impl Answer for DsAnswer {
+    fn feed(&mut self, text: &Text, toks: &[u32]) -> Vec<(Phase, String)> {
+        let mut out = Vec::new();
+        for &t in toks {
+            if self.hit_eos || self.router.stopped {
+                break;
+            }
+            self.n += 1;
+            if t == self.eos {
+                self.hit_eos = true;
+                continue;
+            }
+            out.extend(self.router.feed(&self.detok.push(text, t)));
+        }
+        out
+    }
+
+    fn finish(&mut self, text: &Text) -> Vec<(Phase, String)> {
+        let mut tail = self.router.feed(&self.detok.flush(text));
+        tail.extend(self.router.finish());
+        tail
+    }
+
+    fn ended(&self) -> bool {
+        self.hit_eos || self.router.stopped
+    }
+
+    fn tokens(&self) -> usize {
+        self.n
+    }
+
+    fn reasoning(&self) -> &str {
+        &self.router.reasoning
+    }
+
+    fn content(&self) -> &str {
+        &self.router.content
+    }
+
+    fn tool_calls(&mut self, _text: &Text, _tools: Option<&Value>) -> (Vec<Value>, String) {
+        self.router.tool_calls(self.thinking)
     }
 }
 
