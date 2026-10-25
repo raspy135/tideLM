@@ -14,7 +14,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 ENV_FILE=${GLM_ENV_FILE:-$ROOT/.env.glm}
-[[ -f "$ENV_FILE" ]] || { echo "missing $ENV_FILE (copy configs/glm53-mxfp4.env.example)" >&2; exit 1; }
+[[ -f "$ENV_FILE" ]] || { echo "missing $ENV_FILE (a Python GLM profile: git show a6ec917:configs/glm53-mxfp4.env.example)" >&2; exit 1; }
 set -a; source "$ENV_FILE"; set +a
 PEER=${PEER:-ryan@10.0.0.2}
 IMAGE=${GLM_IMAGE:-deepseek-v41-flash-dgx-spark-dual-adaptive:20261011-topp}

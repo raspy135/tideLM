@@ -3,7 +3,6 @@
 # tide-up.sh ENV_FILE -- serve the model ENV_FILE describes on both Sparks.
 #
 #   scripts/tide-up.sh .env.ds41-mxfp4      DeepSeek-V4.1-Flash(-1017), MXFP4 experts
-#   scripts/tide-up.sh .env.glm53-mxfp4     GLM-5.3, MXFP4 experts
 #   scripts/tide-up.sh .env.glm53-exl3      GLM-5.3, EXL3 experts
 #
 # Copy a profile from configs/*.env.example and edit its paths first. The model follows from
@@ -19,7 +18,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 err() { echo "ERROR: $*" >&2; exit 1; }
 f=${1:-}
-[[ -n "$f" ]] || err "usage: scripts/tide-up.sh ENV_FILE   (e.g. .env.glm53-mxfp4; see configs/)"
+[[ -n "$f" ]] || err "usage: scripts/tide-up.sh ENV_FILE   (e.g. .env.glm53-exl3; see configs/)"
 [[ -f "$f" ]] || { [[ -f "$ROOT/$f" ]] && f="$ROOT/$f"; } || err "no env file $f"
 f="$(cd "$(dirname "$f")" && pwd)/$(basename "$f")"
 if grep -qE '^[[:space:]]*GLM_MODEL_DIR=' "$f"; then
