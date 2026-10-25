@@ -384,7 +384,8 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
      one box is not yet found.
   2. The lossless packed verify head (DSV41_HEAD_KERNEL=packed, 2.94 -> 2.25 ms/step in
      Python), the sharded head's argmax without gathering logits (`ds_argmax_bf16_pairs` /
-     `_combine` are in, unused), the server's tool calls, images and Anthropic routes.
+     `_combine` are in, unused), the server's images and Anthropic routes. (Tool calls are in: the checkpoint's encoding.py ported whole, DSML
+     calls parsed strictly then tolerantly, as server/app.py does; its tool grammar is off in the profile.)
 
 ## Rules carried over from the Python engine
 

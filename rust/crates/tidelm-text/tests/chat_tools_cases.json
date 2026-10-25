@@ -1,0 +1,1271 @@
+{
+ "encode": [
+  {
+   "name": "worked chat",
+   "messages": [
+    {
+     "role": "system",
+     "content": "",
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the weather for a city",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "location": {
+           "type": "string"
+          },
+          "days": {
+           "type": "integer"
+          }
+         },
+         "required": [
+          "location"
+         ]
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "Weather in Berlin?"
+    },
+    {
+     "role": "assistant",
+     "content": "Let me look that up.",
+     "reasoning_content": "The user wants weather.",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"location\":\"Berlin\",\"days\":3}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "{\"temp\": 21}"
+    }
+   ],
+   "thinking": false,
+   "effort": 75,
+   "prompt": "<｜begin▁of▁sentence｜><｜System｜>\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"location\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>Weather in Berlin?<｜Assistant｜></think>Let me look that up.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"location\" string=\"true\">Berlin</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>{\"temp\": 21}</tool_result><｜Assistant｜></think>",
+   "images": []
+  },
+  {
+   "name": "worked thinking",
+   "messages": [
+    {
+     "role": "system",
+     "content": "",
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the weather for a city",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "location": {
+           "type": "string"
+          },
+          "days": {
+           "type": "integer"
+          }
+         },
+         "required": [
+          "location"
+         ]
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "Weather in Berlin?"
+    },
+    {
+     "role": "assistant",
+     "content": "Let me look that up.",
+     "reasoning_content": "The user wants weather.",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"location\":\"Berlin\",\"days\":3}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "{\"temp\": 21}"
+    }
+   ],
+   "thinking": true,
+   "effort": 75,
+   "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"location\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>Weather in Berlin?<｜Assistant｜><think>The user wants weather.</think>Let me look that up.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"location\" string=\"true\">Berlin</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>{\"temp\": 21}</tool_result><｜Assistant｜><think>",
+   "images": []
+  },
+  {
+   "name": "worked thinking effort 60, answer after",
+   "messages": [
+    {
+     "role": "system",
+     "content": "",
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the weather for a city",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "location": {
+           "type": "string"
+          },
+          "days": {
+           "type": "integer"
+          }
+         },
+         "required": [
+          "location"
+         ]
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "Weather in Berlin?"
+    },
+    {
+     "role": "assistant",
+     "content": "Let me look that up.",
+     "reasoning_content": "The user wants weather.",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"location\":\"Berlin\",\"days\":3}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "{\"temp\": 21}"
+    },
+    {
+     "role": "assistant",
+     "content": "It is 21 C."
+    },
+    {
+     "role": "user",
+     "content": "And tomorrow?"
+    }
+   ],
+   "thinking": true,
+   "effort": 60,
+   "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 60 (range 1-100, the higher the value, the more thorough the reasoning)\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"location\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>Weather in Berlin?<｜Assistant｜><think>The user wants weather.</think>Let me look that up.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"location\" string=\"true\">Berlin</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>{\"temp\": 21}</tool_result><｜Assistant｜><think></think>It is 21 C.<｜end▁of▁sentence｜><｜User｜>And tomorrow?<｜Assistant｜><think>",
+   "images": []
+  },
+  {
+   "name": "namespaces",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are helpful.",
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the weather for a city",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "location": {
+           "type": "string"
+          },
+          "days": {
+           "type": "integer"
+          }
+         },
+         "required": [
+          "location"
+         ]
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "search",
+        "description": "Search the web",
+        "parameters": {
+         "properties": {
+          "q": {
+           "type": "string"
+          },
+          "limit": {
+           "type": "number",
+           "default": 15000000000.0
+          }
+         },
+         "type": "object"
+        }
+       },
+       "namespace": {
+        "name": "web",
+        "description": "Web tools"
+       }
+      },
+      {
+       "type": "function",
+       "namespace": "fs",
+       "function": {
+        "name": "read",
+        "parameters": {}
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "fs::write"
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "id": "a",
+       "type": "function",
+       "function": {
+        "name": "web::search",
+        "arguments": "{\"q\": \"rust\", \"limit\": 3}"
+       }
+      },
+      {
+       "id": "b",
+       "type": "function",
+       "function": {
+        "name": "read",
+        "arguments": {
+         "path": "/tmp/x"
+        }
+       },
+       "namespace": "fs"
+      },
+      {
+       "id": "c",
+       "type": "function",
+       "function": {
+        "name": "write",
+        "arguments": "{\"text\": \"hi\"}"
+       },
+       "namespace": "fs"
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c",
+     "content": "ok"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "a",
+     "content": [
+      {
+       "type": "text",
+       "text": "r1"
+      },
+      {
+       "type": "image_url",
+       "image_url": "u"
+      },
+      {
+       "type": "file"
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "b",
+     "content": null
+    },
+    {
+     "role": "user",
+     "content": "thanks"
+    }
+   ],
+   "thinking": true,
+   "effort": 75,
+   "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\nYou are helpful.\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"location\"]}}\n{\"name\": \"web::search\", \"description\": \"Web tools\\nSearch the web\", \"parameters\": {\"properties\": {\"q\": {\"type\": \"string\"}, \"limit\": {\"type\": \"number\", \"default\": 15000000000.0}}, \"type\": \"object\"}}\n{\"name\": \"fs::read\", \"parameters\": {}}\n{\"name\": \"fs::write\"}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>go<｜Assistant｜><think></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"web::search\">\n<｜DSML｜ parameter name=\"q\" string=\"true\">rust</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"limit\" string=\"false\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"fs::read\">\n<｜DSML｜ parameter name=\"path\" string=\"true\">/tmp/x</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"fs::write\">\n<｜DSML｜ parameter name=\"text\" string=\"true\">hi</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>r1\n\n<｜deepseek_image｜>\n\n[Unsupported file]</tool_result>\n\n<tool_result>None</tool_result>\n\n<tool_result>ok</tool_result>\n\nthanks<｜Assistant｜><think>",
+   "images": [
+    {
+     "type": "image",
+     "url": "u"
+    }
+   ]
+  },
+  {
+   "name": "arguments shapes",
+   "messages": [
+    {
+     "role": "system",
+     "content": "",
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the weather for a city",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "location": {
+           "type": "string"
+          },
+          "days": {
+           "type": "integer"
+          }
+         },
+         "required": [
+          "location"
+         ]
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "x"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "1",
+       "type": "function",
+       "function": {
+        "name": "f",
+        "arguments": "\"{\\\"a\\\": 1}\""
+       }
+      },
+      {
+       "id": "2",
+       "type": "function",
+       "function": {
+        "name": "f",
+        "arguments": "not json"
+       }
+      },
+      {
+       "id": "3",
+       "type": "function",
+       "function": {
+        "name": "f",
+        "arguments": "[1,2]"
+       }
+      },
+      {
+       "id": "4",
+       "type": "function",
+       "function": {
+        "name": "f",
+        "arguments": "{\"n\": 1.50, \"big\": 1e10, \"i\": 3, \"neg\": -0.00001, \"u\": \"ü\\n\\\"q\\\"\", \"o\": {\"z\": 1, \"a\": [true, null]}}"
+       }
+      },
+      {
+       "id": "5",
+       "type": "function",
+       "function": {
+        "name": "f",
+        "arguments": "{}"
+       }
+      },
+      {
+       "id": "6",
+       "type": "function",
+       "function": {
+        "name": "f",
+        "arguments": "\"just a string\""
+       }
+      },
+      {
+       "id": "7",
+       "type": "function",
+       "function": {
+        "name": "f",
+        "arguments": "12"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "done"
+    }
+   ],
+   "thinking": false,
+   "effort": 75,
+   "prompt": "<｜begin▁of▁sentence｜><｜System｜>\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"location\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>x<｜Assistant｜></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"a\" string=\"false\">1</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"arguments\" string=\"true\">not json</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"arguments\" string=\"true\">[1,2]</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"n\" string=\"false\">1.5</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"big\" string=\"false\">10000000000.0</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"i\" string=\"false\">3</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"neg\" string=\"false\">-1e-05</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"u\" string=\"true\">ü\n\"q\"</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"o\" string=\"false\">{\"z\": 1, \"a\": [true, null]}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"f\">\n\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"arguments\" string=\"true\">\"just a string\"</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"f\">\n<｜DSML｜ parameter name=\"arguments\" string=\"true\">12</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>done</tool_result><｜Assistant｜></think>",
+   "images": []
+  },
+  {
+   "name": "tool history without tools, thinking",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "r0",
+     "tool_calls": [
+      {
+       "id": "1",
+       "type": "function",
+       "function": {
+        "name": "f",
+        "arguments": "{}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "1",
+     "content": "res"
+    }
+   ],
+   "thinking": true,
+   "effort": 75,
+   "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>r0</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>res</tool_result><｜Assistant｜><think>",
+   "images": []
+  },
+  {
+   "name": "tool history without tools, then user, thinking",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "r0",
+     "tool_calls": [
+      {
+       "id": "1",
+       "type": "function",
+       "function": {
+        "name": "f",
+        "arguments": "{}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "1",
+     "content": "res"
+    },
+    {
+     "role": "assistant",
+     "content": "a1",
+     "reasoning_content": "r1"
+    },
+    {
+     "role": "user",
+     "content": "next"
+    }
+   ],
+   "thinking": true,
+   "effort": 75,
+   "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>res</tool_result><｜Assistant｜></think>a1<｜end▁of▁sentence｜><｜User｜>next<｜Assistant｜><think>",
+   "images": []
+  },
+  {
+   "name": "mid system",
+   "messages": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "assistant",
+     "content": "b"
+    },
+    {
+     "role": "system",
+     "content": "be brief"
+    }
+   ],
+   "thinking": true,
+   "effort": 75,
+   "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>a<｜Assistant｜></think>b<｜end▁of▁sentence｜><｜System｜>be brief<｜Assistant｜><think>",
+   "images": []
+  },
+  {
+   "name": "response format",
+   "messages": [
+    {
+     "role": "system",
+     "content": "s",
+     "response_format": {
+      "type": "object",
+      "properties": {
+       "x": {
+        "type": "number"
+       }
+      }
+     }
+    },
+    {
+     "role": "user",
+     "content": "u"
+    }
+   ],
+   "thinking": false,
+   "effort": 75,
+   "prompt": "<｜begin▁of▁sentence｜><｜System｜>s\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{\"type\": \"object\", \"properties\": {\"x\": {\"type\": \"number\"}}}<｜User｜>u<｜Assistant｜></think>",
+   "images": []
+  },
+  {
+   "name": "list contents",
+   "messages": [
+    {
+     "role": "system",
+     "content": [
+      {
+       "type": "text",
+       "text": "s1"
+      },
+      {
+       "type": "text",
+       "text": "s2"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "u1"
+      },
+      {
+       "type": "video"
+      },
+      {
+       "type": "text",
+       "text": "u2"
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "a1"
+      },
+      {
+       "type": "x"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "u3"
+    },
+    {
+     "role": "user",
+     "content": "u4"
+    }
+   ],
+   "thinking": false,
+   "effort": 75,
+   "prompt": "<｜begin▁of▁sentence｜><｜System｜>s1\n\ns2<｜User｜>u1\n\n[Unsupported video]\n\nu2<｜Assistant｜></think>a1<｜end▁of▁sentence｜><｜User｜>u3\n\nu4<｜Assistant｜></think>",
+   "images": []
+  },
+  {
+   "name": "latest reminder and wo_eos",
+   "messages": [
+    {
+     "role": "user",
+     "content": "u"
+    },
+    {
+     "role": "latest_reminder",
+     "content": "remember"
+    },
+    {
+     "role": "assistant",
+     "content": "partial",
+     "wo_eos": true
+    }
+   ],
+   "thinking": false,
+   "effort": 75,
+   "prompt": "<｜begin▁of▁sentence｜><｜User｜>u<｜Assistant｜></think><｜latest_reminder｜>rememberpartial",
+   "images": []
+  },
+  {
+   "name": "task query",
+   "messages": [
+    {
+     "role": "user",
+     "content": "find",
+     "task": "query"
+    }
+   ],
+   "thinking": false,
+   "effort": 75,
+   "prompt": "<｜begin▁of▁sentence｜><｜User｜>find<｜query｜>",
+   "images": []
+  },
+  {
+   "name": "task action thinking",
+   "messages": [
+    {
+     "role": "user",
+     "content": "do",
+     "task": "action"
+    },
+    {
+     "role": "assistant",
+     "content": "act"
+    }
+   ],
+   "thinking": true,
+   "effort": 75,
+   "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>do<｜Assistant｜><think><｜action｜>act<｜end▁of▁sentence｜>",
+   "images": []
+  },
+  {
+   "name": "images",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "what is this?"
+      },
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "data:image/png;base64,AAAA"
+       }
+      },
+      {
+       "type": "image",
+       "source": {
+        "type": "base64",
+        "media_type": "image/png",
+        "data": "BBBB"
+       }
+      },
+      {
+       "type": "image_url",
+       "image_url": "http://x/y.png"
+      }
+     ]
+    }
+   ],
+   "thinking": false,
+   "effort": 75,
+   "prompt": "<｜begin▁of▁sentence｜><｜User｜>what is this?\n\n<｜deepseek_image｜>\n\n<｜deepseek_image｜>\n\n<｜deepseek_image｜><｜Assistant｜></think>",
+   "images": [
+    {
+     "type": "image",
+     "url": "data:image/png;base64,AAAA"
+    },
+    {
+     "type": "image",
+     "source": {
+      "type": "base64",
+      "media_type": "image/png",
+      "data": "BBBB"
+     }
+    },
+    {
+     "type": "image",
+     "url": "http://x/y.png"
+    }
+   ]
+  },
+  {
+   "name": "tool thinking keeps reasoning",
+   "messages": [
+    {
+     "role": "system",
+     "content": "",
+     "tools": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "description": "Get the weather for a city",
+        "parameters": {
+         "type": "object",
+         "properties": {
+          "location": {
+           "type": "string"
+          },
+          "days": {
+           "type": "integer"
+          }
+         },
+         "required": [
+          "location"
+         ]
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "assistant",
+     "content": "b",
+     "reasoning_content": "rb"
+    },
+    {
+     "role": "user",
+     "content": "c"
+    }
+   ],
+   "thinking": true,
+   "effort": 75,
+   "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"location\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"location\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>a<｜Assistant｜><think>rb</think>b<｜end▁of▁sentence｜><｜User｜>c<｜Assistant｜><think>",
+   "images": []
+  },
+  {
+   "name": "err unknown role",
+   "messages": [
+    {
+     "role": "wizard",
+     "content": "x"
+    }
+   ],
+   "thinking": false,
+   "effort": 75,
+   "error": "Unknown role: wizard"
+  },
+  {
+   "name": "err call without function",
+   "messages": [
+    {
+     "role": "user",
+     "content": "x"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "1"
+      }
+     ]
+    }
+   ],
+   "thinking": false,
+   "effort": 75,
+   "error": "'function'"
+  },
+  {
+   "name": "err call without arguments",
+   "messages": [
+    {
+     "role": "user",
+     "content": "x"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "function": {
+        "name": "f"
+       }
+      }
+     ]
+    }
+   ],
+   "thinking": false,
+   "effort": 75,
+   "error": "'arguments'"
+  },
+  {
+   "name": "err name with ::",
+   "messages": [
+    {
+     "role": "system",
+     "content": "",
+     "tools": [
+      {
+       "function": {
+        "name": "a::b::c"
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "thinking": false,
+   "effort": 75,
+   "error": "Tool name must not contain '::': b::c"
+  },
+  {
+   "name": "err conflicting namespace",
+   "messages": [
+    {
+     "role": "system",
+     "content": "",
+     "tools": [
+      {
+       "namespace": "x",
+       "function": {
+        "name": "y::f"
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "thinking": false,
+   "effort": 75,
+   "error": "Conflicting tool namespaces: x != y"
+  },
+  {
+   "name": "err tool without function",
+   "messages": [
+    {
+     "role": "system",
+     "content": "",
+     "tools": [
+      {
+       "type": "function"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "thinking": false,
+   "effort": 75,
+   "error": "'function'"
+  },
+  {
+   "name": "err typed placeholder",
+   "messages": [
+    {
+     "role": "user",
+     "content": "see <｜deepseek_image｜>"
+    }
+   ],
+   "thinking": false,
+   "effort": 75,
+   "error": "Message content contains image special token '<｜deepseek_image｜>'. Images should be provided as image content blocks."
+  },
+  {
+   "name": "err placeholder in a text block",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "<｜deepseek_image｜>"
+      }
+     ]
+    }
+   ],
+   "thinking": false,
+   "effort": 75,
+   "error": "Text block contains image placeholder '<｜deepseek_image｜>': '<｜deepseek_image｜>'. Images should be separate content blocks."
+  },
+  {
+   "name": "err image without source",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "image_url",
+       "image_url": {}
+      }
+     ]
+    }
+   ],
+   "thinking": false,
+   "effort": 75,
+   "error": "Image block does not contain a valid source"
+  },
+  {
+   "name": "err bad task",
+   "messages": [
+    {
+     "role": "user",
+     "content": "x",
+     "task": "nope"
+    }
+   ],
+   "thinking": false,
+   "effort": 75,
+   "error": "Invalid task: 'nope'. Valid tasks are: ['action', 'read_url', 'authority', 'query', 'title', 'domain']"
+  }
+ ],
+ "parse": [
+  {
+   "name": "one call",
+   "text": "Let me look that up.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"location\" string=\"true\">Berlin</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>",
+   "thinking": false,
+   "parsed": {
+    "content": "Let me look that up.",
+    "reasoning": "",
+    "tool_calls": [
+     [
+      "get_weather",
+      null,
+      "{\"location\": \"Berlin\"}"
+     ]
+    ]
+   },
+   "tolerant": [
+    [
+     "get_weather",
+     "{\"location\": \"Berlin\"}"
+    ]
+   ]
+  },
+  {
+   "name": "one call thinking",
+   "text": "The user is talking about weather.</think>Let me look.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"location\" string=\"true\">Berlin</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>",
+   "thinking": true,
+   "parsed": {
+    "content": "Let me look.",
+    "reasoning": "The user is talking about weather.",
+    "tool_calls": [
+     [
+      "get_weather",
+      null,
+      "{\"location\": \"Berlin\"}"
+     ]
+    ]
+   },
+   "tolerant": [
+    [
+     "get_weather",
+     "{\"location\": \"Berlin\"}"
+    ]
+   ]
+  },
+  {
+   "name": "two calls, typed",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"a\">\n<｜DSML｜ parameter name=\"x\" string=\"false\">[1, 2]</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"y\" string=\"true\">a \"q\"\nline</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"web::b\">\n<｜DSML｜ parameter name=\"n\" string=\"false\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>",
+   "thinking": false,
+   "parsed": {
+    "content": "",
+    "reasoning": "",
+    "tool_calls": [
+     [
+      "a",
+      null,
+      "{\"x\": [1, 2], \"y\": \"a \\\"q\\\"\\nline\"}"
+     ],
+     [
+      "b",
+      "web",
+      "{\"n\": 3}"
+     ]
+    ]
+   },
+   "tolerant": [
+    [
+     "a",
+     "{\"x\": [1, 2], \"y\": \"a \\\"q\\\"\\nline\"}"
+    ],
+    [
+     "web::b",
+     "{\"n\": 3}"
+    ]
+   ]
+  },
+  {
+   "name": "zero params",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>",
+   "thinking": false,
+   "parsed": {
+    "content": "",
+    "reasoning": "",
+    "tool_calls": [
+     [
+      "f",
+      null,
+      "{}"
+     ]
+    ]
+   },
+   "tolerant": [
+    [
+     "f",
+     "{}"
+    ]
+   ]
+  },
+  {
+   "name": "value then newline",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"g\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Berlin<\n/｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>",
+   "thinking": false,
+   "parsed": {
+    "content": "",
+    "reasoning": "",
+    "tool_calls": [
+     [
+      "g",
+      null,
+      "{\"city\": \"Berlin\", \"days\": 3}"
+     ]
+    ]
+   },
+   "tolerant": [
+    [
+     "g",
+     "{\"city\": \"Berlin\", \"days\": 3}"
+    ]
+   ]
+  },
+  {
+   "name": "raw invalid false value",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"h\">\n<｜DSML｜ parameter name=\"x\" string=\"false\">abc</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>",
+   "thinking": false,
+   "parsed": {
+    "content": "",
+    "reasoning": "",
+    "tool_calls": [
+     [
+      "h",
+      null,
+      "{\"x\": abc}"
+     ]
+    ]
+   },
+   "tolerant": [
+    [
+     "h",
+     "{\"x\": \"abc\"}"
+    ]
+   ]
+  },
+  {
+   "name": "duplicate param",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"h\">\n<｜DSML｜ parameter name=\"x\" string=\"true\">1</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"x\" string=\"true\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>",
+   "thinking": false,
+   "error": "Duplicate parameter name: 'x'",
+   "tolerant": [
+    [
+     "h",
+     "{\"x\": \"2\"}"
+    ]
+   ]
+  },
+  {
+   "name": "prose after the block",
+   "text": "ok\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"location\" string=\"true\">Berlin</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\nDone.<｜end▁of▁sentence｜>",
+   "thinking": false,
+   "error": "Unexpected content after tool calls",
+   "tolerant": [
+    [
+     "get_weather",
+     "{\"location\": \"Berlin\"}"
+    ]
+   ]
+  },
+  {
+   "name": "value in the attribute",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"s\">\n<｜DSML｜ parameter name=\"query\" string=\"unified memory specs\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>",
+   "thinking": false,
+   "error": "Parameter format error: ' name=\"query\" string=\"unified memory specs\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>'",
+   "tolerant": [
+    [
+     "s",
+     "{\"query\": \"unified memory specs\"}"
+    ]
+   ]
+  },
+  {
+   "name": "value in the attribute, prose",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"s\">\n<｜DSML｜ parameter name=\"query\" string=\"unified memory specs\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\nSure.<｜end▁of▁sentence｜>",
+   "thinking": false,
+   "error": "Parameter format error: ' name=\"query\" string=\"unified memory specs\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\nSure.<｜end▁of▁sentence｜>'",
+   "tolerant": [
+    [
+     "s",
+     "{\"query\": \"unified memory specs\"}"
+    ]
+   ]
+  },
+  {
+   "name": "missing think end",
+   "text": "reasoning only<｜end▁of▁sentence｜>",
+   "thinking": true,
+   "error": "Invalid thinking format: missing </think>",
+   "tolerant": []
+  },
+  {
+   "name": "no calls",
+   "text": "plain answer<｜end▁of▁sentence｜>",
+   "thinking": false,
+   "parsed": {
+    "content": "plain answer",
+    "reasoning": "",
+    "tool_calls": []
+   },
+   "tolerant": []
+  },
+  {
+   "name": "plain text, no eos",
+   "text": "plain answer",
+   "thinking": false,
+   "error": "Invalid format: missing EOS token",
+   "tolerant": []
+  },
+  {
+   "name": "cut off mid value",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"w\">\n<｜DSML｜ parameter name=\"x\" string=\"true\">Berl<｜end▁of▁sentence｜>",
+   "thinking": false,
+   "error": "Parameter format error: ' name=\"x\" string=\"true\">Berl<｜end▁of▁sentence｜>'",
+   "tolerant": [
+    [
+     "w",
+     "{\"x\": \"Berl\"}"
+    ]
+   ]
+  },
+  {
+   "name": "cut off after >",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"w\">\n<｜DSML｜ parameter name=\"x\" string=\"true\"><｜end▁of▁sentence｜>",
+   "thinking": false,
+   "error": "Parameter format error: ' name=\"x\" string=\"true\"><｜end▁of▁sentence｜>'",
+   "tolerant": [
+    [
+     "w",
+     "{\"x\": \"\"}"
+    ]
+   ]
+  },
+  {
+   "name": "html value",
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"w\">\n<｜DSML｜ parameter name=\"html\" string=\"true\"><b>x</b></｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>",
+   "thinking": false,
+   "parsed": {
+    "content": "",
+    "reasoning": "",
+    "tool_calls": [
+     [
+      "w",
+      null,
+      "{\"html\": \"<b>x</b>\"}"
+     ]
+    ]
+   },
+   "tolerant": [
+    [
+     "w",
+     "{\"html\": \"\"}"
+    ]
+   ]
+  },
+  {
+   "name": "dsml in content",
+   "text": "a ｜DSML｜ b<｜end▁of▁sentence｜>",
+   "thinking": false,
+   "error": "Unexpected special token '｜DSML｜' in content",
+   "tolerant": []
+  },
+  {
+   "name": "bad separator",
+   "text": "\n\n<｜DSML｜ calls>\n\n<｜DSML｜ invoke name=\"a\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>",
+   "thinking": false,
+   "error": "Tool call format error: expected '>\\n' but got '>\n\n'",
+   "tolerant": [
+    [
+     "a",
+     "{}"
+    ]
+   ]
+  },
+  {
+   "name": "call mentioned in reasoning",
+   "text": "think about <｜DSML｜ invoke name=\"g\">\n</think>ok\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"location\" string=\"true\">Berlin</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>",
+   "thinking": true,
+   "error": "Unexpected special token '｜DSML｜' in content",
+   "tolerant": [
+    [
+     "g",
+     "{}"
+    ],
+    [
+     "get_weather",
+     "{\"location\": \"Berlin\"}"
+    ]
+   ]
+  },
+  {
+   "name": "empty block",
+   "text": "\n\n<｜DSML｜ calls>\n</｜DSML｜ calls><｜end▁of▁sentence｜>",
+   "thinking": false,
+   "parsed": {
+    "content": "",
+    "reasoning": "",
+    "tool_calls": []
+   },
+   "tolerant": []
+  }
+ ]
+}

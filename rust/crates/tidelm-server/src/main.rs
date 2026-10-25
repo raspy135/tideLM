@@ -18,6 +18,7 @@
 
 mod api;
 mod http;
+mod output;
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -49,6 +50,8 @@ pub struct Ctx {
     pub default_effort: u32,
     pub eos: u32,
     pub think_end: Option<u32>,
+    /// a vision tower is loaded: image blocks are served
+    pub vision: bool,
     pub engine: mpsc::Sender<Cmd>,
     pub next_id: AtomicU64,
 }
@@ -211,6 +214,7 @@ fn main() -> tidelm_engine::Result<()> {
         default_effort: arg(&args, "--effort").map(|v| v.parse().unwrap()).unwrap_or(75),
         eos,
         think_end,
+        vision: false,
         engine: tx,
         next_id: AtomicU64::new(1),
     });

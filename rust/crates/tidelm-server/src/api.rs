@@ -1,5 +1,6 @@
 //! POST /v1/chat/completions and /v1/debug/prompt: server/app.py's request rules
-//! (parse_sampling, resolve_thinking, build_chat_prompt) over the Rust chat encoder, streamed
+//! (parse_sampling, resolve_thinking, build_chat_prompt) over the Rust port of the checkpoint's
+//! encoder, the answer routed into reasoning, content and tool calls (output.rs) and streamed
 //! as OpenAI chunks with usage.
 
 use std::net::TcpStream;
@@ -10,10 +11,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use tidelm_engine::decode::{Event, Finish, Job};
 use tidelm_engine::forward::Sampling;
-use tidelm_text::chat::{encode, Message, Role};
+use tidelm_text::chat::{encode_messages, py_json, IMAGE};
 use tidelm_text::Text;
 
 use crate::http::{send_event, send_json, start_events, ApiError};
+use crate::output::{OutputRouter, Phase};
 use crate::{Cmd, Ctx};
 
 /// A request that failed: with an answer for the client, or on the connection itself.
@@ -42,7 +44,9 @@ const EFFORT_ALIASES: [(&str, u32); 5] = [("low", 50), ("medium", 60), ("high", 
 const NO_THINKING_EFFORTS: [&str; 2] = ["none", "low"];
 
 struct ChatReq {
-    messages: Vec<Message>,
+    /// as the encoder takes them: developer folded into system, typed image tokens escaped,
+    /// the tools and a response schema on the first (system) message
+    messages: Vec<Value>,
     thinking: bool,
     effort: u32,
     max_tokens: usize,
@@ -127,58 +131,101 @@ fn resolve_thinking(body: &Value, default_thinking: bool, default_effort: u32) -
     Ok((thinking.or(effort_thinking).unwrap_or(default_thinking), effort.unwrap_or(default_effort)))
 }
 
-/// A message's text: a string, or the text parts of a content list.
-fn content_text(v: &Value) -> Result<String, ApiError> {
+/// A typed `<｜deepseek_image｜>` with a zero-width space after the "<": the same characters
+/// as ordinary text, never the image id (server/app.py's IMAGE_TOKEN_ESCAPED).
+const IMAGE_ESCAPED: &str = "<\u{200b}｜deepseek_image｜>";
+const NO_VISION: &str = "image inputs are not supported by this server (no vision tower loaded)";
+
+/// escape_image_tokens: every string of a request structure; a tool call's JSON arguments are
+/// decoded, escaped and written back, since a client's json.dumps may have written the bars
+/// as \uff5c, which a substring replace would miss.
+fn escape_images(v: &mut Value) {
     match v {
-        Value::Null => Ok(String::new()),
-        Value::String(s) => Ok(s.clone()),
-        Value::Array(parts) => {
-            let mut out = String::new();
-            for p in parts {
-                match p.get("type").and_then(|t| t.as_str()) {
-                    Some("text") => out.push_str(p.get("text").and_then(|t| t.as_str()).unwrap_or("")),
-                    Some(t) => return Err(ApiError::bad(format!("content parts of type {t:?} are not supported"), Some("messages"))),
-                    None => return Err(ApiError::bad("a content part needs a `type`", Some("messages"))),
-                }
+        Value::String(s) if s.contains(IMAGE) => *s = s.replace(IMAGE, IMAGE_ESCAPED),
+        Value::Array(a) => a.iter_mut().for_each(escape_images),
+        Value::Object(m) => {
+            if let Some(Value::String(args)) = m.get_mut("function").and_then(|f| f.get_mut("arguments")) {
+                *args = match serde_json::from_str::<Value>(args) {
+                    Ok(mut d) => {
+                        escape_images(&mut d);
+                        py_json(&d)
+                    }
+                    Err(_) => args.replace(IMAGE, IMAGE_ESCAPED),
+                };
             }
-            Ok(out)
+            m.values_mut().for_each(escape_images);
         }
-        _ => Err(ApiError::bad("`content` must be a string or a list of parts", Some("messages"))),
+        _ => {}
     }
 }
 
-fn parse_messages(body: &Value) -> Result<Vec<Message>, ApiError> {
+fn is_image_block(b: &Value) -> bool {
+    matches!(b.get("type").and_then(|t| t.as_str()), Some("image") | Some("image_url") | Some("input_image"))
+}
+
+fn nonempty(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+        _ => true,
+    }
+}
+
+/// build_chat_prompt's message rules, up to the encoder.
+fn parse_messages(body: &Value, vision: bool) -> Result<Vec<Value>, ApiError> {
     let msgs = body.get("messages").and_then(|m| m.as_array()).filter(|m| !m.is_empty())
         .ok_or_else(|| ApiError::bad("`messages` must be a non-empty list", Some("messages")))?;
-    if body.get("tools").is_some_and(|t| !t.is_null() && t.as_array().is_none_or(|a| !a.is_empty())) {
-        return Err(ApiError::bad("tools are not supported by the Rust server yet", Some("tools")));
+    let mut msgs = msgs.clone();
+    for (i, m) in msgs.iter_mut().enumerate() {
+        let Some(role) = m.get("role").and_then(|r| r.as_str()) else {
+            return Err(ApiError::bad(format!("messages[{i}] must be an object with a `role`"), Some("messages")));
+        };
+        // V4.1 has no developer role: fold it into system, mid-conversation too
+        if role == "developer" {
+            m["role"] = Value::String("system".into());
+        }
+        escape_images(m);
+        if !vision && m.get("content").and_then(|c| c.as_array()).is_some_and(|c| c.iter().any(is_image_block)) {
+            return Err(ApiError::bad(NO_VISION, Some("messages")));
+        }
     }
-    msgs.iter()
-        .enumerate()
-        .map(|(i, m)| {
-            let role = match m.get("role").and_then(|r| r.as_str()) {
-                // V4.1 has no developer role: fold it into system, as server/app.py does
-                Some("system") | Some("developer") => Role::System,
-                Some("user") => Role::User,
-                Some("assistant") => Role::Assistant,
-                Some(r) => return Err(ApiError::bad(format!("messages[{i}]: role {r:?} is not supported"), Some("messages"))),
-                None => return Err(ApiError::bad(format!("messages[{i}] must be an object with a `role`"), Some("messages"))),
-            };
-            if m.get("tool_calls").is_some_and(|t| !t.is_null()) {
-                return Err(ApiError::bad("tool calls are not supported by the Rust server yet", Some("messages")));
-            }
-            Ok(Message {
-                role,
-                content: content_text(m.get("content").unwrap_or(&Value::Null))?,
-                reasoning: m.get("reasoning_content").and_then(|r| r.as_str()).map(String::from),
-            })
-        })
-        .collect()
+    // tools and a response schema ride on the first message, which the encoder renders them
+    // for only as a system message
+    let mut tools = body.get("tools").filter(|t| !t.is_null()).cloned();
+    if body.get("tool_choice").and_then(|c| c.as_str()) == Some("none") {
+        tools = None;
+    }
+    if tools.as_ref().is_some_and(|t| !t.is_array()) {
+        return Err(ApiError::bad("`tools` must be a list", Some("tools")));
+    }
+    let mut schema = None;
+    if let Some(rf) = body.get("response_format").and_then(|r| r.as_object()) {
+        if rf.get("type").and_then(|t| t.as_str()) == Some("json_schema") {
+            schema = rf.get("json_schema").and_then(|j| j.get("schema")).filter(|s| !s.is_null()).cloned();
+        }
+    }
+    for v in tools.iter_mut().chain(schema.iter_mut()) {
+        escape_images(v);
+    }
+    let (tools, schema) = (tools.filter(nonempty), schema.filter(nonempty));
+    if tools.is_some() || schema.is_some() {
+        if msgs[0].get("role").and_then(|r| r.as_str()) != Some("system") {
+            msgs.insert(0, json!({"role": "system", "content": ""}));
+        }
+        if let Some(t) = tools {
+            msgs[0]["tools"] = t;
+        }
+        if let Some(s) = schema {
+            msgs[0]["response_format"] = s;
+        }
+    }
+    Ok(msgs)
 }
 
 fn parse(body: &[u8], ctx: &Ctx) -> Result<ChatReq, ApiError> {
     let body: Value = serde_json::from_slice(body).map_err(|e| ApiError::bad(format!("invalid JSON: {e}"), None))?;
-    let messages = parse_messages(&body)?;
+    let messages = parse_messages(&body, ctx.vision)?;
     let (thinking, effort) = resolve_thinking(&body, ctx.default_thinking, ctx.default_effort)?;
     let mt = body.get("max_completion_tokens").filter(|v| !v.is_null()).or_else(|| body.get("max_tokens").filter(|v| !v.is_null()));
     let max_tokens = match mt {
@@ -202,6 +249,11 @@ fn parse(body: &[u8], ctx: &Ctx) -> Result<ChatReq, ApiError> {
     if !matches!(body.get("n"), None | Some(Value::Null)) && body.get("n").and_then(|n| n.as_u64()) != Some(1) {
         return Err(ApiError::bad("only n=1 is supported", Some("n")));
     }
+    // the tool-call grammar's per-request switch; the grammar itself is off in the serving
+    // profile (DSV41_TOOL_GRAMMAR=0) and not ported, but the field is checked the same way
+    if body.get("tool_grammar").is_some_and(|t| !t.is_boolean()) {
+        return Err(ApiError::bad("`tool_grammar` must be a boolean", Some("tool_grammar")));
+    }
     let flag = |k: &'static str| -> Result<bool, ApiError> {
         match body.get(k) {
             None | Some(Value::Null) => Ok(false),
@@ -224,15 +276,19 @@ fn parse(body: &[u8], ctx: &Ctx) -> Result<ChatReq, ApiError> {
     })
 }
 
-fn render(req: &ChatReq, text: &Text) -> Result<(String, Vec<u32>), ApiError> {
-    let prompt = encode(&req.messages, req.thinking, Some(req.effort)).map_err(|e| ApiError::bad(e, Some("messages")))?;
-    let ids = text.encode(&prompt).map_err(|e| ApiError { status: 500, message: format!("tokenizer: {e}"), param: None })?;
-    Ok((prompt, ids))
+fn render(req: &ChatReq, ctx: &Ctx) -> Result<(String, Vec<u32>), ApiError> {
+    let enc = encode_messages(&req.messages, req.thinking, req.effort)
+        .map_err(|e| ApiError::bad(format!("cannot encode messages: {e}"), Some("messages")))?;
+    if !enc.images.is_empty() && !ctx.vision {
+        return Err(ApiError::bad(NO_VISION, Some("messages")));
+    }
+    let ids = ctx.text.encode(&enc.prompt).map_err(|e| ApiError { status: 500, message: format!("tokenizer: {e}"), param: None })?;
+    Ok((enc.prompt, ids))
 }
 
 pub fn debug_prompt(stream: &mut TcpStream, body: &[u8], ctx: &Ctx) -> Result<(), Failure> {
     let req = parse(body, ctx)?;
-    let (prompt, ids) = render(&req, &ctx.text)?;
+    let (prompt, ids) = render(&req, ctx)?;
     send_json(stream, 200, &json!({"prompt": prompt, "prompt_tokens": ids.len(), "ids": ids, "thinking": req.thinking,
                                   "effort": req.effort}))?;
     Ok(())
@@ -261,6 +317,28 @@ impl Detok {
             String::new()
         }
     }
+
+    /// The rest, even a partial character (the answer is over).
+    fn flush(&mut self, text: &Text) -> String {
+        let full = text.decode(&self.ids[self.prefix..]).unwrap_or_default();
+        let prev = text.decode(&self.ids[self.prefix..self.read]).unwrap_or_default();
+        (self.prefix, self.read) = (self.ids.len(), self.ids.len());
+        if full.len() > prev.len() { full.get(prev.len()..).unwrap_or("").to_string() } else { String::new() }
+    }
+}
+
+/// One chunk's delta per run of a phase: {"reasoning_content": ...} or {"content": ...}.
+fn deltas(pieces: Vec<(Phase, String)>) -> Vec<Value> {
+    let mut runs: Vec<(Phase, String)> = Vec::new();
+    for (ph, t) in pieces {
+        match runs.last_mut() {
+            Some((p, s)) if *p == ph => s.push_str(&t),
+            _ => runs.push((ph, t)),
+        }
+    }
+    runs.into_iter()
+        .map(|(ph, t)| if ph == Phase::Reasoning { json!({"reasoning_content": t}) } else { json!({"content": t}) })
+        .collect()
 }
 
 fn now() -> u64 {
@@ -270,7 +348,7 @@ fn now() -> u64 {
 pub fn chat(stream: &mut TcpStream, body: &[u8], ctx: &Ctx) -> Result<(), Failure> {
     let t0 = Instant::now();
     let req = parse(body, ctx)?;
-    let (_, ids) = render(&req, &ctx.text)?;
+    let (_, ids) = render(&req, ctx)?;
     // the drafter writes a block past the last position: keep its width of headroom
     let room = ctx.max_seq.saturating_sub(ids.len() + 8);
     if room == 0 {
@@ -296,19 +374,15 @@ pub fn chat(stream: &mut TcpStream, body: &[u8], ctx: &Ctx) -> Result<(), Failur
     let created = now();
     let chunk = |delta: Value, finish: Value| {
         json!({"id": cid, "object": "chat.completion.chunk", "created": created, "model": ctx.model,
-               "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
-        .to_string()
+               "choices": [{"index": 0, "delta": delta, "finish_reason": finish, "logprobs": null}]})
     };
     if req.stream {
         start_events(stream)?;
-        send_event(stream, &chunk(json!({"role": "assistant", "content": ""}), Value::Null))?;
+        send_event(stream, &chunk(json!({"role": "assistant", "content": ""}), Value::Null).to_string())?;
     }
-    // the answer so far, split at the end of thinking
-    let (mut reasoning, mut content) = (String::new(), String::new());
-    let (mut dr, mut dc) = (Detok::default(), Detok::default());
-    let mut in_thinking = req.thinking;
-    let (mut reasoning_tokens, mut first_token_s) = (0usize, None);
-    let mut stopped_by_text = false;
+    let mut router = OutputRouter::new(req.thinking, req.stop.clone());
+    let mut detok = Detok::default();
+    let (mut first_token_s, mut hit_eos) = (None, false);
     let (finish, gen) = loop {
         let ev = match rx.recv() {
             Ok(ev) => ev,
@@ -317,64 +391,53 @@ pub fn chat(stream: &mut TcpStream, body: &[u8], ctx: &Ctx) -> Result<(), Failur
         match ev {
             Event::Tokens(toks) => {
                 first_token_s.get_or_insert_with(|| t0.elapsed().as_secs_f64());
-                let (mut dreason, mut dcontent) = (String::new(), String::new());
+                let mut pieces = Vec::new();
                 for t in toks {
-                    if stopped_by_text || t == ctx.eos {
+                    if hit_eos || router.stopped {
+                        break;
+                    }
+                    if t == ctx.eos {
+                        hit_eos = !req.ignore_eos;
                         continue;
                     }
-                    if in_thinking {
-                        reasoning_tokens += 1;
-                        if Some(t) == ctx.think_end {
-                            in_thinking = false;
-                        } else {
-                            dreason.push_str(&dr.push(&ctx.text, t));
-                        }
-                        continue;
-                    }
-                    dcontent.push_str(&dc.push(&ctx.text, t));
-                    // text stop sequences end the answer just before themselves; a match can
-                    // only start in the last (longest stop - 1) bytes of what came before
-                    if !req.stop.is_empty() {
-                        let longest = req.stop.iter().map(|s| s.len()).max().unwrap_or(0);
-                        let mut from = content.len().saturating_sub(longest);
-                        while !content.is_char_boundary(from) {
-                            from -= 1;
-                        }
-                        let tail = format!("{}{dcontent}", &content[from..]);
-                        if let Some(at) = req.stop.iter().filter_map(|s| tail.find(s.as_str())).min() {
-                            // the stop may begin in text already sent; only what follows is cut
-                            let keep = (from + at).saturating_sub(content.len());
-                            dcontent.truncate(keep.min(dcontent.len()));
-                            stopped_by_text = true;
-                            let _ = ctx.engine.send(Cmd::Cancel(id));
-                        }
+                    pieces.extend(router.feed(&detok.push(&ctx.text, t)));
+                    if router.stopped {
+                        // a stop string: the answer ends before it
+                        let _ = ctx.engine.send(Cmd::Cancel(id));
                     }
                 }
-                reasoning.push_str(&dreason);
-                content.push_str(&dcontent);
-                if req.stream && (!dreason.is_empty() || !dcontent.is_empty()) {
-                    let mut delta = serde_json::Map::new();
-                    if !dreason.is_empty() {
-                        delta.insert("reasoning_content".into(), Value::String(dreason));
-                    }
-                    if !dcontent.is_empty() {
-                        delta.insert("content".into(), Value::String(dcontent));
-                    }
-                    if send_event(stream, &chunk(Value::Object(delta), Value::Null)).is_err() {
-                        // the client left: free the lane at the next step
-                        let _ = ctx.engine.send(Cmd::Cancel(id));
-                        return Ok(());
+                if req.stream {
+                    for d in deltas(pieces) {
+                        if send_event(stream, &chunk(d, Value::Null).to_string()).is_err() {
+                            // the client left: free the lane at the next step
+                            let _ = ctx.engine.send(Cmd::Cancel(id));
+                            return Ok(());
+                        }
                     }
                 }
             }
             Event::Done(f, g) => break (f, g),
         }
     };
-    let finish_reason = match finish {
-        Finish::Length if !stopped_by_text => "length",
-        _ => "stop",
+    let mut tail = router.feed(&detok.flush(&ctx.text));
+    tail.extend(router.finish());
+    let (calls, unparsed) = router.tool_calls(req.thinking);
+    let finish_reason = if !calls.is_empty() {
+        "tool_calls"
+    } else if hit_eos || router.stopped {
+        "stop"
+    } else {
+        match finish {
+            Finish::Length => "length",
+            _ => "stop",
+        }
     };
     let n = gen.tokens.len();
+    let reasoning_tokens = if req.thinking {
+        gen.tokens.iter().position(|&t| Some(t) == ctx.think_end).unwrap_or(n)
+    } else {
+        0
+    };
     let decode_s = (t0.elapsed().as_secs_f64() - first_token_s.unwrap_or(0.0)).max(1e-9);
     let mut stats = json!({
         "steps": gen.steps,
@@ -402,9 +465,27 @@ pub fn chat(stream: &mut TcpStream, body: &[u8], ctx: &Ctx) -> Result<(), Failur
         "prompt_tokens_details": {"cached_tokens": gen.cached},
     });
     if req.stream {
-        let mut last: Value = serde_json::from_str(&chunk(json!({}), Value::String(finish_reason.into()))).unwrap();
-        last["x_engine_stats"] = stats;
-        send_event(stream, &last.to_string())?;
+        // a block that did not parse goes out as content, as the non-streamed answer has it
+        // (the Python server's stream drops it)
+        let mut last = deltas(tail);
+        if !unparsed.is_empty() {
+            last.push(json!({"content": unparsed}));
+        }
+        if !calls.is_empty() {
+            let indexed: Vec<Value> = calls.iter().enumerate().map(|(i, c)| {
+                let mut c = c.clone();
+                c["index"] = json!(i);
+                c
+            }).collect();
+            last.push(json!({"tool_calls": indexed}));
+        }
+        for d in last {
+            send_event(stream, &chunk(d, Value::Null).to_string())?;
+        }
+        let mut end = chunk(json!({}), Value::String(finish_reason.into()));
+        end["usage"] = usage.clone();
+        end["x_engine_stats"] = stats;
+        send_event(stream, &end.to_string())?;
         if req.include_usage {
             send_event(stream, &json!({"id": cid, "object": "chat.completion.chunk", "created": created, "model": ctx.model,
                                        "choices": [], "usage": usage}).to_string())?;
@@ -412,13 +493,19 @@ pub fn chat(stream: &mut TcpStream, body: &[u8], ctx: &Ctx) -> Result<(), Failur
         send_event(stream, "[DONE]")?;
         return Ok(());
     }
-    let mut message = json!({"role": "assistant", "content": content});
+    let mut message = json!({"role": "assistant", "content": router.content});
     if req.thinking {
-        message["reasoning_content"] = Value::String(reasoning);
+        message["reasoning_content"] = Value::String(router.reasoning.clone());
+    }
+    if !calls.is_empty() {
+        if router.content.is_empty() {
+            message["content"] = Value::Null;
+        }
+        message["tool_calls"] = Value::Array(calls);
     }
     send_json(stream, 200, &json!({
         "id": cid, "object": "chat.completion", "created": created, "model": ctx.model,
-        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason, "logprobs": null}],
         "usage": usage, "x_engine_stats": stats,
     }))?;
     Ok(())
