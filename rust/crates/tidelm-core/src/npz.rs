@@ -148,7 +148,8 @@ fn npy_bytes(a: &Array) -> Vec<u8> {
     out
 }
 
-/// Every member of an uncompressed `.npz`, by name without the `.npy` suffix.
+/// Every member of an `.npz` (np.savez's stored members, or np.savez_compressed's deflated ones),
+/// by name without the `.npy` suffix.
 pub fn parse(bytes: &[u8]) -> Result<BTreeMap<String, Array>, NpzError> {
     // the central directory, from the end-of-central-directory record
     let eocd = (0..bytes.len().saturating_sub(21))
@@ -169,14 +170,22 @@ pub fn parse(bytes: &[u8]) -> Result<BTreeMap<String, Array>, NpzError> {
         let local = u32at(at + 42);
         let name = String::from_utf8_lossy(&bytes[at + 46..at + 46 + nlen]).to_string();
         at += 46 + nlen + xlen + clen;
-        if method != 0 || csize != usize_ {
-            return err(format!("npz: {name} is compressed (method {method}); only np.savez files are read"));
+        if !(method == 0 && csize == usize_ || method == 8) {
+            return err(format!("npz: {name}: zip method {method}; np.savez stores, np.savez_compressed deflates"));
         }
         if local + 30 > bytes.len() || u32at(local) != 0x0403_4b50 {
             return err(format!("npz: {name}: bad local header"));
         }
         let data_at = local + 30 + u16at(local + 26) + u16at(local + 28);
-        let member = bytes.get(data_at..data_at + csize).ok_or_else(|| NpzError(format!("npz: {name}: truncated")))?;
+        let mut member = bytes.get(data_at..data_at + csize).ok_or_else(|| NpzError(format!("npz: {name}: truncated")))?;
+        let inflated;
+        if method == 8 {
+            inflated = miniz_oxide::inflate::decompress_to_vec(member).map_err(|e| NpzError(format!("npz: {name}: {e}")))?;
+            if inflated.len() != usize_ {
+                return err(format!("npz: {name}: inflated to {} bytes, the directory says {usize_}", inflated.len()));
+            }
+            member = &inflated;
+        }
         let key = name.strip_suffix(".npy").unwrap_or(&name).to_string();
         out.insert(key.clone(), parse_npy(&name, member)?);
     }
@@ -296,13 +305,25 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_compressed_member() {
+    fn reads_np_savez_compressed() {
+        // the bundled expert seed is np.savez_compressed
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../profiles/learned-experts-v1.npz");
+        let m = read(&p).unwrap();
+        assert_eq!((m["counts"].shape.clone(), m["keep"].shape.clone()), (vec![40, 384], vec![40, 384]));
+        assert_eq!(m["version"].to_i64().unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn refuses_another_zip_method_or_a_bad_stream() {
         let mut m = BTreeMap::new();
         m.insert("a".to_string(), Array::i64s(vec![1], &[7]));
-        let mut b = to_bytes(&m);
-        // flip the central directory's method to deflate
+        let b = to_bytes(&m);
         let cd = b.windows(4).position(|w| w == [0x50, 0x4b, 0x01, 0x02]).unwrap();
-        b[cd + 10] = 8;
-        assert!(parse(&b).unwrap_err().0.contains("compressed"));
+        let mut bz = b.clone();
+        bz[cd + 10] = 12; // bzip2
+        assert!(parse(&bz).unwrap_err().0.contains("zip method 12"));
+        let mut df = b.clone();
+        df[cd + 10] = 8; // a stored member read as deflate
+        assert!(parse(&df).unwrap_err().0.starts_with("npz: a.npy: "));
     }
 }

@@ -134,7 +134,7 @@ impl Adapt {
     /// `db`: the history file (np.savez: counts, mass, unit = 1, score_history_version = 2;
     /// the Python engine's DSV41_PRUNE_DB format, shared with it), read if present and
     /// valid - otherwise the history starts empty, as Python's does - and written after every
-    /// request.
+    /// request. A copy of the bundled seed (profiles/learned-experts-v1.npz) reads too.
     pub fn new(cfg: AdaptConfig, trace: BTreeMap<u32, Vec<f64>>, layers: usize, experts: usize, db: Option<PathBuf>)
                -> Result<Self> {
         if trace.len() != layers || trace.values().any(|t| t.len() != experts) {
@@ -158,10 +158,14 @@ impl Adapt {
         }
         let m = npz::read(path)?;
         let scalar = |k: &str| m.get(k).map(|a| a.to_i64()).transpose().map(|v| v.and_then(|v| v.first().copied()).unwrap_or(0));
-        if scalar("unit")? != 1 {
+        // the bundled cold-start seed (engine/expert_seed.py, DSV41_EXPERT_SEED=1): the same
+        // request-unit score history in its own container, version 1, with the resident map it
+        // was captured at, which is not restored here: the plan is redone at this budget
+        let seed = scalar("version")? == 1 && m.contains_key("keep");
+        if !seed && scalar("unit")? != 1 {
             return Err("not request-unit demand".into());
         }
-        if scalar("score_history_version")? != 2 {
+        if !seed && scalar("score_history_version")? != 2 {
             return Err("legacy unnormalized score history".into());
         }
         let arr = |k: &str| -> Result<Vec<f64>> {
@@ -459,6 +463,17 @@ mod tests {
         assert!(p.positions(10000, 10000, 32).is_none());
         let (pos, kind) = p.positions(11774, 10810, 32).unwrap();
         assert_eq!((kind, pos.len(), pos[..8].to_vec()), ("excerpt", 64, (0..8).collect::<Vec<_>>()));
+    }
+
+    #[test]
+    fn the_bundled_seed_loads_as_the_python_engine_reads_it() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../profiles/learned-experts-v1.npz");
+        let cfg = AdaptConfig::new("high", 4.0, 600, 6).unwrap().unwrap();
+        let a = Adapt::new(cfg, trace(40, 384), 40, 384, Some(path.clone())).unwrap();
+        let m = npz::read(&path).unwrap();
+        assert_eq!(a.counts, m["counts"].to_f64().unwrap());
+        assert_eq!(a.mass, m["mass"].to_f64().unwrap());
+        assert!(a.counts.iter().sum::<f64>() > 0.0);
     }
 
     #[test]

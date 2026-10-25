@@ -20,8 +20,9 @@
 #   RUST_LANES=1             decode lanes (the profile serves 2); async hot reads past one are off
 #   RUST_DEPTH=confidence    speculation depth policy (window, confidence, or a fixed depth)
 #   RUST_ADAPT_DB=~/tidelm-rust-state/prune_demand_rust.npz
-#                            its own demand history: the Python server's DSV41_PRUNE_DB is
-#                            written by the container (root); the first launch copies it
+#                            its own demand history: the first launch copies the Python server's
+#                            (DSV41_PRUNE_DB, written by its container as root), else the bundled
+#                            seed profiles/learned-experts-v1.npz
 #   RUST_TRACE=results/trace-union/stats/coverage.json   the routing trace the history blends with
 #   RUST_PREFIX_DIR=~/tidelm-rust-state/prefix-cache     the prefix cache's disk tier
 #   RUST_EXPERT_TOPP         unset: off (DSV41_EXPERT_TOPP=0.90 measured slower in Rust, rust/PORT.md)
@@ -137,12 +138,14 @@ fi
 
 [[ -n "${MODEL_DIR:-}" ]] || err "$f sets no MODEL_DIR"
 
-# the demand history: a copy of the Python server's on first use, on both boxes
+# the demand history: on first use a copy of the Python server's (DSV41_PRUNE_DB), else of the
+# bundled seed the Python engine starts a fresh install from (DSV41_EXPERT_SEED=1); on both boxes
 db=${RUST_ADAPT_DB:-$STATE/prune_demand_rust.npz}
 if [[ ! -f "$db" ]]; then
-    src="${DSV41_PRUNE_DB:-}"; [[ "$src" == /* ]] || src="$ROOT/$src"
-    [[ -f "$src" ]] || err "no demand history $db, and no DSV41_PRUNE_DB to start it from"
+    src="${DSV41_PRUNE_DB:-}"; [[ -z "$src" || "$src" == /* ]] || src="$ROOT/$src"
+    [[ -n "$src" && -f "$src" ]] || src="$ROOT/profiles/learned-experts-v1.npz"
     if [[ $check == 0 ]]; then
+        mkdir -p "$(dirname "$db")"
         cp "$src" "$db"
         echo "--- demand history: copied $src to $db"
     fi
