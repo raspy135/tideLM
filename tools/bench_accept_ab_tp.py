@@ -94,6 +94,10 @@ CONFIGS['vocab_listed'] = dict(CONFIGS['x3d_on'], draft_vocab=True)
 # to None at runtime. Target numerics change, so outputs differ and acceptance is part of the cost.
 CONFIGS['topp_off'] = dict(CONFIGS['x3d_on'], expert_topp=None)
 CONFIGS['topp90'] = dict(CONFIGS['x3d_on'], expert_topp=(0.90, 3))
+# 0.85 vs 0.90 on the 2026-10-23 serving base: no x3/x3d keys, since the EXL3 dense/draft packs
+# predate the 1017 weights and the profile loads neither (their set_config branches would assert).
+CONFIGS['topp90s'] = dict(CONFIGS['early_on'], expert_topp=(0.90, 3))
+CONFIGS['topp85s'] = dict(CONFIGS['early_on'], expert_topp=(0.85, 3))
 for _qkv, _sh, _attn in ((24, 16, 4), (24, 16, 12), (12, 0, 4), (24, 0, 4), (0, 16, 4)):
     CONFIGS[f'cand_q{_qkv}_s{_sh}_a{_attn}'] = dict(CONFIGS['draft_fp8_split'], qkv_mb=_qkv, sh_mb=_sh, attn_mb=_attn)
 

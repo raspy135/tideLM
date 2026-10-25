@@ -4225,3 +4225,59 @@ Guard note: `GlmTP._boot_guard` now pins `tools/exl3_moe_cuda.cu`
 (`exl3_moe_cuda.source_digest()`, `x3_moe_cuda` key) and `DSV41_EXL3_PREFILL_CA_TILE`. Before
 this, two ranks with a stale rsync of the .cu would run different prefill kernels and emit
 different tokens with nothing in the log; V41 already pinned the same digest.
+
+## Lossless packing of expert weights is exhausted in both formats (2026-10-23)
+
+Asked again after the prefill campaign, so the numbers for both engines in one place:
+
+- **GLM EXL3 3.0bpw pack**: six random 4 MiB samples of
+  `glm-exl3-experts-r0of2.bin` (139.1 GB) measure **7.9988-7.9999 bits per byte**
+  zero-order; `zlib -9` emits 99.68-100.03% of the input. Headroom <= 0.15%, zero
+  in half the samples. This is by construction: trellis (QTIP-family) quantization
+  stores near-uniform code words whose *decode* is Gaussian-shaped — the
+  compression already happened when the pack was made. Conditional modeling has
+  nothing to condition on. One-liner to reproduce: read 4 MiB at a random offset,
+  byte histogram -> entropy, `zlib.compress(b, 9)`.
+- **DS MXFP4 experts**: 3.884-3.896 bits per 4-bit symbol, ideal zero-order saving
+  2.6-2.9% of code bytes (2026-10-07 entry above; `tools/inspect_fp4_entropy.py`).
+  UE8M0 scales are 5.9% of the payload on top. Unlike the GLM case this does not
+  bound conditional coding, but any decoder sits inside a GEMV that already runs
+  at 208-232 GB/s of the ~230 ceiling: variable-rate symbols break coalesced
+  addressing, and the prize is < 3%.
+
+The one weight tensor with real lossless slack was the BF16 head — exponents,
+not mantissas — and it is already packed and shipped behind
+`DSV41_HEAD_KERNEL=packed` (661.9 -> 508.8 MB, 2026-10-07/08 entries). Expert
+bandwidth levers that remain are about reading fewer bytes (expert top-p, index
+top-k), not packing the bytes tighter.
+
+## Expert top-p 0.85: -2.9 ms/step, and acceptance pays all of it back (2026-10-23)
+
+The speed number the 2026-10-11 entry left open. `tools/bench_accept_ab_tp.py --a topp90s
+--b topp85s --warm-each` (new arms on the serving base: no x3/x3d keys, since the EXL3
+dense/draft packs predate the 1017 weights and their set_config branches assert), one boot,
+`.env.ds41-mxfp4`, frozen map, depth 3, incumbent first, arms interleaved per prompt. Two
+profile features had to be gate-disabled: `DSV41_PROBE_PREFILL=0` (the frozen map fails its
+boot guard; prefill-side, identical in both arms) and `DSV41_HOT_READS=0` (its ring wants 128
+of the gate's 8 transient slots, and kept hot reads would mutate the map mid-bench).
+
+22 prompts, paired per-prompt deltas, 0.85 vs 0.90:
+
+| | 0.90 | 0.85 | paired delta |
+| --- | ---: | ---: | ---: |
+| ms/step | 65.77 | 62.87 | **-2.90 +- 0.46** (-4.4%) |
+| accepted tokens/step | 2.818 | 2.715 | **-0.104 +- 0.049** |
+| tok/s | 42.72 | 43.03 | **+0.30 +- 0.92** |
+
+The step is 4.4% faster and the engine is no faster: the extra 11% of dropped picks moves the
+target's greedy path enough (2/22 outputs identical) that the DSpark drafter — trained against
+the unpruned target — loses a tenth of an accepted token per step, which cancels the read
+saving. Same shape as EXL3 dense attention (2026-10-08: -1.3 ms/step, -0.071 acceptance, net
+zero): a lossy target change's speed gain must beat its acceptance cost, not just its own cost.
+With held-out NLL at 0.85 already near the +0.015 gate on code (+0.0138), there is no reason to
+spend that budget on nothing: **`DSV41_EXPERT_TOPP` stays 0.90.** A tighter rule only pays if
+the drafter is kept in agreement with the pruned target (e.g. pruning the drafter's own
+proposals the same way), which is unbuilt and unmeasured.
+
+Artifacts: `results/expert-topp85-20261023/` (`ab-fp4.json/rank{0,1}.json`, gate logs).
+
