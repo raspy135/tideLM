@@ -8,6 +8,7 @@
 //! by construction and the test pins it against the checkpoint's sha256 anyway.
 
 pub mod chat;
+pub mod glm;
 
 use std::collections::HashMap;
 use std::path::Path;

@@ -3,7 +3,7 @@ name = "tidelm-text"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Tokenizer and the engram compressed token map for the DS v4.1 engine"
+description = "Tokenizer, the engram compressed token map, and the DS v4.1 and GLM-5.3 chat formats"
 
 [dependencies]
 tidelm-core = { path = "../tidelm-core" }

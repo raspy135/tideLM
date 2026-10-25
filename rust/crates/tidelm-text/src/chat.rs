@@ -70,6 +70,38 @@ pub fn py_json(v: &Value) -> String {
     s
 }
 
+/// `json.loads(s)` where serde_json reads a number differently: `-0` is Python's int 0
+/// (json.dumps writes "0"), serde_json's float -0.0 ("-0.0"). Not matched: NaN / Infinity
+/// (Python accepts them, serde_json refuses) and integers past 64 bits (serde_json reads a
+/// float).
+pub fn py_loads(s: &str) -> serde_json::Result<Value> {
+    if !s.contains("-0") {
+        return serde_json::from_str(s);
+    }
+    // drop the sign of every `-0` number outside strings
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let (mut in_str, mut esc, mut last) = (false, false, 0);
+    for i in 0..b.len() {
+        let c = b[i];
+        if in_str {
+            match (esc, c) {
+                (true, _) => esc = false,
+                (false, b'\\') => esc = true,
+                (false, b'"') => in_str = false,
+                _ => {}
+            }
+        } else if c == b'"' {
+            in_str = true;
+        } else if c == b'-' && b.get(i + 1) == Some(&b'0') && !matches!(b.get(i + 2), Some(b'.' | b'e' | b'E' | b'0'..=b'9')) {
+            out.push_str(&s[last..i]);
+            last = i + 1;
+        }
+    }
+    out.push_str(&s[last..]);
+    serde_json::from_str(&out)
+}
+
 fn write_py(v: &Value, out: &mut String) {
     match v {
         Value::Null => out.push_str("null"),
@@ -103,7 +135,7 @@ fn write_py(v: &Value, out: &mut String) {
     }
 }
 
-fn py_number(n: &serde_json::Number) -> String {
+pub(crate) fn py_number(n: &serde_json::Number) -> String {
     match n.as_f64() {
         Some(f) if !(n.is_i64() || n.is_u64()) => py_float(f),
         _ => n.to_string(),
