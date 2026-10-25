@@ -1,0 +1,7 @@
+boot: tokenizer 0.3 s
+adapt: AdaptConfig { halflife: 10.0, prior: 4.0, gate: 0.010173269452189129, min_new: 32, decode_tokens: 600, swap_max: 512, min_gain: 0.005, floor: 6 }
+adapt: demand history /home/ryan/tidelm-rust-state/bench-20261024/seed-45ef7129.npz loaded
+boot: demand, residency, pair 0.6 s
+resident load: layers 6.4 s, embed + head by 7.1 s, drafter experts by 8.0 s; 10128 experts by 13.7 s (in parallel)
+boot: engine 15.2 s
+engine up in 15.3s; serving deepseek on 0.0.0.0:8000 (1 lane, depth Confidence)

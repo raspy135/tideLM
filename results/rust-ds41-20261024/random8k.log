@@ -1,0 +1,13 @@
+note: server serves 'deepseek', using that
+== rust-ds41-random8k: workload=random isl=8192 osl=256 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=8178 ttft=  10910.9 ms  tpot=  30.85 ms  decode= 32.42 tok/s  out=256 (length)
+          accept_len=2.3181818181818183  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=8170 ttft=   9304.4 ms  tpot=  27.75 ms  decode= 36.03 tok/s  out=256 (length)
+          accept_len=2.6020408163265305  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=8171 ttft=   9877.6 ms  tpot=  26.36 ms  decode= 37.94 tok/s  out=256 (length)
+          accept_len=2.802197802197802  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=8178 ttft=   9288.2 ms  tpot=  23.98 ms  decode= 41.71 tok/s  out=256 (length)
+          accept_len=3.2278481012658227  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=9304.4325 ms  tpot=26.3591 ms  decode=37.9376 tok/s
+  -> ENGINE  accept_len=2.8022  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote results/rust-ds41-20261024/random8k.json

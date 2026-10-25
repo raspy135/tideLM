@@ -10,14 +10,21 @@ tide — so the engine gets better the more you use it.
 
 | Profile | Model | Routed experts | Resident | Context | Prose | Code | 8K-token prompt, first token |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,452 / 15,360 (68%) | 512K | **25.6 tok/s** | **43.3 tok/s** | 7.3 s |
+| `ds41-mxfp4`, Rust engine | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,000 / 15,360 (65.1%) | 512K | **30.9 tok/s** | **50.9 tok/s** | 9.3 s |
+| `ds41-mxfp4`, Python engine | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,452 / 15,360 (68%) | 512K | **25.6 tok/s** | **43.3 tok/s** | 7.3 s |
 | `glm53-exl3` | GLM-5.3 | EXL3 3.0 bpw | 12,500 / 19,200 (65.1%) | 256K | **15.2 tok/s** | **20.3 tok/s** | 18.5 s |
 
 *Decode speed is `bench/bench.py`'s median over three measured runs after one warmup: 1,024
 output tokens at temperature 0.6, prose = an essay request, code = an LRU-cache request. The last
 column is the median time to first token of a fresh ~8,200-token prompt (no prefix reused). Each
 profile uses adaptation, hot reads and speculative decoding on two DGX Sparks, with its learned
-expert history. DS was measured on 2026-10-22 with lossless scales, candidate indexing, the
+expert history. The Rust engine (`rust/`, no Python between the socket and the GPU) was measured
+on 2026-10-24 from the Python rows' seed history and an empty prefix cache, at the profile's 512K
+allocation, with packed KV and 10,000 residents: it reads native scales (the lossless scale pack
+is not ported yet, so the Python engine's 10,452 do not fit in its memory):
+[raw runs](results/rust-ds41-20261024/README.md). A second boot gave 30.7 / 50.1 tok/s and
+8.0 s; its 8K first token moves between ~7.6 and ~9.3 s from run to run (the six runs' median
+is 9.3 s), and is 7.5 s on a boot that serves only 8K prompts. Python DS was measured on 2026-10-22 with lossless scales, candidate indexing, the
 split draft weights, an 8-token depth window and 10,452 residents at a 32K context allocation
 (the profile supports 512K): [raw runs](results/ds41-depth8-20261022/README.md). Its code median
 moves with each boot's acceptance (41.1-44.8 across that day's boots) and the 8K first token with
@@ -126,7 +133,12 @@ scripts/tide-up.sh .env.glm53-exl3     # stops whatever is serving, starts this 
 scripts/tide-down.sh
 ```
 
-The engine follows from the profile (`GLM_MODEL_DIR` → GLM-5.3, `MODEL_DIR` → DeepSeek). Boot
+The engine follows from the profile (`GLM_MODEL_DIR` → GLM-5.3, `MODEL_DIR` → DeepSeek, and
+`MODEL_DIR` with `TIDE_ENGINE=rust` → DeepSeek on the Rust engine). The Rust engine runs from the
+checkout rather than the image: build it once with `(cd rust && cargo build --release)` on the
+head (`scripts/rust-up.sh` copies the binary to the worker), and see the profile's `RUST_*`
+settings. It serves the OpenAI API with tool calls and images; the Anthropic route (Claude Code)
+is the Python engine's only for now. Boot
 takes 1-5 minutes; the first requests after a boot are slower while adaptation catches up with
 your traffic. One profile serves at a time: each fills both boxes.
 
