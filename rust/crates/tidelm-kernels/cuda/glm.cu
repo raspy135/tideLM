@@ -1220,6 +1220,36 @@ __global__ void dup_rows_kernel(const __nv_bfloat16* __restrict__ x, int64_t ldx
         for (int g = 0; g < G; ++g) out[((int64_t)t * G + g) * K + c] = v;
     }
 }
+
+// Per row of this rank's logits [M][n]: (max, sum exp((x - max) / temp)) into out[r * ldo],
+// out[r * ldo + 1] -- with the rows' candidates (topk_kernel) the host's nucleus over the
+// pair's whole vocabulary. temp a device scalar (a captured graph replays at any temperature).
+__global__ void __launch_bounds__(1024) row_lse_kernel(const float* __restrict__ x, int64_t ldx, int n,
+                                                       const float* __restrict__ temp, float* __restrict__ out, int64_t ldo) {
+    __shared__ float red[32];
+    const float* row = x + (int64_t)blockIdx.x * ldx;
+    float m = -INFINITY;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) m = fmaxf(m, row[i]);
+    m = warp_max(m);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : -INFINITY;
+        v = warp_max(v);
+        if (threadIdx.x == 0) red[0] = v;
+    }
+    __syncthreads();
+    m = red[0];
+    __syncthreads();
+    const float inv = 1.f / fmaxf(temp[0], 1e-6f);
+    float s = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) s += expf((row[i] - m) * inv);
+    s = block_sum(s, red);
+    if (threadIdx.x == 0) {
+        out[(int64_t)blockIdx.x * ldo] = m;
+        out[(int64_t)blockIdx.x * ldo + 1] = s;
+    }
+}
 }  // namespace
 
 // ---------------------------------------------------------------- C ABI
@@ -1479,6 +1509,12 @@ int glm_quant_int8_rows(void* stream, const void* x, int rows, int H, void* q, v
 
 int glm_dup_rows(void* stream, const void* x, int64_t ldx, void* out, int T, int K, int G) {
     dup_rows_kernel<<<T, 256, 0, GST>>>(static_cast<const __nv_bfloat16*>(x), ldx, static_cast<__nv_bfloat16*>(out), K, G);
+    GRET;
+}
+
+int glm_row_lse(void* stream, const void* x, int64_t ldx, int M, int n, const void* temp, void* out, int64_t ldo) {
+    row_lse_kernel<<<M, 1024, 0, GST>>>(static_cast<const float*>(x), ldx, n, static_cast<const float*>(temp),
+                                        static_cast<float*>(out), ldo);
     GRET;
 }
 

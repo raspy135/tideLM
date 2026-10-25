@@ -68,6 +68,10 @@ fn main() -> Result<()> {
     let t0 = Instant::now();
     let mut eng = Engine::load(&model_dir, opt, rank, world, pair, &residents, &log)?;
     log(&format!("[glm] engine up in {:.0} s", t0.elapsed().as_secs_f64()));
+    eng.graphs = args.iter().any(|a| a == "--graphs");
+    if args.iter().any(|a| a == "--hot") {
+        eng.enable_hot(true)?;
+    }
     if rank == 1 {
         return eng.follow();
     }
@@ -89,6 +93,7 @@ fn main() -> Result<()> {
         eng.keep_hidden(eng.last_rows - 1)?;
         let t2 = Instant::now();
         let (mut rounds, mut accepted) = (0usize, 0usize);
+        let (mut t_draft, mut t_verify, mut t_fill) = (0f64, 0f64, 0f64);
         while out.len() < max_tokens && !stop.contains(&anchor) {
             rounds += 1;
             if depth == 0 {
@@ -97,6 +102,7 @@ fn main() -> Result<()> {
                 continue;
             }
             let p = eng.pos;
+            let ta = Instant::now();
             let mut drafts = vec![eng.mtp(&[anchor], Hidden::Last, p - 1, true)?.unwrap()[0]];
             for k in 1..depth {
                 let d = eng.mtp(&[drafts[k - 1]], Hidden::Mtp, p - 1 + k, true)?.unwrap()[0];
@@ -104,7 +110,9 @@ fn main() -> Result<()> {
             }
             let mut block = vec![anchor];
             block.extend_from_slice(&drafts);
+            let tb = Instant::now();
             let am = eng.forward(&block, false)?;
+            let tc = Instant::now();
             let n_acc = (0..depth).find(|&k| am[k] != drafts[k]).unwrap_or(depth);
             accepted += n_acc;
             eng.set_pos(p + 1 + n_acc)?;
@@ -112,6 +120,9 @@ fn main() -> Result<()> {
                 eng.mtp(&drafts[..n_acc], Hidden::Target(0), p, false)?;
             }
             eng.keep_hidden(n_acc)?;
+            t_draft += (tb - ta).as_secs_f64();
+            t_verify += (tc - tb).as_secs_f64();
+            t_fill += tc.elapsed().as_secs_f64();
             for &d in &drafts[..n_acc] {
                 out.push(d);
                 if stop.contains(&d) {
@@ -129,6 +140,10 @@ fn main() -> Result<()> {
         log(&format!("prompt {} tokens: first token {:.3} s; {} tokens in {:.2} s = {:.2} tok/s ({} rounds, {:.2} accepted a round)",
                      ids.len(), ttft, out.len(), dt, (out.len() - 1) as f64 / dt, rounds,
                      accepted as f64 / rounds.max(1) as f64));
+        log(&format!("per round: drafts {:.1} ms, verify {:.1} ms, fill {:.1} ms", 1e3 * t_draft / rounds as f64,
+                     1e3 * t_verify / rounds as f64, 1e3 * t_fill / rounds as f64));
+        let r = &eng.res.stats;
+        log(&format!("hot reads {} (kept {}, unkept {}, {:.3} s), swaps {}", r.hot_reads, r.hot_kept, r.hot_unkept, r.hot_s, r.swaps));
         log(&format!("--- {}", text.decode(&out)?));
         log(&format!("ids {:?}", &out[..out.len().min(48)]));
         Ok(())

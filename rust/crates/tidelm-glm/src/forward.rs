@@ -41,7 +41,16 @@ const OP_FORWARD: u32 = 1;
 const OP_MTP: u32 = 2;
 const OP_SET_POS: u32 = 3;
 const OP_KEEP_HIDDEN: u32 = 4;
+const OP_SAMPLING: u32 = 5;
+const OP_ZERO_DEMAND: u32 = 7;
+const OP_FULL_ROW: u32 = 6;
 const OP_EXIT: u32 = 99;
+/// Candidates a rank sends a sampled row: its top logits, with its (max, sum of exp) the
+/// host's nucleus over the pair's vocabulary (falls back to the whole row when they do not
+/// cover it).
+pub const CAND: usize = 1024;
+/// a row's floats: max, sum, CAND logits, CAND ids
+const CROW: usize = 2 + 2 * CAND;
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -199,7 +208,7 @@ pub struct Engine {
     vl: usize,
     /// cache rows a split layer holds (ceil(max_seq / world)); its spare row follows
     s_loc: usize,
-    st: Stream,
+    pub(crate) st: Stream,
     blas: Blas,
     pub w: Weights,
     members: Members,
@@ -231,6 +240,25 @@ pub struct Engine {
     /// a decode row's bytes in the split gathers (qrow_bytes, row2_bytes)
     qrow: usize,
     row2: usize,
+    /// the decoder's MoE layers (hot-read points of a segmented decode pass)
+    moe_layers: Vec<usize>,
+    /// decode passes replay CUDA graphs (captured per row count on first use)
+    pub graphs: bool,
+    graphs_map: std::collections::HashMap<GraphKey, tidelm_cuda::GraphExec>,
+    /// synchronous hot reads between a decode pass's segments (None: off)
+    pub hot: Option<crate::adapt::Hot>,
+    pub res: crate::adapt::Res,
+    h_ids: tidelm_cuda::PinnedBuffer<i32>,
+    h_pos: tidelm_cuda::PinnedBuffer<i32>,
+    h_tok: tidelm_cuda::PinnedBuffer<i32>,
+    /// passes also return each row's sampling candidates (set_sampling)
+    pub sampled: bool,
+    temp: DeviceBuffer<f32>,
+    h_temp: tidelm_cuda::PinnedBuffer<f32>,
+    cand: DeviceBuffer<f32>,
+    /// both ranks' candidates of the last sampled pass [world][rows][CROW]
+    h_cand: tidelm_cuda::PinnedBuffer<f32>,
+    cand_rows: usize,
 }
 
 fn np<T: Copy>(b: &DeviceBuffer<T>) -> *mut c_void {
@@ -303,6 +331,10 @@ impl Engine {
                      if opt.kv_split { ", split" } else { "" }));
         let act = Act::new(&cfg, &opt, hl, vl, s_loc, opt.slots + 1)?;
         let mtp_lut: Vec<i32> = (0..e as i32).collect();
+        let moe_layers: Vec<usize> = (0..cfg.layers).filter(|&l| !cfg.dense[l]).collect();
+        let opt_chunk = opt.chunk;
+        let opt_slots = opt.slots;
+        let moe_layers_res = moe_layers.clone();
         let engine = Engine {
             lut: DeviceBuffer::from_slice(&lut_h)?,
             allowed: DeviceBuffer::from_slice(&allowed_h)?,
@@ -335,6 +367,20 @@ impl Engine {
             last_rows: 0,
             qrow: qrow_bytes(hl),
             row2: row2_bytes(hl),
+            moe_layers,
+            graphs: false,
+            graphs_map: std::collections::HashMap::new(),
+            hot: None,
+            res: crate::adapt::Res::new(nl, e, opt_slots, moe_layers_res, residents),
+            h_ids: tidelm_cuda::PinnedBuffer::zeroed(opt_chunk.max(MAX_ROWS))?,
+            h_pos: tidelm_cuda::PinnedBuffer::zeroed(2)?,
+            h_tok: tidelm_cuda::PinnedBuffer::zeroed(MAX_ROWS)?,
+            sampled: false,
+            temp: DeviceBuffer::from_slice(&[1.0f32])?,
+            h_temp: tidelm_cuda::PinnedBuffer::zeroed(1)?,
+            cand: DeviceBuffer::new(MAX_ROWS * CROW)?,
+            h_cand: tidelm_cuda::PinnedBuffer::zeroed(world * MAX_ROWS * CROW)?,
+            cand_rows: 0,
         };
         engine.st.synchronize()?;
         Ok(engine)
@@ -342,6 +388,20 @@ impl Engine {
 
     pub fn stream(&self) -> &Stream {
         &self.st
+    }
+
+    /// The host lut / allowed mirrors to the device (stream-ordered).
+    pub(crate) fn lut_upload(&mut self) -> Result<()> {
+        self.lut.upload_async(0, &self.lut_h, &self.st)?;
+        self.allowed.upload_async(0, &self.allowed_h, &self.st)?;
+        Ok(())
+    }
+
+    /// One [layer][expert] entry of lut / allowed to the device.
+    pub(crate) fn lut_entry(&mut self, i: usize) -> Result<()> {
+        self.lut.upload_async(i, &self.lut_h[i..i + 1], &self.st)?;
+        self.allowed.upload_async(i, &self.allowed_h[i..i + 1], &self.st)?;
+        Ok(())
     }
 
     // ------------------------------------------------------------------ collectives
@@ -424,7 +484,7 @@ impl Engine {
 
     // ------------------------------------------------------------------ attention
     #[allow(clippy::too_many_lines)]
-    fn attention(&self, l: usize, t: usize, prefill: bool, idx_valid: &mut bool) -> Result<()> {
+    fn attention(&self, l: usize, t: usize, prefill: bool) -> Result<()> {
         let (cfg, lw, a) = (&self.cfg, &self.w.layers[l], &self.act);
         let st = self.st.raw();
         let h = cfg.hidden;
@@ -507,10 +567,6 @@ impl Engine {
             if full {
                 ck(unsafe { glm_split_share(st, np(&a.gs), nbytes as i64, self.qrow as i64, (hl * 576 * 2) as i64, np(&a.idx),
                                             TOPK as i64, self.rank as i32, TOPK as i32, t as i32) }, "split share")?;
-                *idx_valid = true;
-            }
-            if !*idx_valid {
-                return Err(format!("layer {l}: a shared indexer layer before any full one").into());
             }
             let hh = cfg.heads;
             let (ns, chunk) = decode_split(TOPK, hh, t);
@@ -536,7 +592,6 @@ impl Engine {
                                              inv_d, np(&a.scores), lim as i64) }, "index scores")?;
                 ck(unsafe { glm_topk(st, np(&a.scores), lim as i64, posb, 1, 0, lim as i32, TOPK as i32, t as i32, np(&a.idx),
                                      TOPK as i64, std::ptr::null_mut(), 0) }, "topk")?;
-                *idx_valid = true;
             }
             let (ns, chunk) = decode_split(TOPK, hl, t);
             ck(unsafe { glm_mla(st, 2, qbase, 0, qrow as i64, 576, hl as i32, np(&kv.cq), np(&kv.cs), np(&kv.cr), 0,
@@ -577,13 +632,7 @@ impl Engine {
                     r0 += n;
                 }
             }
-            if full {
-                *idx_valid = true;
-            }
             let (idx, k) = if dense_causal { (std::ptr::null_mut(), s_all) } else { (np(&a.idx), TOPK) };
-            if !dense_causal && !*idx_valid {
-                return Err(format!("layer {l}: a shared indexer layer before any full one").into());
-            }
             let posp = posb;
             let chunk = k.div_ceil(32) * 32;
             ck(unsafe { glm_mla(st, 2, qbase, 0, qrow as i64, 576, hl as i32, cq, cs, cr, split_n as i32, idx, TOPK as i64,
@@ -605,6 +654,7 @@ impl Engine {
     }
 
     // ------------------------------------------------------------------ MLP
+    /// A layer's MLP over `t` rows of xn -> a: dense, or the MoE's routing and experts.
     fn mlp(&self, l: usize, t: usize, prefill: bool) -> Result<()> {
         let (cfg, lw, a) = (&self.cfg, &self.w.layers[l], &self.act);
         let st = self.st.raw();
@@ -621,35 +671,50 @@ impl Engine {
                 ck(unsafe { glm_moe_out(st, std::ptr::null(), np(&a.shout), np(&a.mout), (t * down.n) as i64) }, "dense out")?;
                 self.gather_cols(np(&a.mout), t, down.n, 2, np(&a.a), prefill)
             }
-            Mlp::Moe { router, bias, sh_gate_up, sh_down } => {
-                let mtp = cfg.mtp && l == cfg.mtp_layer();
-                let e = cfg.experts;
-                let k = cfg.topk;
-                let (lut, allowed, arena) = if mtp {
-                    (np(&self.mtp_lut), np(&self.all_ones), self.mtp_arena.as_ref().unwrap())
-                } else {
-                    (at(&self.lut, l * e), at(&self.allowed, l * e), &self.arena)
-                };
+            Mlp::Moe { .. } => {
                 // rows in sub-chunks: the routed scratch is sized for moe_rows
                 let sub = if prefill { self.opt.moe_rows } else { t };
                 let mut r0 = 0;
                 while r0 < t {
                     let n = sub.min(t - r0);
-                    let xr = at(&a.xn, r0 * h);
-                    self.linear_f32w(xr, h, router, n, e, h, np(&a.logits), if n <= MAX_ROWS { 6 } else { 1 })?;
-                    ck(unsafe { glm_router(st, np(&a.logits), np(bias), std::ptr::null(), std::ptr::null(), n as i32, k as i32,
-                                           cfg.routed_scaling, np(&a.eids), np(&a.ew), allowed, np(&a.hot), std::ptr::null(),
-                                           std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null()) },
-                       "router (exact)")?;
-                    ck(unsafe { glm_router(st, np(&a.logits), np(bias), allowed, lut, n as i32, k as i32, cfg.routed_scaling,
-                                           np(&a.pick), np(&a.wts), std::ptr::null(), std::ptr::null_mut(), np(&a.eids),
-                                           np(&a.ew), at(&self.demand, l * e), np(&self.miss), std::ptr::null()) }, "router")?;
-                    self.moe_rows(sh_gate_up, sh_down, arena, xr, n, prefill, at(&a.a, r0 * h))?;
+                    self.moe_exact(l, r0, n)?;
+                    self.moe_rest(l, r0, n, prefill)?;
                     r0 += n;
                 }
                 Ok(())
             }
         }
+    }
+
+    /// The MoE layer's router over rows [r0, r0 + n) of xn and its exact (unmasked) top-k: the
+    /// demand, miss counters and hot-read candidates come from these.
+    fn moe_exact(&self, l: usize, r0: usize, n: usize) -> Result<()> {
+        let (cfg, a) = (&self.cfg, &self.act);
+        let Mlp::Moe { router, bias, .. } = &self.w.layers[l].mlp else { return Err("moe_exact on a dense layer".into()) };
+        let (e, h) = (cfg.experts, cfg.hidden);
+        let allowed = self.allowed_ptr(l);
+        self.linear_f32w(at(&a.xn, r0 * h), h, router, n, e, h, np(&a.logits), if n <= MAX_ROWS { 6 } else { 1 })?;
+        ck(unsafe { glm_router(self.st.raw(), np(&a.logits), np(bias), std::ptr::null(), std::ptr::null(), n as i32,
+                               cfg.topk as i32, cfg.routed_scaling, np(&a.eids), np(&a.ew), allowed, np(&a.hot), std::ptr::null(),
+                               std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null()) }, "router (exact)")
+    }
+
+    fn allowed_ptr(&self, l: usize) -> *mut c_void {
+        if self.cfg.mtp && l == self.cfg.mtp_layer() { np(&self.all_ones) } else { at(&self.allowed, l * self.cfg.experts) }
+    }
+
+    /// The MoE layer's routing over the residents (after any hot read was installed) and its
+    /// experts over rows [r0, r0 + n) of xn -> the same rows of a.
+    fn moe_rest(&self, l: usize, r0: usize, n: usize, prefill: bool) -> Result<()> {
+        let (cfg, a) = (&self.cfg, &self.act);
+        let Mlp::Moe { bias, sh_gate_up, sh_down, .. } = &self.w.layers[l].mlp else { return Err("moe on a dense layer".into()) };
+        let (e, h) = (cfg.experts, cfg.hidden);
+        let mtp = cfg.mtp && l == cfg.mtp_layer();
+        let (lut, arena) = if mtp { (np(&self.mtp_lut), self.mtp_arena.as_ref().unwrap()) } else { (at(&self.lut, l * e), &self.arena) };
+        ck(unsafe { glm_router(self.st.raw(), np(&a.logits), np(bias), self.allowed_ptr(l), lut, n as i32, cfg.topk as i32,
+                               cfg.routed_scaling, np(&a.pick), np(&a.wts), std::ptr::null(), std::ptr::null_mut(), np(&a.eids),
+                               np(&a.ew), at(&self.demand, l * e), np(&self.miss), std::ptr::null()) }, "router")?;
+        self.moe_rows(sh_gate_up, sh_down, arena, at(&a.xn, r0 * h), n, prefill, at(&a.a, r0 * h))
     }
 
     /// One block of MoE rows (routing done: pick / wts): the shared expert and the routed picks,
@@ -738,23 +803,37 @@ impl Engine {
     }
 
     // ------------------------------------------------------------------ model
-    fn upload_ids(&self, ids: &[u32], pos0: usize, mtp: bool) -> Result<()> {
-        let v: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
-        self.act.tok.upload_async(0, &v, &self.st)?;
-        let p = [pos0 as i32];
+    /// Host -> device of a pass's token ids and first position (pinned staging, before any graph).
+    fn stage(&mut self, ids: &[u32], pos0: usize, mtp: bool) -> Result<()> {
+        let t = ids.len();
+        for (d, &x) in self.h_ids.iter_mut().zip(ids) {
+            *d = x as i32;
+        }
+        let pslot = if mtp { 1 } else { 0 };
+        self.h_pos[pslot] = pos0 as i32;
+        unsafe {
+            tidelm_cuda::memcpy_async(np(&self.act.tok), self.h_ids.raw(), t * 4, tidelm_cuda::ffi::MEMCPY_HOST_TO_DEVICE, &self.st)?;
+            let dst = if mtp { np(&self.act.mpos0) } else { np(&self.act.pos0) };
+            tidelm_cuda::memcpy_async(dst, (self.h_pos.raw() as *mut i32).add(pslot) as *const c_void, 4,
+                                      tidelm_cuda::ffi::MEMCPY_HOST_TO_DEVICE, &self.st)?;
+        }
+        Ok(())
+    }
+
+    /// The pass's positions from its staged first one (and a split cache's rows and bounds).
+    fn positions(&self, t: usize, mtp: bool) -> Result<()> {
+        let a = &self.act;
         if mtp {
-            self.act.mpos0.upload_async(0, &p, &self.st)?;
-            ck(unsafe { glm_positions(self.st.raw(), np(&self.act.mpos0), ids.len() as i32, 0, 1, 0, np(&self.act.mpos),
-                                      std::ptr::null_mut(), std::ptr::null_mut()) }, "mtp positions")
+            ck(unsafe { glm_positions(self.st.raw(), np(&a.mpos0), t as i32, 0, 1, 0, np(&a.mpos), std::ptr::null_mut(),
+                                      std::ptr::null_mut()) }, "mtp positions")
         } else {
-            self.act.pos0.upload_async(0, &p, &self.st)?;
-            ck(unsafe { glm_positions(self.st.raw(), np(&self.act.pos0), ids.len() as i32, self.rank as i32,
-                                      if self.opt.kv_split { self.world as i32 } else { 1 }, self.s_loc as i32, np(&self.act.pos),
-                                      np(&self.act.rows), np(&self.act.bound)) }, "positions")
+            ck(unsafe { glm_positions(self.st.raw(), np(&a.pos0), t as i32, self.rank as i32,
+                                      if self.opt.kv_split { self.world as i32 } else { 1 }, self.s_loc as i32, np(&a.pos),
+                                      np(&a.rows), np(&a.bound)) }, "positions")
         }
     }
 
-    /// The embedding rows of the uploaded ids (zeroed at position 0 for the MTP layer) -> bf16
+    /// The embedding rows of the staged ids (zeroed at position 0 for the MTP layer) -> bf16
     /// at `out`, summed over the pair's vocabulary halves.
     fn embed(&self, t: usize, mtp: bool, out: *mut c_void) -> Result<()> {
         let a = &self.act;
@@ -765,35 +844,71 @@ impl Engine {
         self.allreduce(np(&a.f32buf), t * h, out, t > MAX_ROWS)
     }
 
-    /// The decoder layers over `t` rows at self.pos (ids uploaded): the final norm into hn.
-    fn layers(&self, t: usize) -> Result<()> {
-        let (cfg, a) = (&self.cfg, &self.act);
-        let st = self.st.raw();
-        let h = cfg.hidden as i64;
-        let prefill = t > MAX_ROWS;
-        self.embed(t, false, np(&a.h))?;
-        let mut idx_valid = false;
-        for l in 0..cfg.layers {
-            let lw = &self.w.layers[l];
-            if l == 0 {
-                ck(unsafe { glm_rmsnorm(st, np(&a.h), h, std::ptr::null(), 0, np(&lw.ln_in), np(&a.xn), h, t as i32, h as i32,
-                                        cfg.rms_eps) }, "norm")?;
-            } else {
-                ck(unsafe { glm_rmsnorm(st, np(&a.h), h, np(&a.a), h, np(&lw.ln_in), np(&a.xn), h, t as i32, h as i32,
-                                        cfg.rms_eps) }, "norm")?;
-            }
-            self.attention(l, t, prefill, &mut idx_valid)?;
-            ck(unsafe { glm_rmsnorm(st, np(&a.h), h, np(&a.a), h, np(&lw.ln_post), np(&a.xn), h, t as i32, h as i32,
-                                    cfg.rms_eps) }, "norm")?;
-            self.mlp(l, t, prefill)?;
-        }
-        // h += the last MLP; hn = the final norm (the MTP layer's input)
-        ck(unsafe { glm_rmsnorm(st, np(&a.h), h, np(&a.a), h, np(&self.w.norm), np(&a.hn), h, t as i32, h as i32, cfg.rms_eps) },
-           "final norm")
+    fn norm(&self, x: *mut c_void, add: bool, w: &DeviceBuffer<u16>, y: *mut c_void, t: usize) -> Result<()> {
+        let h = self.cfg.hidden as i64;
+        ck(unsafe { glm_rmsnorm(self.st.raw(), x, h, if add { np(&self.act.a) } else { std::ptr::null() }, h, np(w), y, h,
+                                t as i32, h as i32, self.cfg.rms_eps) }, "norm")
     }
 
-    /// The head over `t` rows of `x` (bf16 [t][H]) and each row's argmax -> act.out_tok.
-    fn head_argmax(&self, x: *const c_void, t: usize) -> Result<Vec<u32>> {
+    /// Layer l's input norm (adding the previous MLP's output past layer 0), attention, the
+    /// residual add and the post-attention norm.
+    fn layer_pre(&self, l: usize, t: usize, prefill: bool) -> Result<()> {
+        let lw = &self.w.layers[l];
+        let a = &self.act;
+        self.norm(np(&a.h), l > 0, &lw.ln_in, np(&a.xn), t)?;
+        self.attention(l, t, prefill)?;
+        self.norm(np(&a.h), true, &lw.ln_post, np(&a.xn), t)
+    }
+
+    /// The decoder layers over `t` rows (staged) at self.pos: the final norm into hn.
+    fn layers(&self, t: usize) -> Result<()> {
+        let prefill = t > MAX_ROWS;
+        self.positions(t, false)?;
+        self.embed(t, false, np(&self.act.h))?;
+        for l in 0..self.cfg.layers {
+            self.layer_pre(l, t, prefill)?;
+            self.mlp(l, t, prefill)?;
+        }
+        self.norm(np(&self.act.h), true, &self.w.norm, np(&self.act.hn), t)
+    }
+
+    /// A decode pass in pieces split where hot reads go: segment 0 runs through the first MoE
+    /// layer's exact routing, segment i + 1 from MoE layer i's resident routing through the
+    /// next one's exact routing, the last through the head's argmax (device only).
+    fn decode_segment(&self, seg: usize, t: usize) -> Result<()> {
+        let cfg = &self.cfg;
+        let moe = &self.moe_layers;
+        let start = if seg == 0 {
+            self.positions(t, false)?;
+            self.embed(t, false, np(&self.act.h))?;
+            0
+        } else {
+            let l = moe[seg - 1];
+            self.moe_rest(l, 0, t, false)?;
+            l + 1
+        };
+        let end = if seg < moe.len() { moe[seg] } else { cfg.layers };
+        for l in start..end {
+            self.layer_pre(l, t, false)?;
+            self.mlp(l, t, false)?;
+        }
+        if seg < moe.len() {
+            self.layer_pre(end, t, false)?;
+            self.moe_exact(end, 0, t)?;
+            if let Some(h) = self.hot.as_ref() {
+                unsafe {
+                    tidelm_cuda::memcpy_async(h.host.raw(), np(&self.act.hot), t * self.cfg.topk * 8,
+                                              tidelm_cuda::ffi::MEMCPY_DEVICE_TO_HOST, &self.st)?;
+                }
+            }
+            return Ok(());
+        }
+        self.norm(np(&self.act.h), true, &self.w.norm, np(&self.act.hn), t)?;
+        self.head_dev(np(&self.act.hn), t)
+    }
+
+    /// The head over `t` rows of `x` (bf16 [t][H]) and each row's argmax into out_tok.
+    fn head_dev(&self, x: *const c_void, t: usize) -> Result<()> {
         let a = &self.act;
         let st = self.st.raw();
         self.exl3(&self.w.head, x, self.cfg.hidden, t, np(&a.head), false)?;
@@ -802,25 +917,104 @@ impl Engine {
         self.gather(np(&a.pairs), t * 8, at(&a.pairs, 2 * VERIFY_ROWS * 2), false)?;
         ck(unsafe { glm_argmax_combine(st, at(&a.pairs, 2 * VERIFY_ROWS * 2), self.world as i32, t as i32, np(&a.out_tok)) },
            "argmax combine")?;
-        let mut out = vec![0i32; t];
-        a.out_tok.download_async(0, &mut out, &self.st)?;
-        self.st.synchronize()?;
-        Ok(out.into_iter().map(|x| x as u32).collect())
+        if self.sampled {
+            let c = np(&self.cand);
+            ck(unsafe { glm_row_lse(st, np(&a.head), self.vl as i64, t as i32, self.vl as i32, np(&self.temp), c, CROW as i64) },
+               "row lse")?;
+            ck(unsafe { glm_topk(st, np(&a.head), self.vl as i64, std::ptr::null(), 1, 0, self.vl as i32, CAND as i32, t as i32,
+                                 at(&self.cand, 2 + CAND), CROW as i64, at(&self.cand, 2), CROW as i64) }, "candidates")?;
+            let nbytes = t * CROW * 4;
+            self.gather(c, nbytes, np(&a.gs), false)?;
+            unsafe {
+                tidelm_cuda::memcpy_async(self.h_cand.raw(), np(&a.gs), self.world * nbytes, tidelm_cuda::ffi::MEMCPY_DEVICE_TO_HOST,
+                                          &self.st)?;
+            }
+        }
+        Ok(())
     }
 
-    /// The MTP layer over rows `ids` (token i + 1 at position pos0 + i) and the previous hidden
-    /// `hsrc` -> its post-norm hidden in mhn and, with `logits`, each row's argmax.
-    fn mtp_core(&mut self, ids: &[u32], hsrc: Hidden, pos0: usize, logits: bool) -> Result<Option<Vec<u32>>> {
-        let t = ids.len();
+    /// Row `row` of the last sampled pass: its candidates over the pair's vocabulary.
+    pub fn candidates(&self, row: usize) -> RowCands {
+        let t = self.cand_rows;
+        let mut rc = RowCands::default();
+        for w in 0..self.world {
+            let base = (w * t + row) * CROW;
+            let r = &self.h_cand[base..base + CROW];
+            rc.lse.push((r[0], r[1]));
+            for i in 0..CAND {
+                let id = r[2 + CAND + i].to_bits() as i32;
+                if id >= 0 {
+                    rc.vals.push(r[2 + i]);
+                    rc.ids.push((id as usize + w * self.vl) as u32);
+                }
+            }
+            rc.min.push(r[2..2 + CAND].iter().cloned().fold(f32::INFINITY, f32::min));
+        }
+        rc
+    }
+
+    /// Sampling on or off for the passes that follow, at this temperature (both ranks: the
+    /// candidates are a gather).
+    pub fn set_sampling(&mut self, temp: Option<f32>) -> Result<()> {
+        self.mirror(|m| {
+            m.u32(OP_SAMPLING).u32(temp.map(|t| t.to_bits()).unwrap_or(0)).u32(temp.is_some() as u32);
+        })?;
+        self.sampling_local(temp)
+    }
+
+    fn sampling_local(&mut self, temp: Option<f32>) -> Result<()> {
+        self.sampled = temp.is_some();
+        if let Some(t) = temp {
+            self.h_temp[0] = t;
+            unsafe {
+                tidelm_cuda::memcpy_async(np(&self.temp), self.h_temp.raw(), 4, tidelm_cuda::ffi::MEMCPY_HOST_TO_DEVICE, &self.st)?;
+            }
+            self.st.synchronize()?;
+        }
+        Ok(())
+    }
+
+    /// Row `row` of the last pass's logits over the whole vocabulary (the nucleus fallback).
+    pub fn full_row(&mut self, row: usize) -> Result<Vec<f32>> {
+        self.mirror(|m| {
+            m.u32(OP_FULL_ROW).u32(row as u32);
+        })?;
+        self.full_row_local(row)
+    }
+
+    fn full_row_local(&mut self, row: usize) -> Result<Vec<f32>> {
+        let vl = self.vl;
+        self.gather(at(&self.act.head, row * vl), vl * 4, np(&self.act.gs), false)?;
+        let mut out = vec![0f32; vl * self.world];
+        self.act.gs.download_async(0, unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out.len() * 4) },
+                                   &self.st)?;
+        self.st.synchronize()?;
+        Ok(out)
+    }
+
+    /// out_tok's first `t` rows to the host (synchronizes the stream).
+    fn read_tokens(&mut self, t: usize) -> Result<Vec<u32>> {
+        unsafe {
+            tidelm_cuda::memcpy_async(self.h_tok.raw(), np(&self.act.out_tok), t * 4, tidelm_cuda::ffi::MEMCPY_DEVICE_TO_HOST,
+                                      &self.st)?;
+        }
+        self.st.synchronize()?;
+        self.cand_rows = t;
+        Ok(self.h_tok[..t].iter().map(|&x| x as u32).collect())
+    }
+
+    /// The MTP layer over `t` staged rows (token i + 1 at position pos0 + i) and the previous
+    /// hidden `hsrc` -> its post-norm hidden in mhn and, with `logits`, each row's argmax in
+    /// out_tok (device only).
+    fn mtp_dev(&self, t: usize, hsrc: Hidden, logits: bool) -> Result<()> {
         let l = self.cfg.mtp_layer();
-        self.mtp_pos = pos0;
-        self.upload_ids(ids, pos0, true)?;
         let (cfg, a) = (&self.cfg, &self.act);
         let st = self.st.raw();
         let h = cfg.hidden;
         let lw = &self.w.layers[l];
         let mx = lw.mtp.as_ref().ok_or("no MTP layer")?;
         let prefill = t > MAX_ROWS;
+        self.positions(t, true)?;
         // e = embed(next ids), zero at position 0; x = eh_proj(cat(enorm(e), hnorm(h_prev)))
         self.embed(t, true, np(&a.xn))?;
         ck(unsafe { glm_rmsnorm(st, np(&a.xn), h as i64, std::ptr::null(), 0, np(&mx.enorm), np(&a.ehin), (2 * h) as i64, t as i32,
@@ -834,19 +1028,73 @@ impl Engine {
                                 h as i32, cfg.rms_eps) }, "hnorm")?;
         self.exl3(&mx.eh, np(&a.ehin), 2 * h, t, np(&a.ehout), true)?;
         self.gather_cols(np(&a.ehout), t, mx.eh.n, 2, np(&a.h), prefill)?;
-        ck(unsafe { glm_rmsnorm(st, np(&a.h), h as i64, std::ptr::null(), 0, np(&lw.ln_in), np(&a.xn), h as i64, t as i32,
-                                h as i32, cfg.rms_eps) }, "norm")?;
-        let mut idx_valid = false;
-        self.attention(l, t, prefill, &mut idx_valid)?;
-        ck(unsafe { glm_rmsnorm(st, np(&a.h), h as i64, np(&a.a), h as i64, np(&lw.ln_post), np(&a.xn), h as i64, t as i32,
-                                h as i32, cfg.rms_eps) }, "norm")?;
+        self.norm(np(&a.h), false, &lw.ln_in, np(&a.xn), t)?;
+        self.attention(l, t, prefill)?;
+        self.norm(np(&a.h), true, &lw.ln_post, np(&a.xn), t)?;
         self.mlp(l, t, prefill)?;
-        ck(unsafe { glm_rmsnorm(st, np(&a.h), h as i64, np(&a.a), h as i64, np(&mx.sh_norm), np(&a.mhn), h as i64, t as i32,
-                                h as i32, cfg.rms_eps) }, "shared head norm")?;
+        self.norm(np(&a.h), true, &mx.sh_norm, np(&a.mhn), t)?;
+        if logits {
+            self.head_dev(np(&a.mhn), t)?;
+        }
+        Ok(())
+    }
+
+    fn mtp_core(&mut self, ids: &[u32], hsrc: Hidden, pos0: usize, logits: bool) -> Result<Option<Vec<u32>>> {
+        let t = ids.len();
+        self.mtp_pos = pos0;
+        self.stage(ids, pos0, true)?;
+        if t <= VERIFY_ROWS && self.graphs {
+            let key = GraphKey::Mtp { t, logits, hidden: hidden_code(hsrc), sampled: self.sampled };
+            self.replay(key, |e| e.mtp_dev(t, hsrc, logits))?;
+        } else {
+            self.mtp_dev(t, hsrc, logits)?;
+        }
         if !logits {
             return Ok(None);
         }
-        Ok(Some(self.head_argmax(np(&a.mhn), t)?))
+        Ok(Some(self.read_tokens(t)?))
+    }
+
+    /// Replay the graph for `key`, capturing it on first use: that first call runs `work`
+    /// eagerly (its results are the pass's), then records it for the next.
+    fn replay(&mut self, key: GraphKey, work: impl Fn(&Engine) -> Result<()>) -> Result<()> {
+        if let Some(g) = self.graphs_map.get(&key) {
+            return g.launch(&self.st).map_err(Into::into);
+        }
+        work(self)?;
+        self.st.begin_capture()?;
+        let recorded = work(self);
+        let g = self.st.end_capture();
+        recorded?;
+        self.graphs_map.insert(key, g?);
+        Ok(())
+    }
+}
+
+/// A sampled row's candidates from both ranks: each rank's (max, sum exp((z - max) / T)), its
+/// top CAND logits (ids global) and the smallest of them.
+#[derive(Clone, Debug, Default)]
+pub struct RowCands {
+    pub lse: Vec<(f32, f32)>,
+    pub vals: Vec<f32>,
+    pub ids: Vec<u32>,
+    pub min: Vec<f32>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum GraphKey {
+    /// decoder rows t, the whole pass
+    Target { t: usize, sampled: bool },
+    /// decoder rows t, one segment between hot-read points
+    Segment { t: usize, seg: usize, sampled: bool },
+    Mtp { t: usize, logits: bool, hidden: u8, sampled: bool },
+}
+
+fn hidden_code(h: Hidden) -> u8 {
+    match h {
+        Hidden::Last => 0,
+        Hidden::Mtp => 1,
+        Hidden::Target(f) => 2 + f as u8,
     }
 }
 
@@ -1023,6 +1271,10 @@ pub fn load_slots(pack: &Pack, arena: &Arena, items: &[(usize, usize, usize)]) -
 // ------------------------------------------------------------------ the engine's calls
 /// What a forward returns: each row's argmax (decode), or the last prompt row's.
 impl Engine {
+    pub(crate) fn mirror_msg(&mut self, msg: impl FnOnce(&mut tidelm_comm::Msg)) -> Result<()> {
+        self.mirror(msg)
+    }
+
     fn mirror(&mut self, msg: impl FnOnce(&mut tidelm_comm::Msg)) -> Result<()> {
         if self.rank == 0 {
             if let Some(p) = self.pair.as_mut() {
@@ -1055,10 +1307,28 @@ impl Engine {
         let h = self.cfg.hidden;
         let mtp = mtp_fill && self.cfg.mtp;
         if t <= MAX_ROWS {
-            self.upload_ids(ids, self.pos, false)?;
-            self.layers(t)?;
+            self.stage(ids, self.pos, false)?;
+            if t <= VERIFY_ROWS && self.graphs {
+                if self.hot.is_some() {
+                    self.hot_begin();
+                    let n = self.moe_layers.len();
+                    for seg in 0..=n {
+                        self.replay(GraphKey::Segment { t, seg, sampled: self.sampled }, |e| e.decode_segment(seg, t))?;
+                        if seg < n {
+                            self.hot_point(self.moe_layers[seg], t, seg, n)?;
+                        }
+                    }
+                    self.hot_release()?;
+                } else {
+                    let nseg = self.moe_layers.len() + 1;
+                    self.replay(GraphKey::Target { t, sampled: self.sampled }, |e| (0..nseg).try_for_each(|seg| e.decode_segment(seg, t)))?;
+                }
+            } else {
+                self.layers(t)?;
+                self.head_dev(np(&self.act.hn), t)?;
+            }
             self.last_rows = t;
-            let out = self.head_argmax(np(&self.act.hn), t)?;
+            let out = self.read_tokens(t)?;
             let p0 = self.pos;
             self.tokens.extend_from_slice(ids);
             self.pos += t;
@@ -1072,11 +1342,12 @@ impl Engine {
         while c0 < t {
             let n = self.opt.chunk.min(t - c0);
             let part = &ids[c0..c0 + n];
-            self.upload_ids(part, self.pos, false)?;
+            self.stage(part, self.pos, false)?;
             self.layers(n)?;
             self.last_rows = n;
             if c0 + n == t {
-                out = self.head_argmax(at(&self.act.hn, (n - 1) * h), 1)?;
+                self.head_dev(at(&self.act.hn, (n - 1) * h), 1)?;
+                out = self.read_tokens(1)?;
             }
             let p0 = self.pos;
             self.tokens.extend_from_slice(part);
@@ -1134,6 +1405,16 @@ impl Engine {
         Ok(())
     }
 
+    /// Forget the demand and miss counters so far (after a warm-up) on both ranks.
+    pub fn zero_demand(&mut self) -> Result<()> {
+        self.mirror(|m| {
+            m.u32(OP_ZERO_DEMAND);
+        })?;
+        self.demand.zero_async(&self.st)?;
+        self.miss.zero_async(&self.st)?;
+        Ok(())
+    }
+
     /// Rank 0: release rank 1's follow loop.
     pub fn stop_follower(&mut self) -> Result<()> {
         self.mirror(|m| {
@@ -1172,6 +1453,20 @@ impl Engine {
                     let n = r.u32()? as usize;
                     self.pos = n.min(self.pos);
                     self.tokens.truncate(self.pos);
+                }
+                OP_SAMPLING => {
+                    let (bits, on) = (r.u32()?, r.u32()? != 0);
+                    self.sampling_local(if on { Some(f32::from_bits(bits)) } else { None })?;
+                }
+                OP_FULL_ROW => {
+                    let row = r.u32()? as usize;
+                    self.full_row_local(row)?;
+                }
+                crate::adapt::OP_ADAPT => self.follow_adapt(&mut r)?,
+                crate::adapt::OP_BG => self.follow_bg(&mut r)?,
+                OP_ZERO_DEMAND => {
+                    self.demand.zero_async(&self.st)?;
+                    self.miss.zero_async(&self.st)?;
                 }
                 OP_EXIT => return Ok(()),
                 op => return Err(format!("rank 1: unknown op {op}").into()),

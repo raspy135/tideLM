@@ -6,6 +6,8 @@ license.workspace = true
 description = "OpenAI- and Anthropic-compatible HTTP routes for the Rust engines (server/app.py, server/muse_app.py)"
 
 [dependencies]
+tidelm-glm = { path = "../tidelm-glm" }
+tidelm-comm = { path = "../tidelm-comm" }
 tidelm-core = { path = "../tidelm-core" }
 tidelm-cuda = { path = "../tidelm-cuda" }
 tidelm-engine = { path = "../tidelm-engine" }

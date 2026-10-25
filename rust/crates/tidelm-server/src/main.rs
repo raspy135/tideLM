@@ -20,6 +20,7 @@
 
 mod anthropic;
 mod api;
+mod glm_main;
 mod glm;
 mod http;
 mod output;
@@ -72,6 +73,11 @@ pub struct Ctx {
 
 fn main() -> tidelm_engine::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(dir) = arg(&args, "--model-dir").map(PathBuf::from) {
+        if glm_main::is_glm(&dir) {
+            return glm_main::main(&args, dir);
+        }
+    }
     // an unknown flag is an error: a test flag the server ignores (--keep-first once) loaded
     // every expert and ran the box out of memory
     const VALUED: [&str; 32] = ["--swa-replay", "--copy-draft", "--bench-width", "--vision", "--model-dir", "--max-seq", "--lanes", "--depth", "--step-rows", "--keep-db", "--budget",

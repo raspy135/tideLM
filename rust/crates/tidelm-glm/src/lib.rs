@@ -2,10 +2,12 @@
 //! MLA with the DSA indexer, the KV cache split by position across the pair, routed experts from
 //! a per-rank arena), its MTP layer, and the serving loop around them. No Python anywhere.
 
+pub mod adapt;
 pub mod arena;
 pub mod config;
 pub mod forward;
 pub mod residency;
+pub mod serve;
 pub mod weights;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;

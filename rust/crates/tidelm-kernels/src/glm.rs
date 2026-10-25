@@ -66,4 +66,6 @@ extern "C" {
                                s: *mut c_void) -> c_int;
     pub fn glm_dup_rows(stream: CudaStream, x: *const c_void, ldx: i64, out: *mut c_void, t: c_int, k: c_int,
                         g: c_int) -> c_int;
+    pub fn glm_row_lse(stream: CudaStream, x: *const c_void, ldx: i64, m: c_int, n: c_int, temp: *const c_void,
+                       out: *mut c_void, ldo: i64) -> c_int;
 }
