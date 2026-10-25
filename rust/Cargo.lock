@@ -1134,6 +1134,7 @@ version = "0.1.0"
 dependencies = [
  "tidelm-core",
  "tidelm-cuda",
+ "tidelm-model",
 ]
 
 [[package]]
@@ -1150,6 +1151,7 @@ name = "tidelm-server"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "sha2",
  "tidelm-core",
  "tidelm-cuda",
  "tidelm-engine",

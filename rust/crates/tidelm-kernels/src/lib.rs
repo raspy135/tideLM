@@ -16,7 +16,10 @@
 //! ABI means a kernel change on the Python side is a build change here, never a silent
 //! semantic drift.
 
+pub mod blas;
 pub mod ds41;
+pub mod exl3;
+pub mod glm;
 pub mod vision;
 
 use std::os::raw::{c_int, c_void};

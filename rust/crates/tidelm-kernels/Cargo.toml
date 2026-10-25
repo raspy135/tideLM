@@ -11,3 +11,4 @@ build = "build.rs"
 [dev-dependencies]
 tidelm-core = { path = "../tidelm-core" }
 tidelm-cuda = { path = "../tidelm-cuda" }
+tidelm-model = { path = "../tidelm-model" }

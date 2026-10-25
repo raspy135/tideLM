@@ -30,8 +30,12 @@ fn main() {
     let engram_src = repo.join("engine/engram_gather.cpp");
     let ds41_src = manifest.join("cuda/ds41.cu");
     let vision_src = manifest.join("cuda/vision.cu");
+    let glm_src = manifest.join("cuda/glm.cu");
+    let exl3_src = repo.join("tools/exl3_moe_cuda.cu");
     println!("cargo:rerun-if-changed={}", ds41_src.display());
     println!("cargo:rerun-if-changed={}", vision_src.display());
+    println!("cargo:rerun-if-changed={}", glm_src.display());
+    println!("cargo:rerun-if-changed={}", exl3_src.display());
     println!("cargo:rerun-if-changed={}", fp4_src.display());
     println!("cargo:rerun-if-changed={}", engram_src.display());
     println!("cargo:rerun-if-env-changed=TIDELM_CUDA_ARCH");
@@ -91,6 +95,26 @@ fn main() {
         vision_obj.to_str().unwrap(),
     ]));
 
+    // GLM-5.3: the engine's own kernels, and the EXL3 trellis kernels exactly as
+    // tools/exl3_moe_cuda.py::_library builds them (no tuning defines)
+    let mut objs = vec![];
+    for (src, name) in [(&glm_src, "glm.o"), (&exl3_src, "exl3_moe_cuda.o")] {
+        let obj = out.join(name);
+        run(Command::new(&nvcc).args([
+            "-std=c++17",
+            "-O3",
+            "-DNDEBUG",
+            "-Xcompiler=-fPIC",
+            "-c",
+            "-gencode",
+            &format!("arch=compute_{arch},code=sm_{arch}"),
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]));
+        objs.push(obj);
+    }
+
     let engram_obj = out.join("engram_gather.o");
     run(Command::new("g++").args([
         "-std=c++17",
@@ -113,6 +137,8 @@ fn main() {
         ds41_obj.to_str().unwrap(),
         vision_obj.to_str().unwrap(),
         engram_obj.to_str().unwrap(),
+        objs[0].to_str().unwrap(),
+        objs[1].to_str().unwrap(),
     ]));
 
     println!("cargo:rustc-link-search=native={}", out.display());
