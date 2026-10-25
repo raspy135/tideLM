@@ -4,8 +4,8 @@ Runs the corpus through the TP2 engine with misses streamed (GLM_MISS=stream: ev
 the router's own), records every layer's top-8 and router weights, and writes (rank 0):
 
   stats.json      per (layer, expert): picks and router-weight mass, overall and per category;
-                  distinct experts per block of b consecutive tokens (b = 1, 2, 4, 6, 8), the
-                  multiplier a b-row verify step pays in expert reads;
+                  distinct experts per block of b consecutive tokens (b = 1 ... 32), overall and
+                  per category, the multiplier a b-row verify step pays in expert reads;
                   miss rate and missed mass against resident fraction, ranked on even documents
                   and measured on odd ones (global ranking by mass across layers).
   resident-<N>.json  the top-N experts by mass, for GLM_RESIDENT at an N-slot budget.
@@ -74,7 +74,10 @@ def main():
     picks = torch.zeros(2, L, E, dtype=torch.float64)       # [even/odd doc, layer, expert]
     mass = torch.zeros(2, L, E, dtype=torch.float64)
     by_cat = defaultdict(lambda: torch.zeros(L, E, dtype=torch.float64))
-    blocks = {b: [0.0, 0] for b in (1, 2, 4, 6, 8)}
+    # 16 and 32: a copy-mode verify (prompt-lookup drafts) is as wide as the copy is long.
+    sizes = (1, 2, 4, 6, 8, 9, 16, 32)
+    blocks = {b: [0.0, 0] for b in sizes}
+    cat_blocks = defaultdict(lambda: {b: [0.0, 0] for b in sizes})
     t0 = time.perf_counter()
     n_tok = 0
     for i, (cat, text) in enumerate(docs):
@@ -106,8 +109,9 @@ def main():
                 if n:
                     blk = ids_l[:n * b].reshape(n, b * k)
                     distinct = torch.tensor([len(set(r.tolist())) for r in blk], dtype=torch.float64)
-                    blocks[b][0] += float(distinct.sum())
-                    blocks[b][1] += n
+                    for acc in (blocks[b], cat_blocks[cat][b]):
+                        acc[0] += float(distinct.sum())
+                        acc[1] += n
         if eng.rank == 0:
             el = time.perf_counter() - t0
             print(f"[trace] doc {i + 1}/{len(docs)} {cat} {len(ids)} tok, {n_tok / el:.1f} tok/s, "
@@ -134,6 +138,8 @@ def main():
              "distinct_experts_per_block": distinct,
              "verify_expert_multiplier": {b: (d / distinct[1] if d and distinct[1] else None)
                                           for b, d in distinct.items()},
+             "distinct_experts_per_block_by_category": {
+                 c: {b: (v[0] / v[1] if v[1] else None) for b, v in bl.items()} for c, bl in cat_blocks.items()},
              "miss_curve_heldout": curve,
              "mass": total_mass.tolist(), "picks": picks.sum(0).tolist(),
              "by_category": {c: v.tolist() for c, v in by_cat.items()},
@@ -149,7 +155,8 @@ def main():
             {"resident": {str(l): sorted(v) for l, v in sorted(resident.items())},
              "source": str(out / "stats.json"), "budget": budget}))
     print(json.dumps({k: stats[k] for k in ("docs", "tokens", "distinct_experts_per_block",
-                                            "verify_expert_multiplier", "miss_curve_heldout",
+                                            "verify_expert_multiplier",
+                                            "distinct_experts_per_block_by_category", "miss_curve_heldout",
                                             "stream_loads", "seconds")}, indent=1), flush=True)
     print(f"[trace] wrote {out}", flush=True)
 

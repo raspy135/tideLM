@@ -4281,3 +4281,117 @@ proposals the same way), which is unbuilt and unmeasured.
 
 Artifacts: `results/expert-topp85-20261023/` (`ab-fp4.json/rank{0,1}.json`, gate logs).
 
+## Copy rounds pay on GLM, where verify width is already 8 and MTP drafting is the cost (2026-10-23)
+
+The DS lookup drafter lost (2026-10-21) because its copies were capped at the depth policy's 3/5
+while DSpark already drafted ~5.6 on the same text. Claude Code transcripts (16 sessions, 2.55M
+visible output tokens, prompt lookup replayed offline) changed the case: 34% of agent output sits
+in exact copy runs >= 8 tokens, 26% >= 16 -- Bash (66% of output: re-run commands, scripts) and
+Edit quotes; prose almost never copies. On DS a deeper copy needs a 10-row verify (+34% a step
+measured, near break-even), so it was not built. GLM verifies 8 rows already and its MTP drafts 7
+sequential passes, so `GLM_LOOKUP=8` (copy the continuation once 8 tokens match, rank 0 decides,
+one gather a round) costs no verify width and skips the drafting.
+
+`tools/bench_glm_lookup.py`, one boot, greedy, off/on/off/on, 256 tokens:
+
+| prompt | tok/s off | on | tokens/round off | on | copy rounds |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| rewrite a 200-line file | 27.8 | 33.8 | 5.95 | 6.89 | 30/37, 6.9 of 7 accepted |
+| re-run a tool call, one flag changed | 25.3 | 33.2 | 6.2 | 6.35 | 14/20 |
+| prose | 13.3 | 14.2 | 1.56 | 1.65 | 0 |
+
+Read against the prose row: no copy round ran there, so its +6% is warm-up drift (each "on" ran
+after an "off"; the first tool_repeat "off" was the process's first config, 19.4). Net: file
+rewrites ~+9%, tool re-runs ~+2% (MTP copies a visible command as well as lookup does; only the
+draft passes are saved). Greedy outputs matched wherever the off/off pair did. Threshold 8 was
+chosen from the transcript replay (estimated optimum flat between 6 and 12; 4 breaks early), not
+swept on the engine. Artifacts: `results/copy-verify-20261023/lookup.json` (local).
+
+## The MTP gate reads a number that is not acceptance; calibrating it is +3% offline (2026-10-23)
+
+`GLM_MTP_DYN=tau` stops a draft chain when the MTP's own chain probability -- the product of its
+drafted tokens' probabilities -- falls below tau. That product is not the acceptance it claims to
+be. Over the 545 recorded rounds of `results/glm-dyn/cal1.json` (five texts, temperature 1.0,
+always drafting 7, 2026-10-19), by draft position:
+
+| stated chain prob | <0.2 | 0.2-0.4 | 0.4-0.6 | 0.6-0.7 | 0.7-0.8 | 0.8-0.9 | 0.9-0.95 | >=0.95 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| draft 1 actual | 0.35 | 0.68 | 0.52 | 0.48 | 0.49 | 0.74 | 0.78 | 0.95 |
+| draft 2 actual | 0.10 | 0.29 | 0.42 | 0.54 | 0.35 | 0.69 | 0.59 | 0.83 |
+| draft 3 actual | 0.08 | 0.19 | 0.28 | 0.28 | 0.35 | 0.55 | 0.74 | 0.76 |
+| draft 4 actual | 0.06 | 0.10 | 0.22 | 0.34 | 0.37 | 0.38 | 0.67 | 0.65 |
+
+A stated 0.5 at draft 3 is accepted in the prefix 0.28 of the time, and the profile's 0.9 is the
+price of that error, not of the depth: it stops at 1.15-1.2 drafts a round.
+
+What a verify row is worth is the *marginal* acceptance, P(the prefix reaches and accepts this
+draft), and it is worth keeping while that beats the row's share of the round:
+(row + draft) ms over the round's ms a token = 26.5/73 = 0.36 at 12-14 tok/s with the measured
+22 ms row. So `GLM_MTP_CAL=tau` (`engine/glm/mtp_cal.py`) looks the acceptance up instead: a table
+of measured acceptance by draft position and stated chain probability, shipped from the counts
+above and updated from every round the gate reaches (rank 0, which drafts and decides; warm-up's
+synthetic text does not teach it).
+
+Replayed over the same records, table fitted leave-one-prompt-out, cost model 95 ms fixed + 22 ms
+a row + 4.5 ms a draft (`tools`-free: `engine/glm/test_mtp_cal.py` scores it, and reproduces the
+flat gate's own sweep):
+
+| gate | modelled tok/s |
+| --- | ---: |
+| flat stated 0.9 (this profile, `GLM_MTP_DYN=0.9`) | 13.22 |
+| flat stated 0.8 | 13.63 |
+| flat stated 0.5 | 13.65 |
+| **calibrated 0.36** | **14.03** |
+| calibrated 0.25 / 0.5 | 13.88 / 13.96 |
+| oracle (drafts only what gets accepted) | 16.86 |
+
++3.0% over the best flat gate and +6.1% over the shipped one, and the optimum is where the
+break-even says it should be. Flat from 0.25 to 0.5, so the threshold is not delicate.
+
+Not adopted yet, and off by default: it changes which drafts are made and with them the text a
+sampled reply follows. **It has not been A/B'd on the box** -- the number above is a model on
+recorded rounds, not a serving measurement. `GLM_MTP_CAL` overrides `GLM_MTP_DYN`; both are now in
+the boot agreement (`mtp_gate`), and the gate is in the code digest. Per-request evidence arrives
+in `x_engine_stats.mtp_cal` (`[accepted, seen]` a draft position). What is left on the table is
+the estimator itself: the same stated confidence spans rates 2-3x apart, so the oracle's +27%
+needs a signal other than the drafter's own probabilities -- `docs/decode-dynamic-depth.md`
+reached the same limit for DSpark's confidence head.
+
+### On the box, the ladder loses and the calibrated gate is already where the break-even is (2026-10-23)
+
+`bench/bench.py`, two Sparks, the shipped profile (12,500 residents, 256K FP8, split cache,
+`GLM_LOOKUP=8`), temperature 0.6, seed 42, the same prompts in every arm (same label salt), three
+measured runs after one warmup, the demand DB restored to one snapshot before every boot
+(`results/glm-stats/db.ab-base.pt`), one boot an arm:
+
+| gate | code tok/s | code drafts / accepted | prose tok/s | prose drafts / accepted |
+| --- | ---: | ---: | ---: | ---: |
+| flat stated 0.9 (shipped) | 19.60 | 3.27 / 2.38 | 15.10 | 1.74 / 0.99 |
+| `GLM_MTP_CAL=0.36` | 20.24, 20.22 | 3.42 / 2.52 | 15.31 | 1.73 / 1.05 |
+| `GLM_MTP_LADDER=0.7,0.5,0.2,0.1,0.05` | 17.86 | 5.66 / 2.86 | 13.29 | 4.28 / 1.25 |
+
+The ladder is the user-facing idea (lower the bar with depth instead of re-scaling the reading) and
+it is the worst of the three: -10% on code, -12% on prose. The ladder arm is also the only one that
+reaches every position, so it measured the whole acceptance curve on the box:
+
+| draft position | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| code | 0.87 | 0.75 | 0.61 | 0.45 | 0.31 | 0.23 | 0.19 |
+| prose | 0.78 | 0.50 | 0.21 | 0.10 | 0.05 | 0.02 | 0.01 |
+
+At these rounds a verify row costs 26.5 ms against 50-56 ms a token on code and 65-75 on prose, so
+the break-even acceptance is 0.50 and 0.38: depth 3 on code, depth 2 on prose. The flat 0.9 gate
+keeps 3.3 and 1.7 -- **already at the break-even on both workloads** -- which is why the calibrated
+gate, which keeps about the same counts, only moves code (+0.14 accepted a round, +3%, the offline
+model's +3%) and leaves prose alone. The ladder keeps 5.7 and 4.3 rows at 0.2-0.45 and 0.05-0.2,
+i.e. it drafts where the row is worth 4-17 tok/s in a 18-15 tok/s round.
+
+Read against the T=1.0 calibration set above: there the flat 0.9 stopped at 1.2 drafts, and that is
+where "the gate is too strict" came from. On the benchmark workloads it does not. `GLM_MTP_CAL=0.36`
+is now the `glm53-exl3` profile's setting, on that +3% and on a 10-12% loss for the ladder;
+`GLM_MTP_LADDER` stays empty -- it is kept only as the measured-worse alternative its A/B needs.
+Artifacts: `results/mtp-cal-20261023/` (`A*`-calibrated, `B*`-flat, `C*`-ladder).
+
+One boot an arm is not proof, and this run is a reminder: the first calibrated boot (before the
+other arms) measured code 18.4 tok/s at 2.3 drafts a round; two runs on a second boot of the same
+arm both agreed at 20.2. The 18.4 is unexplained and is why the calibrated row has two numbers.

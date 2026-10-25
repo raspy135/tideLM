@@ -473,9 +473,34 @@ class GlmTP:
         self.two_passed = False
         self.mtp_fill = True
         self.spec_stats = {"rounds": 0, "accepted": 0}
+        # GLM_LOOKUP=n: a round whose last n tokens (prompt and output) occurred earlier, with a full
+        # round's worth of tokens after them, verifies that continuation instead of MTP drafts: same
+        # rows, no draft passes. 8 from Claude Code transcripts: 24% of agent output sits in exact
+        # copies past 8 matched tokens (repeated tool calls, Edit quotes); prose almost never
+        # copies (docs/gotchas.md 2026-10-23). 0: off.
+        self.lookup_n = int(env("GLM_LOOKUP", "0"))
         self.spec_cal = None            # [(draft index, confidence product, accepted)] when a tool asks
         self.spec_cal_overlap = False   # sampled rounds: also each draft's overlap with the target
         self.mtp_dyn = float(env("GLM_MTP_DYN", "0"))
+        # GLM_MTP_CAL=tau: stop the draft chain on the *calibrated* acceptance (engine/glm/
+        # mtp_cal.py) instead of the MTP's own chain probability. The stated product is optimistic
+        # by up to 3x at depth, so the flat gate answers with 0.9 and stops at ~1.2 drafts; the
+        # calibrated reading puts the threshold back at a verify row's break-even (~0.36). Off by
+        # default: drafts change the text a sampled reply follows, and the A/B is still missing.
+        self.mtp_cal = None
+        mtp_cal = float(env("GLM_MTP_CAL", "0"))
+        ladder = env("GLM_MTP_LADDER", "").strip()
+        if self.mtp_on and (ladder or mtp_cal > 0):
+            from .mtp_cal import CalibratedGate, LadderGate
+            if ladder:
+                self.mtp_cal = LadderGate(ladder)
+                self.log(f"[glm] MTP gate: ladder {ladder}"
+                         + (f" (GLM_MTP_CAL={mtp_cal:g}, GLM_MTP_DYN={self.mtp_dyn:g} unused)"
+                            if mtp_cal or self.mtp_dyn else ""))
+            else:
+                self.mtp_cal = CalibratedGate(mtp_cal, prior=env("GLM_MTP_CAL_PRIOR", "1") == "1")
+                self.log(f"[glm] MTP gate: calibrated, tau {mtp_cal:g}"
+                         + (f" (GLM_MTP_DYN={self.mtp_dyn:g} unused)" if self.mtp_dyn else ""))
         self.mtp_graph_rows = 1
         if self.mtp_on and self.x3 is not None and int(env("GLM_MTP_DEPTH", "3")) > 7:
             # exl3.routed's graph-safe decode path takes <= 64 picks (8 rows x top-8); a deeper
@@ -548,7 +573,8 @@ class GlmTP:
                                           "index_kernel.py", "exl3.py", "sparse_attn.py",
                                           "norm_kernel.py", "direct_io.py", "mxfp4_dense.py", "exl3_attn.py",
                                           "kv_split.py", "prefix_store.py", "kvb_fp8.py", "kv_fp4.py",
-                                          "route_kernel.py", "rope_kernel.py", "index_bounds.py", "exl3_model.py"))).hexdigest()[:16]
+                                          "route_kernel.py", "rope_kernel.py", "index_bounds.py", "exl3_model.py",
+                                          "mtp_cal.py"))).hexdigest()[:16]
         self.code_digest = digest
         # The EXL3 MoE kernels live outside engine/glm/ (tools/exl3_moe_cuda.cu) and are JIT-built
         # per node: a stale rsync would run different kernels and emit different tokens with
@@ -564,6 +590,8 @@ class GlmTP:
                 "prefill_moe": self.prefill_moe, "graphs": self.use_graphs, "max_seq": self.max_seq,
                 "chunk": self.chunk, "slots": self.slots_resident, "transient": transient, "mtp": self.mtp_on,
                 "head": env("GLM_HEAD", "exl3" if self.exl3_checkpoint else "bf16"), "depth": env("GLM_MTP_DEPTH", "3"), "db": env("GLM_STATS_DB", ""),
+                "mtp_gate": [env("GLM_MTP_DYN", "0"), env("GLM_MTP_CAL", "0"), env("GLM_MTP_CAL_PRIOR", "1"),
+                             env("GLM_MTP_LADDER", "")],
                 "xfmt": self.xfmt, "kv": env("GLM_KV", "bf16"), "kv_fp8_layers": self.kv_fp8_layers, "index_kernel": self.index_kernel, "gather_merge": self.gather_merge, "attn_kernel": self.attn_kernel, "fused_norm": FUSED_NORM, "h_ring": self.h_ring_n, "fixed_dense": self.fixed_dense, "exl3_attn": self.exl3_attn, "kv_split": self.kv_split, "prefix_disk": env("GLM_PREFIX_DISK", "0"), "kvb_fp8": self.kvb_fp8, "embed_q": self.embed_q, "router_bf16": self.router_bf16, "draft_head": env("GLM_DRAFT_HEAD", "same"), "x3pack_dims": self.x3pack.reader.header.get("dims") if self.x3pack else None,
                 "fuse_qkv_a": self.fuse_qkv_a, "prefill_reduce": self.prefill_reduce, "dense_causal": self.dense_causal,
                 "index_buckets": self.index_buckets,
@@ -578,7 +606,7 @@ class GlmTP:
                                             "GLM_HOT_TARGET", "GLM_HOT_KEEP", "GLM_HOT_MAX", "GLM_HOT_KEEP_AUDIT", "GLM_HOT_PACE",
                                             "GLM_HOT_PACE_LEAD", "GLM_SUB_WEIGHT", "GLM_MTP_FULL", "GLM_MISS_LOG",
                                             "GLM_MTP_DYN", "GLM_ROUTE_KERNEL", "GLM_LOOP_GUARD", "GLM_LOOP_EXACT", "GLM_LOOP_READS",
-                                            "GLM_LOOP_BREAK", "GLM_HOT_ASYNC", "GLM_KV4_PREFILL")],
+                                            "GLM_LOOP_BREAK", "GLM_HOT_ASYNC", "GLM_KV4_PREFILL", "GLM_LOOKUP")],
                 "adapt": [env(k, "") for k in ("GLM_ADAPT", "GLM_ADAPT_EVERY", "GLM_ADAPT_PREFILL_SWAPS",
                                                "GLM_ADAPT_DECODE_SWAPS", "GLM_ADAPT_DECAY", "GLM_ADAPT_CROSS_LAYER",
                                                "GLM_ADAPT_MARGIN", "GLM_BG", "GLM_BG_EVERY", "GLM_BG_READS", "GLM_PREFILL_TWO_PASS",
@@ -1368,7 +1396,9 @@ class GlmTP:
                 "loops": h.get("loop_guards", 0), "breaks": h.get("loop_breaks", 0),
                 "swaps": self.adapt_totals["swaps"] if self.demand is not None else 0, "tokens": len(self.tokens),
                 "rounds": self.spec_stats.get("rounds", 0), "accepted": self.spec_stats.get("accepted", 0),
-                "drafted": self.spec_stats.get("drafted", 0)}
+                "drafted": self.spec_stats.get("drafted", 0),
+                "mtp_cal": self.mtp_cal.rates() if self.mtp_cal is not None else None,
+                **{k: self.spec_stats.get(k, 0) for k in ("copy_rounds", "copy_accepted")}}
 
     @staticmethod
     def request_stats(s0, s1, s2):
@@ -1385,7 +1415,16 @@ class GlmTP:
                 "hot_per_tok": round((s2["hot"] - s1["hot"]) / max(1, s2.get("tokens", 0) - s1.get("tokens", 0)), 2),
                 "swaps": s2["swaps"] - s0["swaps"],
                 "drafted_per_round": round((s2["drafted"] - s1["drafted"]) / max(1, s2["rounds"] - s1["rounds"]), 2),
-                "accepted_per_round": round((s2["accepted"] - s1["accepted"]) / max(1, s2["rounds"] - s1["rounds"]), 2)}
+                "accepted_per_round": round((s2["accepted"] - s1["accepted"]) / max(1, s2["rounds"] - s1["rounds"]), 2),
+                **({"copy_rounds": s2["copy_rounds"] - s1["copy_rounds"],
+                    "copy_accepted_per_round": round((s2["copy_accepted"] - s1["copy_accepted"])
+                                                     / (s2["copy_rounds"] - s1["copy_rounds"]), 2)}
+                   if s2.get("copy_rounds", 0) - s1.get("copy_rounds", 0) else {}),
+                # GLM_MTP_CAL: what this request taught the gate, [accepted, seen] a draft position.
+                **(({"mtp_cal": {k: [a2 - s1["mtp_cal"].get(k, [0, 0])[0], n2 - s1["mtp_cal"].get(k, [0, 0])[1]]
+                                 for k, (a2, n2) in s2["mtp_cal"].items()
+                                 if n2 > s1["mtp_cal"].get(k, [0, 0])[1]}})
+                   if s2.get("mtp_cal") and s1.get("mtp_cal") else {})}
 
     def miss_totals(self):
         """miss_stats with the graph replays' device counts folded in."""
@@ -2550,8 +2589,15 @@ class GlmTP:
             self.adapt_log.append(("prefill", n, round(sec, 2), self.last_churn))
         spec = self.mtp_on and depth > 0
         self.mtp_fill = not spec
+        # A calibrated gate (GLM_MTP_CAL) decides per round like the dynamic one, so it needs the
+        # same set of verify widths captured ahead of time.
+        gate_on = bool(dyn) or self.mtp_cal is not None
         if spec:
-            self.graph_rows |= set(range(1, depth + 2)) if dyn else {depth + 1}
+            self.graph_rows |= set(range(1, depth + 2)) if gate_on else {depth + 1}
+        lookup, synced = None, 0
+        if spec and self.lookup_n and self.rank == 0:
+            from engine.lookup_draft import ExactDraftCache
+            lookup = ExactDraftCache(list(prompt), self.lookup_n)
         emitted = 0
         decide = self._decide
         anchor = decide(self.sample(logits[-1], temperature, top_p, top_k, gen) if self.rank == 0 else None)
@@ -2600,11 +2646,29 @@ class GlmTP:
             # Under GLM_MTP_DYN rank 0 decides whether each draft is kept (and which it is), so
             # both ranks run the same MTP calls and verify the same rows.
             drafts, qs, confs, conf, sig, zs = [], [], [], 1.0, [], []
-            hm, z = self.mtp_forward(torch.tensor([anchor], device=self.dev), h_last, P - 1)
-            for k in range(depth):
+            pending = []                           # (position, stated conf) the gate must learn from
+            copy = None
+            if self.lookup_n:
+                # GLM_LOOKUP: rank 0 looks the round up; both ranks enter this one gather.
+                prop = None
+                if lookup is not None:
+                    lookup.extend(out[synced:])
+                    synced = len(out)
+                    prop = lookup.propose(depth)
+                v = decide([1, *prop] if prop else [0] * (depth + 1), depth + 1)
+                if v[0]:
+                    copy = v[1:]
+            if copy is not None:
+                # The MTP cache still needs position P-1 (the drafting call writes it otherwise);
+                # the accepted rows are filled after the verify as usual.
+                drafts = copy
+                self.mtp_forward(torch.tensor([anchor], device=self.dev), h_last, P - 1, logits=False)
+            else:
+                hm, z = self.mtp_forward(torch.tensor([anchor], device=self.dev), h_last, P - 1)
+            for k in range(0 if copy is not None else depth):
                 q, p = None, 1.0
                 if temperature <= 0:
-                    if dyn:
+                    if gate_on:
                         zl = z[-1].float()
                         p, d = torch.stack([(zl.max() - torch.logsumexp(zl, 0)).exp(), zl.argmax().float()]).tolist()
                         d = int(d)
@@ -2620,15 +2684,24 @@ class GlmTP:
                         sig.append((p, pm))
                         if self.spec_cal_overlap:
                             zs.append(z[-1].float().clone())
-                    elif dyn and self.rank == 0:
+                    elif gate_on and self.rank == 0:
                         p = float(q[d])
-                    if not dyn:
+                    if not gate_on:
                         d = decide(d)
-                if dyn:
+                if gate_on:
                     conf *= p
-                    keep, d = decide([conf >= dyn, d], 2)
+                    if self.mtp_cal is not None:
+                        # The gate is rank 0's, like every other speculative decision: rank 1's
+                        # copy is only there so `gate_on` and the boot line agree, and its own
+                        # counts are never consulted (rank 0's `keep` arrives over `decide`).
+                        keep = self.mtp_cal.keep(k, conf) if self.rank == 0 else True
+                    else:
+                        keep = conf >= dyn
+                    keep, d = decide([keep, d], 2)
                     if not keep:
                         break
+                    if self.mtp_cal is not None:
+                        pending.append((k, conf))
                 qs.append(q)
                 drafts.append(d)
                 confs.append(conf)
@@ -2640,6 +2713,11 @@ class GlmTP:
             th = self.last_hidden                                    # [nd+1, H]
             decision = None
             if self.rank == 0:
+                if copy is not None and temperature > 0:
+                    # A copied draft's proposal is a point mass: accepted with the target's own
+                    # probability, and a rejection resamples the target without it -- exact.
+                    qs = [torch.zeros(tl.shape[-1], device=self.dev).index_fill_(
+                        0, torch.tensor([d], device=self.dev), 1.0) for d in drafts]
                 n_acc, nxt = nd, None
                 for k in range(nd):
                     if temperature <= 0:
@@ -2675,11 +2753,22 @@ class GlmTP:
                                 alt[T] = float(torch.minimum(pk, qT).sum())
                             ov[k] = (float(torch.minimum(pk, qs[k]).sum()), alt)
             n_acc, nxt = decide(decision, 2)
+            # The gate learns from what the verifier accepted. Rank 0 holds the table: its `conf`
+            # is the stated chain probability on both the greedy and the sampled path, while rank
+            # 1's stays 1.0 on the sampled one (it never drew a token). Warm-up's synthetic text
+            # (a repeating pattern, then noise) is not what the table is for, and copies draft
+            # nothing, so neither teaches it.
+            if self.mtp_cal is not None and self.rank == 0 and copy is None and not self._warming:
+                for k, c in pending:
+                    self.mtp_cal.observe(k, c, k < n_acc)
             z_anchor = tl[n_acc]                  # nxt came from the first rejected row, or after the last
             self.spec_stats["rounds"] += 1
             self.spec_stats["accepted"] += n_acc
             self.spec_stats["drafted"] = self.spec_stats.get("drafted", 0) + nd
-            if self.spec_cal is not None and dyn and self.rank == 0:
+            if copy is not None:
+                self.spec_stats["copy_rounds"] = self.spec_stats.get("copy_rounds", 0) + 1
+                self.spec_stats["copy_accepted"] = self.spec_stats.get("copy_accepted", 0) + n_acc
+            if self.spec_cal is not None and dyn and self.rank == 0 and copy is None:
                 if temperature > 0:
                     self.spec_cal.extend((k, c, k < n_acc, sig[k][0], sig[k][1], *(ov[k] if isinstance(ov[k], tuple) else (ov[k],)))
                                          for k, c in enumerate(confs))
