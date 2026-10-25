@@ -376,6 +376,33 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
   filler rows also sit (its ring's last slot), so an excerpt never touches a lane's restored
   rows.
 
+  Image inputs are in (2026-10-24), the profile's DSV41_VISION=1 / VISION_MODE=peer (`--vision 0`
+  turns them off). The server decodes and preprocesses as the checkpoint's image_processor.py
+  does (crates/tidelm-image: PNG, JPEG through libjpeg-turbo - Pillow's library - GIF's first
+  frame, WebP; Pillow's integer bicubic in ImageOps.pad; the bf16 normalization), and expands
+  each placeholder into its span. Rank 1 holds the tower (0.97 GB) and sends rank 0 the
+  aligner rows over the control channel; both splice them, with the three learned delimiters,
+  into the embedding, route the span with ffn.gate.bias_vl in all 40 layers (the reference's
+  choice: the Python engine's decoder replay routes up to 125 tail positions of a span with the
+  text bias in layers 21-39), and keep engram off it (dead n-gram positions, gate skipped). A
+  step with image rows runs eager. The prefix cache keys an image's positions by a digest of its
+  patches, so a prompt reuses a span only with the same image. An http(s) URL is fetched (30 s,
+  64 MB); a local path, which the Python reader opens, is refused.
+  - preprocessing: 12 images (PNG RGB / RGBA / palette / gray / 16-bit gray, JPEG 4:2:0 / 4:2:2 /
+    4:4:4 / gray, GIF, WebP; upscaled, padded, tall) give Pillow's patches bit for bit
+    (tests/pillow holds 10 of them)
+  - the tower (vision.cu: a flash attention for the 16 x 64 heads, 2D RoPE, the epilogues;
+    ds41's tensor-core GEMMs), against an fp32 run of the same weights on a 640 x 480 image:
+    4.53% relative error and 0.99898 mean row cosine, where PyTorch's bf16 tower has 4.75% and
+    0.99887 (the two bf16 towers differ from each other by 2.7%: summation order, grown over 32
+    blocks of large activations; the patch embedding is bit-equal). 0.115 s at 1,610 patches
+    (Python 0.055) and 0.487 s at 8,418 (Python 0.471)
+  - the pair: the 640 x 480 image's text ("TIDE 42 vision"), shapes and colors read back;
+    first token 0.84 s for its 227-token prompt, 1.59 s for a 1920 x 1080 image's 989; the same
+    request again restores 226 of 227 tokens (0.06 s); the same grid with other pixels restores
+    none. The first image prompt missed 30% of its expert picks with residents fitted to text
+    (the boundary pass then moved 311 experts).
+
   Still missing, in order of what the numbers above say (prefill at large chunks is in: M5,
   8K first token 27.3 -> 6.76 s):
   1. With speculation the pair's logits digest no longer equals one box's (4 layers, prose
@@ -384,8 +411,9 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
      one box is not yet found.
   2. The lossless packed verify head (DSV41_HEAD_KERNEL=packed, 2.94 -> 2.25 ms/step in
      Python), the sharded head's argmax without gathering logits (`ds_argmax_bf16_pairs` /
-     `_combine` are in, unused), the server's images and Anthropic routes. (Tool calls are in: the checkpoint's encoding.py ported whole, DSML
-     calls parsed strictly then tolerantly, as server/app.py does; its tool grammar is off in the profile.)
+     `_combine` are in, unused), the server's Anthropic routes. (Tool calls are in: the checkpoint's encoding.py ported whole, DSML
+     calls parsed strictly then tolerantly, as server/app.py does; its tool grammar is off in the profile.
+     Images are in: below.)
 
 ## Rules carried over from the Python engine
 

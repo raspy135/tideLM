@@ -16,6 +16,7 @@ pub mod keep;
 pub mod pair;
 pub mod prefix_disk;
 pub mod rope;
+pub mod vision;
 pub mod weights;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;

@@ -9,6 +9,7 @@ members = [
     "crates/tidelm-engine",
     "crates/tidelm-comm",
     "crates/tidelm-server",
+    "crates/tidelm-image",
 ]
 
 [workspace.package]

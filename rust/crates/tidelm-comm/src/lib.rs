@@ -168,6 +168,15 @@ impl Msg {
         }
         self
     }
+    /// u16 values (bf16 rows): a u64 count, then the values
+    pub fn u16s(&mut self, v: &[u16]) -> &mut Self {
+        self.u64(v.len() as u64);
+        self.0.reserve(v.len() * 2);
+        for &x in v {
+            self.0.extend_from_slice(&x.to_le_bytes());
+        }
+        self
+    }
 }
 
 pub struct Reader<'a> {
@@ -192,5 +201,11 @@ impl<'a> Reader<'a> {
     pub fn u32s(&mut self) -> Result<Vec<u32>> {
         let n = self.u32()? as usize;
         (0..n).map(|_| self.u32()).collect()
+    }
+    pub fn u16s(&mut self) -> Result<Vec<u16>> {
+        let n = self.u64()? as usize;
+        let b = self.buf.get(self.at..self.at + 2 * n).ok_or("control message truncated")?;
+        self.at += 2 * n;
+        Ok(b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
     }
 }

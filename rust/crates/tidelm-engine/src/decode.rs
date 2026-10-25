@@ -436,13 +436,15 @@ pub struct SchedOptions {
 }
 
 /// Why a request ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Finish {
     /// a stop token
     Stop,
     /// max_tokens
     Length,
     Cancelled,
+    /// it could not start (its images could not be encoded): why
+    Error(String),
 }
 
 /// What the scheduler reports to a request's sink, on the engine's thread.
@@ -461,6 +463,12 @@ pub struct Job {
     pub seed: u64,
     pub stop: Vec<u32>,
     pub sink: Box<dyn FnMut(Event) + Send>,
+    /// the prompt's images: each span's first position in `prompt` (whose span positions
+    /// carry image_token_id), grid and patches
+    pub images: Vec<crate::vision::ImageIn>,
+    /// the prefix cache's key for `prompt` (vision::span_keys at image positions, so a prompt
+    /// shares a span only with one that shows the same image); None: the prompt itself
+    pub key: Option<Vec<u32>>,
 }
 
 struct Slot {
@@ -894,7 +902,7 @@ impl Scheduler {
         let lanes = self.slots.len();
         for lane in 0..lanes {
             if self.slots[lane].is_none() {
-                if let Some(job) = self.queue.pop_front() {
+                if let Some(mut job) = self.queue.pop_front() {
                     engine.reset_lane(lane)?;
                     match &mut self.policies[lane] {
                         LanePolicy::Window(p) => p.reset_request(),
@@ -902,12 +910,19 @@ impl Scheduler {
                         LanePolicy::None => {}
                     }
                     let rng = Pcg64::from_seed(job.seed as u128);
-                    let (restored, snap) = self.prefix_admit(engine, lane, &job.prompt)?;
+                    let (restored, snap) = self.prefix_admit(engine, lane, job.key.as_deref().unwrap_or(&job.prompt))?;
+                    // the images its prefill still reaches (or none: the lane's previous go)
+                    if let Err(e) = engine.set_images(lane, &job.images, restored) {
+                        eprintln!("request {}: images: {e}", job.id);
+                        (job.sink)(Event::Done(Finish::Error(e.to_string()), Generation::default()));
+                        continue;
+                    }
                     // one excerpt at a time in the probe lane
                     let probe_lane = engine.probe_lane();
                     let lane_busy = self.slots.iter().flatten().any(|s| s.probe.as_ref().is_some_and(|p| p.lane == probe_lane));
+                    // the probe routes prompt rows as text: an image request skips it (probe_prefill.py)
                     let probe = match (&self.adapt, &self.probe) {
-                        (Some(a), Some(pc)) => pc.positions(job.prompt.len(), known(restored, job.prompt.len()), a.cfg.min_new).and_then(|(pos, kind)| {
+                        (Some(a), Some(pc)) if job.images.is_empty() => pc.positions(job.prompt.len(), known(restored, job.prompt.len()), a.cfg.min_new).and_then(|(pos, kind)| {
                             let excerpt = kind == "excerpt";
                             if excerpt && lane_busy {
                                 return None;
@@ -1231,6 +1246,8 @@ pub fn generate_batch(engine: &mut Engine, reqs: &[Request], opt: &BatchOptions)
                     out.lock().unwrap()[i] = Some(g);
                 }
             }),
+            images: Vec::new(),
+            key: None,
         })?;
     }
     while !sched.idle() {

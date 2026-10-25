@@ -1,0 +1,82 @@
+[
+ {
+  "name": "synth.png",
+  "vit_h": 35,
+  "vit_w": 46,
+  "llm_h": 12,
+  "llm_w": 16,
+  "sha256": "9f4c7a6292eebd6a0c7541f7f773bf6cadc611775400218c07189f8730a4c84c"
+ },
+ {
+  "name": "synth.jpg",
+  "vit_h": 35,
+  "vit_w": 46,
+  "llm_h": 12,
+  "llm_w": 16,
+  "sha256": "8b55688c8518733af6df49dd13dc5fdf27ac9f934a8d6682e48972256d28de0f"
+ },
+ {
+  "name": "noise422.jpg",
+  "vit_h": 32,
+  "vit_w": 49,
+  "llm_h": 11,
+  "llm_w": 17,
+  "sha256": "d4865e82135d3f11d35c471d738717e5cd57307d6b368635a6db820c47d9620d"
+ },
+ {
+  "name": "gray.jpg",
+  "vit_h": 35,
+  "vit_w": 46,
+  "llm_h": 12,
+  "llm_w": 16,
+  "sha256": "03fe636ab9b539ac8d9adf8391b571ba6c643ae69b35c4d26cc76a2482cc2497"
+ },
+ {
+  "name": "small_rgba.png",
+  "vit_h": 34,
+  "vit_w": 45,
+  "llm_h": 12,
+  "llm_w": 15,
+  "sha256": "886598dc9301134d5864b429edf4966e7121dc82b25ed6453e231708e66340d3"
+ },
+ {
+  "name": "pal.png",
+  "vit_h": 32,
+  "vit_w": 48,
+  "llm_h": 11,
+  "llm_w": 16,
+  "sha256": "5f1b8e5c8d9e6e5cf104d8f691a3094248b95e79ac21e3707d3cf967369a6421"
+ },
+ {
+  "name": "tall_gray.png",
+  "vit_h": 185,
+  "vit_w": 9,
+  "llm_h": 62,
+  "llm_w": 3,
+  "sha256": "17c3255fd94e017a7e49ba69df3dae2c4d8bd13b4f1fb6ab3c3c35ace355b779"
+ },
+ {
+  "name": "gray16.png",
+  "vit_h": 32,
+  "vit_w": 48,
+  "llm_h": 11,
+  "llm_w": 16,
+  "sha256": "a865eba4a327847af7e92e654f2510ac2f763aff7ce9351f917902d70f91231e"
+ },
+ {
+  "name": "anim.gif",
+  "vit_h": 35,
+  "vit_w": 44,
+  "llm_h": 12,
+  "llm_w": 15,
+  "sha256": "8216433cf64577b5e1f561ab29cf2914cd4cd73f0b26cbb2726ecb85b4f618ee"
+ },
+ {
+  "name": "synth.webp",
+  "vit_h": 35,
+  "vit_w": 46,
+  "llm_h": 12,
+  "llm_w": 16,
+  "sha256": "6b296f65d7a29986596c882bcaa194ff5cc5d6614f448ed7f5a6a68dd70d346b"
+ }
+]

@@ -225,7 +225,7 @@ fn parse_messages(body: &Value, vision: bool) -> Result<Vec<Value>, ApiError> {
 
 fn parse(body: &[u8], ctx: &Ctx) -> Result<ChatReq, ApiError> {
     let body: Value = serde_json::from_slice(body).map_err(|e| ApiError::bad(format!("invalid JSON: {e}"), None))?;
-    let messages = parse_messages(&body, ctx.vision)?;
+    let messages = parse_messages(&body, ctx.vision.is_some())?;
     let (thinking, effort) = resolve_thinking(&body, ctx.default_thinking, ctx.default_effort)?;
     let mt = body.get("max_completion_tokens").filter(|v| !v.is_null()).or_else(|| body.get("max_tokens").filter(|v| !v.is_null()));
     let max_tokens = match mt {
@@ -276,21 +276,25 @@ fn parse(body: &[u8], ctx: &Ctx) -> Result<ChatReq, ApiError> {
     })
 }
 
-fn render(req: &ChatReq, ctx: &Ctx) -> Result<(String, Vec<u32>), ApiError> {
+/// The prompt, its ids with every image placeholder expanded into its span, and the images.
+fn render(req: &ChatReq, ctx: &Ctx) -> Result<(String, crate::vision::Expanded), ApiError> {
     let enc = encode_messages(&req.messages, req.thinking, req.effort)
         .map_err(|e| ApiError::bad(format!("cannot encode messages: {e}"), Some("messages")))?;
-    if !enc.images.is_empty() && !ctx.vision {
-        return Err(ApiError::bad(NO_VISION, Some("messages")));
-    }
     let ids = ctx.text.encode(&enc.prompt).map_err(|e| ApiError { status: 500, message: format!("tokenizer: {e}"), param: None })?;
-    Ok((enc.prompt, ids))
+    let ex = match &ctx.vision {
+        Some(v) => crate::vision::expand(&ids, &enc.images, v)
+            .map_err(|e| ApiError::bad(format!("cannot process image inputs: {e}"), Some("messages")))?,
+        None if !enc.images.is_empty() => return Err(ApiError::bad(NO_VISION, Some("messages"))),
+        None => crate::vision::Expanded { ids, images: Vec::new(), key: None },
+    };
+    Ok((enc.prompt, ex))
 }
 
 pub fn debug_prompt(stream: &mut TcpStream, body: &[u8], ctx: &Ctx) -> Result<(), Failure> {
     let req = parse(body, ctx)?;
-    let (prompt, ids) = render(&req, ctx)?;
-    send_json(stream, 200, &json!({"prompt": prompt, "prompt_tokens": ids.len(), "ids": ids, "thinking": req.thinking,
-                                  "effort": req.effort}))?;
+    let (prompt, ex) = render(&req, ctx)?;
+    send_json(stream, 200, &json!({"prompt": prompt, "prompt_tokens": ex.ids.len(), "ids": ex.ids, "thinking": req.thinking,
+                                  "effort": req.effort, "images": ex.images.len()}))?;
     Ok(())
 }
 
@@ -348,7 +352,8 @@ fn now() -> u64 {
 pub fn chat(stream: &mut TcpStream, body: &[u8], ctx: &Ctx) -> Result<(), Failure> {
     let t0 = Instant::now();
     let req = parse(body, ctx)?;
-    let (_, ids) = render(&req, ctx)?;
+    let (_, ex) = render(&req, ctx)?;
+    let (ids, images, key) = (ex.ids, ex.images, ex.key);
     // the drafter writes a block past the last position: keep its width of headroom
     let room = ctx.max_seq.saturating_sub(ids.len() + 8);
     if room == 0 {
@@ -368,6 +373,8 @@ pub fn chat(stream: &mut TcpStream, body: &[u8], ctx: &Ctx) -> Result<(), Failur
         sink: Box::new(move |ev| {
             let _ = tx.send(ev);
         }),
+        images,
+        key,
     };
     ctx.engine.send(Cmd::Submit(job)).map_err(|_| ApiError { status: 503, message: "the engine is not running".into(), param: None })?;
     let cid = format!("chatcmpl-{id:x}{:x}", seed & 0xffff_ffff);
@@ -415,6 +422,17 @@ pub fn chat(stream: &mut TcpStream, body: &[u8], ctx: &Ctx) -> Result<(), Failur
                         }
                     }
                 }
+            }
+            Event::Done(Finish::Error(e), _) => {
+                // the request never started (its images could not be encoded)
+                let err = json!({"error": {"message": format!("cannot process image inputs: {e}"), "type": "server_error",
+                                           "param": null, "code": null}});
+                if req.stream {
+                    send_event(stream, &err.to_string())?;
+                    send_event(stream, "[DONE]")?;
+                    return Ok(());
+                }
+                return Err(ApiError { status: 500, message: format!("cannot process image inputs: {e}"), param: None }.into());
             }
             Event::Done(f, g) => break (f, g),
         }

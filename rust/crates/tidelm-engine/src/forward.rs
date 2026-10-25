@@ -123,17 +123,17 @@ enum Readback<'a> {
     Nucleus(&'a [Sampling]),
 }
 
-fn ck(rc: i32, what: &str) -> Result<()> {
+pub(crate) fn ck(rc: i32, what: &str) -> Result<()> {
     if rc != 0 {
         return Err(format!("{what}: CUDA error {rc}").into());
     }
     Ok(())
 }
 
-fn np<T: Copy>(b: &DeviceBuffer<T>) -> *mut c_void {
+pub(crate) fn np<T: Copy>(b: &DeviceBuffer<T>) -> *mut c_void {
     b.raw()
 }
-fn nul() -> *mut c_void {
+pub(crate) fn nul() -> *mut c_void {
     std::ptr::null_mut()
 }
 fn off(p: *mut c_void, bytes: usize) -> *mut c_void {
@@ -251,7 +251,7 @@ pub fn row_bucket(t: usize) -> usize {
 
 /// A GEMM weight operand.
 #[derive(Clone, Copy)]
-enum Wt<'a> {
+pub(crate) enum Wt<'a> {
     Fp8(&'a Fp8),
     /// bf16 `[n][k]`
     Bf16 { w: *mut c_void, n: usize, k: usize },
@@ -263,7 +263,7 @@ enum Wt<'a> {
 /// differently from the FMA kernel). Shapes it cannot take (K % 64) run the FMA kernel over
 /// 16-row slices.
 #[allow(clippy::too_many_arguments)]
-fn gemm(sr: *mut c_void, part: &DeviceBuffer<f32>, x: *mut c_void, ldx: usize, w: Wt, m: usize, y: *mut c_void,
+pub(crate) fn gemm(sr: *mut c_void, part: &DeviceBuffer<f32>, x: *mut c_void, ldx: usize, w: Wt, m: usize, y: *mut c_void,
         f32_out: bool, ldy: usize) -> Result<()> {
     let (n, k) = match w {
         Wt::Fp8(f) => (f.n, f.k),
@@ -364,12 +364,15 @@ pub struct Options {
     /// resident only: arena slots past the residents for experts read in while serving (the
     /// hot-read ring); 0 for none
     pub hot_ring: usize,
+    /// image inputs: the vision tower (rank 1 of a pair, else this box), the span delimiters
+    /// and the image router bias (DSV41_VISION=1, DSV41_VISION_MODE=peer)
+    pub vision: bool,
 }
 
 impl Options {
     pub fn streaming(max_seq: usize, spec: bool) -> Self {
         Options { max_seq, max_lanes: 1, spec, resident: false, graphs: false, n_layers: None, keep: None, dspark_keep: None,
-                  tp: None, record_demand: false, hot_ring: 0 }
+                  tp: None, record_demand: false, hot_ring: 0, vision: false }
     }
 
     /// The bytes both ranks of a pair must agree on before they start (tidelm_comm::join):
@@ -386,11 +389,11 @@ impl Options {
         let vocab = Config::load(model_dir)?.vocab_size;
         let listed = crate::draft_vocab::from_env(vocab)?.map(|ids| crate::draft_vocab::digest(&ids)).unwrap_or(0);
         Ok(format!("tidelm-pair v3 tp | max_seq {} lanes {} spec {} resident {} graphs {} layers {:?} | keep {:x} \
-                    dspark_keep {:x} record {} hot_ring {} | exe {:x} | config {:x} | draft vocab {listed:x} | env NO_QDQ={:?} ENGRAM_CACHE_MB={:?} \
+                    dspark_keep {:x} record {} hot_ring {} vision {} | exe {:x} | config {:x} | draft vocab {listed:x} | env NO_QDQ={:?} ENGRAM_CACHE_MB={:?} \
                     DRAFT_HEAD_FMT={:?} TP_DRAFT={:?} EXPERT_TOPP={:?}/{:?} PREFILL_ROWS={} NO_SPLITK={:?} \
                     HOT={:?}/{:?}/{:?} PACKED_KV={:?}",
                    self.max_seq, self.max_lanes, self.spec, self.resident, self.graphs, self.n_layers, keep_digest,
-                   mask(&self.dspark_keep), self.record_demand, self.hot_ring, fnv(&exe), fnv(&cfg), std::env::var("TIDELM_NO_QDQ").ok(),
+                   mask(&self.dspark_keep), self.record_demand, self.hot_ring, self.vision, fnv(&exe), fnv(&cfg), std::env::var("TIDELM_NO_QDQ").ok(),
                    std::env::var("TIDELM_ENGRAM_CACHE_MB").ok(), std::env::var("TIDELM_DRAFT_HEAD_FMT").ok(),
                    std::env::var("TIDELM_TP_DRAFT").ok(), std::env::var("TIDELM_EXPERT_TOPP").ok(),
                    std::env::var("TIDELM_EXPERT_TOPP_MIN_K").ok(), prefill_rows(), std::env::var("TIDELM_NO_SPLITK").ok(),
@@ -414,6 +417,7 @@ const OP_RESTORE: u32 = 11;
 const OP_SNAP_DROP: u32 = 12;
 const OP_DISK_SAVE: u32 = 13;
 const OP_DISK_LOAD: u32 = 14;
+const OP_VISION: u32 = 15;
 
 /// This engine's half of a tensor-parallel pair: the RoCE one-shot gather every sharded
 /// output goes through, the NCCL communicator, and the control channel. Rank 0 (the
@@ -824,6 +828,8 @@ struct StepShape {
     /// the step has prompt rows / decode rows: which attention kernels it launches
     prompt: bool,
     decode: bool,
+    /// some rows are an image span's (spliced, routed with bias_vl): the step runs eager
+    vision: bool,
 }
 
 fn bucket(n: usize, lo: usize, hi: usize) -> usize {
@@ -1159,6 +1165,30 @@ struct Dspark {
     noise_row: DeviceBuffer<u16>,
 }
 
+/// A lane's image spans (Engine::set_images) and the table their positions read: the aligner
+/// rows of the images its prefill still feeds, then the three delimiters.
+struct LaneVision {
+    /// (first position, vit_h, vit_w, the span's first table row; None for a span never fed)
+    spans: Vec<(usize, usize, usize, Option<usize>)>,
+    table: DeviceBuffer<u16>,
+    delims: usize,
+}
+
+impl LaneVision {
+    /// The table row position `p` reads, or None outside every span.
+    fn row_at(&self, p: usize, r: usize) -> Result<Option<i32>> {
+        for &(s, vh, vw, base) in &self.spans {
+            if p >= s && p < s + crate::vision::span_len(vh, vw, r) {
+                return Ok(Some(match crate::vision::span_slot(p - s, vh, vw, r) {
+                    Ok(cell) => (base.ok_or("an image span the prefill feeds was not encoded")? + cell) as i32,
+                    Err(k) => (self.delims + k) as i32,
+                }));
+            }
+        }
+        Ok(None)
+    }
+}
+
 pub struct Engine {
     pub cfg: Config,
     ckpt: Checkpoint,
@@ -1207,6 +1237,17 @@ pub struct Engine {
     /// the prefix cache's disk tier (enable_prefix_disk) and its namespace
     disk: Option<crate::prefix_disk::Disk>,
     disk_ns: u64,
+    /// vision (Options::vision): the span delimiters [3][dim] on every rank; the tower on the
+    /// rank that encodes images (rank 1 of a pair, else this box); per lane its request's image
+    /// spans and the rows they read (Engine::set_images)
+    vis_delims: Option<DeviceBuffer<u16>>,
+    tower: Option<crate::vision::Tower>,
+    lane_vis: Vec<Option<LaneVision>>,
+    /// a step with image rows: per row the lane table's row it takes (-1: none) and 1 for an
+    /// image span's rows; the (first row, rows, lane) runs to splice
+    vis_idx: DeviceBuffer<i32>,
+    vis_img: DeviceBuffer<i32>,
+    vis_splices: Vec<(usize, usize, usize)>,
     /// the same for the DSpark blocks
     dspark_keep: Option<DeviceBuffer<u8>>,
     /// per (drafting lanes, sampled)
@@ -1736,6 +1777,24 @@ impl Engine {
         } else {
             (None, None)
         };
+        // vision: the delimiters on every rank, the tower where images are encoded - rank 1 of a
+        // pair (the profile's DSV41_VISION_MODE=peer: rank 0 keeps its memory for the server),
+        // else this box
+        let (vis_delims, tower) = if opts.vision {
+            let delims = crate::vision::load_delimiters(&ckpt, &stream, &cfg)?;
+            let tower = match opts.tp.map(|tp| tp.rank) {
+                Some(0) => None,
+                _ => {
+                    let tv = Instant::now();
+                    let tw = crate::vision::Tower::load(&ckpt, &stream, &cfg)?;
+                    eprintln!("vision: tower {:.2} GB in {:.1} s", tw.bytes() as f64 / 1e9, tv.elapsed().as_secs_f64());
+                    Some(tw)
+                }
+            };
+            (Some(delims), tower)
+        } else {
+            (None, None)
+        };
         Ok(Engine {
             arena: Arena::new(ARENA_SLOTS + 1, None)?,
             expert_stage: PinnedBuffer::uninit(STAGE_BYTES)?,
@@ -1770,6 +1829,12 @@ impl Engine {
             snaps: HashMap::new(),
             disk: None,
             disk_ns: 0,
+            vis_delims,
+            tower,
+            lane_vis: (0..=max_lanes).map(|_| None).collect(),
+            vis_idx: DeviceBuffer::zeroed(t)?,
+            vis_img: DeviceBuffer::zeroed(t)?,
+            vis_splices: Vec::new(),
             dspark_keep,
             draft_graphs: HashMap::new(),
             draft_cols: draft_vocab.len(),
@@ -1956,6 +2021,17 @@ impl Engine {
                     let ids: Vec<u64> = (0..n).map(|_| r.u64()).collect::<std::result::Result<_, _>>()?;
                     self.prefix_drop(lane, &ids)?;
                 }
+                OP_VISION => {
+                    let lane = r.u32()? as usize;
+                    let n = r.u32()? as usize;
+                    let mut images = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let (start, vit_h, vit_w) = (r.u64()? as usize, r.u32()? as usize, r.u32()? as usize);
+                        images.push(crate::vision::ImageIn { start, vit_h, vit_w, patches: r.u16s()? });
+                    }
+                    let need: Vec<bool> = images.iter().map(|im| !im.patches.is_empty()).collect();
+                    self.set_images_inner(lane, &images, &need)?;
+                }
                 OP_SHUTDOWN => return Ok(()),
                 op => return Err(format!("rank 1: unknown control op {op}").into()),
             }
@@ -2051,6 +2127,111 @@ impl Engine {
     /// The engram n-gram hashes of `prompt`'s rows at `positions` ([row][engram layer][col]),
     /// each from its own place in the prompt (a fresh hash state over the whole prompt): a
     /// probe excerpt's rows (Seg::hashes) see no n-gram across the excerpt's joins.
+    /// Whether this engine takes image inputs (Options::vision).
+    pub fn vision(&self) -> bool {
+        self.vis_delims.is_some()
+    }
+
+    /// Lane `lane`'s request shows `images`: the rows of their spans for its prefill from
+    /// position `from` on (an image wholly before it - a restored prefix - is not encoded). The
+    /// tower runs on its rank; in a pair rank 1 sends rank 0 the rows over the control channel,
+    /// so both splice the same bits. A failure leaves the lane without images on both ranks
+    /// and errors here. A text request (no images) clears the lane's.
+    pub fn set_images(&mut self, lane: usize, images: &[crate::vision::ImageIn], from: usize) -> Result<()> {
+        if lane >= self.max_lanes {
+            return Err(format!("lane {lane} of {}", self.max_lanes).into());
+        }
+        // both ranks hold the same lane state: nothing to say when there is none to clear
+        if images.is_empty() && self.lane_vis[lane].is_none() {
+            return Ok(());
+        }
+        if self.vis_delims.is_none() {
+            return Err("this engine was started without vision".into());
+        }
+        let r = self.cfg.vision_downsample_ratio;
+        let need: Vec<bool> = images.iter().map(|im| im.start + crate::vision::span_len(im.vit_h, im.vit_w, r) > from).collect();
+        self.mirror(|m| {
+            m.u32(OP_VISION).u32(lane as u32).u32(images.len() as u32);
+            for (im, &nd) in images.iter().zip(&need) {
+                m.u64(im.start as u64).u32(im.vit_h as u32).u32(im.vit_w as u32).u16s(if nd { &im.patches } else { &[] });
+            }
+        })?;
+        self.set_images_inner(lane, images, &need)
+    }
+
+    fn set_images_inner(&mut self, lane: usize, images: &[crate::vision::ImageIn], need: &[bool]) -> Result<()> {
+        self.lane_vis[lane] = None;
+        if images.is_empty() {
+            return Ok(());
+        }
+        let (d, r) = (self.cfg.dim, self.cfg.vision_downsample_ratio);
+        let cells: Vec<usize> = images.iter().map(|im| im.vit_h.div_ceil(r) * im.vit_w.div_ceil(r)).collect();
+        let total: usize = cells.iter().zip(need).filter(|(_, &nd)| nd).map(|(&c, _)| c).sum();
+        let table = DeviceBuffer::<u16>::new((total + 3) * d)?;
+        let encoded: Result<()> = match &self.tower {
+            Some(tower) => (|| {
+                let mut at = 0;
+                for (im, &nd) in images.iter().zip(need) {
+                    if nd {
+                        let rows = tower.forward(&self.stream, &im.patches, im.vit_h, im.vit_w)?;
+                        table.copy_from(at * d, &rows, 0, rows.len(), &self.stream)?;
+                        at += rows.len() / d;
+                    }
+                }
+                self.stream.synchronize()?;
+                Ok(())
+            })(),
+            None => Ok(()),
+        };
+        match (self.pair.is_some(), self.leader) {
+            // rank 1: rank 0 gets the rows, or why there are none (this rank keeps following)
+            (true, false) => {
+                let mut m = tidelm_comm::Msg::default();
+                match &encoded {
+                    Ok(()) => {
+                        m.u32(1).u16s(&table.download()?[..total * d]);
+                    }
+                    Err(e) => {
+                        eprintln!("rank 1: vision tower: {e}");
+                        m.u32(0).u32s(&e.to_string().bytes().map(|b| b as u32).collect::<Vec<_>>());
+                    }
+                }
+                self.pair.as_mut().unwrap().ctl.send(&m.0)?;
+                if encoded.is_err() {
+                    return Ok(());
+                }
+            }
+            // rank 0: the rows rank 1 encoded
+            (true, true) if self.tower.is_none() => {
+                let msg = self.pair.as_mut().unwrap().ctl.recv()?;
+                let mut rd = tidelm_comm::Reader::new(&msg);
+                if rd.u32()? != 1 {
+                    let why = String::from_utf8(rd.u32s()?.iter().map(|&b| b as u8).collect()).unwrap_or_default();
+                    return Err(format!("the vision tower (rank 1): {why}").into());
+                }
+                let rows = rd.u16s()?;
+                if rows.len() != total * d {
+                    return Err(format!("rank 1 sent {} image row values for {total} rows", rows.len()).into());
+                }
+                table.upload_async(0, &rows, &self.stream)?;
+            }
+            _ => {}
+        }
+        encoded?;
+        table.copy_from(total * d, self.vis_delims.as_ref().unwrap(), 0, 3 * d, &self.stream)?;
+        self.stream.synchronize()?;
+        let mut spans = Vec::with_capacity(images.len());
+        let mut at = 0;
+        for ((im, &nd), &c) in images.iter().zip(need).zip(&cells) {
+            spans.push((im.start, im.vit_h, im.vit_w, nd.then_some(at)));
+            if nd {
+                at += c;
+            }
+        }
+        self.lane_vis[lane] = Some(LaneVision { spans, table, delims: total });
+        Ok(())
+    }
+
     pub fn prompt_hashes(&self, prompt: &[u32], positions: &[usize]) -> Vec<i64> {
         let mut h = self.hash.fresh();
         let all = h.hash(prompt, 0, None);
@@ -2308,8 +2489,10 @@ impl Engine {
         self.snaps.insert((lane, snap), snapv);
         self.restore_inner(lane, snap)?;
         // the n-gram history of the restored prefix, as the hashing would have written it
+        // (a bundle's tokens are prefix keys: an image's positions hash as dead)
+        let (ids, mask) = crate::vision::split_key(&b.tokens[..n], self.cfg.image_token_id);
         let l = &mut self.lanes[lane];
-        l.hash.hash(&b.tokens[..n], 0, None);
+        l.hash.hash(&ids, 0, mask.as_deref());
         Ok(b.tokens)
     }
 
@@ -2720,7 +2903,8 @@ impl Engine {
     fn run_segment(&mut self, shape: StepShape, k: usize, l0: usize, l1: usize) -> Result<()> {
         // prefill-sized steps run eager: their work dwarfs the launches, and a graph per row
         // count would pin memory for shapes seen once
-        if !self.use_graphs || shape.t > TMAX {
+        // an image step's splice and router bias read per-lane tables: never captured
+        if !self.use_graphs || shape.t > TMAX || shape.vision {
             return self.device_step(shape, l0, l1);
         }
         let key = (shape, k);
@@ -2827,18 +3011,54 @@ impl Engine {
             a.live_pairs.upload_async(0, &[(rows * cfg.n_activated_experts) as i32], st)?;
             a.decode_rows.upload_async(0, &dec, st)?;
         }
+        // image rows: the table row each takes; the n-gram hasher skips them (and the next
+        // rows' read-ahead too)
+        let vr = cfg.vision_downsample_ratio;
+        let (mut vidx, mut vimg) = (Vec::new(), Vec::new());
+        self.vis_splices.clear();
+        let mut masks: Vec<(Option<Vec<bool>>, Option<Vec<bool>>)> = Vec::with_capacity(segs.len());
+        for (i, sg) in segs.iter().enumerate() {
+            let s = self.lanes[sg.lane].len;
+            let Some(v) = self.lane_vis[sg.lane].as_ref().filter(|_| sg.hashes.is_none()) else {
+                masks.push((None, None));
+                continue;
+            };
+            let at: Vec<Option<i32>> = (0..sg.ids.len()).map(|j| v.row_at(s + j, vr)).collect::<Result<_>>()?;
+            let ahead: Vec<bool> = (0..sg.next.len()).map(|j| v.row_at(s + sg.ids.len() + j, vr).map(|x| x.is_none())).collect::<Result<_>>()?;
+            let ahead = ahead.iter().any(|&live| !live).then_some(ahead);
+            if at.iter().all(|x| x.is_none()) {
+                masks.push((None, ahead));
+                continue;
+            }
+            if vidx.is_empty() {
+                (vidx, vimg) = (vec![-1i32; tb], vec![0i32; tb]);
+            }
+            for (j, x) in at.iter().enumerate() {
+                if let Some(row) = x {
+                    vidx[firsts[i] + j] = *row;
+                    vimg[firsts[i] + j] = 1;
+                }
+            }
+            self.vis_splices.push((firsts[i], sg.ids.len(), sg.lane));
+            masks.push((Some(at.iter().map(|x| x.is_none()).collect()), ahead));
+        }
+        let vision = !vidx.is_empty();
+        if vision {
+            self.vis_idx.upload_async(0, &vidx, &self.stream)?;
+            self.vis_img.upload_async(0, &vimg, &self.stream)?;
+        }
         self.live_rows = rows;
         self.embed_host(&ids, rows)?;
         let n_eng = cfg.engram_layer_ids.len();
         let cols = self.hash.layout.n_hash_cols();
         // [row][n_engram_layers][cols], live rows only
         let mut hashes = Vec::with_capacity(rows * n_eng * cols);
-        for sg in segs {
+        for (i, sg) in segs.iter().enumerate() {
             let l = &mut self.lanes[sg.lane];
             match sg.hashes {
                 Some(h) if h.len() == sg.ids.len() * n_eng * cols => hashes.extend_from_slice(h),
                 Some(h) => return Err(format!("lane {}: {} hashes for {} rows", sg.lane, h.len(), sg.ids.len()).into()),
-                None => hashes.extend(l.hash.hash(sg.ids, l.len, None)),
+                None => hashes.extend(l.hash.hash(sg.ids, l.len, masks[i].0.as_deref())),
             }
         }
         self.times.compute_s += tw.elapsed().as_secs_f64();
@@ -2864,9 +3084,9 @@ impl Engine {
         // positions their next step rewrites before it hashes (NgramHashState::hash)
         self.eg_prefetch.clear();
         let mut ahead: Vec<i64> = Vec::new();
-        for sg in segs.iter().filter(|sg| !sg.next.is_empty()) {
+        for (i, sg) in segs.iter().enumerate().filter(|(_, sg)| !sg.next.is_empty()) {
             let l = &mut self.lanes[sg.lane];
-            ahead.extend(l.hash.hash(sg.next, l.len + sg.ids.len(), None));
+            ahead.extend(l.hash.hash(sg.next, l.len + sg.ids.len(), masks[i].1.as_deref()));
         }
         if !ahead.is_empty() {
             let n_ahead = ahead.len() / (n_eng * cols);
@@ -2899,6 +3119,7 @@ impl Engine {
             head: hb,
             prompt: segs.iter().any(|sg| !sg.decode),
             decode: segs.iter().any(|sg| sg.decode),
+            vision,
         };
         Ok(Plan { shape, firsts, heads })
     }
@@ -2943,7 +3164,7 @@ impl Engine {
                     }
                     ck(unsafe {
                         ds_engram_gate(sr, np(&a.h), np(&a.ekv), np(&e.weight), t as i32, d as i32, hc as i32, cfg.norm_eps,
-                                       (d as f64).powf(-0.5) as f32)
+                                       (d as f64).powf(-0.5) as f32, if shape.vision { np(&self.vis_img) } else { nul() })
                     }, "engram gate")?;
                 }
                 // the DSpark main hidden reads the attention INPUT of its target layers
@@ -2988,6 +3209,16 @@ impl Engine {
     fn begin_step(&mut self, shape: StepShape) -> Result<()> {
         let t = shape.t;
         self.embed_dev(t)?;
+        if shape.vision {
+            let (d, hc) = (self.cfg.dim, self.cfg.hc_mult);
+            for &(r0, rows, lane) in &self.vis_splices {
+                let tab = &self.lane_vis[lane].as_ref().ok_or("an image step's lane has no images")?.table;
+                ck(unsafe {
+                    ds_splice_rows(self.stream.raw(), self.act.h.ptr_at(r0 * hc * d), np(tab), self.vis_idx.ptr_at(r0), rows as i32,
+                                   d as i32, hc as i32)
+                }, "image splice")?;
+            }
+        }
         let sr = self.stream.raw();
         let a = &self.act;
         ck(unsafe { ds_visible(sr, np(&a.pos), t as i32, 1, shape.c1 as i32, np(&a.cidx1), np(&a.clen1)) }, "visible r1")?;
@@ -3735,15 +3966,25 @@ impl Engine {
                 (Some(l), Some(dm), Some(ms)) => (dm.ptr_at(l * e), dm.ptr_at((nl + l) * e), np(ms)),
                 _ => (nul(), nul(), nul()),
             };
+            // an image span's rows select with bias_vl in every backbone layer (the drafter
+            // reads text only)
+            let (img, bias_vl) = match (layer, self.shape) {
+                (Some(_), Some(sh)) if sh.vision => {
+                    let b = w.gate_bias_vl.as_ref().ok_or("image rows, and the checkpoint has no ffn.gate.bias_vl")?;
+                    (np(&self.vis_img), np(b))
+                }
+                _ => (nul(), nul()),
+            };
             if counts.is_null() && hot.is_none() {
                 ck(unsafe {
-                    ds_router(sr, np(&a.z), np(&w.gate_bias), keep, ti, e as i32, k as i32, cfg.route_scale, np(&a.idx), np(&a.rw))
+                    ds_router(sr, np(&a.z), np(&w.gate_bias), keep, ti, e as i32, k as i32, cfg.route_scale, np(&a.idx), np(&a.rw),
+                              img, bias_vl)
                 }, "router")?;
             } else {
                 ck(unsafe {
                     ds_router_rec(sr, np(&a.z), np(&w.gate_bias), keep, ti, e as i32, k as i32, cfg.route_scale, np(&a.idx),
                                   np(&a.rw), counts, mass, ms, (2 * nl * e) as i64, np(&a.lane), self.max_lanes as i32 + 1,
-                                  np(&a.decode_rows), hot.map(|h| np(&h.rows)).unwrap_or(nul()), np(&a.live_pairs))
+                                  np(&a.decode_rows), hot.map(|h| np(&h.rows)).unwrap_or(nul()), np(&a.live_pairs), img, bias_vl)
                 }, "router (recording)")?;
             }
             if let (Some(h), Some(l)) = (hot, layer) {

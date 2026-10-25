@@ -1,0 +1,19 @@
+[package]
+name = "tidelm-image"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Image inputs for the DS v4.1 vision tower: the checkpoint's image_processor.py (Pillow decode, ImageOps.pad with Pillow's bicubic, patches) in Rust"
+
+[dependencies]
+png = "0.18"
+# libjpeg-turbo built from its source: Pillow decodes JPEG with the same library (ISLOW IDCT,
+# fancy upsampling), so the pixels are the same bits
+turbojpeg = "1.5"
+image-webp = "0.2"
+gif = "0.13"
+sha2 = "0.10"
+
+[dev-dependencies]
+sha2 = "0.10"
+serde_json = "1"

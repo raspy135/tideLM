@@ -79,10 +79,12 @@ extern "C" {
     ) -> c_int;
 
     /// z f32 [M, E] gate logits -> idx int32 [M, K], weights f32 [M, K]. `keep` (u8 [E]
-    /// or null) masks non-routable experts.
+    /// or null) masks non-routable experts. `img` (i32 [M] or null): rows of an image span,
+    /// which select with `bias_vl` [E] instead of `bias`.
     pub fn ds_router(
         stream: CudaStream, z: *const c_void, bias: *const c_void, keep: *const c_void,
         m: c_int, e: c_int, k: c_int, route_scale: f32, idx: *mut c_void, weights: *mut c_void,
+        img: *const c_void, bias_vl: *const c_void,
     ) -> c_int;
 
     /// ds_router, recording demand: per row its top-k of the unmasked selection logits; per
@@ -97,7 +99,7 @@ extern "C" {
         stream: CudaStream, z: *const c_void, bias: *const c_void, keep: *const c_void, m: c_int, e: c_int, k: c_int,
         route_scale: f32, idx: *mut c_void, weights: *mut c_void, counts: *mut c_void, mass: *mut c_void,
         miss: *mut c_void, lane_stride: i64, lane: *const c_void, lanes: c_int, phase: *const c_void, hot: *mut c_void,
-        live: *const c_void,
+        live: *const c_void, img: *const c_void, bias_vl: *const c_void,
     ) -> c_int;
 
     /// Hot reads' marks: `marks` [n][3] (LUT index, keep index, slot); apply (1) saves each
@@ -171,10 +173,16 @@ extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    /// `skip` (i32 [M] or null): rows left as they are (an image span's: no engram there)
     pub fn ds_engram_gate(
         stream: CudaStream, h: *mut c_void, kv: *const c_void, weight: *const c_void, m: c_int,
-        d: c_int, hc: c_int, eps: f32, dim_scale: f32,
+        d: c_int, hc: c_int, eps: f32, dim_scale: f32, skip: *const c_void,
     ) -> c_int;
+
+    /// The image splice: rows m with idx[m] >= 0 take bf16 row idx[m] of `table` [.., d] in all
+    /// hc copies of h [M, hc, d].
+    pub fn ds_splice_rows(stream: CudaStream, h: *mut c_void, table: *const c_void, idx: *const c_void, m: c_int, d: c_int,
+                          hc: c_int) -> c_int;
 
     pub fn ds_embed_hc(
         stream: CudaStream, ids: *const c_void, table: *const c_void, h: *mut c_void, m: c_int,

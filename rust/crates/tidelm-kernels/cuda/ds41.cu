@@ -1251,6 +1251,9 @@ struct RouterRec {
     float* hot;
     // the step's live pairs (rows x K) or null: rows past them are filler and ask for nothing
     const int* live;
+    // image rows (model.py moe's image_mask: a whole image span) select with bias_vl, or null
+    const int* img;
+    const float* bias_vl;
 };
 
 __global__ void router_kernel(const float* __restrict__ z, const float* __restrict__ bias,
@@ -1262,6 +1265,7 @@ __global__ void router_kernel(const float* __restrict__ z, const float* __restri
     __shared__ float bv[32];
     __shared__ int bi[32];
     const int m = blockIdx.x;
+    if (rec.img && rec.img[m]) bias = rec.bias_vl;
     for (int e = threadIdx.x; e < E; e += blockDim.x) {
         const float x = z[(int64_t)m * E + e];
         const float sp = x > 20.f ? x : log1pf(expf(x));
@@ -2215,9 +2219,12 @@ __global__ void engram_dequant_kernel(const uint8_t* __restrict__ raw, const int
 //   sum(h * weight * key) * rstd(h) * rstd(key) * dim^-0.5)), out = bf16(h + gate * value).
 // kv rows are [hc * D keys | D values]. One block per (token, i); in place on h.
 __global__ void engram_gate_kernel(__nv_bfloat16* h, const __nv_bfloat16* __restrict__ kv,
-                                   const float* __restrict__ weight, int D, int hc, float eps, float dim_scale) {
+                                   const float* __restrict__ weight, int D, int hc, float eps, float dim_scale,
+                                   const int* __restrict__ skip) {
     __shared__ float scratch[32];
     const int m = blockIdx.x / hc, i = blockIdx.x % hc;
+    // an image row: engram_combine's gate is zero where engram_mask is False
+    if (skip && skip[m]) return;
     __nv_bfloat16* hr = h + ((int64_t)m * hc + i) * D;
     const __nv_bfloat16* kr = kv + (int64_t)m * (hc + 1) * D + (int64_t)i * D;
     const __nv_bfloat16* vr = kv + (int64_t)m * (hc + 1) * D + (int64_t)hc * D;
@@ -3388,21 +3395,25 @@ int ds_rope(void* stream, void* x, int64_t ld_row, int rows, int heads, int64_t 
 }
 
 int ds_router(void* stream, const void* z, const void* bias, const void* keep, int M, int E, int K,
-              float route_scale, void* idx, void* weights) {
-    if (K > 8) return cudaErrorInvalidValue;
+              float route_scale, void* idx, void* weights, const void* img, const void* bias_vl) {
+    if (K > 8 || (img && !bias_vl)) return cudaErrorInvalidValue;
+    RouterRec rec{};
+    rec.img = static_cast<const int*>(img);
+    rec.bias_vl = static_cast<const float*>(bias_vl);
     router_kernel<<<M, 128, 2 * E * sizeof(float), static_cast<cudaStream_t>(stream)>>>(
         static_cast<const float*>(z), static_cast<const float*>(bias), static_cast<const uint8_t*>(keep), E, K,
-        route_scale, static_cast<int*>(idx), static_cast<float*>(weights), RouterRec{});
+        route_scale, static_cast<int*>(idx), static_cast<float*>(weights), rec);
     return static_cast<int>(cudaGetLastError());
 }
 
 int ds_router_rec(void* stream, const void* z, const void* bias, const void* keep, int M, int E, int K,
                   float route_scale, void* idx, void* weights, void* counts, void* mass, void* miss,
-                  int64_t lane_stride, const void* lane, int lanes, const void* phase, void* hot, const void* live) {
-    if (K > 8) return cudaErrorInvalidValue;
+                  int64_t lane_stride, const void* lane, int lanes, const void* phase, void* hot, const void* live,
+                  const void* img, const void* bias_vl) {
+    if (K > 8 || (img && !bias_vl)) return cudaErrorInvalidValue;
     RouterRec rec{static_cast<double*>(counts), static_cast<double*>(mass), static_cast<double*>(miss), lane_stride,
                   static_cast<const int*>(lane), lanes, static_cast<const int*>(phase), static_cast<float*>(hot),
-                  static_cast<const int*>(live)};
+                  static_cast<const int*>(live), static_cast<const int*>(img), static_cast<const float*>(bias_vl)};
     if (rec.counts && (!rec.mass || !rec.miss)) return cudaErrorInvalidValue;
     router_kernel<<<M, 128, 2 * E * sizeof(float), static_cast<cudaStream_t>(stream)>>>(
         static_cast<const float*>(z), static_cast<const float*>(bias), static_cast<const uint8_t*>(keep), E, K,
@@ -3590,10 +3601,28 @@ int ds_engram_dequant(void* stream, const void* raw, const void* inv, int tokens
 }
 
 int ds_engram_gate(void* stream, void* h, const void* kv, const void* weight, int M, int D, int hc, float eps,
-                   float dim_scale) {
+                   float dim_scale, const void* skip) {
     engram_gate_kernel<<<M * hc, 256, 0, static_cast<cudaStream_t>(stream)>>>(
         static_cast<__nv_bfloat16*>(h), static_cast<const __nv_bfloat16*>(kv), static_cast<const float*>(weight),
-        D, hc, eps, dim_scale);
+        D, hc, eps, dim_scale, static_cast<const int*>(skip));
+    return static_cast<int>(cudaGetLastError());
+}
+
+// The image splice (inference/model.py's embed of an image span): rows with idx[m] >= 0 take
+// table row idx[m] - an aligner row or a learned delimiter - in every hc copy.
+__global__ void splice_rows_kernel(__nv_bfloat16* __restrict__ h, const __nv_bfloat16* __restrict__ table,
+                                   const int* __restrict__ idx, int D, int hc) {
+    const int m = blockIdx.y, src = idx[m];
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (src < 0 || d >= D) return;
+    const __nv_bfloat16 v = table[(int64_t)src * D + d];
+    for (int c = 0; c < hc; ++c) h[((int64_t)m * hc + c) * D + d] = v;
+}
+
+int ds_splice_rows(void* stream, void* h, const void* table, const void* idx, int M, int D, int hc) {
+    dim3 grid((D + 255) / 256, M);
+    splice_rows_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<__nv_bfloat16*>(h), static_cast<const __nv_bfloat16*>(table), static_cast<const int*>(idx), D, hc);
     return static_cast<int>(cudaGetLastError());
 }
 

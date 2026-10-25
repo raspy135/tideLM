@@ -19,6 +19,7 @@
 mod api;
 mod http;
 mod output;
+mod vision;
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -50,8 +51,8 @@ pub struct Ctx {
     pub default_effort: u32,
     pub eos: u32,
     pub think_end: Option<u32>,
-    /// a vision tower is loaded: image blocks are served
-    pub vision: bool,
+    /// image inputs (the engine has vision): the preprocessing's settings
+    pub vision: Option<vision::VisionCtx>,
     pub engine: mpsc::Sender<Cmd>,
     pub next_id: AtomicU64,
 }
@@ -60,7 +61,7 @@ fn main() -> tidelm_engine::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     // an unknown flag is an error: a test flag the server ignores (--keep-first once) loaded
     // every expert and ran the box out of memory
-    const VALUED: [&str; 28] = ["--model-dir", "--max-seq", "--lanes", "--depth", "--step-rows", "--keep-db", "--budget",
+    const VALUED: [&str; 29] = ["--vision", "--model-dir", "--max-seq", "--lanes", "--depth", "--step-rows", "--keep-db", "--budget",
                                 "--keep-first", "--layers", "--served-model-name", "--effort", "--host", "--port", "--world",
                                 "--rank", "--adapt-db", "--trace", "--adapt-sensitivity", "--adapt-prior", "--adapt-decode-tokens", "--adapt-probe", "--hot-ring", "--prefix-cache",
                                 "--prefix-snapshots", "--prefix-disk", "--prefix-disk-gb", "--prefix-disk-interval",
@@ -153,6 +154,10 @@ fn main() -> tidelm_engine::Result<()> {
             None if record => 128,
             None => 0,
         },
+        // image inputs (DSV41_VISION=1 in the serving profile): on when the checkpoint has a
+        // tower, --vision 0 off
+        vision: arg(&args, "--vision").as_deref() != Some("0")
+            && tidelm_engine::config::Config::load(&model_dir)?.vision_n_layers > 0,
     };
     // rank 1 of an adapting pair needs rank 0's residents before it loads them: it joins first
     let pair = match &pair_args {
@@ -214,7 +219,14 @@ fn main() -> tidelm_engine::Result<()> {
         default_effort: arg(&args, "--effort").map(|v| v.parse().unwrap()).unwrap_or(75),
         eos,
         think_end,
-        vision: false,
+        vision: engine.vision().then(|| {
+            let c = &engine.cfg;
+            vision::VisionCtx {
+                plan: tidelm_image::Plan { patch: c.vision_patch_size, ratio: c.vision_downsample_ratio,
+                                           max_tokens: c.vision_max_n_token, min_pixels: c.vision_min_pixels },
+                image_token_id: c.image_token_id,
+            }
+        }),
         engine: tx,
         next_id: AtomicU64::new(1),
     });

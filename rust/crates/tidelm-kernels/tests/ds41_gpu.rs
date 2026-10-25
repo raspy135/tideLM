@@ -528,7 +528,7 @@ fn router_selects_topk_on_biased_scores_and_weights_by_raw_scores() {
     }
     let (dz, db, dk) = (dev(&z), dev(&bias), dev(&keep));
     let (di, dw) = (DeviceBuffer::<i32>::zeroed(m * k).unwrap(), DeviceBuffer::<f32>::zeroed(m * k).unwrap());
-    ok(unsafe { ds_router(st.raw(), p(&dz), p(&db), p(&dk), m as i32, e as i32, k as i32, 1.5, p(&di), p(&dw)) });
+    ok(unsafe { ds_router(st.raw(), p(&dz), p(&db), p(&dk), m as i32, e as i32, k as i32, 1.5, p(&di), p(&dw), null(), null()) });
     st.synchronize().unwrap();
     let (gi, gw) = (di.download().unwrap(), dw.download().unwrap());
     for r in 0..m {
@@ -571,10 +571,10 @@ fn router_records_unmasked_demand_misses_and_hot_shares() {
     let miss = DeviceBuffer::<f64>::zeroed(lanes * 8).unwrap();
     let hot = DeviceBuffer::<f32>::zeroed(m * k * 2).unwrap();
     let cand = DeviceBuffer::<f32>::zeroed(24).unwrap();
-    ok(unsafe { ds_router(st.raw(), p(&dz), p(&db), p(&dk), m as i32, e as i32, k as i32, 1.5, p(&di0), p(&dw0)) });
+    ok(unsafe { ds_router(st.raw(), p(&dz), p(&db), p(&dk), m as i32, e as i32, k as i32, 1.5, p(&di0), p(&dw0), null(), null()) });
     ok(unsafe {
         ds_router_rec(st.raw(), p(&dz), p(&db), p(&dk), m as i32, e as i32, k as i32, 1.5, p(&di), p(&dw), p(&rec),
-                      rec.ptr_at(e), p(&miss), stride as i64, p(&dl), lanes as i32, p(&dp), p(&hot), null())
+                      rec.ptr_at(e), p(&miss), stride as i64, p(&dl), lanes as i32, p(&dp), p(&hot), null(), null(), null())
     });
     ok(unsafe { ds_hot_candidates(st.raw(), p(&hot), (m * k) as i32, 12, p(&cand)) });
     st.synchronize().unwrap();
@@ -939,7 +939,7 @@ fn engram_dequant_gate_embed_argmax() {
     let (dh, dkv, dwt) = (dev(&h), dev(&kv), dev(&weight));
     let eps = 1e-20f32;
     let dim_scale = (d as f64).powf(-0.5) as f32;
-    ok(unsafe { ds_engram_gate(st.raw(), p(&dh), p(&dkv), p(&dwt), m as i32, d as i32, hc as i32, eps, dim_scale) });
+    ok(unsafe { ds_engram_gate(st.raw(), p(&dh), p(&dkv), p(&dwt), m as i32, d as i32, hc as i32, eps, dim_scale, null()) });
     st.synchronize().unwrap();
     let got = dh.download().unwrap();
     for r in 0..m {

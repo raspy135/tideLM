@@ -17,6 +17,7 @@
 //! semantic drift.
 
 pub mod ds41;
+pub mod vision;
 
 use std::os::raw::{c_int, c_void};
 

@@ -51,6 +51,29 @@ pub struct Config {
     pub dspark_markov_rank: usize,
     pub dspark_n_routed_experts: usize,
     pub dspark_n_activated_experts: usize,
+    /// the vision tower (inference/vision.py); a text-only checkpoint has no vision_* keys
+    #[serde(default)]
+    pub vision_n_layers: usize,
+    #[serde(default)]
+    pub vision_dim: usize,
+    #[serde(default)]
+    pub vision_n_heads: usize,
+    #[serde(default)]
+    pub vision_inter_dim: usize,
+    #[serde(default)]
+    pub vision_patch_size: usize,
+    #[serde(default)]
+    pub vision_downsample_ratio: usize,
+    #[serde(default)]
+    pub vision_max_n_token: usize,
+    #[serde(default)]
+    pub vision_min_pixels: usize,
+    #[serde(default)]
+    pub vision_max_wh_ratio: Option<f64>,
+    #[serde(default)]
+    pub vision_rope_theta: f32,
+    #[serde(default)]
+    pub image_token_id: u32,
 }
 
 impl Config {

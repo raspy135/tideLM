@@ -199,6 +199,8 @@ pub struct Layer {
     pub hc_ffn_scale: DeviceBuffer<f32>,
     pub gate_w: DeviceBuffer<u16>,
     pub gate_bias: DeviceBuffer<f32>,
+    /// the selection bias of image rows (model.py moe's image_mask), where the checkpoint has one
+    pub gate_bias_vl: Option<DeviceBuffer<f32>>,
     pub sh_w1: Fp8,
     pub sh_w2: Fp8,
     pub sh_w3: Fp8,
@@ -320,6 +322,10 @@ impl Layer {
             hc_ffn_scale: ld.f32(&format!("{p}hc_ffn_scale"), &[3])?,
             gate_w: ld.bf16(&format!("{p}ffn.gate.weight"), &[n_experts, d])?,
             gate_bias: ld.f32(&format!("{p}ffn.gate.bias"), &[n_experts])?,
+            gate_bias_vl: match ld.ckpt.has(&format!("{p}ffn.gate.bias_vl")) {
+                true => Some(ld.f32(&format!("{p}ffn.gate.bias_vl"), &[n_experts])?),
+                false => None,
+            },
             sh_w1: {
                 let n = cfg.moe_inter_dim;
                 ld.fp8_rows(&format!("{p}ffn.shared_experts.w1"), n, d, t.rows(n).0, t.rows(n).1)?

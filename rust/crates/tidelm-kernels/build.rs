@@ -29,7 +29,9 @@ fn main() {
     let fp4_src = repo.join("tools/fp4_moe_cuda.cu");
     let engram_src = repo.join("engine/engram_gather.cpp");
     let ds41_src = manifest.join("cuda/ds41.cu");
+    let vision_src = manifest.join("cuda/vision.cu");
     println!("cargo:rerun-if-changed={}", ds41_src.display());
+    println!("cargo:rerun-if-changed={}", vision_src.display());
     println!("cargo:rerun-if-changed={}", fp4_src.display());
     println!("cargo:rerun-if-changed={}", engram_src.display());
     println!("cargo:rerun-if-env-changed=TIDELM_CUDA_ARCH");
@@ -74,6 +76,21 @@ fn main() {
         ds41_obj.to_str().unwrap(),
     ]));
 
+    // the vision tower's kernels, the same way
+    let vision_obj = out.join("vision.o");
+    run(Command::new(&nvcc).args([
+        "-std=c++17",
+        "-O3",
+        "-DNDEBUG",
+        "-Xcompiler=-fPIC",
+        "-c",
+        "-gencode",
+        &format!("arch=compute_{arch},code=sm_{arch}"),
+        vision_src.to_str().unwrap(),
+        "-o",
+        vision_obj.to_str().unwrap(),
+    ]));
+
     let engram_obj = out.join("engram_gather.o");
     run(Command::new("g++").args([
         "-std=c++17",
@@ -94,6 +111,7 @@ fn main() {
         archive.to_str().unwrap(),
         fp4_obj.to_str().unwrap(),
         ds41_obj.to_str().unwrap(),
+        vision_obj.to_str().unwrap(),
         engram_obj.to_str().unwrap(),
     ]));
 
