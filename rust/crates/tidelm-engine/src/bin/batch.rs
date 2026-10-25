@@ -90,6 +90,8 @@ fn main() -> tidelm_engine::Result<()> {
         keep,
         dspark_keep,
         tp: None,
+        record_demand: false,
+        hot_ring: 0,
     };
     let t0 = Instant::now();
     let pair_args = tidelm_engine::pair::pair_args(&args)?;

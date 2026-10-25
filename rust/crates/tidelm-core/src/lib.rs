@@ -9,6 +9,7 @@
 
 pub mod depth;
 pub mod engram_hash;
+pub mod npz;
 pub mod numpy_rng;
 pub mod residency;
 pub mod sampling;

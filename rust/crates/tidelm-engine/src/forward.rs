@@ -348,12 +348,18 @@ pub struct Options {
     /// tensor parallel over the pair (weights::Tp): this rank's shard of every backbone
     /// layer, routed expert and the head. None: one box.
     pub tp: Option<Tp>,
+    /// resident only: record each lane's expert demand and misses (adaptive residency:
+    /// crate::adapt), read with Engine::lane_demand
+    pub record_demand: bool,
+    /// resident only: arena slots past the residents for experts read in while serving (the
+    /// hot-read ring); 0 for none
+    pub hot_ring: usize,
 }
 
 impl Options {
     pub fn streaming(max_seq: usize, spec: bool) -> Self {
         Options { max_seq, max_lanes: 1, spec, resident: false, graphs: false, n_layers: None, keep: None, dspark_keep: None,
-                  tp: None }
+                  tp: None, record_demand: false, hot_ring: 0 }
     }
 
     /// The bytes both ranks of a pair must agree on before they start (tidelm_comm::join):
@@ -361,6 +367,8 @@ impl Options {
     pub fn boot_config(&self, model_dir: &std::path::Path) -> Result<Vec<u8>> {
         let fnv = |bytes: &[u8]| bytes.iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3));
         let mask = |m: &Option<Vec<Vec<bool>>>| m.as_ref().map(|m| fnv(&m.iter().flatten().map(|&b| b as u8).collect::<Vec<_>>())).unwrap_or(0);
+        // adaptive residency: rank 1 receives rank 0's resident set during the join (pair.rs)
+        let keep_digest = if self.record_demand { 0 } else { mask(&self.keep) };
         let exe = std::fs::read("/proc/self/exe")?;
         let cfg = std::fs::read(model_dir.join("config.json")).or_else(|_| std::fs::read(model_dir.join("inference/config.json")))?;
         // the drafter's listed vocabulary by content: two ranks listing different ids draft
@@ -368,13 +376,16 @@ impl Options {
         let vocab = Config::load(model_dir)?.vocab_size;
         let listed = crate::draft_vocab::from_env(vocab)?.map(|ids| crate::draft_vocab::digest(&ids)).unwrap_or(0);
         Ok(format!("tidelm-pair v3 tp | max_seq {} lanes {} spec {} resident {} graphs {} layers {:?} | keep {:x} \
-                    dspark_keep {:x} | exe {:x} | config {:x} | draft vocab {listed:x} | env NO_QDQ={:?} ENGRAM_CACHE_MB={:?} \
-                    DRAFT_HEAD_FMT={:?} TP_DRAFT={:?} EXPERT_TOPP={:?}/{:?} PREFILL_ROWS={} NO_SPLITK={:?}",
-                   self.max_seq, self.max_lanes, self.spec, self.resident, self.graphs, self.n_layers, mask(&self.keep),
-                   mask(&self.dspark_keep), fnv(&exe), fnv(&cfg), std::env::var("TIDELM_NO_QDQ").ok(),
+                    dspark_keep {:x} record {} hot_ring {} | exe {:x} | config {:x} | draft vocab {listed:x} | env NO_QDQ={:?} ENGRAM_CACHE_MB={:?} \
+                    DRAFT_HEAD_FMT={:?} TP_DRAFT={:?} EXPERT_TOPP={:?}/{:?} PREFILL_ROWS={} NO_SPLITK={:?} \
+                    HOT={:?}/{:?}/{:?}",
+                   self.max_seq, self.max_lanes, self.spec, self.resident, self.graphs, self.n_layers, keep_digest,
+                   mask(&self.dspark_keep), self.record_demand, self.hot_ring, fnv(&exe), fnv(&cfg), std::env::var("TIDELM_NO_QDQ").ok(),
                    std::env::var("TIDELM_ENGRAM_CACHE_MB").ok(), std::env::var("TIDELM_DRAFT_HEAD_FMT").ok(),
                    std::env::var("TIDELM_TP_DRAFT").ok(), std::env::var("TIDELM_EXPERT_TOPP").ok(),
-                   std::env::var("TIDELM_EXPERT_TOPP_MIN_K").ok(), prefill_rows(), std::env::var("TIDELM_NO_SPLITK").ok())
+                   std::env::var("TIDELM_EXPERT_TOPP_MIN_K").ok(), prefill_rows(), std::env::var("TIDELM_NO_SPLITK").ok(),
+                   std::env::var("TIDELM_HOT_MIN").ok(), std::env::var("TIDELM_HOT_MAX").ok(),
+                   std::env::var("TIDELM_HOT_PER_LAYER").ok())
                    .into_bytes())
     }
 }
@@ -417,11 +428,25 @@ pub enum Want {
     All,
 }
 
+/// One lane's recorded expert demand (Engine::lane_demand): per backbone layer and expert
+/// [layer * E + e] the picks of the router's unmasked top-k and their scores, and per phase
+/// (0 prompt, 1 decode) [missed, picks, missed score, score], a miss a pick that was not
+/// routable.
+#[derive(Clone, Debug, Default)]
+pub struct LaneDemand {
+    pub counts: Vec<f64>,
+    pub mass: Vec<f64>,
+    pub miss: [f64; 8],
+}
+
 /// One lane's rows in a step: tokens `ids` at that lane's next positions. `decode`: the rows
 /// are generated tokens (a decode step or a verify block), not prompt - only those take
 /// TIDELM_EXPERT_TOPP. `next`: the rows the lane's next step will likely feed after these (a
 /// prompt's next chunk), whose engram rows are read from NVMe while this step computes - a
 /// hint only: what the next step really feeds is gathered as always, hits or not.
+/// `hashes`: the rows' engram n-gram hashes ([row][engram layer][col], NgramHashState::hash's
+/// layout) instead of hashing `ids` at the lane's positions - a probe's excerpt rows keep the
+/// n-grams of their place in the prompt (probe_prefill.excerpt_hashes).
 #[derive(Clone, Copy, Debug)]
 pub struct Seg<'a> {
     pub lane: usize,
@@ -429,6 +454,7 @@ pub struct Seg<'a> {
     pub want: Want,
     pub decode: bool,
     pub next: &'a [u32],
+    pub hashes: Option<&'a [i64]>,
 }
 
 /// Per-call wall-clock split, printed by the CLI: where a streaming step's time goes.
@@ -973,6 +999,113 @@ fn io_threads() -> usize {
     std::env::var("TIDELM_IO_THREADS").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n >= 1).unwrap_or(8)
 }
 
+/// One hot read for a reader thread: the expert's tensor-name prefix, where its slot's six
+/// tensors go (this rank's share), and where to report.
+struct HotJob {
+    prefix: String,
+    dsts: [(usize, usize); 6],
+    done: std::sync::mpsc::Sender<std::result::Result<(), String>>,
+}
+
+/// Async hot reads' state (crate::hot): the ring over the backbone arena's spare slots, the
+/// candidate rows and table on the device, the table's host copy (the next step plans from
+/// it), the marks of the step in flight, and the reader threads.
+struct Hot {
+    cfg: crate::hot::HotConfig,
+    ring: crate::hot::HotRing,
+    /// [TMAX][topk][2] the step's (share, expert) per row and pick
+    rows: DeviceBuffer<f32>,
+    /// [layer][2 x WIDTH]
+    table: DeviceBuffer<f32>,
+    table_host: PinnedBuffer<f32>,
+    marks: DeviceBuffer<i32>,
+    saved: DeviceBuffer<i32>,
+    n_marks: usize,
+    jobs: std::sync::mpsc::Sender<HotJob>,
+    waits: Vec<std::sync::mpsc::Receiver<std::result::Result<(), String>>>,
+    /// arena slot -> its six destinations (this rank's share)
+    dsts: HashMap<usize, [(usize, usize); 6]>,
+    stats: crate::hot::HotStats,
+}
+
+impl Hot {
+    /// The state the next plan is made from - the last decode step's candidate table and the
+    /// ring - as one number: both ranks must hold the same (their plans are not sent).
+    fn digest(&self) -> u64 {
+        let mut h = 0xcbf29ce484222325u64;
+        let mut mix = |v: u64| h = (h ^ v).wrapping_mul(0x100000001b3);
+        for &x in self.table_host.iter() {
+            mix(x.to_bits() as u64);
+        }
+        for (&(l, x), &slot) in self.ring.live.iter().chain(self.ring.pending.iter()) {
+            mix(((l as u64) << 40) | ((x as u64) << 20) | slot as u64);
+        }
+        h
+    }
+
+    /// `cap` reader threads (a step's reads in parallel), each with its own checkpoint
+    /// handle, staging buffer and stream.
+    fn new(cfg: crate::hot::HotConfig, slots: Vec<usize>, model_dir: &std::path::Path, layers: usize, topk: usize,
+           set: &ExpertSet) -> Result<Self> {
+        let (rank, world) = set.tp.map(|t| (t.rank, t.world)).unwrap_or((0, 1));
+        let dsts = slots.iter().map(|&s| (s, set.arena.slot_dsts(s, rank).map(|(d, _, n)| (d as usize, n)))).collect();
+        let (tx, rx) = std::sync::mpsc::channel::<HotJob>();
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let ckpt = std::sync::Arc::new(Checkpoint::open(model_dir)?);
+        for _ in 0..cfg.cap.max(1) {
+            let (rx, ckpt) = (rx.clone(), ckpt.clone());
+            std::thread::spawn(move || {
+                let setup = || -> Result<(Stream, PinnedBuffer<u8>)> {
+                    tidelm_cuda::set_device(0)?;
+                    Ok((Stream::new()?, PinnedBuffer::<u8>::uninit(STAGE_BYTES)?))
+                };
+                let (stream, mut stage) = match setup() {
+                    Ok(x) => x,
+                    Err(e) => {
+                        eprintln!("hot reads: reader setup failed: {e}");
+                        return;
+                    }
+                };
+                let reader = ExpertReader::new(&ckpt);
+                loop {
+                    let job = match rx.lock().unwrap().recv() {
+                        Ok(j) => j,
+                        Err(_) => return,
+                    };
+                    let mut run = || -> Result<()> {
+                        let views = reader.read_expert_share_into(&mut stage, &job.prefix, rank, world)?;
+                        for (&(off, len), &(dst, n)) in views.iter().zip(job.dsts.iter()) {
+                            if len != n {
+                                return Err(format!("{}: a share of {len} bytes, the arena expects {n}", job.prefix).into());
+                            }
+                            let src = unsafe { stage.as_ptr().add(off) } as *const c_void;
+                            unsafe { memcpy_async(dst as *mut c_void, src, n, MEMCPY_HOST_TO_DEVICE, &stream)? };
+                        }
+                        stream.synchronize()?;
+                        Ok(())
+                    };
+                    let _ = job.done.send(run().map_err(|e| e.to_string()));
+                }
+            });
+        }
+        let n = slots.len();
+        Ok(Hot {
+            cfg,
+            ring: crate::hot::HotRing::new(slots),
+            rows: DeviceBuffer::zeroed(TMAX * topk * 2)?,
+            table: DeviceBuffer::zeroed(layers * 2 * crate::hot::WIDTH)?,
+            table_host: PinnedBuffer::<f32>::zeroed(layers * 2 * crate::hot::WIDTH)?,
+            marks: DeviceBuffer::zeroed(3 * n)?,
+            saved: DeviceBuffer::zeroed(2 * n)?,
+            n_marks: 0,
+            jobs: tx,
+            waits: Vec::new(),
+            dsts,
+            stats: Default::default(),
+        })
+    }
+}
+
 /// Everything the resident mode keeps on the device besides the per-step activations.
 struct Resident {
     /// lent out (taken) for the duration of each block
@@ -1029,6 +1162,14 @@ pub struct Engine {
     resident: Option<Resident>,
     /// [layer][expert] routable mask (u8) for the router, both modes; None = all
     keep: Option<DeviceBuffer<u8>>,
+    /// Options::record_demand: per lane [counts | mass][layer][expert] f64 (adapt.rs's
+    /// request demand) and per (lane, phase) [missed, picks, missed score, score]
+    demand: Option<DeviceBuffer<f64>>,
+    miss: Option<DeviceBuffer<f64>>,
+    /// async hot reads (Options::hot_ring > 0): crate::hot
+    hot: Option<Hot>,
+    /// rank 1: rank 0's hot-read state digest for the step being replayed
+    peer_hot: Option<u64>,
     /// the same for the DSpark blocks
     dspark_keep: Option<DeviceBuffer<u8>>,
     /// per (drafting lanes, sampled)
@@ -1106,7 +1247,8 @@ impl Resident {
         std::thread::scope(|sc| -> Result<Self> {
         let experts_h = sc.spawn(|| -> Result<(ExpertSet, f64)> {
             tidelm_cuda::set_device(0)?;
-            let set = ExpertSet::load(ckpt, "layers.", n_layers, cfg.n_routed_experts, opts.keep.as_deref(), opts.tp, 0)?;
+            let set = ExpertSet::load(ckpt, "layers.", n_layers, cfg.n_routed_experts, opts.keep.as_deref(), opts.tp,
+                                      opts.hot_ring)?;
             Ok((set, t0.elapsed().as_secs_f64()))
         });
         let mut ld = Loader::new(ckpt, stream)?;
@@ -1301,6 +1443,8 @@ impl Engine {
             Some(k) => k.iter().take(n_layers).map(|row| row.iter().filter(|&&b| b).count()).sum::<usize>(),
             None => n_layers * cfg.n_routed_experts,
         }
+        // and the hot-read ring's slots past them (the null slot is one past those)
+        + opts.hot_ring
         .max(cfg.n_mtp_layers * cfg.dspark_n_routed_experts)
         .max(ARENA_SLOTS);
         let route_entries = (unsafe { ds_route_blocks(p as i32, route_slots as i32 + 1, 64) } as usize * 64).max(p * 16);
@@ -1514,6 +1658,33 @@ impl Engine {
         let eg_inv = (0..n_eng).map(|_| DeviceBuffer::zeroed(t * eng_cols)).collect::<std::result::Result<_, _>>()?;
         let eg_host = (0..n_eng).map(|_| PinnedBuffer::zeroed(t * eng_cols * ENGRAM_ROW)).collect::<std::result::Result<_, _>>()?;
         let lanes_v = (0..max_lanes).map(|_| Lane { len: 0, hash: hash.fresh(), last: (0, 0, 0), step: u64::MAX }).collect();
+        // async hot reads: the backbone arena's spare slots are the ring
+        let hot = match (&resident, opts.hot_ring) {
+            (_, 0) => None,
+            (Some(res), ring) => {
+                if max_lanes != 1 {
+                    return Err("async hot reads plan from one lane's verify rows: --lanes 1 (DSV41_MAX_CONCURRENCY=1)".into());
+                }
+                if opts.keep.is_none() {
+                    return Err("hot reads need pruned residency (a keep mask)".into());
+                }
+                let hcfg = crate::hot::HotConfig::from_env(ring, cfg.n_activated_experts)?;
+                let set = &res.experts;
+                let slots: Vec<usize> = (0..set.owner.len()).filter(|&i| set.owner[i].is_none()).collect();
+                if slots.len() != ring {
+                    return Err(format!("{} spare arena slots for a ring of {ring}", slots.len()).into());
+                }
+                Some(Hot::new(hcfg, slots, model_dir, n_layers, cfg.n_activated_experts, set)?)
+            }
+            (None, _) => return Err("hot reads need resident mode".into()),
+        };
+        // per lane, both halves (counts, mass) of every backbone layer's experts
+        let (demand, miss) = if opts.record_demand && opts.resident {
+            let n = 2 * n_layers * cfg.n_routed_experts;
+            (Some(DeviceBuffer::<f64>::zeroed(max_lanes * n)?), Some(DeviceBuffer::<f64>::zeroed(max_lanes * 8)?))
+        } else {
+            (None, None)
+        };
         Ok(Engine {
             arena: Arena::new(ARENA_SLOTS + 1, None)?,
             expert_stage: PinnedBuffer::uninit(STAGE_BYTES)?,
@@ -1541,6 +1712,10 @@ impl Engine {
             dspark,
             resident,
             keep,
+            demand,
+            miss,
+            hot,
+            peer_hot: None,
             dspark_keep,
             draft_graphs: HashMap::new(),
             draft_cols: draft_vocab.len(),
@@ -1618,7 +1793,7 @@ impl Engine {
                 OP_FORWARD => {
                     let _logits = r.u32()?;
                     let n = r.u32()? as usize;
-                    let mut owned: Vec<(usize, Want, bool, Vec<u32>, Vec<u32>)> = Vec::with_capacity(n);
+                    let mut owned: Vec<(usize, Want, bool, Vec<u32>, Vec<u32>, Option<Vec<i64>>)> = Vec::with_capacity(n);
                     for _ in 0..n {
                         let lane = r.u32()? as usize;
                         let want = match r.u32()? {
@@ -1628,12 +1803,19 @@ impl Engine {
                         };
                         let decode = r.u32()? != 0;
                         let ids = r.u32s()?;
-                        owned.push((lane, want, decode, ids, r.u32s()?));
+                        let next = r.u32s()?;
+                        let has = r.u32()? != 0;
+                        let nh = r.u32()? as usize;
+                        let h: Vec<i64> = (0..nh).map(|_| r.u64().map(|x| x as i64)).collect::<std::result::Result<_, _>>()?;
+                        owned.push((lane, want, decode, ids, next, has.then_some(h)));
                     }
                     let segs: Vec<Seg> = owned
                         .iter()
-                        .map(|(lane, want, decode, ids, next)| Seg { lane: *lane, ids, want: *want, decode: *decode, next })
+                        .map(|(lane, want, decode, ids, next, h)| Seg {
+                            lane: *lane, ids, want: *want, decode: *decode, next, hashes: h.as_deref(),
+                        })
                         .collect();
+                    self.peer_hot = Some(r.u64()?);
                     // what comes back is rank 0's business: the cheapest read-back
                     self.run_step(&segs, Readback::Argmax)?;
                 }
@@ -1686,6 +1868,98 @@ impl Engine {
 
     pub fn max_lanes(&self) -> usize {
         self.max_lanes
+    }
+
+    /// A decode step's start (fastdecode._hot_async_begin): plan from the last decode step's
+    /// candidates, take ring slots and start their reads, and mark every live ring expert
+    /// routable (LUT -> its slot, keep -> 1) for this step's graphs.
+    fn hot_begin(&mut self) -> Result<()> {
+        let n_layers = self.n_layers;
+        let st = &self.stream;
+        let (Some(hot), Some(res), Some(keep)) = (self.hot.as_mut(), self.resident.as_ref(), self.keep.as_ref()) else {
+            return Ok(());
+        };
+        let e = res.experts.n_experts;
+        let taken = hot.ring.taken();
+        let plan = crate::hot::plan_async(&hot.cfg, &hot.table_host, n_layers, &taken, &mut hot.stats);
+        for (l, x) in plan {
+            let slot = hot.ring.take((l, x));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let job = HotJob { prefix: format!("layers.{l}.ffn.experts.{x}."), dsts: hot.dsts[&slot], done: tx };
+            hot.jobs.send(job).map_err(|_| "hot reads: the reader threads are gone")?;
+            hot.waits.push(rx);
+        }
+        let marks: Vec<i32> =
+            hot.ring.live.iter().flat_map(|(&(l, x), &slot)| [(l * (e + 1) + x) as i32, (l * e + x) as i32, slot as i32]).collect();
+        hot.n_marks = marks.len() / 3;
+        if hot.n_marks > 0 {
+            hot.marks.upload_async(0, &marks, st)?;
+            ck(unsafe { ds_hot_marks(st.raw(), np(&res.experts.lut), np(keep), np(&hot.marks), np(&hot.saved), hot.n_marks as i32, 1) }, "hot marks")?;
+        }
+        Ok(())
+    }
+
+    /// A decode step's end (fastdecode._hot_async_end): undo the marks after its graphs, copy
+    /// its candidate table to the host (final at the step's read-back), wait for the reads it
+    /// started, and make them routable from the next step.
+    fn hot_end(&mut self) -> Result<()> {
+        let st = &self.stream;
+        let (Some(hot), Some(res), Some(keep)) = (self.hot.as_mut(), self.resident.as_ref(), self.keep.as_ref()) else {
+            return Ok(());
+        };
+        if hot.n_marks > 0 {
+            ck(unsafe { ds_hot_marks(st.raw(), np(&res.experts.lut), np(keep), np(&hot.marks), np(&hot.saved), hot.n_marks as i32, 0) }, "hot unmarks")?;
+            hot.n_marks = 0;
+        }
+        hot.table.download_async(0, &mut hot.table_host[..], st)?;
+        let t0 = Instant::now();
+        for rx in hot.waits.drain(..) {
+            // one rank without the expert would route the same rows to garbage
+            rx.recv().map_err(|_| "hot reads: a reader thread died")?.map_err(|e| format!("hot read failed: {e}"))?;
+        }
+        hot.stats.wait_s += t0.elapsed().as_secs_f64();
+        hot.ring.promote();
+        Ok(())
+    }
+
+    /// Async hot reads' counters since boot, if on.
+    pub fn hot_stats(&self) -> Option<crate::hot::HotStats> {
+        self.hot.as_ref().map(|h| h.stats.clone())
+    }
+
+    /// Lane `lane`'s recorded demand since it was last taken (Options::record_demand), after
+    /// every queued step; `take` zeroes it (a request's demand is folded once). Rank-local:
+    /// rank 0 plans, so nothing here is mirrored.
+    pub fn lane_demand(&mut self, lane: usize, take: bool) -> Result<LaneDemand> {
+        let (Some(dm), Some(ms)) = (&self.demand, &self.miss) else {
+            return Err("demand is recorded only with Options::record_demand (resident)".into());
+        };
+        if lane >= self.max_lanes {
+            return Err(format!("lane {lane} of {}", self.max_lanes).into());
+        }
+        let n = self.n_layers * self.cfg.n_routed_experts;
+        let mut both = vec![0f64; 2 * n];
+        let mut miss = [0f64; 8];
+        dm.download_async(lane * 2 * n, &mut both, &self.stream)?;
+        ms.download_async(lane * 8, &mut miss, &self.stream)?;
+        self.stream.synchronize()?;
+        if take {
+            dm.upload_async(lane * 2 * n, &vec![0f64; 2 * n], &self.stream)?;
+            ms.upload_async(lane * 8, &[0f64; 8], &self.stream)?;
+            self.stream.synchronize()?;
+        }
+        let mass = both.split_off(n);
+        Ok(LaneDemand { counts: both, mass, miss })
+    }
+
+    /// The engram n-gram hashes of `prompt`'s rows at `positions` ([row][engram layer][col]),
+    /// each from its own place in the prompt (a fresh hash state over the whole prompt): a
+    /// probe excerpt's rows (Seg::hashes) see no n-gram across the excerpt's joins.
+    pub fn prompt_hashes(&self, prompt: &[u32], positions: &[usize]) -> Vec<i64> {
+        let mut h = self.hash.fresh();
+        let all = h.hash(prompt, 0, None);
+        let per = all.len() / prompt.len().max(1);
+        positions.iter().flat_map(|&p| all[p * per..(p + 1) * per].iter().copied()).collect()
     }
 
     /// The backbone's resident experts, [layer][expert] (resident mode).
@@ -1897,7 +2171,7 @@ impl Engine {
     /// `forward` with the rows the next call will feed (Seg::next), whose engram rows are
     /// read while this one computes.
     pub fn forward_next(&mut self, ids: &[u32], next: &[u32], want: Want) -> Result<Vec<u16>> {
-        Ok(self.forward_batch(&[Seg { lane: 0, ids, want, decode: false, next }])?.remove(0))
+        Ok(self.forward_batch(&[Seg { lane: 0, ids, want, decode: false, next, hashes: None }])?.remove(0))
     }
 
     /// One backbone step over every segment's rows (at most TMAX together, each lane at most
@@ -1972,6 +2246,13 @@ impl Engine {
     /// engram rows it needs have been gathered. The gathers run on their own threads from the
     /// start of the step, so a layer's NVMe reads overlap every segment before it.
     fn run_step(&mut self, segs: &[Seg], readback: Readback) -> Result<Plan> {
+        let hot_digest = self.hot.as_ref().map(|h| h.digest()).unwrap_or(0);
+        // rank 1 replays: its hot-read state must be rank 0's, or the pair's plans diverge
+        if let Some(theirs) = self.peer_hot.take() {
+            if theirs != hot_digest {
+                return Err(format!("hot reads: rank 0's state {theirs:x} is not this rank's {hot_digest:x}").into());
+            }
+        }
         self.mirror(|m| {
             m.u32(OP_FORWARD).u32(0).u32(segs.len() as u32);
             for sg in segs {
@@ -1981,13 +2262,24 @@ impl Engine {
                     Want::All => 2,
                 };
                 m.u32(sg.lane as u32).u32(want).u32(sg.decode as u32).u32s(sg.ids).u32s(sg.next);
+                let h = sg.hashes.unwrap_or(&[]);
+                m.u32(sg.hashes.is_some() as u32).u32(h.len() as u32);
+                for &x in h {
+                    m.u64(x as u64);
+                }
             }
+            m.u64(hot_digest);
         })?;
         let tp = Instant::now();
         let plan = self.prepare(segs)?;
         let shape = plan.shape;
         self.eager_step = shape.t > TMAX;
         let td = Instant::now();
+        // a decode step reads last step's heaviest misses and routes to the ring's live ones
+        let hot_step = self.hot.is_some() && shape.decode && !shape.prompt;
+        if hot_step {
+            self.hot_begin()?;
+        }
         self.times.prepare_s += (td - tp).as_secs_f64();
         let mut tables = std::mem::take(&mut self.engram_tables);
         let jobs = std::mem::take(&mut self.eg_jobs);
@@ -2045,6 +2337,9 @@ impl Engine {
         self.engram_tables = tables;
         self.eager_step = false;
         res?;
+        if hot_step {
+            self.hot_end()?;
+        }
         self.collect(segs, &plan, readback)?;
         self.times.device_s += td.elapsed().as_secs_f64();
         Ok(plan)
@@ -2164,7 +2459,11 @@ impl Engine {
         let mut hashes = Vec::with_capacity(rows * n_eng * cols);
         for sg in segs {
             let l = &mut self.lanes[sg.lane];
-            hashes.extend(l.hash.hash(sg.ids, l.len, None));
+            match sg.hashes {
+                Some(h) if h.len() == sg.ids.len() * n_eng * cols => hashes.extend_from_slice(h),
+                Some(h) => return Err(format!("lane {}: {} hashes for {} rows", sg.lane, h.len(), sg.ids.len()).into()),
+                None => hashes.extend(l.hash.hash(sg.ids, l.len, None)),
+            }
         }
         self.times.compute_s += tw.elapsed().as_secs_f64();
         let st = &self.stream;
@@ -3021,7 +3320,32 @@ impl Engine {
                 _ => nul(),
             };
             gemm(sr, &a.mma_part, np(&a.y), d, Wt::Bf16 { w: np(&w.gate_w), n: e, k: d }, t, np(&a.z), true, e)?;
-            ck(unsafe { ds_router(sr, np(&a.z), np(&w.gate_bias), keep, ti, e as i32, k as i32, cfg.route_scale, np(&a.idx), np(&a.rw)) }, "router")?;
+            // a backbone layer of a recording engine records its lanes' demand on the way, and
+            // a decode step's leaves its hot-read candidates
+            let hot = match (&self.hot, self.shape, layer) {
+                (Some(h), Some(sh), Some(_)) if sh.decode && !sh.prompt => Some(h),
+                _ => None,
+            };
+            let nl = self.n_layers;
+            let (counts, mass, ms) = match (layer, &self.demand, &self.miss) {
+                (Some(l), Some(dm), Some(ms)) => (dm.ptr_at(l * e), dm.ptr_at((nl + l) * e), np(ms)),
+                _ => (nul(), nul(), nul()),
+            };
+            if counts.is_null() && hot.is_none() {
+                ck(unsafe {
+                    ds_router(sr, np(&a.z), np(&w.gate_bias), keep, ti, e as i32, k as i32, cfg.route_scale, np(&a.idx), np(&a.rw))
+                }, "router")?;
+            } else {
+                ck(unsafe {
+                    ds_router_rec(sr, np(&a.z), np(&w.gate_bias), keep, ti, e as i32, k as i32, cfg.route_scale, np(&a.idx),
+                                  np(&a.rw), counts, mass, ms, (2 * nl * e) as i64, np(&a.lane), self.max_lanes as i32,
+                                  np(&a.decode_rows), hot.map(|h| np(&h.rows)).unwrap_or(nul()))
+                }, "router (recording)")?;
+            }
+            if let (Some(h), Some(l)) = (hot, layer) {
+                let wd = crate::hot::WIDTH;
+                ck(unsafe { ds_hot_candidates(sr, np(&h.rows), (t * k) as i32, wd as i32, h.table.ptr_at(l * 2 * wd)) }, "hot candidates")?;
+            }
             // the backbone's decode rows only; the drafter's router is untouched
             if let (Some(_), Some((topp, min_k))) = (layer, self.expert_topp) {
                 ck(unsafe { ds_expert_topp(sr, np(&a.idx), np(&a.rw), ti, k as i32, topp, min_k, e as i32, np(&a.decode_rows)) }, "expert top-p")?;

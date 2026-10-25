@@ -57,9 +57,9 @@ fn main() -> tidelm_engine::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     // an unknown flag is an error: a test flag the server ignores (--keep-first once) loaded
     // every expert and ran the box out of memory
-    const VALUED: [&str; 15] = ["--model-dir", "--max-seq", "--lanes", "--depth", "--step-rows", "--keep-db", "--budget",
+    const VALUED: [&str; 22] = ["--model-dir", "--max-seq", "--lanes", "--depth", "--step-rows", "--keep-db", "--budget",
                                 "--keep-first", "--layers", "--served-model-name", "--effort", "--host", "--port", "--world",
-                                "--rank"];
+                                "--rank", "--adapt-db", "--trace", "--adapt-sensitivity", "--adapt-prior", "--adapt-decode-tokens", "--adapt-probe", "--hot-ring"];
     const FLAGS: [&str; 3] = ["--resident", "--graphs", "--thinking"];
     let mut i = 1;
     while i < args.len() {
@@ -98,8 +98,36 @@ fn main() -> tidelm_engine::Result<()> {
     };
     // --keep-first K (tests): the first K experts of every layer
     let keep_first: Option<usize> = arg(&args, "--keep-first").map(|v| v.parse().unwrap());
-    let keep = match (&scores, arg(&args, "--budget")) {
-        (Some(s), Some(b)) => Some(tidelm_engine::keep::keep_from_scores(s, 6, b.parse().unwrap())?),
+    // adaptive residency (--adapt-db HISTORY.npz --trace coverage.json --budget N): the
+    // Python engine's DSV41_PRUNE_DB history and routing trace, its knobs as the serving
+    // profile sets them (sensitivity high, prior 4, a decode pass every 600 tokens). Rank 0
+    // reads the history and picks the boot residents; rank 1 receives them in the join.
+    let pair_args = tidelm_engine::pair::pair_args(&args)?;
+    let leader = pair_args.as_ref().map(|pa| pa.rank == 0).unwrap_or(true);
+    let adapt = match arg(&args, "--adapt-db") {
+        Some(db) => {
+            let sens = arg(&args, "--adapt-sensitivity").unwrap_or_else(|| "high".into());
+            let prior: f64 = arg(&args, "--adapt-prior").map(|v| v.parse()).transpose()?.unwrap_or(4.0);
+            let every: usize = arg(&args, "--adapt-decode-tokens").map(|v| v.parse()).transpose()?.unwrap_or(600);
+            let cfg = tidelm_engine::adapt::AdaptConfig::new(&sens, prior, every, 6)?
+                .ok_or("--adapt-sensitivity off: drop --adapt-db to freeze the residents")?;
+            if leader {
+                let trace = arg(&args, "--trace").ok_or("--adapt-db needs --trace (a routing trace's coverage.json)")?;
+                let trace = tidelm_engine::adapt::load_trace(std::path::Path::new(&trace), 40, 384)?;
+                eprintln!("adapt: {cfg:?}");
+                Some(tidelm_engine::adapt::Adapt::new(cfg, trace, 40, 384, Some(PathBuf::from(db)))?)
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+    let record = arg(&args, "--adapt-db").is_some();
+    let keep = match (&adapt, &scores, arg(&args, "--budget")) {
+        (Some(a), _, Some(b)) => Some(a.boot_keep(b.parse()?)?),
+        (Some(_), _, None) => return Err("--adapt-db needs --budget (the resident experts)".into()),
+        (None, _, _) if record => None,
+        (None, Some(s), Some(b)) => Some(tidelm_engine::keep::keep_from_scores(s, 6, b.parse().unwrap())?),
         _ => keep_first.map(|k| vec![(0..384).map(|e| e < k).collect::<Vec<bool>>(); 40]),
     };
     let mut opts = Options {
@@ -112,9 +140,21 @@ fn main() -> tidelm_engine::Result<()> {
         keep,
         dspark_keep: None,
         tp: None,
+        record_demand: record,
+        // async hot reads (DSV41_HOT_READS=1, HOT_ASYNC=1, HOT_RING=128 in the serving profile):
+        // on with adaptation, --hot-ring 0 turns them off
+        hot_ring: match arg(&args, "--hot-ring") {
+            Some(v) => v.parse()?,
+            None if record => 128,
+            None => 0,
+        },
     };
-    let pair_args = tidelm_engine::pair::pair_args(&args)?;
+    // rank 1 of an adapting pair needs rank 0's residents before it loads them: it joins first
     let pair = match &pair_args {
+        Some(pa) if record && pa.rank == 1 => {
+            let p = tidelm_engine::pair::join(&mut opts, &model_dir, pa)?;
+            Some(std::thread::spawn(move || Ok(p)))
+        }
         Some(pa) => Some(tidelm_engine::pair::join_in_background(&mut opts, &model_dir, pa)?),
         None => None,
     };
@@ -130,7 +170,12 @@ fn main() -> tidelm_engine::Result<()> {
         }
     }
     // a step no lane decodes in prefills up to the engine's prefill rows (TIDELM_PREFILL_ROWS)
-    let sched = Scheduler::new(&engine, SchedOptions { depth, step_rows, prefill_rows: Some(engine.pmax), logits: false })?;
+    let mut sched = Scheduler::new(&engine, SchedOptions { depth, step_rows, prefill_rows: Some(engine.pmax), logits: false })?;
+    // the probe before each prefill (DSV41_PROBE_PREFILL=1 in the serving profile): --adapt-probe 0 skips it
+    if let Some(a) = adapt {
+        let probe = arg(&args, "--adapt-probe").as_deref() != Some("0");
+        sched.set_adapt(a, probe.then(tidelm_engine::adapt::ProbeConfig::default));
+    }
     let single = |s: &str| -> Option<u32> {
         match text.encode(s) {
             Ok(ids) if ids.len() == 1 => Some(ids[0]),

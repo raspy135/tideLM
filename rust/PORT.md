@@ -314,11 +314,54 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
   confidence), and code's acceptance fell from 3.79 / 3.72 / 3.37 to 3.45 / 3.61 / 3.29 tokens
   a step under the window policy - the drafter predicts the unpruned target.
 
+  Adaptive expert loading is in (2026-10-24), every stage the serving profile enables, with its
+  settings (`tidelm-server --adapt-db HISTORY.npz --trace coverage.json --budget N`; rank 0 reads
+  the history and sends rank 1 the boot residents during the join):
+  - demand: each backbone router also takes its unmasked top-6 and records per lane the picks'
+    counts and scores and per phase the misses (`ds_router_rec`); the history is the Python
+    engine's `DSV41_PRUNE_DB` file (np.savez, request units, score history v2), read and
+    written in place by `tidelm_core::npz`, blended with the routing trace (rank "sum", prior 4,
+    half-life 10 folds, miss gate 0.0101733 - adapt_config.py at sensitivity high);
+  - boot: the same residents as the Python engine's from the same files (budget 10,000: the
+    masks are byte-identical), and the planner gives the same 512 moves in the same order for
+    the same pending demand (examples/adapt_boot.rs against the engine's own functions in the
+    `tidelm:local` container);
+  - pre-prefill: the probe (probe_prefill.SmallProbe): below 500 tokens the prompt is routed
+    once with the current residents (two-pass), above it a 64-token excerpt (select_spans:
+    head, two suffix windows, tail) keeping each row's engram n-grams from its place in the
+    prompt; at >= 1.02% predicted misses the residents are re-fitted before the real prefill;
+  - post-prefill: the prompt folds into the history at the prefill -> decode boundary and a
+    prompt of >= 32 tokens missed at >= the gate re-fits them;
+  - post-decode: every 600 output tokens a stretch missed at >= the gate re-fits them to the
+    history previewed with the answer so far; each request's end folds and saves it and plans;
+  - hot load: async hot reads (hot_reads.py at HOT_MIN 0.3, HOT_MAX 2, ring 128 past the
+    residents): the heaviest missing picks of a decode step are read during the next and
+    routable from the one after (marks on the LUT and keep mask around the step's graphs);
+    both ranks plan alone from the same table, and rank 0 sends a digest of that state with
+    every step so a divergence stops the pair rather than routing garbage.
+  Moves read each rank's share on the io workers: 9-243 experts in 0.10-0.32 s a pass.
+
+  The pair, bench.py's README prompts (sampled 0.6, 1,024 tokens, median of 3), adaptation +
+  probe + hot reads on from the Python server's history, against the Python README rows (same
+  stages on):
+
+  | workload | Rust | Python |
+  |---|---:|---:|
+  | prose decode | 30.63 tok/s (decode misses 6.0 / 4.9 / 4.3%) | 25.59 |
+  | code decode | 50.65 tok/s (5.6 / 4.4 / 4.0%) | 43.31 |
+  | prose / code first token | 0.71 / 0.73 s | 1.22 / 1.25 s |
+  | 8K first token | 7.31 s (6.76 with adaptation off) | 7.3 s |
+
+  Hot reads: 972 reads over 3,401 decode steps, 1.7 s waited in all; prose decode 32.36 tok/s
+  with them and 32.37 without, in back-to-back runs. Rust's layers 21-39 vote with every prompt
+  row (it computes them all; Python's SWA decoder replay routes only the last 128 there).
+
   Still missing, in order of what the numbers above say (prefill at large chunks is in: M5,
   8K first token 27.3 -> 6.76 s):
-  1. Hot reads and adaptation (the resident set re-planned from demand before and after
-     prefill and during long answers, misses read from NVMe): today the resident set is
-     fixed at boot and the rest is pruned.
+  1. With speculation the pair's logits digest no longer equals one box's (4 layers, prose
+     prompt, `--spec`: e7aff077 vs 79e83f92); already so at 3f6fa2d, after the drafter split
+     claimed bit-identity. The two ranks agree with each other; where the pair departs from
+     one box is not yet found.
   2. The lossless packed verify head (DSV41_HEAD_KERNEL=packed, 2.94 -> 2.25 ms/step in
      Python), the sharded head's argmax without gathering logits (`ds_argmax_bf16_pairs` /
      `_combine` are in, unused), the server's tool calls, images and Anthropic routes.

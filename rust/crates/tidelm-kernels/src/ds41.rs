@@ -85,6 +85,29 @@ extern "C" {
         m: c_int, e: c_int, k: c_int, route_scale: f32, idx: *mut c_void, weights: *mut c_void,
     ) -> c_int;
 
+    /// ds_router, recording demand: per row its top-k of the unmasked selection logits; per
+    /// pick counts[lane][e] += 1 and mass[lane][e] += score (f64; lane l at + l * lane_stride),
+    /// per (lane, phase) miss[l * 8 + phase * 4 ..] += [missed, picks, missed score, score]
+    /// (phase from `phase` [m], 1 decode / 0 prompt; null 0). Rows whose lane (`lane` [m], null
+    /// 0) is >= `lanes` record nothing. `hot` (or null): [m][k][2] (share of the row's top-k
+    /// score if `keep` masks the pick and the row is not filler, else 0; expert id as f32).
+    /// counts null: hot only.
+    pub fn ds_router_rec(
+        stream: CudaStream, z: *const c_void, bias: *const c_void, keep: *const c_void, m: c_int, e: c_int, k: c_int,
+        route_scale: f32, idx: *mut c_void, weights: *mut c_void, counts: *mut c_void, mass: *mut c_void,
+        miss: *mut c_void, lane_stride: i64, lane: *const c_void, lanes: c_int, phase: *const c_void, hot: *mut c_void,
+    ) -> c_int;
+
+    /// Hot reads' marks: `marks` [n][3] (LUT index, keep index, slot); apply (1) saves each
+    /// LUT entry and keep byte to `saved` [n][2], points the LUT at the slot and sets keep;
+    /// undo (0) restores them.
+    pub fn ds_hot_marks(stream: CudaStream, lut: *mut c_void, keep: *mut c_void, marks: *const c_void, saved: *mut c_void,
+                        n: c_int, apply: c_int) -> c_int;
+
+    /// The `w` largest shares of `n` (share, id) entries (ds_router_rec's `hot`), descending,
+    /// ties to the earlier entry: out[0..n) shares, out[w..w+n) ids, zeros past n (w <= 32).
+    pub fn ds_hot_candidates(stream: CudaStream, hot: *const c_void, n: c_int, w: c_int, out: *mut c_void) -> c_int;
+
     pub fn ds_swiglu(
         stream: CudaStream, gate: *const c_void, ldg: i64, up: *const c_void, ldu: i64,
         h: *mut c_void, ldh: i64, m: c_int, n: c_int, limit: f32,

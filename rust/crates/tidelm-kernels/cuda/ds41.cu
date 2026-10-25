@@ -1234,9 +1234,26 @@ __global__ void rope_kernel(__nv_bfloat16* x, int64_t ld_row, int heads, int64_t
 // model.py::moe for text tokens: scores = sqrt(softplus(z)); selection on scores + bias
 // (optionally masked to resident experts); weights from the raw scores, normalized over the
 // top-k and scaled. torch.topk order: descending; ties take the lower expert id here.
+// Demand recording for adaptive residency (model.py::_record_prune_miss): each row's top-K
+// of the UNMASKED selection logits (score + bias; ties to the lower index), per pick
+// counts[lane][e] += 1 and mass[lane][e] += score[e] (the pre-bias score), and per (lane,
+// phase) [missed, picks, missed score, score] with a miss a pick `keep` masks. Rows whose lane
+// is >= `lanes` (filler) record nothing. `hot`: per row and unmasked pick its share of the
+// row's top-K score, zero for a routable pick, and the expert id (hot reads' candidates).
+struct RouterRec {
+    double* counts;
+    double* mass;
+    double* miss;
+    int64_t lane_stride;
+    const int* lane;
+    int lanes;
+    const int* phase;
+    float* hot;
+};
+
 __global__ void router_kernel(const float* __restrict__ z, const float* __restrict__ bias,
                               const uint8_t* __restrict__ keep, int E, int K, float route_scale,
-                              int* __restrict__ idx_out, float* __restrict__ w_out) {
+                              int* __restrict__ idx_out, float* __restrict__ w_out, RouterRec rec) {
     extern __shared__ float sh[];
     float* score = sh;      // [E]
     float* sel = sh + E;    // [E]
@@ -1285,6 +1302,125 @@ __global__ void router_kernel(const float* __restrict__ z, const float* __restri
             idx_out[m * K + k] = chosen[k];
             w_out[m * K + k] = score[chosen[k]] / (sum + 1e-20f) * route_scale;
         }
+    }
+    const int ln = rec.lane ? rec.lane[m] : 0;
+    const bool record = rec.counts && ln < rec.lanes;
+    if (!record && !rec.hot) return;
+    // the unmasked choices: the same selection over every expert
+    __syncthreads();
+    for (int e = threadIdx.x; e < E; e += blockDim.x) sel[e] = score[e] + bias[e];
+    __syncthreads();
+    for (int k = 0; k < K; ++k) {
+        float best = -INFINITY;
+        int besti = 0x7fffffff;
+        for (int e = threadIdx.x; e < E; e += blockDim.x) {
+            const float v = sel[e];
+            if (v > best || (v == best && e < besti)) { best = v; besti = e; }
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, besti, o);
+            if (ov > best || (ov == best && oi < besti)) { best = ov; besti = oi; }
+        }
+        const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+        if (lane == 0) { bv[warp] = best; bi[warp] = besti; }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float b = bv[0];
+            int bidx = bi[0];
+            for (int i = 1; i < (int)(blockDim.x >> 5); ++i)
+                if (bv[i] > b || (bv[i] == b && bi[i] < bidx)) { b = bv[i]; bidx = bi[i]; }
+            bi[0] = bidx;
+            sel[bidx] = -INFINITY;
+        }
+        __syncthreads();
+        chosen[k] = bi[0];
+        __syncthreads();
+    }
+    if (threadIdx.x != 0) return;
+    float ssum = 0.f;
+    for (int k = 0; k < K; ++k) ssum += score[chosen[k]];
+    double missed = 0.0, missed_mass = 0.0, mass = 0.0;
+    for (int k = 0; k < K; ++k) {
+        const int e = chosen[k];
+        const bool miss = keep && !keep[e];
+        if (record) {
+            atomicAdd(&rec.counts[(int64_t)ln * rec.lane_stride + e], 1.0);
+            atomicAdd(&rec.mass[(int64_t)ln * rec.lane_stride + e], (double)score[e]);
+            missed += miss;
+            missed_mass += miss ? (double)score[e] : 0.0;
+            mass += score[e];
+        }
+        if (rec.hot) {
+            // a filler row asks for nothing
+            rec.hot[((int64_t)m * K + k) * 2] = miss && ln < rec.lanes ? score[e] / (ssum + 1e-20f) : 0.f;
+            rec.hot[((int64_t)m * K + k) * 2 + 1] = (float)e;
+        }
+    }
+    if (record) {
+        double* ms = rec.miss + (int64_t)ln * 8 + (rec.phase && rec.phase[m] ? 4 : 0);
+        atomicAdd(&ms[0], missed);
+        atomicAdd(&ms[1], (double)K);
+        atomicAdd(&ms[2], missed_mass);
+        atomicAdd(&ms[3], mass);
+    }
+}
+
+// Hot reads' marks (fastdecode._hot_async_begin / _end): `marks` [n][3] = (LUT index, keep
+// index, ring slot). Apply saves each LUT entry and keep byte into `saved` [n][2] and routes
+// the expert to its ring slot; undo puts the saved values back.
+__global__ void hot_marks_kernel(int* __restrict__ lut, uint8_t* __restrict__ keep, const int* __restrict__ marks,
+                                 int* __restrict__ saved, int n, int apply) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int li = marks[3 * i], ki = marks[3 * i + 1];
+    if (apply) {
+        saved[2 * i] = lut[li];
+        saved[2 * i + 1] = keep[ki];
+        lut[li] = marks[3 * i + 2];
+        keep[ki] = 1;
+    } else {
+        lut[li] = saved[2 * i];
+        keep[ki] = (uint8_t)saved[2 * i + 1];
+    }
+}
+
+// A hot layer's candidates (hot_reads.HotReads.candidates): of the step's M x K (share, id)
+// entries the W largest shares, descending (ties: the lower row, then the lower pick), as
+// out[0..n) shares and out[W..W+n) ids (as f32), zeros past n. One block.
+__global__ void __launch_bounds__(256) hot_candidates_kernel(const float* __restrict__ hot, int n, int W,
+                                                             float* __restrict__ out) {
+    __shared__ float bv[8];
+    __shared__ int bi[8];
+    __shared__ int taken[32];
+    const int tid = threadIdx.x;
+    for (int w = 0; w < W; ++w) {
+        float best = -1.f;
+        int besti = 0x7fffffff;
+        for (int i = tid; i < n; i += blockDim.x) {
+            bool used = false;
+            for (int j = 0; j < w; ++j) used |= taken[j] == i;
+            const float v = hot[2 * i];
+            if (!used && (v > best || (v == best && i < besti))) { best = v; besti = i; }
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, besti, o);
+            if (ov > best || (ov == best && oi < besti)) { best = ov; besti = oi; }
+        }
+        if ((tid & 31) == 0) { bv[tid >> 5] = best; bi[tid >> 5] = besti; }
+        __syncthreads();
+        if (tid == 0) {
+            float b = bv[0];
+            int bidx = bi[0];
+            for (int i = 1; i < (int)(blockDim.x >> 5); ++i)
+                if (bv[i] > b || (bv[i] == b && bi[i] < bidx)) { b = bv[i]; bidx = bi[i]; }
+            taken[w] = bidx;
+            const bool ok = bidx < n;
+            out[w] = ok ? hot[2 * bidx] : 0.f;
+            out[W + w] = ok ? hot[2 * bidx + 1] : 0.f;
+        }
+        __syncthreads();
     }
 }
 
@@ -3145,7 +3281,34 @@ int ds_router(void* stream, const void* z, const void* bias, const void* keep, i
     if (K > 8) return cudaErrorInvalidValue;
     router_kernel<<<M, 128, 2 * E * sizeof(float), static_cast<cudaStream_t>(stream)>>>(
         static_cast<const float*>(z), static_cast<const float*>(bias), static_cast<const uint8_t*>(keep), E, K,
-        route_scale, static_cast<int*>(idx), static_cast<float*>(weights));
+        route_scale, static_cast<int*>(idx), static_cast<float*>(weights), RouterRec{});
+    return static_cast<int>(cudaGetLastError());
+}
+
+int ds_router_rec(void* stream, const void* z, const void* bias, const void* keep, int M, int E, int K,
+                  float route_scale, void* idx, void* weights, void* counts, void* mass, void* miss,
+                  int64_t lane_stride, const void* lane, int lanes, const void* phase, void* hot) {
+    if (K > 8) return cudaErrorInvalidValue;
+    RouterRec rec{static_cast<double*>(counts), static_cast<double*>(mass), static_cast<double*>(miss), lane_stride,
+                  static_cast<const int*>(lane), lanes, static_cast<const int*>(phase), static_cast<float*>(hot)};
+    if (rec.counts && (!rec.mass || !rec.miss)) return cudaErrorInvalidValue;
+    router_kernel<<<M, 128, 2 * E * sizeof(float), static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const float*>(z), static_cast<const float*>(bias), static_cast<const uint8_t*>(keep), E, K,
+        route_scale, static_cast<int*>(idx), static_cast<float*>(weights), rec);
+    return static_cast<int>(cudaGetLastError());
+}
+
+int ds_hot_marks(void* stream, void* lut, void* keep, const void* marks, void* saved, int n, int apply) {
+    if (n <= 0) return cudaSuccess;
+    hot_marks_kernel<<<(n + 127) / 128, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<int*>(lut), static_cast<uint8_t*>(keep), static_cast<const int*>(marks), static_cast<int*>(saved), n, apply);
+    return static_cast<int>(cudaGetLastError());
+}
+
+int ds_hot_candidates(void* stream, const void* hot, int n, int W, void* out) {
+    if (W < 1 || W > 32 || n < 0) return cudaErrorInvalidValue;
+    hot_candidates_kernel<<<1, 256, 0, static_cast<cudaStream_t>(stream)>>>(static_cast<const float*>(hot), n, W,
+                                                                           static_cast<float*>(out));
     return static_cast<int>(cudaGetLastError());
 }
 

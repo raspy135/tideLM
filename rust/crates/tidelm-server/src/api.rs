@@ -376,13 +376,24 @@ pub fn chat(stream: &mut TcpStream, body: &[u8], ctx: &Ctx) -> Result<(), Failur
     };
     let n = gen.tokens.len();
     let decode_s = (t0.elapsed().as_secs_f64() - first_token_s.unwrap_or(0.0)).max(1e-9);
-    let stats = json!({
+    let mut stats = json!({
         "steps": gen.steps,
         "accept_len_mean": if gen.steps > 0 { (n.saturating_sub(1)) as f64 / gen.steps as f64 } else { 0.0 },
         "decode_tok_s": (n.saturating_sub(1)) as f64 / decode_s,
         "ttft_s": first_token_s.unwrap_or(0.0),
         "engine": "tidelm-rust",
     });
+    // adaptive residency: the Python engine's prune_miss_request, plus each phase's rate
+    let m = &gen.miss;
+    let (missed, picks) = (m[0] + m[4], m[1] + m[5]);
+    if picks > 0.0 {
+        let rate = |a: f64, b: f64| if b > 0.0 { a / b } else { 0.0 };
+        stats["prune_miss_request"] = json!({
+            "miss_rate": rate(missed, picks), "missed_slots": missed as u64, "slots": picks as u64,
+            "score_miss_rate": rate(m[2] + m[6], m[3] + m[7]),
+            "prompt_miss_rate": rate(m[0], m[1]), "decode_miss_rate": rate(m[4], m[5]),
+        });
+    }
     let usage = json!({
         "prompt_tokens": ids.len(),
         "completion_tokens": n,

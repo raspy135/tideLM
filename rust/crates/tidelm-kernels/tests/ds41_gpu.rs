@@ -550,6 +550,114 @@ fn router_selects_topk_on_biased_scores_and_weights_by_raw_scores() {
     }
 }
 
+/// Demand recording: the unmasked top-6 counted and score-weighted per lane, misses per lane
+/// and phase, filler rows (lane >= lanes) nothing, the routing outputs unchanged; the hot
+/// shares, and the candidates kernel's top 12 of them.
+#[test]
+fn router_records_unmasked_demand_misses_and_hot_shares() {
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(33);
+    let (m, e, k, lanes) = (7usize, 384usize, 6usize, 2usize);
+    let z: Vec<f32> = (0..m * e).map(|_| rng.normal() * 3.0).collect();
+    let bias: Vec<f32> = (0..e).map(|_| rng.normal() * 0.1).collect();
+    let keep: Vec<u8> = (0..e).map(|j| (j % 3 != 0) as u8).collect();
+    let lane = [0i32, 1, 0, 1, 2, 0, 1]; // row 4 is filler
+    let phase = [0i32, 0, 1, 1, 1, 0, 1];
+    let (dz, db, dk, dl, dp) = (dev(&z), dev(&bias), dev(&keep), dev(&lane), dev(&phase));
+    let (di, dw) = (DeviceBuffer::<i32>::zeroed(m * k).unwrap(), DeviceBuffer::<f32>::zeroed(m * k).unwrap());
+    let (di0, dw0) = (DeviceBuffer::<i32>::zeroed(m * k).unwrap(), DeviceBuffer::<f32>::zeroed(m * k).unwrap());
+    let stride = 2 * e; // a lane's counts row then its mass row, one layer
+    let rec = DeviceBuffer::<f64>::zeroed(lanes * stride).unwrap();
+    let miss = DeviceBuffer::<f64>::zeroed(lanes * 8).unwrap();
+    let hot = DeviceBuffer::<f32>::zeroed(m * k * 2).unwrap();
+    let cand = DeviceBuffer::<f32>::zeroed(24).unwrap();
+    ok(unsafe { ds_router(st.raw(), p(&dz), p(&db), p(&dk), m as i32, e as i32, k as i32, 1.5, p(&di0), p(&dw0)) });
+    ok(unsafe {
+        ds_router_rec(st.raw(), p(&dz), p(&db), p(&dk), m as i32, e as i32, k as i32, 1.5, p(&di), p(&dw), p(&rec),
+                      rec.ptr_at(e), p(&miss), stride as i64, p(&dl), lanes as i32, p(&dp), p(&hot))
+    });
+    ok(unsafe { ds_hot_candidates(st.raw(), p(&hot), (m * k) as i32, 12, p(&cand)) });
+    st.synchronize().unwrap();
+    assert_eq!(di.download().unwrap(), di0.download().unwrap(), "recording changed the routing");
+    assert_eq!(dw.download().unwrap(), dw0.download().unwrap(), "recording changed the weights");
+    let (recv, missv, hotv, candv) = (rec.download().unwrap(), miss.download().unwrap(), hot.download().unwrap(), cand.download().unwrap());
+    let mut want_rec = vec![0f64; lanes * stride];
+    let mut want_miss = vec![0f64; lanes * 8];
+    let mut want_hot = vec![0f32; m * k * 2];
+    for r in 0..m {
+        let score: Vec<f32> = (0..e)
+            .map(|j| {
+                let x = z[r * e + j];
+                (if x > 20.0 { x } else { x.exp().ln_1p() }).sqrt()
+            })
+            .collect();
+        let mut order: Vec<usize> = (0..e).collect();
+        order.sort_by(|&a, &b| (score[b] + bias[b]).partial_cmp(&(score[a] + bias[a])).unwrap().then(a.cmp(&b)));
+        let picks = &order[..k];
+        let ssum: f32 = picks.iter().map(|&j| score[j]).sum();
+        for (t, &j) in picks.iter().enumerate() {
+            // a filler row (lane >= lanes) asks for nothing
+            want_hot[(r * k + t) * 2] = if keep[j] == 0 && (lane[r] as usize) < lanes { score[j] / (ssum + 1e-20) } else { 0.0 };
+            want_hot[(r * k + t) * 2 + 1] = j as f32;
+        }
+        let l = lane[r] as usize;
+        if l >= lanes {
+            continue;
+        }
+        let ms = l * 8 + if phase[r] == 1 { 4 } else { 0 };
+        for &j in picks {
+            want_rec[l * stride + j] += 1.0;
+            want_rec[l * stride + e + j] += score[j] as f64;
+            if keep[j] == 0 {
+                want_miss[ms] += 1.0;
+                want_miss[ms + 2] += score[j] as f64;
+            }
+            want_miss[ms + 1] += 1.0;
+            want_miss[ms + 3] += score[j] as f64;
+        }
+    }
+    // counts exact; score sums to float precision (the device's expf / log1pf round
+    // differently from the host's in the last bit)
+    for (i, (&g, &w)) in recv.iter().zip(&want_rec).enumerate() {
+        let tol = if i % stride < e { 0.0 } else { 1e-6 * w.abs().max(1.0) };
+        assert!((g - w).abs() <= tol, "demand [{i}]: {g} vs {w}");
+    }
+    // per phase [missed, picks] exact, [missed score, score] to float precision
+    for (i, (&g, &w)) in missv.iter().zip(&want_miss).enumerate() {
+        let tol = if i % 4 < 2 { 0.0 } else { 1e-6 * w.abs().max(1.0) };
+        assert!((g - w).abs() <= tol, "miss [{i}]: {g} vs {w}");
+    }
+    for (i, (&g, &w)) in hotv.iter().zip(&want_hot).enumerate() {
+        assert!((g - w).abs() <= 1e-6, "hot [{i}]: {g} vs {w}");
+    }
+    let mut entries: Vec<(f32, usize)> = (0..m * k).map(|i| (want_hot[2 * i], i)).collect();
+    entries.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1)));
+    for w in 0..12 {
+        let (v, i) = entries[w];
+        assert!((candv[w] - v).abs() <= 1e-6 && candv[12 + w] == want_hot[2 * i + 1], "candidate {w}: {} / {}", candv[w], candv[12 + w]);
+    }
+}
+
+/// Hot reads' marks route an expert to its ring slot for a step and put everything back.
+#[test]
+fn hot_marks_apply_and_undo() {
+    let Some(st) = setup() else { return };
+    let lut0: Vec<i32> = (0..40).map(|i| if i % 3 == 0 { -1 } else { i * 10 }).collect();
+    let keep0: Vec<u8> = (0..32).map(|i| (i % 2) as u8).collect();
+    let (lut, keep) = (dev(&lut0), dev(&keep0));
+    let marks = dev(&[3i32, 4, 900, 7, 5, 901, 9, 6, 902]);
+    let saved = DeviceBuffer::<i32>::zeroed(6).unwrap();
+    ok(unsafe { ds_hot_marks(st.raw(), p(&lut), p(&keep), p(&marks), p(&saved), 3, 1) });
+    st.synchronize().unwrap();
+    let (l1, k1) = (lut.download().unwrap(), keep.download().unwrap());
+    assert_eq!((l1[3], l1[7], l1[9]), (900, 901, 902));
+    assert_eq!((k1[4], k1[5], k1[6]), (1, 1, 1));
+    ok(unsafe { ds_hot_marks(st.raw(), p(&lut), p(&keep), p(&marks), p(&saved), 3, 0) });
+    st.synchronize().unwrap();
+    assert_eq!(lut.download().unwrap(), lut0);
+    assert_eq!(keep.download().unwrap(), keep0);
+}
+
 #[test]
 fn swiglu_and_moe_combine() {
     let Some(st) = setup() else { return };

@@ -47,6 +47,9 @@ pub struct Generation {
     pub accept_expected: f64,
     pub accept_seen: u64,
     pub accept_tests: u64,
+    /// with adaptive residency, the request's routed picks the residents missed, per phase
+    /// (0 prompt, 1 decode): [missed, picks, missed score, score] (forward::LaneDemand::miss)
+    pub miss: [f64; 8],
 }
 
 fn digest(h: u64, logits: &[u16]) -> u64 {
@@ -161,7 +164,7 @@ fn prefill_first(engine: &mut Engine, prompt: &[u32], seed: bool, opt: &DecodeOp
     let mut first = None;
     for (i, chunk) in chunks.iter().enumerate() {
         if i + 1 == chunks.len() {
-            first = Some(next_token(step_rows(engine, Seg { lane: 0, ids: chunk, want: Want::Last, decode: false, next: &[] }, opt, g)?, rng));
+            first = Some(next_token(step_rows(engine, Seg { lane: 0, ids: chunk, want: Want::Last, decode: false, next: &[], hashes: None }, opt, g)?, rng));
         } else {
             engine.forward_next(chunk, chunks[i + 1], Want::Nothing)?;
         }
@@ -198,7 +201,7 @@ pub fn generate(engine: &mut Engine, prompt: &[u32], max_tokens: usize, stop: &[
     let mut pos = prompt.len(); // position of `tok`, not yet forwarded
     while g.tokens.len() < max_tokens && !stop.contains(&tok) {
         if !spec {
-            tok = next_token(step_rows(engine, Seg { lane: 0, ids: &[tok], want: Want::Last, decode: true, next: &[] }, opt, &mut g)?, &mut rng);
+            tok = next_token(step_rows(engine, Seg { lane: 0, ids: &[tok], want: Want::Last, decode: true, next: &[], hashes: None }, opt, &mut g)?, &mut rng);
             pos += 1;
             g.tokens.push(tok);
             g.steps += 1;
@@ -229,7 +232,7 @@ pub fn generate(engine: &mut Engine, prompt: &[u32], max_tokens: usize, stop: &[
         .min(drafts.len());
         let mut block = vec![tok];
         block.extend_from_slice(&drafts[..d]);
-        let (a, mut emitted) = match step_rows(engine, Seg { lane: 0, ids: &block, want: Want::All, decode: true, next: &[] }, opt, &mut g)? {
+        let (a, mut emitted) = match step_rows(engine, Seg { lane: 0, ids: &block, want: Want::All, decode: true, next: &[], hashes: None }, opt, &mut g)? {
             Rows::Greedy(am) => accept(&block, &am, stop),
             Rows::Sampled(p) => {
                 let pr: Vec<SparseRow> = p.iter().map(|n| n.row()).collect();
@@ -393,6 +396,14 @@ pub struct BatchStats {
     pub forward_s: f64,
     pub post_s: f64,
     pub cache_s: f64,
+    /// adaptive residency: passes that moved experts, the experts moved, and the seconds
+    /// spent (planning + reading them in)
+    pub adapt_passes: usize,
+    pub adapt_moves: usize,
+    pub adapt_s: f64,
+    /// probes run before prefills, and the rows they fed
+    pub probes: usize,
+    pub probe_rows: usize,
 }
 
 /// How the scheduler picks each decoding lane's verify depth.
@@ -457,6 +468,20 @@ struct Slot {
     rng: Pcg64,
     /// the draft's distributions, while its block is being verified
     q: Vec<Nucleus>,
+    /// adaptive residency's decode window: the output token count and the lane's decode
+    /// [missed, picks] at the last decode check (crate::adapt)
+    mark: (usize, f64, f64),
+    /// the probe this request runs before its prefill (adapt::ProbeConfig)
+    probe: Option<ProbeRun>,
+}
+
+/// A request's probe: the prompt rows it feeds (positions 0.. of its lane), their engram
+/// hashes from their places in the prompt, how many have been fed, and its kind.
+struct ProbeRun {
+    ids: Vec<u32>,
+    hashes: Vec<i64>,
+    fed: usize,
+    kind: &'static str,
 }
 
 /// A lane's depth policy, kept across the requests the lane serves (its step-time estimates
@@ -483,6 +508,11 @@ pub struct Scheduler {
     cancelled: Vec<u64>,
     rr: usize,
     pub stats: BatchStats,
+    /// adaptive residency (rank 0 of a pair, or one box): folds each request's demand into the
+    /// history and re-fits the residents at the prefill -> decode boundary, every
+    /// decode_tokens output tokens, and at the end of each request (set_adapt)
+    adapt: Option<crate::adapt::Adapt>,
+    probe: Option<crate::adapt::ProbeConfig>,
 }
 
 impl Scheduler {
@@ -523,7 +553,101 @@ impl Scheduler {
             cancelled: Vec::new(),
             rr: 0,
             stats: BatchStats::default(),
+            adapt: None,
+            probe: None,
         })
+    }
+
+    /// Adaptive residency for this scheduler's engine, which must record demand
+    /// (Options::record_demand).
+    /// `probe`: also probe each prompt before its prefill (the "pre-prefill" pass).
+    pub fn set_adapt(&mut self, adapt: crate::adapt::Adapt, probe: Option<crate::adapt::ProbeConfig>) {
+        self.adapt = Some(adapt);
+        self.probe = probe;
+    }
+
+    /// A probe's end (predictive_prefill.begin): its demand is a preview of the prompt's; if
+    /// the residents would miss at least the gate of it (per layer, averaged), they are
+    /// re-fitted to the history previewed with it. Then the lane starts the real prefill.
+    fn probe_finish(&mut self, engine: &mut Engine, lane: usize) -> Result<()> {
+        let pr = self.slots[lane].as_mut().unwrap().probe.take().unwrap();
+        let d = engine.lane_demand(lane, true)?;
+        engine.reset_lane(lane)?;
+        let Some(adapt) = self.adapt.as_ref() else { return Ok(()) };
+        let keep = engine.resident_mask().ok_or("adaptive residency needs resident mode")?;
+        let predicted = adapt.predicted_miss(&keep, &d);
+        self.stats.probes += 1;
+        self.stats.probe_rows += pr.ids.len();
+        if predicted >= adapt.cfg.gate {
+            let n = self.slots[lane].as_ref().unwrap().job.prompt.len();
+            self.adapt_pass(engine, Some(&d), &format!("probe, {} {} of {n} tokens, predicted miss {predicted:.4}", pr.kind, pr.ids.len()))?;
+        }
+        Ok(())
+    }
+
+    /// Re-fit the residents to the history (previewed with `pending`), moving experts on both
+    /// ranks; logs and counts what it did. `why` names the trigger.
+    fn adapt_pass(&mut self, engine: &mut Engine, pending: Option<&crate::forward::LaneDemand>, why: &str) -> Result<()> {
+        let Some(adapt) = self.adapt.as_mut() else { return Ok(()) };
+        let t0 = std::time::Instant::now();
+        let keep = engine.resident_mask().ok_or("adaptive residency needs resident mode")?;
+        let plan = adapt.plan(&keep, pending)?;
+        if plan.is_empty() {
+            return Ok(());
+        }
+        engine.move_experts(&plan)?;
+        adapt.generation += 1;
+        let across = plan.iter().filter(|m| m[0] != m[2]).count();
+        let after = engine.resident_mask().unwrap();
+        let per: Vec<usize> = after.iter().map(|k| k.iter().filter(|&&b| b).count()).collect();
+        let dt = t0.elapsed().as_secs_f64();
+        eprintln!("adapt ({why}): moved {} experts ({across} across layers; residents a layer {}-{}, generation {}) in {:.2} s",
+                  plan.len(), per.iter().min().unwrap(), per.iter().max().unwrap(), adapt.generation, dt);
+        self.stats.adapt_passes += 1;
+        self.stats.adapt_moves += plan.len();
+        self.stats.adapt_s += dt;
+        Ok(())
+    }
+
+    /// The prefill -> decode boundary of `lane` (model.py's maintain_inline): its prompt's
+    /// demand folds into the history; a prompt of at least min_new tokens that the residents
+    /// served worse than the gate re-fits them.
+    fn adapt_boundary(&mut self, engine: &mut Engine, lane: usize) -> Result<()> {
+        let Some(adapt) = self.adapt.as_mut() else { return Ok(()) };
+        let d = engine.lane_demand(lane, true)?;
+        adapt.fold(&d);
+        let s = self.slots[lane].as_mut().unwrap();
+        for (a, b) in s.gen.miss.iter_mut().zip(&d.miss) {
+            *a += b;
+        }
+        s.mark = (s.gen.tokens.len().max(1), 0.0, 0.0);
+        let (rate, _) = crate::adapt::miss_rate(&d);
+        let (picks, new) = (d.miss[1] + d.miss[5], s.job.prompt.len());
+        if new >= adapt.cfg.min_new && picks > 0.0 && rate >= adapt.cfg.gate {
+            self.adapt_pass(engine, None, &format!("prompt of {new} tokens, miss rate {rate:.4}"))?;
+        }
+        Ok(())
+    }
+
+    /// Every decode_tokens output tokens of `lane`: a stretch the residents served worse than
+    /// the gate re-fits them to the history previewed with the answer's demand so far (no
+    /// vote cast).
+    fn adapt_decode(&mut self, engine: &mut Engine, lane: usize) -> Result<()> {
+        let Some(adapt) = self.adapt.as_ref() else { return Ok(()) };
+        let n = adapt.cfg.decode_tokens;
+        let (gate, mark) = (adapt.cfg.gate, self.slots[lane].as_ref().unwrap().mark);
+        let n_out = self.slots[lane].as_ref().unwrap().gen.tokens.len();
+        if n == 0 || n_out < mark.0 + n {
+            return Ok(());
+        }
+        let d = engine.lane_demand(lane, false)?;
+        let (missed, picks) = (d.miss[4] - mark.1, d.miss[5] - mark.2);
+        self.slots[lane].as_mut().unwrap().mark = (n_out, d.miss[4], d.miss[5]);
+        if picks > 0.0 && missed / picks >= gate {
+            self.adapt_pass(engine, Some(&d), &format!("output token {n_out}, miss rate {:.4} over the last {} tokens",
+                                                       missed / picks, n_out - mark.0))?;
+        }
+        Ok(())
     }
 
     pub fn submit(&mut self, job: Job) -> Result<()> {
@@ -550,11 +674,28 @@ impl Scheduler {
         self.slots.iter().filter(|s| s.is_some()).count()
     }
 
-    fn finish(&mut self, lane: usize, why: Finish) {
-        if let Some(mut s) = self.slots[lane].take() {
-            let gen = std::mem::take(&mut s.gen);
-            (s.job.sink)(Event::Done(why, gen));
+    /// End `lane`'s request: with adaptive residency its demand folds into the history
+    /// (saved), and a plan re-fits the residents before the next step.
+    fn finish(&mut self, engine: &mut Engine, lane: usize, why: Finish) -> Result<()> {
+        let Some(mut s) = self.slots[lane].take() else { return Ok(()) };
+        if let Some(adapt) = self.adapt.as_mut() {
+            let d = engine.lane_demand(lane, true)?;
+            adapt.fold(&d);
+            adapt.save();
+            for (a, b) in s.gen.miss.iter_mut().zip(&d.miss) {
+                *a += b;
+            }
         }
+        let gen = std::mem::take(&mut s.gen);
+        (s.job.sink)(Event::Done(why, gen));
+        if let Some(h) = engine.hot_stats() {
+            eprintln!("hot reads: {} reads over {} decode steps since boot ({} capped, {:.2} s waited)", h.reads, h.steps, h.capped,
+                      h.wait_s);
+        }
+        if self.adapt.is_some() {
+            self.adapt_pass(engine, None, "end of request")?;
+        }
+        Ok(())
     }
 
     /// One backbone step (admitting, drafting, verifying, emitting), or nothing when idle.
@@ -573,7 +714,7 @@ impl Scheduler {
             self.queue = keep;
             for lane in 0..self.slots.len() {
                 if matches!(&self.slots[lane], Some(s) if cancelled.contains(&s.job.id)) {
-                    self.finish(lane, Finish::Cancelled);
+                    self.finish(engine, lane, Finish::Cancelled)?;
                 }
             }
         }
@@ -588,7 +729,18 @@ impl Scheduler {
                         LanePolicy::None => {}
                     }
                     let rng = Pcg64::from_seed(job.seed as u128);
-                    self.slots[lane] = Some(Slot { job, fed: 0, tok: None, gen: Generation::default(), rng, q: Vec::new() });
+                    let probe = match (&self.adapt, &self.probe) {
+                        (Some(a), Some(pc)) => pc.positions(job.prompt.len(), a.cfg.min_new).map(|(pos, kind)| ProbeRun {
+                            ids: pos.iter().map(|&p| job.prompt[p]).collect(),
+                            hashes: engine.prompt_hashes(&job.prompt, &pos),
+                            fed: 0,
+                            kind,
+                        }),
+                        _ => None,
+                    };
+                    self.slots[lane] = Some(Slot {
+                        job, fed: 0, tok: None, gen: Generation::default(), rng, q: Vec::new(), mark: (1, 0.0, 0.0), probe,
+                    });
                 }
             }
         }
@@ -632,12 +784,16 @@ impl Scheduler {
         if decode.is_empty() {
             room = self.opt.prefill_rows.unwrap_or(budget).clamp(1, engine.pmax);
         }
+        // (lane, rows, a probe's rows)
         let mut prefill = Vec::new();
         for (lane, slot) in self.slots.iter().enumerate() {
             if let Some(s) = slot {
                 if s.tok.is_none() && room > 0 {
-                    let c = (s.job.prompt.len() - s.fed).min(room);
-                    prefill.push((lane, c));
+                    let c = match &s.probe {
+                        Some(pr) => (pr.ids.len() - pr.fed).min(room),
+                        None => (s.job.prompt.len() - s.fed).min(room),
+                    };
+                    prefill.push((lane, c, s.probe.is_some()));
                     room -= c;
                 }
             }
@@ -696,16 +852,26 @@ impl Scheduler {
         let mut segs: Vec<Seg> = decode
             .iter()
             .zip(&blocks)
-            .map(|(&(lane, _), blk)| Seg { lane, ids: blk, want: if spec { Want::All } else { Want::Last }, decode: true, next: &[] })
+            .map(|(&(lane, _), blk)| Seg { lane, ids: blk, want: if spec { Want::All } else { Want::Last }, decode: true, next: &[], hashes: None })
             .collect();
-        for &(lane, c) in &prefill {
+        for &(lane, c, probing) in &prefill {
             let s = self.slots[lane].as_ref().unwrap();
+            if probing {
+                // routed with the residents, read for its demand alone: no logits, no seeding
+                let pr = s.probe.as_ref().unwrap();
+                let per = pr.hashes.len() / pr.ids.len();
+                segs.push(Seg {
+                    lane, ids: &pr.ids[pr.fed..pr.fed + c], want: Want::Nothing, decode: false, next: &[],
+                    hashes: Some(&pr.hashes[pr.fed * per..(pr.fed + c) * per]),
+                });
+                continue;
+            }
             let p = &s.job.prompt;
             let want = if s.fed + c == p.len() { Want::Last } else { Want::Nothing };
             // the next chunk, as wide as this one: prefetched engram rows past what the next
             // step takes stay cached for the one after
             let next = &p[s.fed + c..p.len().min(s.fed + 2 * c)];
-            segs.push(Seg { lane, ids: &p[s.fed..s.fed + c], want, decode: false, next });
+            segs.push(Seg { lane, ids: &p[s.fed..s.fed + c], want, decode: false, next, hashes: None });
         }
         self.stats.steps += 1;
         self.stats.rows += segs.iter().map(|s| s.ids.len()).sum::<usize>();
@@ -731,8 +897,8 @@ impl Scheduler {
         let tp = std::time::Instant::now();
         self.stats.forward_s += (tp - tf).as_secs_f64();
         let (mut rollbacks, mut seeds) = (Vec::new(), Vec::new());
-        // (lane, tokens emitted, (depth, accepted) of a speculative step)
-        let mut emits: Vec<(usize, Vec<u32>, Option<(usize, usize)>)> = Vec::new();
+        // (lane, tokens emitted, (depth, accepted) of a speculative step, its prompt's end)
+        let mut emits: Vec<(usize, Vec<u32>, Option<(usize, usize)>, bool)> = Vec::new();
         for (i, &(lane, d)) in decode.iter().enumerate() {
             let s = self.slots[lane].as_mut().unwrap();
             if self.opt.logits {
@@ -760,14 +926,23 @@ impl Scheduler {
                 seeds.push((lane, a + 1));
                 s.gen.accepted.push(a);
                 s.gen.depths.push(d);
-                emits.push((lane, emitted, Some((d, a))));
+                emits.push((lane, emitted, Some((d, a)), false));
             } else {
                 let t = if sampled { draw(&nuc[i][0], unif(&mut s.rng)) } else { am[i][0] };
-                emits.push((lane, vec![t], None));
+                emits.push((lane, vec![t], None, false));
             }
         }
-        for (j, &(lane, c)) in prefill.iter().enumerate() {
+        let mut probed = Vec::new();
+        for (j, &(lane, c, probing)) in prefill.iter().enumerate() {
             let s = self.slots[lane].as_mut().unwrap();
+            if probing {
+                let pr = s.probe.as_mut().unwrap();
+                pr.fed += c;
+                if pr.fed == pr.ids.len() {
+                    probed.push(lane);
+                }
+                continue;
+            }
             s.fed += c;
             if spec {
                 seeds.push((lane, c));
@@ -779,7 +954,7 @@ impl Scheduler {
                 let t = if s.job.sampling.is_greedy() { am[decode.len() + j][0] } else {
                     draw(&nuc[decode.len() + j][0], unif(&mut s.rng))
                 };
-                emits.push((lane, vec![t], None));
+                emits.push((lane, vec![t], None, true));
             }
         }
         let tc = std::time::Instant::now();
@@ -789,7 +964,7 @@ impl Scheduler {
         self.stats.cache_s += tc.elapsed().as_secs_f64();
         // a step that captured a graph is not timed for the depth policies
         let step_s = (engine.graph_captures == caps).then(|| t0.elapsed().as_secs_f64());
-        for (lane, mut emitted, verify) in emits {
+        for (lane, mut emitted, verify, prompt_end) in emits {
             let s = self.slots[lane].as_mut().unwrap();
             if let Some((d, a)) = verify {
                 match &mut self.policies[lane] {
@@ -807,9 +982,18 @@ impl Scheduler {
             let stopped = emitted.iter().any(|t| s.job.stop.contains(t));
             let full = s.gen.tokens.len() >= s.job.max_tokens;
             (s.job.sink)(Event::Tokens(emitted));
-            if stopped || full {
-                self.finish(lane, if stopped { Finish::Stop } else { Finish::Length });
+            // the first token came from the pre-adaptation step, as model.py's does
+            if prompt_end {
+                self.adapt_boundary(engine, lane)?;
             }
+            if stopped || full {
+                self.finish(engine, lane, if stopped { Finish::Stop } else { Finish::Length })?;
+            } else if !prompt_end {
+                self.adapt_decode(engine, lane)?;
+            }
+        }
+        for lane in probed {
+            self.probe_finish(engine, lane)?;
         }
         Ok(())
     }

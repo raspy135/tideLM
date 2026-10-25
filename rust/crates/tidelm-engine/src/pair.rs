@@ -46,6 +46,27 @@ pub fn join(opts: &mut Options, model_dir: &std::path::Path, pa: &PairArgs) -> R
     let (comm, mut ctl) = tidelm_comm::join(pa.rank, &pa.addr, &boot, Duration::from_secs(300))?;
     let hcas: Option<Vec<String>> = std::env::var("NCCL_IB_HCA").ok().map(|v| v.split(',').map(|s| s.to_string()).collect());
     let roce = tidelm_comm::roce::Roce::setup(pa.rank, &mut ctl, tp_max_gather(), hcas.as_deref())?;
+    // adaptive residency: the demand history lives on rank 0, which chose the boot residents
+    // from it; rank 1 takes them as they are (the boot config compares no keep digest then)
+    if opts.record_demand {
+        if pa.rank == 0 {
+            let keep = opts.keep.as_ref().ok_or("adaptive residency: rank 0 has no resident set to send")?;
+            let flat: Vec<u8> = keep.iter().flatten().map(|&b| b as u8).collect();
+            let mut m = tidelm_comm::Msg::default();
+            m.u32(keep.len() as u32).u32(keep.first().map(|r| r.len()).unwrap_or(0) as u32)
+                .u32s(&flat.iter().map(|&b| b as u32).collect::<Vec<_>>());
+            ctl.send(&m.0)?;
+        } else {
+            let msg = ctl.recv()?;
+            let mut r = tidelm_comm::Reader::new(&msg);
+            let (layers, experts) = (r.u32()? as usize, r.u32()? as usize);
+            let flat = r.u32s()?;
+            if flat.len() != layers * experts {
+                return Err("adaptive residency: a malformed resident set from rank 0".into());
+            }
+            opts.keep = Some(flat.chunks(experts).map(|row| row.iter().map(|&b| b != 0).collect()).collect());
+        }
+    }
     opts.tp = Some(Tp { rank: pa.rank, world: 2 });
     Ok(Pair { comm, ctl, roce })
 }

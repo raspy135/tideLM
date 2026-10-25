@@ -72,7 +72,7 @@ fn main() -> tidelm_engine::Result<()> {
         (Some(s), Some(b)) => Some(tidelm_engine::keep::keep_from_scores(s, 6, b.parse().unwrap())?),
         _ => keep_first.map(|k| vec![(0..384).map(|e| e < k).collect::<Vec<bool>>(); 40]),
     };
-    let opts = Options { max_seq, max_lanes: 1, spec: spec || compare || flag("--sweep-depth") || flag("--dist-check") || flag("--bench"), resident: flag("--resident"), graphs: flag("--graphs"), n_layers, keep, dspark_keep: None, tp: None };
+    let opts = Options { max_seq, max_lanes: 1, spec: spec || compare || flag("--sweep-depth") || flag("--dist-check") || flag("--bench"), resident: flag("--resident"), graphs: flag("--graphs"), n_layers, keep, dspark_keep: None, tp: None, record_demand: false, hot_ring: 0 };
     let pair_args = tidelm_engine::pair::pair_args(&args)?;
     let mut opts = opts;
     let pair = match &pair_args {
