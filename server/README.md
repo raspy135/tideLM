@@ -42,6 +42,7 @@ or `<repo>/models/DeepSeek-V4.1-Flash`, first match wins.
 | `POST /v1/chat/completions` | `messages`, `tools`, `tool_choice` (`none` drops the schemas), `response_format` (`json_schema` is rendered into the system prompt), `stream`, `stream_options.include_usage`, `max_tokens`/`max_completion_tokens` (131072), `temperature` (1.0), `top_p` (0.95), `stop`, `seed`, `ignore_eos`, thinking controls below. `n>1`, images and `logprobs` are rejected with 400. Message role `developer` (OpenAI's newer name for `system`) is folded into `system`; any other unknown role is rejected. |
 | `POST /v1/completions` | raw `prompt` (string, or a list of token ids). Strings get BOS prepended unless `"add_bos": false`. No thinking/tool parsing: the text comes back verbatim. Stream and non-stream. |
 | `POST /v1/debug/prompt` | same body as chat; returns the rendered prompt string, its token ids and the resolved thinking/effort. Handy for the engine author. |
+| `POST /v1/messages`, `POST /v1/messages/count_tokens` | Anthropic Messages API (`server/anthropic_api.py`, shared with the GLM server below): the request is translated into the chat body above and rendered, generated and cached by the chat path, so the prompt is token-identical to the equivalent chat request. User-turn images pass through when the vision tower is loaded. `max_tokens` is clamped to the context left; a prompt over it gets Anthropic's `prompt is too long` wording, on which Claude Code compacts. Streamed headers wait for the first token, so a long prefill runs against the client's response timeout, not its stream idle watchdog. For Claude Code: `claude --settings results/claude-code.json` (written by `scripts/tide-up.sh`). Measured 2026-10-23 with Claude Code 2.1.309: first prompt 16,050 tokens, 18.7 s prefill, saved to the disk prefix cache; later turns and a new session reused 98.5-100%. |
 
 Errors are OpenAI-shaped: `{"error": {"message", "type", "param", "code"}}` with HTTP 400/404/500.
 Mid-stream failures are sent as a `data: {"error": ...}` event followed by `data: [DONE]`.
@@ -146,7 +147,20 @@ front end with the same API shape. It runs one request at a time and answers:
 | `POST /v1/chat/completions` | chat, streaming or not; tool calls; `reasoning_content` for the model's thinking |
 | `POST /v1/completions` | raw prompt completion |
 | `POST /v1/debug/prompt` | the rendered prompt and its token count (template and tokenizer only; `bench/bench.py` sizes prompts with it) |
+| `POST /v1/messages` | Anthropic Messages API, streaming or not: text and `tool_use` blocks, `stop_reason`, `usage` with the reused prefix as `cache_read_input_tokens`. For Claude Code: `claude --settings results/claude-code.json`, which `scripts/tide-up.sh` writes for a GLM profile. |
+| `POST /v1/messages/count_tokens` | the prompt's token count (template and tokenizer only) |
 | `GET /v1/models`, `GET /health` | the served model id (`SERVED_MODEL_NAME`, `glm-5.3` in the profiles); liveness and queue length |
+
+`/v1/messages` (`server/anthropic_api.py`) shares the queue, template and parser with the chat
+endpoint. Reasoning is not returned as thinking blocks; the server remembers each answer's reasoning
+by its tool-use ids and restores it when the client sends that turn back, because GLM's template
+re-renders earlier turns' `<think>` and a prompt without it would miss the prefix cache from the
+previous answer on. Claude Code's attribution block (a per-request fingerprint at the top of the
+system prompt) is dropped for the same reason. Effort is always `GLM_REASONING_EFFORT`; `thinking`,
+`output_config`, `cache_control` and server tools are accepted and ignored; images become a
+placeholder. Measured with Claude Code 2.1.309 (2026-10-23, a three-turn tool task): first turn
+15,580 prompt tokens, 44.7 s to first token; the next two reused 15,689 / 15,842 and prefilled
+77 / 23 new tokens, 2.6 / 2.1 s.
 
 Reasoning effort is taken from `reasoning.effort`, then `reasoning_effort`, then
 `chat_template_kwargs.reasoning_effort`, then `GLM_REASONING_EFFORT` (`low` in the profiles). GLM's

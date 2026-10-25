@@ -49,6 +49,7 @@ from tool_grammar import TOOL_CALLS_MARKER, make_factory  # noqa: E402
 from server.progress import DecodeProgress  # noqa: E402
 from server import commands as dream_commands  # noqa: E402  (opt-in: DSV41_DREAM=1)
 from server import conversation_log  # noqa: E402
+from server import anthropic_api as anthropic  # noqa: E402  (POST /v1/messages)
 from engine.adapt_config import CFG as ADAPT  # noqa: E402  (expert adaptation settings)
 
 log = logging.getLogger("dsv41.server")
@@ -1096,6 +1097,9 @@ def _json_bytes(obj: Any) -> bytes:
     return json.dumps(obj, ensure_ascii=False).encode("utf-8")
 
 
+ANTHROPIC_MEMO = anthropic.ReasoningMemo()
+
+
 # ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
@@ -1261,6 +1265,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0].rstrip("/")
+        if path.startswith("/v1/messages"):
+            return self._anthropic(path)
         try:
             body = self._read_json()
             if path == "/v1/chat/completions":
@@ -1283,6 +1289,100 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_error(APIError(500, f"internal error: {e}", err_type="server_error"))
             except Exception:
                 pass
+
+    def _anthropic(self, path: str) -> None:
+        """/v1/messages and /v1/messages/count_tokens, with errors in Anthropic's shape."""
+        try:
+            body = self._read_json()
+            if path not in ("/v1/messages", "/v1/messages/count_tokens"):
+                raise APIError(404, f"no route for POST {path}")
+            self._messages(body, count_only=path.endswith("/count_tokens"))
+        except APIError as e:
+            self._send_json(e.status, anthropic.error(e.message, anthropic.ERROR_KINDS.get(e.status, "api_error")))
+        except (ClientWriteError, BrokenPipeError, ConnectionResetError, TimeoutError):
+            log.info("client disconnected")
+        except Exception as e:  # anything else is a server bug
+            log.exception("unhandled error")
+            try:
+                self._send_json(500, anthropic.error(f"internal error: {e}", "api_error"))
+            except Exception:
+                pass
+
+    def _messages(self, body: dict, count_only: bool = False) -> None:
+        """Anthropic Messages API (server/anthropic_api.py): the request becomes a chat body, and
+        prompt, generation, tool parsing and the response cache are the chat path's own.
+
+        Streamed headers wait for the first event, so a long prefill counts against the client's
+        response timeout (Claude Code: 10 min) rather than its stream idle watchdog; this
+        generator cannot send pings while it prefills."""
+        st = self.state
+        msgs, tools = anthropic.to_chat(body, ANTHROPIC_MEMO, images=VISION_OK)
+        chat = {"messages": msgs, "tools": tools or None, "stop": body.get("stop_sequences"),
+                "max_tokens": body.get("max_tokens") or DEFAULT_MAX_TOKENS}
+        for k in ("temperature", "top_p"):
+            if body.get(k) is not None:
+                chat[k] = body[k]
+        sampling = parse_sampling(chat)
+        thinking, effort = resolve_thinking(chat, st.args.default_thinking, st.args.default_effort)
+        _prompt, prompt_ids, rendered, vl = build_chat_prompt(chat, st.enc, st.tok, thinking, effort, st.engine)
+        if count_only:
+            self._send_json(200, {"input_tokens": len(prompt_ids)})
+            return
+        _log_prompt(_prompt, prompt_ids, thinking, effort)
+        # Claude Code asks for up to 64K output tokens whatever the prompt; clamp to the context
+        # left instead of refusing, as the GLM server does.
+        room = st.engine.max_context - len(prompt_ids) - 8
+        if room < 1:
+            raise APIError(400, anthropic.too_long(len(prompt_ids), st.engine.max_context),
+                           code="context_length_exceeded")
+        sampling["max_tokens"] = min(sampling["max_tokens"], room)
+        stream = bool(body.get("stream", False))
+        mid = "msg_" + uuid.uuid4().hex[:24]
+        result = GenerationResult()
+        out = None
+
+        def begin():
+            self._start_sse()
+            return anthropic.Stream(lambda data: self._write_client(
+                f"{len(data):X}\r\n".encode("ascii") + data + b"\r\n"), mid, st.model_name, len(prompt_ids))
+
+        with st.request_context():
+            try:
+                with closing(st.generate(prompt_ids, sampling, thinking=thinking, vl=vl, detect_tool_calls=True,
+                                         result=result, tools=rendered)) as events:
+                    for kind, text in events:
+                        if not stream:
+                            continue
+                        out = out or begin()
+                        if kind == "content":
+                            out.text(text)
+                        out.ping()
+            except (ClientWriteError, BrokenPipeError, ConnectionResetError, TimeoutError) as e:
+                log.info("client disconnected mid-stream after %d tokens (%s)", len(result.gen_ids), e)
+                return
+            except Exception as e:
+                if out is None:                  # nothing sent yet: an ordinary error response
+                    raise
+                log.exception("engine error mid-stream")
+                out.error(e.message if isinstance(e, APIError) else f"engine error: {e}")
+                self._end_sse()
+                return
+            router = result.router
+            text = router.content.strip()
+            uses = anthropic.tool_uses(result.tool_calls)
+            stop = {"tool_calls": "tool_use", "length": "max_tokens"}.get(result.finish_reason, "end_turn")
+            use = anthropic.usage_counts(len(prompt_ids), int((result.stats or {}).get("prefix_cached_tokens") or 0),
+                                         len(result.gen_ids))
+            ANTHROPIC_MEMO.put(text, [u["id"] for u in uses], router.reasoning if thinking else "")
+            if stream:
+                out = out or begin()
+                out.finish(uses, stop, use)
+                self._end_sse()
+            else:
+                self._send_json(200, anthropic.message(mid, st.model_name, text, uses, stop, use))
+            st.cache_response(prompt_ids, result, thinking=thinking, vision=vl is not None)
+            conversation_log.record(chat, thinking, effort, st.model_name, router.reasoning,
+                                    router.content, result.tool_calls, result.finish_reason)
 
     # -- endpoints ---------------------------------------------------------
     def _debug_prompt(self, body: dict) -> None:

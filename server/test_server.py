@@ -318,6 +318,75 @@ def test_chat_stream_thinking_off():
     assert r["usage"]["completion_tokens_details"]["reasoning_tokens"] == 0
 
 
+ANTHROPIC_TOOLS = [{"name": "get_weather", "description": "Get the weather for a city",
+                    "input_schema": TOOLS[0]["function"]["parameters"]}]
+
+
+def anthropic_events(body) -> list:
+    """POST /v1/messages with stream=true; return [(event name, data)] in order."""
+    req = urllib.request.Request(SERVER["base"] + "/v1/messages?beta=true",
+                                 data=json.dumps(dict(body, stream=True)).encode("utf-8"), method="POST",
+                                 headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        assert r.headers["Content-Type"].startswith("text/event-stream"), r.headers["Content-Type"]
+        frames = r.read().decode("utf-8").strip().split("\n\n")
+    out = []
+    for frame in frames:
+        name, data = frame.split("\n", 1)
+        data = json.loads(data.removeprefix("data: "))
+        assert name == "event: " + data["type"], frame
+        out.append((data["type"], data))
+    return out
+
+
+def test_anthropic_messages():
+    """The Anthropic Messages API (server/anthropic_api.py) for Claude Code: same prompt as the
+    equivalent chat request, tool calls as tool_use blocks, Anthropic SSE grammar and errors."""
+    body = {"model": "x", "max_tokens": 64000, "tools": ANTHROPIC_TOOLS,
+            "system": [{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1; cch=0;"},
+                       {"type": "text", "text": "You are a helpful assistant.", "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "Weather in Berlin?"}]}],
+            "thinking": {"type": "adaptive"}}
+    status, n = post("/v1/messages/count_tokens", body)
+    assert status == 200, n
+    status, dbg = post("/v1/debug/prompt", {"tools": TOOLS, "messages": [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Weather in Berlin?"}]})
+    assert n["input_tokens"] == dbg["prompt_tokens"], (n, dbg["prompt_tokens"])
+
+    status, r = post("/v1/messages?beta=true", body)
+    assert status == 200, r
+    assert r["type"] == "message" and r["stop_reason"] == "tool_use", r
+    assert r["content"][0] == {"type": "text", "text": "Let me look that up."}, r["content"]
+    use = r["content"][1]
+    assert use["type"] == "tool_use" and use["id"].startswith("toolu_") and use["name"] == "get_weather"
+    assert use["input"] == {"location": "Berlin"}
+    assert set(r["usage"]) >= {"input_tokens", "output_tokens", "cache_read_input_tokens"}
+
+    ev = anthropic_events(body)
+    kinds = [k for k, _ in ev if k != "ping"]
+    kinds = [k for i, k in enumerate(kinds) if i == 0 or k != kinds[i - 1]]
+    assert kinds == ["message_start", "content_block_start", "content_block_delta", "content_block_stop",
+                     "content_block_start", "content_block_delta", "content_block_stop",
+                     "message_delta", "message_stop"], kinds
+    text = "".join(d["delta"]["text"] for k, d in ev if k == "content_block_delta" and d["delta"]["type"] == "text_delta")
+    assert text == "Let me look that up.", text
+    args = "".join(d["delta"]["partial_json"] for k, d in ev
+                   if k == "content_block_delta" and d["delta"]["type"] == "input_json_delta")
+    assert json.loads(args) == {"location": "Berlin"}
+    assert [d for k, d in ev if k == "message_delta"][0]["delta"]["stop_reason"] == "tool_use"
+
+    # The tool round trip encodes, and a turn's text after its results is kept.
+    status, r2 = post("/v1/messages", dict(body, messages=body["messages"] + [
+        {"role": "assistant", "content": r["content"]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use["id"], "content": "{\"temp\": 21}"},
+                                     {"type": "text", "text": "Answer in Celsius."}]}]))
+    assert status == 200, r2
+
+    status, err = post("/v1/messages/nope", body)
+    assert status == 404 and err["type"] == "error" and err["error"]["type"] == "not_found_error", err
+
+
 def test_tools_nonstream_and_stream():
     status, r = chat([{"role": "user", "content": "Weather in Berlin?"}], tools=TOOLS, reasoning_effort="high")
     assert status == 200, r

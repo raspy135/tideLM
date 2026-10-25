@@ -27,9 +27,11 @@ import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from server import anthropic_api as A  # noqa: E402
 from server.progress import DecodeProgress  # noqa: E402
 
 START, MESSAGE, EOM, EOT, EOS = "<|start|>", "<|message|>", "<|eom|>", "<|eot|>", "<|end_of_text|>"
@@ -299,6 +301,8 @@ def follower_loop(engine):
 
 def make_handler(tpl: Template, jobs, model_name: str, defaults: dict, parser_cls=None):
     Parser_ = parser_cls or Parser
+    memo = A.ReasoningMemo()
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -320,12 +324,26 @@ def make_handler(tpl: Template, jobs, model_name: str, defaults: dict, parser_cl
                 return self._json(200, {"object": "list", "data": [{"id": model_name, "object": "model"}]})
             self._json(404, {"error": "not found"})
 
+        def _error(self, code, message, anthropic):
+            self._json(code, A.error(message) if anthropic else {"error": message})
+
         def do_POST(self):
+            # Claude Code posts to /v1/messages?beta=true.
+            path = urlsplit(self.path).path.rstrip("/")
+            anthropic = path.startswith("/v1/messages")
+            tools = None
             try:
                 n = int(self.headers.get("Content-Length", 0))
                 req = json.loads(self.rfile.read(n) or b"{}")
-                path = self.path.rstrip("/")
-                if path == "/v1/chat/completions":
+                if anthropic:
+                    msgs, tools = A.to_chat(req, memo)
+                    text = tpl.render(msgs, tools, defaults["reasoning_effort"])
+                    if path == "/v1/messages/count_tokens":
+                        return self._json(200, {"input_tokens": len(tpl.encode(text))})
+                    if path != "/v1/messages":
+                        return self._error(404, "not found", True)
+                    chat = "anthropic"
+                elif path == "/v1/chat/completions":
                     text = tpl.render(req.get("messages", []), req.get("tools"),
                                       request_effort(req, defaults["reasoning_effort"]))
                     chat = True
@@ -351,12 +369,15 @@ def make_handler(tpl: Template, jobs, model_name: str, defaults: dict, parser_cl
                 if len(prompt) + params["max_tokens"] > defaults["max_seq"]:
                     params["max_tokens"] = max(1, defaults["max_seq"] - len(prompt) - 1)
                     if len(prompt) >= defaults["max_seq"]:
-                        return self._json(400, {"error": f"prompt of {len(prompt)} tokens exceeds the context"})
+                        return self._error(400, A.too_long(len(prompt), defaults["max_seq"]) if anthropic
+                                           else f"prompt of {len(prompt)} tokens exceeds the context", anthropic)
             except Exception as exc:
-                return self._json(400, {"error": f"{type(exc).__name__}: {exc}"})
+                return self._error(400, f"{type(exc).__name__}: {exc}", anthropic)
             job = Job(prompt, params)
             jobs.put(job)
-            if req.get("stream"):
+            if anthropic:
+                self._messages(job, tools, bool(req.get("stream")))
+            elif req.get("stream"):
                 self._stream(job, req, chat)
             else:
                 self._complete(job, req, chat)
@@ -446,6 +467,60 @@ def make_handler(tpl: Template, jobs, model_name: str, defaults: dict, parser_cl
                      x_engine_stats=job.stats)
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                job.cancelled.set()
+                for _ in self._events(job):
+                    pass
+
+        def _messages(self, job, tools, stream):
+            """An Anthropic Messages reply (server/anthropic_api.py), whole or as SSE events."""
+            parser = Parser_(tpl)
+            mid = f"msg_{uuid.uuid4().hex[:24]}"
+            n = 0
+            if not stream:
+                for tok in self._events(job):
+                    n += 1
+                    parser.feed(tok)
+                parser.finish()
+                text, reasoning, uses = A.answer(parser, tools)
+                memo.put(text, [u["id"] for u in uses], reasoning)
+                return self._json(200, A.message(mid, model_name, text, uses,
+                                                 A.stop_reason(uses, n, job.params["max_tokens"]), A.usage(job, n)))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+
+            def write(data):
+                self.wfile.write(data)
+                self.wfile.flush()
+
+            try:
+                out = A.Stream(write, mid, model_name, len(job.prompt))
+                while True:
+                    try:
+                        tok = job.out.get(timeout=A.PING_S)
+                    except queue.Empty:              # prefill: no token yet
+                        out.ping(idle=False)
+                        continue
+                    if tok is None:
+                        break
+                    if isinstance(tok, Exception):
+                        out.error(f"{type(tok).__name__}: {tok}")
+                        raise tok
+                    n += 1
+                    for chan, delta in parser.feed(tok):
+                        if chan == "content":
+                            out.text(delta)
+                    out.ping()
+                for chan, delta in parser.finish():
+                    if chan == "content":
+                        out.text(delta)
+                full, reasoning, uses = A.answer(parser, tools)
+                memo.put(full, [u["id"] for u in uses], reasoning)
+                out.finish(uses, A.stop_reason(uses, n, job.params["max_tokens"]), A.usage(job, n))
             except (BrokenPipeError, ConnectionResetError):
                 job.cancelled.set()
                 for _ in self._events(job):

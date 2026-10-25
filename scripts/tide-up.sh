@@ -13,6 +13,12 @@
 # experts, FP4 KV, ...) falls back to Python with a note, unless it asked for TIDE_ENGINE=rust.
 # One pair fills both boxes, so whatever is serving is stopped first, after the checks.
 # scripts/tide-down.sh stops it again.
+#
+# Both engines serve the OpenAI API (/v1/chat/completions) and the Anthropic one (/v1/messages,
+# server/anthropic_api.py) on the same port. Once the server is up this also writes
+# results/claude-code.json, the settings that point Claude Code at it with the profile's model
+# name, port and context: `claude --settings results/claude-code.json`. Other Claude Code
+# sessions keep their own model.
 # ---------------------------------------------------------------------------------------
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -47,9 +53,33 @@ esac
 mkdir -p "$ROOT/results"
 echo "$f" > "$ROOT/results/.tide-active"
 echo "--- TideLM: $engine engine, profile $f"
+claude_cfg="$ROOT/results/claude-code.json"
+rm -f "$claude_cfg"
 if [[ $engine == glm ]]; then
-    GLM_ENV_FILE="$f" exec "$ROOT/scripts/glm-up.sh"
+    GLM_ENV_FILE="$f" "$ROOT/scripts/glm-up.sh"
 elif [[ $engine == rust || $engine == rust-glm ]]; then
-    exec "$ROOT/scripts/rust-up.sh" "$f"
+    "$ROOT/scripts/rust-up.sh" "$f"
+else
+    TIDE_ENV_FILE="$f" "$ROOT/scripts/dual-up.sh"
 fi
-TIDE_ENV_FILE="$f" exec "$ROOT/scripts/dual-up.sh"
+# The launchers' own defaults when the profile leaves a setting out.
+(set -a; source "$f"; set +a; python3 - "$claude_cfg" "$engine" <<'PY'
+import json, os, sys
+glm = sys.argv[2] in ("glm", "rust-glm")
+model = os.environ.get("SERVED_MODEL_NAME") or ("glm-5.3" if glm else "deepseek-v4.1-flash")
+context = os.environ.get("GLM_MAX_SEQ", "262144") if glm else os.environ.get("MAX_SEQ", "32768")
+env = {"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{os.environ.get('PORT', '8000')}",
+       "ANTHROPIC_AUTH_TOKEN": "tidelm", "ANTHROPIC_MODEL": model,
+       "ANTHROPIC_DEFAULT_OPUS_MODEL": model, "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
+       "ANTHROPIC_DEFAULT_HAIKU_MODEL": model, "CLAUDE_CODE_SUBAGENT_MODEL": model,
+       "CLAUDE_CODE_MAX_CONTEXT_TOKENS": context,
+       # Fewer request fields the server would only ignore, and no attribution block: its
+       # per-request fingerprint at the top of the prompt would defeat the prefix cache (the
+       # server drops it too).
+       "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1", "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+       "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
+with open(sys.argv[1], "w") as fh:
+    json.dump({"env": env}, fh, indent=2)
+print(f"--- OpenAI API: {env['ANTHROPIC_BASE_URL']}/v1   Claude Code: claude --settings {sys.argv[1]}")
+PY
+)
