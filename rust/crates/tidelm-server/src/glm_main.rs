@@ -235,8 +235,6 @@ fn engine_loop(mut srv: Server, rx: mpsc::Receiver<Cmd>) -> tidelm_engine::Resul
             continue;
         }
         let id = job.id;
-        let t0 = Instant::now();
-        let n_prompt = job.prompt.len();
         let (s0, r0) = (srv.stats.clone(), srv.eng.res.stats.clone());
         let mut poll = || {
             while let Ok(c) = rx.try_recv() {
@@ -256,9 +254,9 @@ fn engine_loop(mut srv: Server, rx: mpsc::Receiver<Cmd>) -> tidelm_engine::Resul
         }
         let (s1, r1) = (&srv.stats, &srv.eng.res.stats);
         let rounds = (s1.rounds - s0.rounds).max(1) as f64;
-        eprintln!("[glm] request {id}: prompt {n_prompt}, {:.1} s, {:.2} drafted / {:.2} accepted a round, copy rounds {}, \
+        eprintln!("request {id}, GLM: {:.2} drafted / {:.2} accepted a round, copy rounds {}, \
                    hot reads {} (kept {}), swaps {}, fallbacks {}",
-                  t0.elapsed().as_secs_f64(), (s1.drafted - s0.drafted) as f64 / rounds, (s1.accepted - s0.accepted) as f64 / rounds,
+                  (s1.drafted - s0.drafted) as f64 / rounds, (s1.accepted - s0.accepted) as f64 / rounds,
                   s1.copy_rounds - s0.copy_rounds, r1.hot_reads - r0.hot_reads, r1.hot_kept - r0.hot_kept, r1.swaps - r0.swaps,
                   s1.fallbacks - s0.fallbacks);
     }

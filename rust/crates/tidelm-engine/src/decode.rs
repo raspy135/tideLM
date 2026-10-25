@@ -56,6 +56,9 @@ pub struct Generation {
     /// copied tokens they accepted
     pub copy_steps: usize,
     pub copy_accepted: usize,
+    /// when the scheduler took the request into a lane: what it waited in the queue before,
+    /// and its prefill after (the server's request log line)
+    pub admitted: Option<std::time::Instant>,
 }
 
 fn digest(h: u64, logits: &[u16]) -> u64 {
@@ -970,7 +973,7 @@ impl Scheduler {
                     if probe.as_ref().is_some_and(|p| p.lane == probe_lane) {
                         engine.reset_lane(probe_lane)?;
                     }
-                    let gen = Generation { cached: restored, ..Default::default() };
+                    let gen = Generation { cached: restored, admitted: Some(std::time::Instant::now()), ..Default::default() };
                     // an image span's positions all carry its placeholder id: never copied
                     let skip = (!job.images.is_empty()).then_some(engine.cfg.image_token_id);
                     let copy = self.copy.clone().filter(|_| job.copy_draft).map(|c| crate::copy::CopyDraft::new(&job.prompt, c, skip));

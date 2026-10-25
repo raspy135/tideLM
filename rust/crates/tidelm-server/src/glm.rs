@@ -366,7 +366,6 @@ fn run(stream: &mut TcpStream, ctx: &Ctx, g: &GlmSettings, req: Request, tools: 
     let total = t0.elapsed().as_secs_f64();
     let n = answer.tokens();
     let st = stats(n_prompt, n, &gen, first, total);
-    eprintln!("[glm] request: {st}");
     let usage = json!({"prompt_tokens": n_prompt, "completion_tokens": n, "total_tokens": n_prompt + n, "muse": st});
     let (calls, _) = answer.tool_calls(&ctx.text, tools);
     let reason = finish_reason(&calls, &answer, &finish);

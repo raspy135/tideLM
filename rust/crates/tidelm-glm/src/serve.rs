@@ -288,7 +288,7 @@ impl Server {
 
     /// One request, its tokens to `job.sink` as they are decided. `cancelled` is polled every round.
     pub fn run(&mut self, mut job: Job, cancelled: &mut dyn FnMut() -> bool) -> Result<()> {
-        let mut g = Generation::default();
+        let mut g = Generation { admitted: Some(std::time::Instant::now()), ..Default::default() };
         let finish = self.generate(&mut job, &mut g, cancelled)?;
         let ok = !matches!(finish, Finish::Error(_));
         (job.sink)(Event::Done(finish, g));

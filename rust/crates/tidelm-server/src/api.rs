@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
-use tidelm_engine::decode::{Event, Finish, Job};
+use tidelm_engine::decode::{Event, Finish, Generation, Job};
 use tidelm_engine::forward::Sampling;
 use tidelm_engine::vision::ImageIn;
 use tidelm_text::chat::{encode_messages, py_json, py_loads, IMAGE};
@@ -62,20 +62,70 @@ pub fn submit(ctx: &Ctx, r: Request) -> Result<(u64, mpsc::Receiver<Event>), Api
     let (tx, rx) = mpsc::channel::<Event>();
     let job = Job {
         id,
-        prompt: r.prompt,
         max_tokens: r.max_tokens,
         sampling: r.sampling,
         seed: r.seed,
+        sink: sink(id, r.prompt.len(), tx),
+        prompt: r.prompt,
         stop: r.stop,
-        sink: Box::new(move |ev| {
-            let _ = tx.send(ev);
-        }),
         images: r.images,
         key: r.key,
         copy_draft: r.copy_draft,
     };
     ctx.engine.send(Cmd::Submit(job)).map_err(|_| ApiError { status: 503, message: "the engine is not running".into(), param: None })?;
     Ok((id, rx))
+}
+
+/// A job's sink: its events to the handler, and one line in the server log when it ends. The
+/// clock is the engine thread's: queued is submit to admission, prefill admission to the first
+/// token (prefix restore, the probe and the post-prefill adaptation included), decode the rest
+/// at x_engine_stats' rate (tokens after the first over the time after it).
+pub fn sink(id: u64, prompt: usize, tx: mpsc::Sender<Event>) -> Box<dyn FnMut(Event) + Send> {
+    let (t0, mut first, mut n) = (Instant::now(), None, 0);
+    Box::new(move |ev| {
+        match &ev {
+            Event::Tokens(t) => {
+                if !t.is_empty() {
+                    first.get_or_insert_with(Instant::now);
+                }
+                n += t.len();
+            }
+            Event::Done(f, g) => eprintln!("{}", request_line(id, prompt, n, [t0, first.unwrap_or(t0), Instant::now()], first.is_some(), f, g)),
+        }
+        let _ = tx.send(ev);
+    })
+}
+
+/// `at`: submitted, first token, done
+pub fn request_line(id: u64, prompt: usize, n: usize, at: [Instant; 3], got: bool, f: &Finish, g: &Generation) -> String {
+    let s = |a: Instant, b: Instant| b.saturating_duration_since(a).as_secs_f64();
+    let [t0, first, end] = at;
+    let start = g.admitted.unwrap_or(t0).max(t0);
+    let mut line = format!("request {id}: prompt {prompt}");
+    if g.cached > 0 {
+        line += &format!(" ({} cached)", g.cached);
+    }
+    let queued = s(t0, start);
+    if queued >= 0.05 {
+        line += &format!(", queued {queued:.2} s");
+    }
+    if got {
+        let (new, pf, dt) = (prompt.saturating_sub(g.cached), s(start, first), s(first, end));
+        line += &format!(", prefill {new} in {pf:.2} s ({:.0} tok/s)", new as f64 / pf.max(1e-9));
+        line += &format!(", decode {n} in {dt:.2} s ({:.2} tok/s", n.saturating_sub(1) as f64 / dt.max(1e-9));
+        if g.steps > 0 {
+            line += &format!(", {:.2} a step", n.saturating_sub(1) as f64 / g.steps as f64);
+        }
+        line += ")";
+    } else {
+        line += &format!(", no tokens in {:.2} s", s(t0, end));
+    }
+    match f {
+        Finish::Stop => line + ", stop",
+        Finish::Length => line + ", length",
+        Finish::Cancelled => line + ", cancelled",
+        Finish::Error(e) => line + ", error: " + e,
+    }
 }
 
 /// A request body as json.loads reads it (an empty body is `{}`)
@@ -463,9 +513,7 @@ pub fn chat(stream: &mut TcpStream, body: &[u8], ctx: &Ctx) -> Result<(), Failur
         sampling: Sampling { temperature: req.temperature, top_p: req.top_p },
         seed,
         stop: if req.ignore_eos { Vec::new() } else { vec![ctx.eos] },
-        sink: Box::new(move |ev| {
-            let _ = tx.send(ev);
-        }),
+        sink: sink(id, ids.len(), tx),
         images,
         key,
         copy_draft: req.copy_draft,
@@ -629,4 +677,28 @@ pub fn chat(stream: &mut TcpStream, body: &[u8], ctx: &Ctx) -> Result<(), Failur
         "usage": usage, "x_engine_stats": stats,
     }))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn the_request_line_splits_queue_prefill_and_decode() {
+        let t0 = Instant::now();
+        let at = |s: f64| t0 + Duration::from_secs_f64(s);
+        // 1,000 prompt tokens, 200 from the prefix cache; admitted after 0.5 s in the queue, first
+        // token 2 s later, 101 tokens over the next 5 s in 40 steps
+        let g = Generation { cached: 200, steps: 40, admitted: Some(at(0.5)), ..Default::default() };
+        assert_eq!(request_line(7, 1000, 101, [t0, at(2.5), at(7.5)], true, &Finish::Length, &g),
+                   "request 7: prompt 1000 (200 cached), queued 0.50 s, prefill 800 in 2.00 s (400 tok/s), \
+                    decode 101 in 5.00 s (20.00 tok/s, 2.50 a step), length");
+        // admitted at once, nothing cached: no queue, no cache part
+        let g = Generation { admitted: Some(t0), ..Default::default() };
+        assert_eq!(request_line(8, 64, 1, [t0, at(0.25), at(0.25)], true, &Finish::Stop, &g),
+                   "request 8: prompt 64, prefill 64 in 0.25 s (256 tok/s), decode 1 in 0.00 s (0.00 tok/s), stop");
+        assert_eq!(request_line(9, 64, 0, [t0, t0, at(1.0)], false, &Finish::Cancelled, &Generation::default()),
+                   "request 9: prompt 64, no tokens in 1.00 s, cancelled");
+    }
 }
