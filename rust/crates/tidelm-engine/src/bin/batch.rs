@@ -82,6 +82,7 @@ fn main() -> tidelm_engine::Result<()> {
     let dspark_keep = keep_first.map(|k| vec![(0..128).map(|e| e < k.min(128)).collect::<Vec<bool>>(); 3]);
     let opts = Options {
         vision: false,
+        swa_replay: false,
         max_seq: num("--max-seq", 1024),
         max_lanes: lanes,
         spec,

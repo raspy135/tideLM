@@ -367,12 +367,16 @@ pub struct Options {
     /// image inputs: the vision tower (rank 1 of a pair, else this box), the span delimiters
     /// and the image router bias (DSV41_VISION=1, DSV41_VISION_MODE=peer)
     pub vision: bool,
+    /// the decoder SWA bounded replay (DSV41_SWA_REPLAY=1): prompt rows run the encoder half
+    /// (layers 0..=candidate_source_layer) and the decoder half replays a prompt's last window
+    /// rows once (engine/model.py::decoder_replay)
+    pub swa_replay: bool,
 }
 
 impl Options {
     pub fn streaming(max_seq: usize, spec: bool) -> Self {
         Options { max_seq, max_lanes: 1, spec, resident: false, graphs: false, n_layers: None, keep: None, dspark_keep: None,
-                  tp: None, record_demand: false, hot_ring: 0, vision: false }
+                  tp: None, record_demand: false, hot_ring: 0, vision: false, swa_replay: false }
     }
 
     /// The bytes both ranks of a pair must agree on before they start (tidelm_comm::join):
@@ -389,11 +393,11 @@ impl Options {
         let vocab = Config::load(model_dir)?.vocab_size;
         let listed = crate::draft_vocab::from_env(vocab)?.map(|ids| crate::draft_vocab::digest(&ids)).unwrap_or(0);
         Ok(format!("tidelm-pair v3 tp | max_seq {} lanes {} spec {} resident {} graphs {} layers {:?} | keep {:x} \
-                    dspark_keep {:x} record {} hot_ring {} vision {} | exe {:x} | config {:x} | draft vocab {listed:x} | env NO_QDQ={:?} ENGRAM_CACHE_MB={:?} \
+                    dspark_keep {:x} record {} hot_ring {} vision {} replay {} | exe {:x} | config {:x} | draft vocab {listed:x} | env NO_QDQ={:?} ENGRAM_CACHE_MB={:?} \
                     DRAFT_HEAD_FMT={:?} TP_DRAFT={:?} EXPERT_TOPP={:?}/{:?} PREFILL_ROWS={} NO_SPLITK={:?} \
                     HOT={:?}/{:?}/{:?} PACKED_KV={:?}",
                    self.max_seq, self.max_lanes, self.spec, self.resident, self.graphs, self.n_layers, keep_digest,
-                   mask(&self.dspark_keep), self.record_demand, self.hot_ring, self.vision, fnv(&exe), fnv(&cfg), std::env::var("TIDELM_NO_QDQ").ok(),
+                   mask(&self.dspark_keep), self.record_demand, self.hot_ring, self.vision, self.swa_replay, fnv(&exe), fnv(&cfg), std::env::var("TIDELM_NO_QDQ").ok(),
                    std::env::var("TIDELM_ENGRAM_CACHE_MB").ok(), std::env::var("TIDELM_DRAFT_HEAD_FMT").ok(),
                    std::env::var("TIDELM_TP_DRAFT").ok(), std::env::var("TIDELM_EXPERT_TOPP").ok(),
                    std::env::var("TIDELM_EXPERT_TOPP_MIN_K").ok(), prefill_rows(), std::env::var("TIDELM_NO_SPLITK").ok(),
@@ -418,6 +422,7 @@ const OP_SNAP_DROP: u32 = 12;
 const OP_DISK_SAVE: u32 = 13;
 const OP_DISK_LOAD: u32 = 14;
 const OP_VISION: u32 = 15;
+const OP_REPLAY: u32 = 16;
 
 /// This engine's half of a tensor-parallel pair: the RoCE one-shot gather every sharded
 /// output goes through, the NCCL communicator, and the control channel. Rank 0 (the
@@ -813,6 +818,8 @@ enum Selection {
 /// visible counts, and filler rows run in the scratch lane.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct StepShape {
+    /// which layers the step runs (Stage)
+    stage: Stage,
     t: usize,
     /// all-visible list widths per ratio (bucketed, <= index_topk)
     c1: usize,
@@ -842,6 +849,20 @@ struct Plan {
     shape: StepShape,
     firsts: Vec<usize>,
     heads: Vec<(usize, usize)>,
+}
+
+/// Which layers a step runs (engine/model.py::decoder_replay, the decoder SWA bounded replay):
+/// every layer; the encoder half alone - prompt rows through layers 0..=candidate_source_layer
+/// (everything that writes global KV), no head; or a replay - a prompt's last window rows from
+/// their state entering that layer (kept by the steps that ran them) through the rest, then
+/// the head. The replay re-runs the encoder's last layer for its rows to remake their index
+/// top-k and candidate pool (rewriting that layer's KV for them with the same values), where
+/// the Python engine carries both across.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Stage {
+    Full,
+    Encoder,
+    Replay,
 }
 
 /// How a block's attention sees keys: the backbone's (window ring + compressed cache) or a
@@ -1141,6 +1162,11 @@ struct LaneSnap {
     /// per ratio-2 source (kv-source order): [2][hd] f32 (kv, score) and its flag
     pending: DeviceBuffer<f32>,
     flags: DeviceBuffer<i32>,
+    /// the replay's: the lane's kept rows (rep_h / rep_pre, all window slots) and its decoder
+    /// layers' window floor
+    rep_h: DeviceBuffer<u16>,
+    rep_pre: DeviceBuffer<f32>,
+    floor: i32,
 }
 
 /// Everything the resident mode keeps on the device besides the per-step activations.
@@ -1248,6 +1274,17 @@ pub struct Engine {
     vis_idx: DeviceBuffer<i32>,
     vis_img: DeviceBuffer<i32>,
     vis_splices: Vec<(usize, usize, usize)>,
+    /// the decoder SWA bounded replay (Options::swa_replay): per lane the state entering the
+    /// replay layer of its last window prompt rows (h [hc][d] bf16, pre [hc] f32 at slot
+    /// lane * window + position % window), a step's rows' slots (-1: none kept), and per lane
+    /// its decoder layers' window floor - the first position their rings hold KV for - with
+    /// its host copy
+    swa_replay: bool,
+    rep_h: DeviceBuffer<u16>,
+    rep_pre: DeviceBuffer<f32>,
+    rep_idx: DeviceBuffer<i32>,
+    win_floor: DeviceBuffer<i32>,
+    floors: Vec<i32>,
     /// the same for the DSpark blocks
     dspark_keep: Option<DeviceBuffer<u8>>,
     /// per (drafting lanes, sampled)
@@ -1780,6 +1817,9 @@ impl Engine {
         // vision: the delimiters on every rank, the tower where images are encoded - rank 1 of a
         // pair (the profile's DSV41_VISION_MODE=peer: rank 0 keeps its memory for the server),
         // else this box
+        // the replay needs the decoder half: a truncated test model runs every layer
+        let swa_replay = opts.swa_replay && cfg.candidate_source_layer >= 0 && (cfg.candidate_source_layer as usize) + 1 < n_layers;
+        let cfg_w = cfg.window_size;
         let (vis_delims, tower) = if opts.vision {
             let delims = crate::vision::load_delimiters(&ckpt, &stream, &cfg)?;
             let tower = match opts.tp.map(|tp| tp.rank) {
@@ -1835,6 +1875,12 @@ impl Engine {
             vis_idx: DeviceBuffer::zeroed(t)?,
             vis_img: DeviceBuffer::zeroed(t)?,
             vis_splices: Vec::new(),
+            swa_replay,
+            rep_h: DeviceBuffer::zeroed(if swa_replay { (max_lanes + 1) * cfg_w * hc * d } else { 1 })?,
+            rep_pre: DeviceBuffer::zeroed(if swa_replay { (max_lanes + 1) * cfg_w * hc } else { 1 })?,
+            rep_idx: DeviceBuffer::zeroed(t)?,
+            win_floor: DeviceBuffer::zeroed(max_lanes + 1)?,
+            floors: vec![0; max_lanes + 1],
             dspark_keep,
             draft_graphs: HashMap::new(),
             draft_cols: draft_vocab.len(),
@@ -1915,7 +1961,11 @@ impl Engine {
             let mut r = tidelm_comm::Reader::new(&msg);
             match r.u32()? {
                 OP_FORWARD => {
-                    let _logits = r.u32()?;
+                    let stage = match r.u32()? {
+                        0 => Stage::Full,
+                        1 => Stage::Encoder,
+                        _ => return Err("rank 1: a forward step's stage is Full or Encoder".into()),
+                    };
                     let n = r.u32()? as usize;
                     let mut owned: Vec<(usize, Want, bool, Vec<u32>, Vec<u32>, Option<Vec<i64>>)> = Vec::with_capacity(n);
                     for _ in 0..n {
@@ -1941,7 +1991,7 @@ impl Engine {
                         .collect();
                     self.peer_hot = Some(r.u64()?);
                     // what comes back is rank 0's business: the cheapest read-back
-                    self.run_step(&segs, Readback::Argmax)?;
+                    self.run_step(&segs, Readback::Argmax, stage)?;
                 }
                 OP_DRAFT => {
                     let n = r.u32()? as usize;
@@ -2031,6 +2081,10 @@ impl Engine {
                     }
                     let need: Vec<bool> = images.iter().map(|im| !im.patches.is_empty()).collect();
                     self.set_images_inner(lane, &images, &need)?;
+                }
+                OP_REPLAY => {
+                    let lanes: Vec<usize> = r.u32s()?.into_iter().map(|l| l as usize).collect();
+                    self.run_replay(&lanes, Readback::Argmax)?;
                 }
                 OP_SHUTDOWN => return Ok(()),
                 op => return Err(format!("rank 1: unknown control op {op}").into()),
@@ -2285,10 +2339,24 @@ impl Engine {
                 }, "snapshot pending")?;
             }
         }
+        let (rep_h, rep_pre) = self.lane_rep_copy(lane)?;
         // `idx` is freed at the end of this call: the gathers must be done with it
-        st.synchronize()?;
-        self.snaps.insert((lane, id), LaneSnap { n, w, rows, pending, flags });
+        self.stream.synchronize()?;
+        let floor = self.floors[lane];
+        self.snaps.insert((lane, id), LaneSnap { n, w, rows, pending, flags, rep_h, rep_pre, floor });
         Ok(())
+    }
+
+    /// A copy of lane `lane`'s kept replay rows (one-element buffers without the replay).
+    fn lane_rep_copy(&self, lane: usize) -> Result<(DeviceBuffer<u16>, DeviceBuffer<f32>)> {
+        if !self.swa_replay {
+            return Ok((DeviceBuffer::zeroed(1)?, DeviceBuffer::zeroed(1)?));
+        }
+        let (w, hc, d) = (self.cfg.window_size, self.cfg.hc_mult, self.cfg.dim);
+        let (h, p) = (DeviceBuffer::<u16>::new(w * hc * d)?, DeviceBuffer::<f32>::new(w * hc)?);
+        h.copy_from(0, &self.rep_h, lane * w * hc * d, w * hc * d, &self.stream)?;
+        p.copy_from(0, &self.rep_pre, lane * w * hc, w * hc, &self.stream)?;
+        Ok((h, p))
     }
 
     /// Restore lane `lane` to snapshot `id`: its window rows and pending state back, its length
@@ -2317,6 +2385,13 @@ impl Engine {
             r2.psc.copy_from(lane * hd, &snap.pending, i * 2 * hd + hd, hd, st)?;
             r2.flag.copy_from(lane, &snap.flags, i, 1, st)?;
         }
+        if self.swa_replay {
+            let (w, hc, d) = (self.cfg.window_size, self.cfg.hc_mult, self.cfg.dim);
+            self.rep_h.copy_from(lane * w * hc * d, &snap.rep_h, 0, w * hc * d, st)?;
+            self.rep_pre.copy_from(lane * w * hc, &snap.rep_pre, 0, w * hc, st)?;
+        }
+        self.floors[lane] = snap.floor;
+        self.win_floor.upload_async(0, &self.floors, st)?;
         st.synchronize()?;
         let l = &mut self.lanes[lane];
         l.len = n;
@@ -2334,8 +2409,8 @@ impl Engine {
         let mut h = fnv(0xcbf29ce484222325, &exe);
         let cfg_json = std::fs::read(self.ckpt.model_dir().join("inference/config.json")).or_else(|_| std::fs::read(self.ckpt.model_dir().join("config.json")))?;
         h = fnv(h, &cfg_json);
-        let settings = format!("layers {} spec {} packed {} qdq {} ring {} window {} rank {}", self.n_layers, self.dspark.is_some(),
-                               self.packed_kv, !self.no_qdq, self.ring, self.cfg.window_size, self.rank());
+        let settings = format!("layers {} spec {} packed {} qdq {} ring {} window {} rank {} replay {}", self.n_layers, self.dspark.is_some(),
+                               self.packed_kv, !self.no_qdq, self.ring, self.cfg.window_size, self.rank(), self.swa_replay);
         h = fnv(h, settings.as_bytes());
         self.disk_ns = h;
         self.disk = Some(crate::prefix_disk::Disk::open(cfg, self.rank())?);
@@ -2389,10 +2464,16 @@ impl Engine {
         for &sid in snap_ids {
             let sn = self.snaps.get(&(lane, sid)).ok_or_else(|| format!("disk save: lane {lane} has no snapshot {sid}"))?;
             let mut h = crate::prefix_disk::SnapHost { n: sn.n, w: sn.w, rows: vec![0; sn.rows.len()], pending: vec![0.0; sn.pending.len()],
-                                                       flags: vec![0; sn.flags.len()] };
+                                                       flags: vec![0; sn.flags.len()], rep_h: Vec::new(), rep_pre: Vec::new(),
+                                                       floor: sn.floor as i64 };
             sn.rows.download_async(0, &mut h.rows, st)?;
             sn.pending.download_async(0, &mut h.pending, st)?;
             sn.flags.download_async(0, &mut h.flags, st)?;
+            if self.swa_replay {
+                (h.rep_h, h.rep_pre) = (vec![0; sn.rep_h.len()], vec![0.0; sn.rep_pre.len()]);
+                sn.rep_h.download_async(0, &mut h.rep_h, st)?;
+                sn.rep_pre.download_async(0, &mut h.rep_pre, st)?;
+            }
             snaps.push(h);
         }
         let n_max = snaps.iter().map(|s| s.n).max().unwrap_or(0);
@@ -2484,7 +2565,14 @@ impl Engine {
             rows: DeviceBuffer::from_slice(&sh.rows)?,
             pending: DeviceBuffer::from_slice(if sh.pending.is_empty() { &[0f32][..] } else { &sh.pending })?,
             flags: DeviceBuffer::from_slice(if sh.flags.is_empty() { &[0i32][..] } else { &sh.flags })?,
+            rep_h: DeviceBuffer::from_slice(if sh.rep_h.is_empty() { &[0u16][..] } else { &sh.rep_h })?,
+            rep_pre: DeviceBuffer::from_slice(if sh.rep_pre.is_empty() { &[0f32][..] } else { &sh.rep_pre })?,
+            floor: sh.floor as i32,
         };
+        let (w, hc, d) = (self.cfg.window_size, self.cfg.hc_mult, self.cfg.dim);
+        if self.swa_replay && (snapv.rep_h.len() != w * hc * d || snapv.rep_pre.len() != w * hc) {
+            return Err(format!("bundle {id}: no replay rows for this engine").into());
+        }
         st.synchronize()?;
         self.snaps.insert((lane, snap), snapv);
         self.restore_inner(lane, snap)?;
@@ -2627,6 +2715,8 @@ impl Engine {
         for st in self.caches.r2.values() {
             st.flag.upload_async(lane, &[0], &self.stream)?;
         }
+        self.floors[lane] = 0;
+        self.win_floor.upload_async(0, &self.floors, &self.stream)?;
         self.stream.synchronize()?;
         Ok(())
     }
@@ -2734,7 +2824,7 @@ impl Engine {
     /// `want` asks for (the engine's head rounds them).
     pub fn forward_batch(&mut self, segs: &[Seg]) -> Result<Vec<Vec<u16>>> {
         let v = self.cfg.vocab_size;
-        let plan = self.run_step(segs, Readback::Logits)?;
+        let plan = self.run_step(segs, Readback::Logits, Stage::Full)?;
         Ok(plan.heads.iter().map(|&(h0, n)| self.logits_host[h0 * v..(h0 + n) * v].to_vec()).collect())
     }
 
@@ -2742,8 +2832,82 @@ impl Engine {
     /// asks for (first index on ties, as decode::argmax_bf16), computed on the device so
     /// only the ids come back.
     pub fn forward_batch_argmax(&mut self, segs: &[Seg]) -> Result<Vec<Vec<u32>>> {
-        let plan = self.run_step(segs, Readback::Argmax)?;
+        let plan = self.run_step(segs, Readback::Argmax, Stage::Full)?;
         Ok(plan.heads.iter().map(|&(h0, n)| self.am_host[h0..h0 + n].iter().map(|&x| x as u32).collect()).collect())
+    }
+
+    /// Prompt rows through the encoder half alone (Stage::Encoder; their segments want
+    /// nothing): the decoder half runs once over the prompt's tail in replay_batch_*.
+    pub fn encode_batch(&mut self, segs: &[Seg]) -> Result<()> {
+        if !self.swa_replay {
+            return Err("encode_batch: the engine runs without the bounded replay".into());
+        }
+        if segs.iter().any(|sg| sg.decode || sg.want != Want::Nothing) {
+            return Err("encode_batch: prompt rows only, wanting no logits".into());
+        }
+        self.run_step(segs, Readback::Argmax, Stage::Encoder)?;
+        Ok(())
+    }
+
+    /// Whether prompts run as encoder steps and a bounded replay (Options::swa_replay).
+    pub fn swa_replay(&self) -> bool {
+        self.swa_replay
+    }
+
+    /// Rows a replay of `lane` covers: its prompt's last window positions.
+    pub fn replay_rows(&self, lane: usize) -> usize {
+        self.lanes[lane].len.min(self.cfg.window_size)
+    }
+
+    /// model.py::decoder_replay for each lane, after the encoder steps of its whole prompt:
+    /// the last window rows from their kept state through the replay layers on, their decoder
+    /// windows starting at the first of them; the last row's argmax per lane. The rows are the
+    /// lanes' last step segments (DSpark seeds from them), the lanes' lengths unchanged.
+    pub fn replay_batch_argmax(&mut self, lanes: &[usize]) -> Result<Vec<u32>> {
+        let plan = self.run_replay(lanes, Readback::Argmax)?;
+        Ok(plan.heads.iter().map(|&(h0, _)| self.am_host[h0] as u32).collect())
+    }
+
+    /// replay_batch_argmax, the last row's nucleus at each lane's sampling.
+    pub fn replay_batch_sampled(&mut self, lanes: &[usize], sampling: &[Sampling]) -> Result<Vec<Nucleus>> {
+        if sampling.len() != lanes.len() {
+            return Err(format!("{} lanes, {} samplings", lanes.len(), sampling.len()).into());
+        }
+        let plan = self.run_replay(lanes, Readback::Nucleus(sampling))?;
+        Ok(self.nuclei(&plan, sampling)?.into_iter().map(|mut r| r.remove(0)).collect())
+    }
+
+    fn run_replay(&mut self, lanes: &[usize], readback: Readback) -> Result<Plan> {
+        self.mirror(|m| {
+            m.u32(OP_REPLAY).u32s(&lanes.iter().map(|&l| l as u32).collect::<Vec<_>>());
+        })?;
+        if !self.swa_replay {
+            return Err("replay: the engine runs without the bounded replay".into());
+        }
+        let tp = Instant::now();
+        let plan = self.prepare_replay(lanes)?;
+        let shape = plan.shape;
+        self.eager_step = shape.t > TMAX;
+        let td = Instant::now();
+        self.times.prepare_s += (td - tp).as_secs_f64();
+        let res = (|| -> Result<()> {
+            for (k, (l0, l1)) in self.segments_for(Stage::Replay).into_iter().enumerate() {
+                self.run_segment(shape, k, l0, l1)?;
+            }
+            Ok(())
+        })();
+        self.eager_step = false;
+        res?;
+        self.read_heads(&plan, readback)?;
+        // the rows are the lanes' last segments (seed_draft_batch reads them); no new positions
+        for (i, &ln) in lanes.iter().enumerate() {
+            let rows = self.replay_rows(ln);
+            let l = &mut self.lanes[ln];
+            l.last = (l.len - rows, plan.firsts[i], rows);
+            l.step = self.step_no;
+        }
+        self.times.device_s += td.elapsed().as_secs_f64();
+        Ok(plan)
     }
 
     /// `forward_batch` for sampling: per segment, the nucleus of each row its `want` asks for
@@ -2753,9 +2917,14 @@ impl Engine {
         if sampling.len() != segs.len() {
             return Err(format!("{} segments, {} samplings", segs.len(), sampling.len()).into());
         }
-        let plan = self.run_step(segs, Readback::Nucleus(sampling))?;
+        let plan = self.run_step(segs, Readback::Nucleus(sampling), Stage::Full)?;
+        self.nuclei(&plan, sampling)
+    }
+
+    /// Each head row's nucleus after a Readback::Nucleus step, per segment.
+    fn nuclei(&mut self, plan: &Plan, sampling: &[Sampling]) -> Result<Vec<Vec<Nucleus>>> {
         let v = self.cfg.vocab_size;
-        let mut out = Vec::with_capacity(segs.len());
+        let mut out = Vec::with_capacity(plan.heads.len());
         for (i, &(h0, n)) in plan.heads.iter().enumerate() {
             let mut rows = Vec::with_capacity(n);
             for h in h0..h0 + n {
@@ -2797,10 +2966,26 @@ impl Engine {
         out
     }
 
+    /// The step's layer ranges at `stage`: the encoder's end at the replay layer included, the
+    /// replay's from it.
+    fn segments_for(&self, stage: Stage) -> Vec<(usize, usize)> {
+        let rl = self.rep_layer();
+        match stage {
+            Stage::Full => self.segments(),
+            Stage::Encoder => self.segments().into_iter().filter(|s| s.0 <= rl).map(|(a, b)| (a, b.min(rl + 1))).collect(),
+            Stage::Replay => vec![(rl, self.n_layers)],
+        }
+    }
+
+    /// The layer a replay starts at: the encoder half's last (candidate_source_layer).
+    fn rep_layer(&self) -> usize {
+        self.cfg.candidate_source_layer.max(0) as usize
+    }
+
     /// One backbone step: host preparation, then the graph segments, each started once the
     /// engram rows it needs have been gathered. The gathers run on their own threads from the
     /// start of the step, so a layer's NVMe reads overlap every segment before it.
-    fn run_step(&mut self, segs: &[Seg], readback: Readback) -> Result<Plan> {
+    fn run_step(&mut self, segs: &[Seg], readback: Readback, stage: Stage) -> Result<Plan> {
         let hot_digest = self.hot.as_ref().map(|h| h.digest()).unwrap_or(0);
         // rank 1 replays: its hot-read state must be rank 0's, or the pair's plans diverge
         if let Some(theirs) = self.peer_hot.take() {
@@ -2809,7 +2994,7 @@ impl Engine {
             }
         }
         self.mirror(|m| {
-            m.u32(OP_FORWARD).u32(0).u32(segs.len() as u32);
+            m.u32(OP_FORWARD).u32(stage as u32).u32(segs.len() as u32);
             for sg in segs {
                 let want = match sg.want {
                     Want::Nothing => 0,
@@ -2826,7 +3011,7 @@ impl Engine {
             m.u64(hot_digest);
         })?;
         let tp = Instant::now();
-        let plan = self.prepare(segs)?;
+        let plan = self.prepare(segs, stage)?;
         let shape = plan.shape;
         self.eager_step = shape.t > TMAX;
         let td = Instant::now();
@@ -2866,7 +3051,7 @@ impl Engine {
                 }));
             }
             let mut first_err = None;
-            for (k, (l0, l1)) in self.segments().into_iter().enumerate() {
+            for (k, (l0, l1)) in self.segments_for(shape.stage).into_iter().enumerate() {
                 if let Some((li, n, rx)) = pending.remove(&l0) {
                     let te = Instant::now();
                     let rc = rx.recv().unwrap_or(-1);
@@ -2926,7 +3111,7 @@ impl Engine {
     /// Host work before a step's device work: the rows' positions and lanes, the segments,
     /// the embedding's host half, the n-gram hashes and their engram rows (an NVMe gather),
     /// and the step's shape.
-    fn prepare(&mut self, segs: &[Seg]) -> Result<Plan> {
+    fn prepare(&mut self, segs: &[Seg], stage: Stage) -> Result<Plan> {
         if segs.is_empty() {
             return Err("a step needs at least one segment".into());
         }
@@ -3047,6 +3232,18 @@ impl Engine {
             self.vis_idx.upload_async(0, &vidx, &self.stream)?;
             self.vis_img.upload_async(0, &vimg, &self.stream)?;
         }
+        // the replay's kept rows: each prompt segment's last window rows, at their slots
+        if self.swa_replay {
+            let w = self.cfg.window_size;
+            let mut ri = vec![-1i32; tb];
+            for (i, sg) in segs.iter().enumerate().filter(|(_, sg)| !sg.decode) {
+                let (s0, t) = (self.lanes[sg.lane].len, sg.ids.len());
+                for j in t.saturating_sub(w)..t {
+                    ri[firsts[i] + j] = (sg.lane * w + (s0 + j) % w) as i32;
+                }
+            }
+            self.rep_idx.upload_async(0, &ri, &self.stream)?;
+        }
         self.live_rows = rows;
         self.embed_host(&ids, rows)?;
         let n_eng = cfg.engram_layer_ids.len();
@@ -3110,6 +3307,7 @@ impl Engine {
             (if r == 1 { nc1 } else { nc2 }) > 2048 * 8
         };
         let shape = StepShape {
+            stage,
             t: tb,
             c1: bucket(nc1.min(topk), 16, topk),
             c2: bucket(nc2.min(topk), 16, topk),
@@ -3124,6 +3322,125 @@ impl Engine {
         Ok(Plan { shape, firsts, heads })
     }
 
+    /// A replay step's host half (prepare's, for rows the lanes already hold): per lane its
+    /// last window positions in order, prompt rows, the last one's head row; their kept state's
+    /// slots; their decoder windows' floor at the first of them; image rows' router flags.
+    fn prepare_replay(&mut self, lanes: &[usize]) -> Result<Plan> {
+        if lanes.is_empty() {
+            return Err("a replay needs a lane".into());
+        }
+        let cfg = self.cfg.clone();
+        let w = cfg.window_size;
+        let mut seen = vec![false; self.max_lanes + 1];
+        let mut rows = 0;
+        for &ln in lanes {
+            if ln >= self.max_lanes || std::mem::replace(&mut seen[ln], true) || self.lanes[ln].len == 0 {
+                return Err(format!("replay: lane {ln} out of range, repeated or empty").into());
+            }
+            rows += self.replay_rows(ln);
+        }
+        if rows > self.pmax {
+            return Err(format!("a replay takes at most {} rows, got {rows}", self.pmax).into());
+        }
+        let tb = row_bucket(rows);
+        let scratch = self.max_lanes;
+        let filler = (self.ring - 1).min(self.max_seq.saturating_sub(1)) as i32;
+        let (mut pos, mut lane, mut dec, mut ri) = (vec![filler; tb], vec![scratch as i32; tb], vec![0i32; tb], vec![(scratch * w) as i32; tb]);
+        let nseg = self.max_lanes + 1;
+        let (mut sf, mut sn, mut sl) = (vec![0i32; nseg], vec![0i32; nseg], vec![scratch as i32; nseg]);
+        let (mut head_rows, mut heads, mut firsts) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut nc1, mut nc2, mut vimg, mut any_img) = (0usize, 0usize, vec![0i32; tb], false);
+        let vr = cfg.vision_downsample_ratio;
+        let mut r = 0;
+        for (i, &ln) in lanes.iter().enumerate() {
+            let (len, t) = (self.lanes[ln].len, self.replay_rows(ln));
+            let s0 = len - t;
+            for j in 0..t {
+                let p = s0 + j;
+                pos[r + j] = p as i32;
+                lane[r + j] = ln as i32;
+                ri[r + j] = (ln * w + p % w) as i32;
+                if let Some(v) = &self.lane_vis[ln] {
+                    if v.row_at(p, vr)?.is_some() {
+                        vimg[r + j] = 1;
+                        any_img = true;
+                    }
+                }
+            }
+            dec[r..r + t].iter_mut().for_each(|x| *x = 0);
+            (sf[i], sn[i], sl[i]) = (r as i32, t as i32, ln as i32);
+            heads.push((head_rows.len(), 1));
+            head_rows.push((r + t - 1) as i32);
+            firsts.push(r);
+            nc1 = nc1.max(len);
+            nc2 = nc2.max(len / 2);
+            self.floors[ln] = s0 as i32;
+            r += t;
+        }
+        let nw = head_rows.len();
+        let hb = row_bucket(nw);
+        head_rows.resize(hb.max(1), 0);
+        {
+            let st = &self.stream;
+            let a = &self.act;
+            a.pos.upload_async(0, &pos, st)?;
+            a.lane.upload_async(0, &lane, st)?;
+            let cpos2: Vec<i32> = pos.iter().map(|&p| (p - 1).max(0)).collect();
+            self.cpos1.upload_async(0, &pos, st)?;
+            self.cpos2.upload_async(0, &cpos2, st)?;
+            a.seg_first.upload_async(0, &sf, st)?;
+            a.seg_count.upload_async(0, &sn, st)?;
+            a.seg_lane.upload_async(0, &sl, st)?;
+            a.head_rows.upload_async(0, &head_rows, st)?;
+            a.live_pairs.upload_async(0, &[(rows * cfg.n_activated_experts) as i32], st)?;
+            a.decode_rows.upload_async(0, &dec, st)?;
+            self.rep_idx.upload_async(0, &ri, st)?;
+            self.win_floor.upload_async(0, &self.floors, st)?;
+            if any_img {
+                self.vis_img.upload_async(0, &vimg, st)?;
+            }
+        }
+        self.live_rows = rows;
+        self.vis_splices.clear();
+        let topk = cfg.index_topk;
+        let indexed = |nc: usize, r: usize| -> Option<usize> { (nc > topk).then(|| bucket(nc, 2048, self.max_seq / r + 1)) };
+        let cand_src = cfg.candidate_source_layer;
+        let cand = cand_src >= 0 && (cand_src as usize) < self.n_layers && {
+            let r = cfg.compress_ratios[cand_src as usize].max(1);
+            (if r == 1 { nc1 } else { nc2 }) > 2048 * 8
+        };
+        let shape = StepShape {
+            stage: Stage::Replay,
+            t: tb,
+            c1: bucket(nc1.min(topk), 16, topk),
+            c2: bucket(nc2.min(topk), 16, topk),
+            n1: indexed(nc1, 1),
+            n2: indexed(nc2, 2),
+            cand,
+            head: hb,
+            prompt: true,
+            decode: false,
+            vision: any_img,
+        };
+        Ok(Plan { shape, firsts, heads })
+    }
+
+    /// The replay step's start (begin_step's): its rows' kept state into the stream in place of
+    /// an embedding, and the all-visible compressed lists from their positions.
+    fn begin_replay(&mut self, shape: StepShape) -> Result<()> {
+        let (t, d, hc) = (shape.t, self.cfg.dim, self.cfg.hc_mult);
+        let sr = self.stream.raw();
+        let a = &self.act;
+        ck(unsafe { ds_gather_rows_u16(sr, np(&self.rep_h), np(&self.rep_idx), np(&a.h), t as i32, (hc * d) as i32) }, "replay rows")?;
+        // f32 rows as pairs of 16-bit words
+        ck(unsafe { ds_gather_rows_u16(sr, np(&self.rep_pre), np(&self.rep_idx), np(&a.pre), t as i32, (hc * 2) as i32) }, "replay mixes")?;
+        ck(unsafe { ds_visible(sr, np(&a.pos), t as i32, 1, shape.c1 as i32, np(&a.cidx1), np(&a.clen1)) }, "visible r1")?;
+        ck(unsafe { ds_visible(sr, np(&a.pos), t as i32, 2, shape.c2 as i32, np(&a.cidx2), np(&a.clen2)) }, "visible r2")?;
+        self.selection = Selection::AllVisible;
+        self.cand_live = false;
+        Ok(())
+    }
+
     /// Every device operation of layers l0..l1 of a backbone step (the embedding first, the
     /// head last), in stream order, with no host decision that depends on buffer contents:
     /// the body a step graph segment captures.
@@ -3135,8 +3452,18 @@ impl Engine {
         if l0 == 0 {
             self.begin_step(shape)?;
         }
+        let rl = self.rep_layer();
+        if shape.stage == Stage::Replay && l0 == rl {
+            self.begin_replay(shape)?;
+        }
         let cols = self.hash.layout.n_hash_cols();
         for l in l0..l1 {
+            // a step's prompt rows leave the replay their state entering the replay layer
+            if self.swa_replay && l == rl && shape.prompt && shape.stage != Stage::Replay {
+                let (sr, a) = (self.stream.raw(), &self.act);
+                ck(unsafe { ds_scatter_rows_u16(sr, np(&a.h), np(&self.rep_idx), np(&self.rep_h), t as i32, (hc * d) as i32) }, "replay keep")?;
+                ck(unsafe { ds_scatter_rows_u16(sr, np(&a.pre), np(&self.rep_idx), np(&self.rep_pre), t as i32, (hc * 2) as i32) }, "replay keep mixes")?;
+            }
             let t0 = Instant::now();
             // resident: borrow the layer out of the resident set for this block (put back below)
             let w = match self.resident.as_mut() {
@@ -3231,10 +3558,27 @@ impl Engine {
     /// After the step's device work: read back the logits, their argmaxes or their nuclei
     /// into the pinned buffers, advance the lanes.
     fn collect(&mut self, segs: &[Seg], plan: &Plan, readback: Readback) -> Result<()> {
+        self.read_heads(plan, readback)?;
+        let logits = matches!(readback, Readback::Logits);
+        let nw: usize = plan.heads.iter().map(|h| h.1).sum();
+        let v = self.cfg.vocab_size;
+        for (i, sg) in segs.iter().enumerate() {
+            let l = &mut self.lanes[sg.lane];
+            l.last = (l.len, plan.firsts[i], sg.ids.len());
+            l.step = self.step_no;
+            l.len += sg.ids.len();
+        }
+        if let (Some(dir), true, true, 1) = (&self.dump_dir, logits, nw > 0, segs.len()) {
+            dump_bf16(&dir.join("logits.f32"), &self.logits_host[(nw - 1) * v..nw * v])?;
+        }
+        Ok(())
+    }
+
+    /// The step's head rows read back as `readback` asks; the step is counted.
+    fn read_heads(&mut self, plan: &Plan, readback: Readback) -> Result<()> {
         let st = &self.stream;
         let v = self.cfg.vocab_size;
         let nw: usize = plan.heads.iter().map(|h| h.1).sum();
-        let logits = matches!(readback, Readback::Logits);
         match readback {
             _ if nw == 0 => {}
             Readback::Logits => self.act.logits.download_async(0, &mut self.logits_host[..nw * v], st)?,
@@ -3259,15 +3603,6 @@ impl Engine {
         }
         st.synchronize()?;
         self.step_no += 1;
-        for (i, sg) in segs.iter().enumerate() {
-            let l = &mut self.lanes[sg.lane];
-            l.last = (l.len, plan.firsts[i], sg.ids.len());
-            l.step = self.step_no;
-            l.len += sg.ids.len();
-        }
-        if let (Some(dir), true, true, 1) = (&self.dump_dir, logits, nw > 0, segs.len()) {
-            dump_bf16(&dir.join("logits.f32"), &self.logits_host[(nw - 1) * v..nw * v])?;
-        }
         Ok(())
     }
 
@@ -3751,9 +4086,14 @@ impl Engine {
         };
         let (split_rows, prompt_rows) = (decode || !prompt, prompt);
         let flags = if split_rows && prompt_rows { np(&a.decode_rows) } else { nul() };
+        // the decoder layers' rings hold KV from each lane's replay floor on
+        let floor = match ctx {
+            Ctx::Main { l, .. } if self.swa_replay && l > self.rep_layer() => np(&self.win_floor),
+            _ => nul(),
+        };
         if split_rows {
             ck(unsafe {
-                ds_attn_decode(sr, np(&a.q), np(ring), self.ring as i32, np(win_pos), cfg.window_size as i32, 0, ckv_ptr, cidx_ptr,
+                ds_attn_decode(sr, np(&a.q), np(ring), self.ring as i32, np(win_pos), cfg.window_size as i32, floor, ckv_ptr, cidx_ptr,
                                c as i32, np(&w.attn_sink), scale, np(&a.o), ti, h as i32, np(&a.lane), (self.ring * hd) as i64,
                                ckv_ls as i64, np(&a.attn_work), a.attn_work.len() as i64, flags, fp4)
             }, "attention")?;
@@ -3763,7 +4103,7 @@ impl Engine {
             // against 7.39 at 16 heads (2,048 rows over 128 + 1,024 keys, examples/bench_attn.rs
             // --prefill; Python's tools/prefill_attn.py at 32 heads, 7.35)
             ck(unsafe {
-                ds_attn_prefill(sr, np(&a.q), np(ring), self.ring as i32, np(win_pos), cfg.window_size as i32, 0, ckv_ptr, cidx_ptr,
+                ds_attn_prefill(sr, np(&a.q), np(ring), self.ring as i32, np(win_pos), cfg.window_size as i32, floor, ckv_ptr, cidx_ptr,
                                 c as i32, np(&w.attn_sink), scale, np(&a.o), ti, h as i32, np(&a.lane), (self.ring * hd) as i64,
                                 ckv_ls as i64, flags, 32, fp4)
             }, "attention (prompt rows)")?;
@@ -3962,8 +4302,11 @@ impl Engine {
                 _ => None,
             };
             let nl = self.n_layers;
+            // a replay's first layer ran for its rows in their encoder steps: their demand there
+            // is already recorded
+            let replayed = self.shape.is_some_and(|sh| sh.stage == Stage::Replay) && layer == Some(self.rep_layer());
             let (counts, mass, ms) = match (layer, &self.demand, &self.miss) {
-                (Some(l), Some(dm), Some(ms)) => (dm.ptr_at(l * e), dm.ptr_at((nl + l) * e), np(ms)),
+                (Some(l), Some(dm), Some(ms)) if !replayed => (dm.ptr_at(l * e), dm.ptr_at((nl + l) * e), np(ms)),
                 _ => (nul(), nul(), nul()),
             };
             // an image span's rows select with bias_vl in every backbone layer (the drafter

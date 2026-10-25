@@ -427,6 +427,22 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
   run's), a re-run tool call 60.9 -> 100.4 (equal), quoting code 50.6 -> 75.1; back to back on one
   boot, fresh code 57.4 -> 58.9 and prose 32.3 -> 32.5 tok/s, no copy step firing on either.
 
+  The decoder SWA bounded replay is in (2026-10-24, --swa-replay 1, the profile's
+  DSV41_SWA_REPLAY=1; tech report 2.2 / 3.2.2, engine/model.py::decoder_replay): prompt rows run
+  the encoder half (layers 0..=20, everything that writes global KV, no head); every step that
+  runs prompt rows keeps their state entering layer 20 for the last 128 positions of a lane; the
+  prompt's end replays those rows through layers 20-39 and the head, the decoder layers' windows
+  floored at the replay's first position (a per-lane floor the attention kernels read, which
+  decode keeps until the window passes it). Layer 20 runs again in the replay to remake its rows'
+  index top-k and candidate pool - the Python engine carries both across - and the drafter seeds
+  from the replayed rows. Snapshots and disk bundles carry the kept rows and the floor (bundle
+  format 2); restoring a prompt's own snapshot at length - 1 (an exact re-send) runs its last row
+  through every layer against the restored decoder windows instead of replaying, which is the same
+  computation. Measured: a 14-token prompt's greedy output equal to the full prefill's (86 of 86
+  tokens), a 6,032-token needle prompt 6.03 -> 3.79 s to its first token with the same answer;
+  the README protocol 8K first token 9.30 -> 4.81 s. An exact re-send of 8,028 tokens 0.29 s, a
+  follow-up turn after it 0.72 s.
+
   Still missing, in order of what the numbers above say (prefill at large chunks is in: M5,
   8K first token 27.3 -> 6.76 s):
   1. With speculation the pair's logits digest no longer equals one box's (4 layers, prose

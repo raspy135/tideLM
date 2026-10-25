@@ -729,14 +729,14 @@ fn attention_decode_matches_the_sinked_softmax_reference() {
     let (wp, wl) = if mode == 1 || mode == 3 { (p(&work), wb as i64) } else { (null(), 0) };
     if mode != 2 && mode != 4 {
         ok(unsafe {
-            ds_attn_decode(st.raw(), p(&dq), p(&dring), ring_size as i32, p(&dpos), w as i32, 0, p(&dckv), p(&dcidx),
+            ds_attn_decode(st.raw(), p(&dq), p(&dring), ring_size as i32, p(&dpos), w as i32, null(), p(&dckv), p(&dcidx),
                            c as i32, p(&dsink), scale, p(&dout), m as i32, h as i32, null(), 0, 0, wp, wl,
                            if mode == 3 { p(&decode_rows) } else { null() }, 0)
         });
     }
     if mode >= 2 {
         ok(unsafe {
-            ds_attn_prefill(st.raw(), p(&dq), p(&dring), ring_size as i32, p(&dpos), w as i32, 0, p(&dckv), p(&dcidx),
+            ds_attn_prefill(st.raw(), p(&dq), p(&dring), ring_size as i32, p(&dpos), w as i32, null(), p(&dckv), p(&dcidx),
                             c as i32, p(&dsink), scale, p(&dout), m as i32, h as i32, null(), 0, 0,
                             if mode == 3 { p(&decode_rows) } else { null() }, if mode == 4 { 32 } else { 16 }, 0)
         });
@@ -843,10 +843,10 @@ fn packed_kv_is_the_qdq_rows_and_attention_reads_it_bit_for_bit() {
         let out = DeviceBuffer::<u16>::zeroed(m * h * d).unwrap();
         ok(unsafe {
             if prefill {
-                ds_attn_prefill(st.raw(), p(&dq), p(&dring), ring_size as i32, p(&dp), w as i32, 0, ckv, p(&dc), c as i32, p(&ds),
+                ds_attn_prefill(st.raw(), p(&dq), p(&dring), ring_size as i32, p(&dp), w as i32, null(), ckv, p(&dc), c as i32, p(&ds),
                                 scale, p(&out), m as i32, h as i32, null(), 0, 0, null(), 32, fp4)
             } else {
-                ds_attn_decode(st.raw(), p(&dq), p(&dring), ring_size as i32, p(&dp), w as i32, 0, ckv, p(&dc), c as i32, p(&ds),
+                ds_attn_decode(st.raw(), p(&dq), p(&dring), ring_size as i32, p(&dp), w as i32, null(), ckv, p(&dc), c as i32, p(&ds),
                                scale, p(&out), m as i32, h as i32, null(), 0, 0, p(&work), wb as i64, null(), fp4)
             }
         });
@@ -1392,7 +1392,7 @@ fn lane_rows_read_and_write_only_their_own_caches() {
     let wb = unsafe { ds_attn_work_bytes(3, h as i32, (w + c) as i32) } as usize;
     let work = DeviceBuffer::<u8>::zeroed(wb).unwrap();
     ok(unsafe {
-        ds_attn_decode(st.raw(), p(&dq), p(&drings), ring as i32, p(&dp), w as i32, 0, p(&dckvs), p(&dc), c as i32, p(&dsink),
+        ds_attn_decode(st.raw(), p(&dq), p(&drings), ring as i32, p(&dp), w as i32, null(), p(&dckvs), p(&dc), c as i32, p(&dsink),
                        scale, p(&both), 3, h as i32, p(&dl), (ring * d) as i64, (n_ckv * d) as i64, p(&work), wb as i64, null(), 0)
     });
     st.synchronize().unwrap();
@@ -1403,7 +1403,7 @@ fn lane_rows_read_and_write_only_their_own_caches() {
             dev(&ckvs[ln * n_ckv * d..(ln + 1) * n_ckv * d]), dev(&pos[row..row + 1]), dev(&cidx[row * c..(row + 1) * c]));
         let one = DeviceBuffer::<u16>::zeroed(h * d).unwrap();
         ok(unsafe {
-            ds_attn_decode(st.raw(), p(&dq1), p(&dr1), ring as i32, p(&dp1), w as i32, 0, p(&dk1), p(&dc1), c as i32, p(&dsink),
+            ds_attn_decode(st.raw(), p(&dq1), p(&dr1), ring as i32, p(&dp1), w as i32, null(), p(&dk1), p(&dc1), c as i32, p(&dsink),
                            scale, p(&one), 1, h as i32, null(), 0, 0, p(&work), wb as i64, null(), 0)
         });
         st.synchronize().unwrap();

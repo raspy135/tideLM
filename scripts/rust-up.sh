@@ -9,7 +9,7 @@
 # KEEP_FREE_GB (the memory guard), DSV41_ADAPT_SENSITIVITY / _PRIOR / _DECODE_TOKENS,
 # DSV41_PROBE_PREFILL, DSV41_PREFIX_CACHE / _SNAPSHOTS / _DISK / _DISK_GB /
 # _DISK_MIN_INTERVAL_S / _DISK_DEDUP, DSV41_VISION, DSV41_HOT_READS / _ASYNC / _MIN / _MAX /
-# _RING, DSV41_PACKED_KV. The Python kernels' other DSV41_* knobs mean nothing here.
+# _RING, DSV41_PACKED_KV, DSV41_SWA_REPLAY. The Python kernels' other DSV41_* knobs mean nothing here.
 #
 # The Rust engine's own, with their defaults:
 #   RUST_BUDGET=10000        resident experts (next to 512K tokens of context per lane)
@@ -53,7 +53,7 @@ args=(--resident --graphs --model-dir "$MODEL_DIR" --served-model-name "${SERVED
       --adapt-prior "${DSV41_ADAPT_PRIOR:-4}" --adapt-decode-tokens "${DSV41_ADAPT_DECODE_TOKENS:-600}"
       --adapt-probe "${DSV41_PROBE_PREFILL:-1}"
       --prefix-cache "${DSV41_PREFIX_CACHE:-1}" --prefix-snapshots "${DSV41_PREFIX_SNAPSHOTS:-16}"
-      --copy-draft "${RUST_COPY_DRAFT:-1}")
+      --copy-draft "${RUST_COPY_DRAFT:-1}" --swa-replay "${DSV41_SWA_REPLAY:-1}")
 if [[ "${SPEC:-1}" == 0 ]]; then args+=(--depth plain); else args+=(--depth "${RUST_DEPTH:-confidence}"); fi
 # async hot reads plan from one lane's verify rows: on only with one lane
 if [[ "${DSV41_HOT_READS:-1}" == 1 && "${DSV41_HOT_ASYNC:-1}" == 1 && "${DSV41_MAX_CONCURRENCY:-1}" == 1 ]]; then

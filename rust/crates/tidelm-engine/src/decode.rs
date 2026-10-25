@@ -499,6 +499,10 @@ struct Slot {
     restored: usize,
     /// the copy drafter's index of the prompt and the output (set_copy_draft)
     copy: Option<crate::copy::CopyDraft>,
+    /// restored to its own prompt's snapshot at length - 1, taken after that prompt's replay:
+    /// its last row runs every layer against the restored decoder windows, which are the replay
+    /// it would redo (Engine::swa_replay)
+    shortcut: bool,
 }
 
 /// A request's probe: the prompt rows it feeds and the lane they go to - the request's own
@@ -643,9 +647,9 @@ impl Scheduler {
     /// last prompt: its length and id (0, None: a miss, and every snapshot of the lane goes).
     /// Snapshots past it are of rows this prompt rewrites, so they go too (v41_engine
     /// _restore_prefix); the prompt's own snapshot at its length - 1 becomes a boundary.
-    fn prefix_admit(&mut self, engine: &mut Engine, lane: usize, prompt: &[u32]) -> Result<(usize, Option<u64>)> {
+    fn prefix_admit(&mut self, engine: &mut Engine, lane: usize, prompt: &[u32]) -> Result<(usize, Option<u64>, bool)> {
         if self.prefix_snaps.is_none() {
-            return Ok((0, None));
+            return Ok((0, None, false));
         }
         let lp = &self.prefix[lane];
         let common = lp.tokens.iter().zip(prompt).take_while(|(a, b)| a == b).count();
@@ -668,11 +672,13 @@ impl Scheduler {
                 self.stats.prefix_hits += 1;
                 self.stats.prefix_tokens += n;
                 eprintln!("prefix disk: restored {n} of {} tokens from bundle {id}", prompt.len());
-                return Ok((n, Some(snap)));
+                return Ok((n, Some(snap), false));
             }
-            return Ok((0, None));
+            return Ok((0, None, false));
         }
         let lp = &mut self.prefix[lane];
+        // the lane's last prompt's own snapshot (at its length - 1, after its replay)
+        let full = best.is_some() && best == lp.full;
         let mut stale: Vec<u64> = Vec::new();
         let out = match best {
             Some((n, id)) => {
@@ -702,7 +708,7 @@ impl Scheduler {
             self.stats.prefix_hits += 1;
             self.stats.prefix_tokens += out.0;
         }
-        Ok(out)
+        Ok((out.0, out.1, full))
     }
 
     /// A boundary snapshot of `lane` at its fed length `n` before its next prompt chunk (the
@@ -932,7 +938,7 @@ impl Scheduler {
                         LanePolicy::None => {}
                     }
                     let rng = Pcg64::from_seed(job.seed as u128);
-                    let (restored, snap) = self.prefix_admit(engine, lane, job.key.as_deref().unwrap_or(&job.prompt))?;
+                    let (restored, snap, from_full) = self.prefix_admit(engine, lane, job.key.as_deref().unwrap_or(&job.prompt))?;
                     // the images its prefill still reaches (or none: the lane's previous go)
                     if let Err(e) = engine.set_images(lane, &job.images, restored) {
                         eprintln!("request {}: images: {e}", job.id);
@@ -968,8 +974,9 @@ impl Scheduler {
                     // an image span's positions all carry its placeholder id: never copied
                     let skip = (!job.images.is_empty()).then_some(engine.cfg.image_token_id);
                     let copy = self.copy.clone().filter(|_| job.copy_draft).map(|c| crate::copy::CopyDraft::new(&job.prompt, c, skip));
+                    let shortcut = engine.swa_replay() && from_full && restored + 1 == job.prompt.len();
                     self.slots[lane] = Some(Slot {
-                        job, fed: restored, tok: None, gen, rng, q: Vec::new(), mark: (1, 0.0, 0.0), probe, restored, copy,
+                        job, fed: restored, tok: None, gen, rng, q: Vec::new(), mark: (1, 0.0, 0.0), probe, restored, copy, shortcut,
                     });
                 }
             }
@@ -1041,6 +1048,15 @@ impl Scheduler {
                 }
             }
         }
+        // with the bounded replay a prompt chunk runs the encoder half; a probe's rows (routed
+        // through every layer for their demand) and a shortcut's last row run whole - a step is
+        // one or the other, those first
+        let replay = engine.swa_replay();
+        let whole = |s: &Self, e: &(usize, usize, bool)| e.2 || s.slots[e.0].as_ref().unwrap().shortcut;
+        if replay && prefill.iter().any(|e| whole(self, e)) {
+            prefill.retain(|e| whole(self, e));
+        }
+        let encoder = replay && !prefill.is_empty() && decode.is_empty() && !prefill.iter().any(|e| whole(self, e));
         // the prefix cache's boundary snapshots: a prompt chunk past position 0 starts where
         // its lane stands now
         for &(lane, _, probing) in &prefill {
@@ -1138,7 +1154,7 @@ impl Scheduler {
                 continue;
             }
             let p = &s.job.prompt;
-            let want = if s.fed + c == p.len() { Want::Last } else { Want::Nothing };
+            let want = if s.fed + c == p.len() && !encoder { Want::Last } else { Want::Nothing };
             // the next chunk, as wide as this one: prefetched engram rows past what the next
             // step takes stay cached for the one after
             let next = &p[s.fed + c..p.len().min(s.fed + 2 * c)];
@@ -1159,7 +1175,10 @@ impl Scheduler {
         // decoding lanes', then the prefill entries', in segment order
         let owners = decode.iter().map(|d| d.0).chain(prefill.iter().map(|p| p.0));
         let seg_sampling: Vec<Sampling> = owners.map(|l| self.slots[l].as_ref().unwrap().job.sampling).collect();
-        let (am, logits, nuc): (Vec<Vec<u32>>, Vec<Vec<u16>>, Vec<Vec<Nucleus>>) = if self.opt.logits {
+        let (am, logits, nuc): (Vec<Vec<u32>>, Vec<Vec<u16>>, Vec<Vec<Nucleus>>) = if encoder {
+            engine.encode_batch(&segs)?;
+            (Vec::new(), Vec::new(), Vec::new())
+        } else if self.opt.logits {
             let lg = engine.forward_batch(&segs)?;
             (lg.iter().map(|l| l.chunks(v).map(argmax_bf16).collect()).collect(), lg, Vec::new())
         } else if seg_sampling.iter().all(|s| s.is_greedy()) {
@@ -1215,6 +1234,7 @@ impl Scheduler {
             }
         }
         let mut probed = Vec::new();
+        let mut replay_lanes: Vec<usize> = Vec::new();
         for (j, &(lane, c, probing)) in prefill.iter().enumerate() {
             let s = self.slots[lane].as_mut().unwrap();
             if probing {
@@ -1230,6 +1250,13 @@ impl Scheduler {
                 continue;
             }
             s.fed += c;
+            if encoder {
+                // its first token comes from the replay below
+                if s.fed == s.job.prompt.len() {
+                    replay_lanes.push(lane);
+                }
+                continue;
+            }
             if spec {
                 seeds.push((lane, c));
             }
@@ -1241,6 +1268,28 @@ impl Scheduler {
                     draw(&nuc[decode.len() + j][0], unif(&mut s.rng))
                 };
                 emits.push((lane, vec![t], None, true));
+            }
+        }
+        // the decoder half over each finished prompt's tail (model.py::decoder_replay): the
+        // first token, and the drafter seeded from the replayed rows
+        if !replay_lanes.is_empty() {
+            let sm: Vec<Sampling> = replay_lanes.iter().map(|&l| self.slots[l].as_ref().unwrap().job.sampling).collect();
+            let toks: Vec<u32> = if sm.iter().all(|x| x.is_greedy()) {
+                engine.replay_batch_argmax(&replay_lanes)?
+            } else {
+                let nuc = engine.replay_batch_sampled(&replay_lanes, &sm)?;
+                replay_lanes
+                    .iter()
+                    .zip(&nuc)
+                    .zip(&sm)
+                    .map(|((&l, n), x)| if x.is_greedy() { n.ids[0] } else { draw(n, unif(&mut self.slots[l].as_mut().unwrap().rng)) })
+                    .collect()
+            };
+            for (&l, &t) in replay_lanes.iter().zip(&toks) {
+                if spec {
+                    seeds.push((l, engine.replay_rows(l)));
+                }
+                emits.push((l, vec![t], None, true));
             }
         }
         let tc = std::time::Instant::now();

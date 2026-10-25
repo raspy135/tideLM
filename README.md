@@ -10,7 +10,7 @@ tide — so the engine gets better the more you use it.
 
 | Profile | Model | Routed experts | Resident | Context | Prose | Code | 8K-token prompt, first token |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `ds41-mxfp4`, Rust engine | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,000 / 15,360 (65.1%) | 512K | **30.9 tok/s** | **50.9 tok/s** | 9.3 s |
+| `ds41-mxfp4`, Rust engine | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,000 / 15,360 (65.1%) | 2 x 512K | **31.8 tok/s** | **49.0 tok/s** | 4.8 s |
 | `ds41-mxfp4`, Python engine | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,452 / 15,360 (68%) | 512K | **25.6 tok/s** | **43.3 tok/s** | 7.3 s |
 | `glm53-exl3` | GLM-5.3 | EXL3 3.0 bpw | 12,500 / 19,200 (65.1%) | 256K | **15.2 tok/s** | **20.3 tok/s** | 18.5 s |
 
@@ -19,12 +19,13 @@ output tokens at temperature 0.6, prose = an essay request, code = an LRU-cache 
 column is the median time to first token of a fresh ~8,200-token prompt (no prefix reused). Each
 profile uses adaptation, hot reads and speculative decoding on two DGX Sparks, with its learned
 expert history. The Rust engine (`rust/`, no Python between the socket and the GPU) was measured
-on 2026-10-24 from the Python rows' seed history and an empty prefix cache, at the profile's 512K
-allocation, with packed KV and 10,000 residents: it reads native scales (the lossless scale pack
-is not ported yet, so the Python engine's 10,452 do not fit in its memory):
-[raw runs](results/rust-ds41-20261024/README.md). A second boot gave 30.7 / 50.1 tok/s and
-8.0 s; its 8K first token moves between ~7.6 and ~9.3 s from run to run (the six runs' median
-is 9.3 s), and is 7.5 s on a boot that serves only 8K prompts. Python DS was measured on 2026-10-22 with lossless scales, candidate indexing, the
+on 2026-10-24 from the Python rows' seed history and an empty prefix cache, as the profile ships:
+two lanes of 512K (so no async hot reads), packed KV, the decoder SWA bounded replay (prompt rows
+run layers 0-20, layers 20-39 replay the prompt's last 128 rows, as the Python engine's
+`DSV41_SWA_REPLAY`), the copy drafter, and 10,000 residents on native scales (the lossless scale
+pack is not ported yet, so the Python engine's 10,452 do not fit in its memory):
+[raw runs](results/rust-ds41-20261024/README.md). Before the replay, one lane: 30.9 / 50.9 tok/s
+and 9.3 s (a second boot 30.7 / 50.1 and 8.0 s). Python DS was measured on 2026-10-22 with lossless scales, candidate indexing, the
 split draft weights, an 8-token depth window and 10,452 residents at a 32K context allocation
 (the profile supports 512K): [raw runs](results/ds41-depth8-20261022/README.md). Its code median
 moves with each boot's acceptance (41.1-44.8 across that day's boots) and the 8K first token with

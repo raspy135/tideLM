@@ -124,7 +124,7 @@ extern "C" {
 
     pub fn ds_attn_decode(
         stream: CudaStream, q: *const c_void, ring: *const c_void, ring_size: c_int,
-        pos: *const c_void, w: c_int, win_lo: c_int, ckv: *const c_void, cidx: *const c_void,
+        pos: *const c_void, w: c_int, win_lo: *const c_void, ckv: *const c_void, cidx: *const c_void,
         c: c_int, sink: *const c_void, scale: f32, out: *mut c_void, m: c_int, h: c_int,
         lane: *const c_void, ring_lstride: i64, ckv_lstride: i64, work: *mut c_void, work_bytes: i64,
         decode_rows: *const c_void, ckv_fp4: c_int,
@@ -133,7 +133,7 @@ extern "C" {
     /// ds_attn_decode's attention for prompt rows in one pass a row (no split, no workspace),
     /// `heads_per_block` 16 or 32; rows with rows[m] != 0 are skipped (null: none).
     pub fn ds_attn_prefill(
-        stream: CudaStream, q: *const c_void, ring: *const c_void, ring_size: c_int, pos: *const c_void, w: c_int, win_lo: c_int,
+        stream: CudaStream, q: *const c_void, ring: *const c_void, ring_size: c_int, pos: *const c_void, w: c_int, win_lo: *const c_void,
         ckv: *const c_void, cidx: *const c_void, c: c_int, sink: *const c_void, scale: f32, out: *mut c_void, m: c_int, h: c_int,
         lane: *const c_void, ring_lstride: i64, ckv_lstride: i64, rows: *const c_void, heads_per_block: c_int, ckv_fp4: c_int,
     ) -> c_int;

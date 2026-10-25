@@ -36,3 +36,21 @@ Packed KV costs 0.3 s of it at 64K (bf16 KV 7.34 / 7.16 s), and bf16 KV does not
 
 Minimum MemAvailable over the second boot: 6 / 7 GiB (rank 0 / 1), against the profile's
 `KEEP_FREE_GB=6`.
+
+## The shipped profile after the bounded replay (`replay/`)
+
+The same reset and protocol (seed history `45ef7129`, empty prefix cache, the chart's salts,
+temperature 0.6, seed 42, `--ignore-eos`, three runs after a warmup, one boot) on the profile as
+it ships after the day's changes: two lanes (`DSV41_MAX_CONCURRENCY=2`, 512K each, so no async
+hot reads), the decoder SWA bounded replay (prompt rows run layers 0-20; layers 20-39 replay the
+prompt's last 128 rows), the copy drafter, 10,000 residents.
+
+| Workload | Output tokens | tok/s (runs) | Median tok/s | TTFT (runs) | Median TTFT |
+| --- | ---: | --- | ---: | --- | ---: |
+| Prose | 1024 | 31.09 / 31.88 / 31.78 | **31.78** | 0.70 / 0.70 / 0.68 s | 0.700 s |
+| Code | 1024 | 48.95 / 49.50 / 48.27 | **48.95** | 0.74 / 0.71 / 0.74 s | 0.737 s |
+| Random 8K | 256 | 34.23 / 35.24 / 35.59 | 35.24 | 6.99 / 4.78 / 4.81 s | **4.807 s** |
+
+Against the first boot above: prose +2.9%, code -3.9% (inside the two boots' 50.07-50.93 and the
+acceptance it moves with: 3.39 / 3.49 / 3.41 here; no copy step fires on these prompts), the 8K
+first token 9.30 -> 4.81 s (Python 7.28).

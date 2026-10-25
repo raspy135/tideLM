@@ -61,7 +61,7 @@ fn main() -> tidelm_engine::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     // an unknown flag is an error: a test flag the server ignores (--keep-first once) loaded
     // every expert and ran the box out of memory
-    const VALUED: [&str; 31] = ["--copy-draft", "--bench-width", "--vision", "--model-dir", "--max-seq", "--lanes", "--depth", "--step-rows", "--keep-db", "--budget",
+    const VALUED: [&str; 32] = ["--swa-replay", "--copy-draft", "--bench-width", "--vision", "--model-dir", "--max-seq", "--lanes", "--depth", "--step-rows", "--keep-db", "--budget",
                                 "--keep-first", "--layers", "--served-model-name", "--effort", "--host", "--port", "--world",
                                 "--rank", "--adapt-db", "--trace", "--adapt-sensitivity", "--adapt-prior", "--adapt-decode-tokens", "--adapt-probe", "--hot-ring", "--prefix-cache",
                                 "--prefix-snapshots", "--prefix-disk", "--prefix-disk-gb", "--prefix-disk-interval",
@@ -158,6 +158,9 @@ fn main() -> tidelm_engine::Result<()> {
         // tower, --vision 0 off
         vision: arg(&args, "--vision").as_deref() != Some("0")
             && tidelm_engine::config::Config::load(&model_dir)?.vision_n_layers > 0,
+        // the decoder SWA bounded replay (DSV41_SWA_REPLAY=1): --swa-replay 0 runs every layer
+        // over every prompt row
+        swa_replay: arg(&args, "--swa-replay").as_deref() != Some("0"),
     };
     // rank 1 of an adapting pair needs rank 0's residents before it loads them: it joins first
     let pair = match &pair_args {

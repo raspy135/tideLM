@@ -63,7 +63,7 @@ fn main() -> tidelm_engine::Result<()> {
     if args.iter().any(|a| a == "--spec") {
         return spec_parity(&model_dir, token_map, &ids, layers, keep, steps);
     }
-    let base = Options { vision: false, max_seq: 1024, max_lanes: 1, spec: false, resident: false, graphs: false, n_layers: Some(layers), keep, dspark_keep: None, tp: None, record_demand: false, hot_ring: 0 };
+    let base = Options { vision: false, swa_replay: false, max_seq: 1024, max_lanes: 1, spec: false, resident: false, graphs: false, n_layers: Some(layers), keep, dspark_keep: None, tp: None, record_demand: false, hot_ring: 0 };
 
     let (sl, st, _) = {
         let mut e = Engine::new(&model_dir, token_map.clone(), base.clone())?;
@@ -99,7 +99,7 @@ fn main() -> tidelm_engine::Result<()> {
 fn spec_parity(model_dir: &std::path::Path, token_map: Vec<i64>, ids: &[u32], layers: usize,
                keep: Option<Vec<Vec<bool>>>, steps: usize) -> tidelm_engine::Result<()> {
     let dkeep = Some(vec![(0..128).map(|e| e < 8).collect::<Vec<bool>>(); 3]);
-    let base = Options { vision: false, max_seq: 1024, max_lanes: 1, spec: true, resident: false, graphs: false, n_layers: Some(layers), keep,
+    let base = Options { vision: false, swa_replay: false, max_seq: 1024, max_lanes: 1, spec: true, resident: false, graphs: false, n_layers: Some(layers), keep,
                          dspark_keep: dkeep, tp: None, record_demand: false, hot_ring: 0 };
     let n = steps + 1;
     let mut results = Vec::new();
@@ -159,7 +159,7 @@ fn oracle_spec(e: &mut Engine, ids: &[u32], n: usize, truth: &[u32]) -> tidelm_e
 /// and the top-1/top-2 margin alone — a kernel bug moves logits by O(1), rounding by ~1e-2.
 fn mma_rounding(model_dir: &std::path::Path, token_map: Vec<i64>, text: &Text, layers: usize,
                 keep: Option<Vec<Vec<bool>>>) -> tidelm_engine::Result<()> {
-    let opts = Options { vision: false, max_seq: 1024, max_lanes: 2, spec: false, resident: true, graphs: false, n_layers: Some(layers), keep,
+    let opts = Options { vision: false, swa_replay: false, max_seq: 1024, max_lanes: 2, spec: false, resident: true, graphs: false, n_layers: Some(layers), keep,
                          dspark_keep: None, tp: None, record_demand: false, hot_ring: 0 };
     let mut e = Engine::new(model_dir, token_map, opts)?;
     let f = |h: u16| f32::from_bits((h as u32) << 16) as f64;

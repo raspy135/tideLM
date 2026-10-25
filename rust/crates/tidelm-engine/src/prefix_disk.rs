@@ -26,6 +26,10 @@ pub struct SnapHost {
     pub rows: Vec<u16>,
     pub pending: Vec<f32>,
     pub flags: Vec<i32>,
+    /// the bounded replay's kept rows and decoder window floor (empty / 0 without it)
+    pub rep_h: Vec<u16>,
+    pub rep_pre: Vec<f32>,
+    pub floor: i64,
 }
 
 /// A saved prompt: its tokens, snapshots, and per kv-source layer the compressed rows (the
@@ -40,7 +44,8 @@ pub struct Bundle {
     pub ik: Vec<(usize, Vec<u8>)>,
 }
 
-const MAGIC: &[u8; 8] = b"TIDEPFX1";
+// 2: snapshots carry the bounded replay's kept rows and window floor
+const MAGIC: &[u8; 8] = b"TIDEPFX2";
 
 /// A 64-bit checksum of the file's bytes, fast enough to run on every load (several GB/s).
 pub fn checksum(b: &[u8]) -> u64 {
@@ -93,6 +98,9 @@ pub fn encode(b: &Bundle) -> Vec<u8> {
         put_slice(&mut o, &s.rows);
         put_slice(&mut o, &s.pending);
         put_slice(&mut o, &s.flags);
+        put_slice(&mut o, &s.rep_h);
+        put_slice(&mut o, &s.rep_pre);
+        put_u64(&mut o, s.floor as u64);
     }
     for part in [&b.ckv, &b.ik] {
         put_u64(&mut o, part.len() as u64);
@@ -144,7 +152,8 @@ pub fn decode(b: &[u8]) -> Result<Bundle> {
     let mut snaps = Vec::new();
     for _ in 0..r.u64()? {
         let (n, w) = (r.u64()? as usize, r.u64()? as usize);
-        snaps.push(SnapHost { n, w, rows: r.vec()?, pending: r.vec()?, flags: r.vec()? });
+        let (rows, pending, flags, rep_h, rep_pre) = (r.vec()?, r.vec()?, r.vec()?, r.vec()?, r.vec()?);
+        snaps.push(SnapHost { n, w, rows, pending, flags, rep_h, rep_pre, floor: r.u64()? as i64 });
     }
     let mut parts = [Vec::new(), Vec::new()];
     for part in parts.iter_mut() {
@@ -357,8 +366,10 @@ mod tests {
         Bundle {
             id: id.into(),
             namespace: 7,
-            snaps: vec![SnapHost { n: 3, w: 3, rows: vec![1, 2, 3], pending: vec![0.5; 4], flags: vec![1] },
-                        SnapHost { n: tokens.len() - 1, w: 4, rows: vec![9; 8], pending: vec![], flags: vec![] }],
+            snaps: vec![SnapHost { n: 3, w: 3, rows: vec![1, 2, 3], pending: vec![0.5; 4], flags: vec![1], rep_h: vec![7; 6],
+                                   rep_pre: vec![0.25; 2], floor: 0 },
+                        SnapHost { n: tokens.len() - 1, w: 4, rows: vec![9; 8], pending: vec![], flags: vec![], rep_h: vec![], rep_pre: vec![],
+                                   floor: 5 }],
             tokens,
             ckv: vec![(2, vec![1, 2, 3, 4]), (20, vec![5; 9])],
             ik: vec![(2, vec![7; 3])],

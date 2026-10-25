@@ -1586,7 +1586,7 @@ __device__ __forceinline__ void ldsm_x2_trans(uint32_t& b0, uint32_t& b1, const 
 
 __global__ void __launch_bounds__(256) attn_fd_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ ring_base, int ring_size,
-    const int* __restrict__ pos, int W, int win_lo, const __nv_bfloat16* __restrict__ ckv_base,
+    const int* __restrict__ pos, int W, const int* __restrict__ win_lo, const __nv_bfloat16* __restrict__ ckv_base,
     const int* __restrict__ cidx, int C, float scale, int H, const int* __restrict__ row_lane,
     int64_t ring_lstride, int64_t ckv_lstride, int tiles_per_split, int S, float* __restrict__ part_o,
     float* __restrict__ part_ml, const int* __restrict__ decode_rows, int ckv_fp4) {
@@ -1606,6 +1606,9 @@ __global__ void __launch_bounds__(256) attn_fd_kernel(
     const int NK = W + C;
     const int p = pos[m];
     const int ln = row_lane ? row_lane[m] : 0;
+    // the lane's window floor: the first position whose window KV this layer's ring holds
+    // (null: 0) - a decoder layer's after a prompt's bounded replay
+    const int lo = win_lo ? win_lo[ln] : 0;
     const __nv_bfloat16* ring = ring_base + (int64_t)ln * ring_lstride;
     const __nv_bfloat16* ckv = ckv_base ? ckv_base + (int64_t)ln * ckv_lstride : nullptr;
     // packed KV: the same lane offset (ckv_lstride counts bf16 units), rows of kPkRow bytes
@@ -1637,7 +1640,7 @@ __global__ void __launch_bounds__(256) attn_fd_kernel(
             const __nv_bfloat16* kr = nullptr;
             if (n < W) {
                 const int kp = p - (W - 1 - n);
-                if (kp >= 0 && kp >= win_lo) kr = ring + (int64_t)(kp % ring_size) * kFdD;
+                if (kp >= 0 && kp >= lo) kr = ring + (int64_t)(kp % ring_size) * kFdD;
             } else if (n < NK) {
                 const int jj = idx_s[n - s_lo];
                 if (jj >= 0) {
@@ -1778,7 +1781,7 @@ __global__ void __launch_bounds__(256) attn_fd_kernel(
 template <int MT, int NT>
 __global__ void __launch_bounds__(256) attn_prefill_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ ring_base, int ring_size,
-    const int* __restrict__ pos, int W, int win_lo, const __nv_bfloat16* __restrict__ ckv_base,
+    const int* __restrict__ pos, int W, const int* __restrict__ win_lo, const __nv_bfloat16* __restrict__ ckv_base,
     const int* __restrict__ cidx, int C, float scale, int H, const int* __restrict__ row_lane,
     int64_t ring_lstride, int64_t ckv_lstride, const float* __restrict__ sink, const int* __restrict__ rows,
     __nv_bfloat16* __restrict__ out, int ckv_fp4) {
@@ -1799,6 +1802,9 @@ __global__ void __launch_bounds__(256) attn_prefill_kernel(
     const int NK = W + C;
     const int p = pos[m];
     const int ln = row_lane ? row_lane[m] : 0;
+    // the lane's window floor: the first position whose window KV this layer's ring holds
+    // (null: 0) - a decoder layer's after a prompt's bounded replay
+    const int lo = win_lo ? win_lo[ln] : 0;
     const __nv_bfloat16* ring = ring_base + (int64_t)ln * ring_lstride;
     const __nv_bfloat16* ckv = ckv_base ? ckv_base + (int64_t)ln * ckv_lstride : nullptr;
     // packed KV: the same lane offset (ckv_lstride counts bf16 units), rows of kPkRow bytes
@@ -1828,7 +1834,7 @@ __global__ void __launch_bounds__(256) attn_prefill_kernel(
             const __nv_bfloat16* kr = nullptr;
             if (n < W) {
                 const int kp = p - (W - 1 - n);
-                if (kp >= 0 && kp >= win_lo) kr = ring + (int64_t)(kp % ring_size) * kFdD;
+                if (kp >= 0 && kp >= lo) kr = ring + (int64_t)(kp % ring_size) * kFdD;
             } else if (n < NK) {
                 const int jj = idx_s[n - W];
                 if (jj >= 0) {
@@ -2028,7 +2034,7 @@ constexpr int kAttnHG = 4;
 template <int HG>
 __global__ void __launch_bounds__(256) attn_decode_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ ring_base, int ring_size,
-    const int* __restrict__ pos, int W, int win_lo, const __nv_bfloat16* __restrict__ ckv_base,
+    const int* __restrict__ pos, int W, const int* __restrict__ win_lo, const __nv_bfloat16* __restrict__ ckv_base,
     const int* __restrict__ cidx, int C, const float* __restrict__ sink, float scale,
     __nv_bfloat16* __restrict__ out, int H, const int* __restrict__ row_lane, int64_t ring_lstride,
     int64_t ckv_lstride) {
@@ -2042,6 +2048,7 @@ __global__ void __launch_bounds__(256) attn_decode_kernel(
     const int NK = W + C;
     const int p = pos[m];
     const int ln = row_lane ? row_lane[m] : 0;
+    const int lo = win_lo ? win_lo[ln] : 0;
     const __nv_bfloat16* ring = ring_base + (int64_t)ln * ring_lstride;
     const __nv_bfloat16* ckv = ckv_base ? ckv_base + (int64_t)ln * ckv_lstride : nullptr;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
@@ -2053,7 +2060,7 @@ __global__ void __launch_bounds__(256) attn_decode_kernel(
     auto key_row = [&](int n) -> const __nv_bfloat16* {
         if (n < W) {
             const int kp = p - (W - 1 - n);
-            if (kp < 0 || kp < win_lo) return nullptr;
+            if (kp < 0 || kp < lo) return nullptr;
             return ring + (int64_t)(kp % ring_size) * D;
         }
         const int j = cidx[(int64_t)m * C + (n - W)];
@@ -3218,7 +3225,8 @@ __global__ void scatter_rows_u16_kernel(const uint16_t* __restrict__ src, const 
                                         int D) {
     const int m = blockIdx.y;
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
-    if (d < D) out[(int64_t)idx[m] * D + d] = src[(int64_t)m * D + d];
+    // a row whose index is negative stays where it is
+    if (d < D && idx[m] >= 0) out[(int64_t)idx[m] * D + d] = src[(int64_t)m * D + d];
 }
 
 // Routed expert ids -> arena slots through the device LUT (model.py: lut[L][indices]).
@@ -3454,7 +3462,7 @@ int ds_moe_combine(void* stream, const void* parts, int K, int M, const void* sh
 
 extern "C++" {
 template <int HG>
-static int launch_attn(cudaStream_t st, const void* q, const void* ring, int ring_size, const void* pos, int W, int win_lo,
+static int launch_attn(cudaStream_t st, const void* q, const void* ring, int ring_size, const void* pos, int W, const void* win_lo,
                        const void* ckv, const void* cidx, int C, const void* sink, float scale, void* out, int M, int H,
                        const void* lane, int64_t ring_lstride, int64_t ckv_lstride) {
     const size_t smem = (size_t)HG * (512 + W + C) * sizeof(float);
@@ -3468,7 +3476,7 @@ static int launch_attn(cudaStream_t st, const void* q, const void* ring, int rin
     dim3 grid(H / HG, M);
     attn_decode_kernel<HG><<<grid, 256, smem, st>>>(
         static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(ring), ring_size,
-        static_cast<const int*>(pos), W, win_lo, static_cast<const __nv_bfloat16*>(ckv),
+        static_cast<const int*>(pos), W, static_cast<const int*>(win_lo), static_cast<const __nv_bfloat16*>(ckv),
         static_cast<const int*>(cidx), C, static_cast<const float*>(sink), scale,
         static_cast<__nv_bfloat16*>(out), H, static_cast<const int*>(lane), ring_lstride, ckv_lstride);
     return static_cast<int>(cudaGetLastError());
@@ -3483,7 +3491,7 @@ int64_t ds_attn_work_bytes(int M, int H, int NK) {
 }
 
 int ds_attn_decode(void* stream, const void* q, const void* ring, int ring_size, const void* pos, int W,
-                   int win_lo, const void* ckv, const void* cidx, int C, const void* sink, float scale, void* out,
+                   const void* win_lo, const void* ckv, const void* cidx, int C, const void* sink, float scale, void* out,
                    int M, int H, const void* lane, int64_t ring_lstride, int64_t ckv_lstride, void* work,
                    int64_t work_bytes, const void* decode_rows, int ckv_fp4) {
     const int* dr = static_cast<const int*>(decode_rows);
@@ -3504,7 +3512,7 @@ int ds_attn_decode(void* stream, const void* q, const void* ring, int ring_size,
         }
         attn_fd_kernel<<<dim3(hb, S, M), 256, smem, static_cast<cudaStream_t>(stream)>>>(
             static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(ring), ring_size,
-            static_cast<const int*>(pos), W, win_lo, static_cast<const __nv_bfloat16*>(ckv), static_cast<const int*>(cidx),
+            static_cast<const int*>(pos), W, static_cast<const int*>(win_lo), static_cast<const __nv_bfloat16*>(ckv), static_cast<const int*>(cidx),
             C, scale, H, static_cast<const int*>(lane), ring_lstride, ckv_lstride, tps, S, po, pml, dr, ckv_fp4);
         attn_fd_combine_kernel<<<dim3(H, M), 256, 0, static_cast<cudaStream_t>(stream)>>>(
             po, pml, S, H, static_cast<const float*>(sink), static_cast<__nv_bfloat16*>(out), dr);
@@ -3521,7 +3529,7 @@ int ds_attn_decode(void* stream, const void* q, const void* ring, int ring_size,
     return launch_attn<1>(st, q, ring, ring_size, pos, W, win_lo, ckv, cidx, C, sink, scale, out, M, H, lane, ring_lstride, ckv_lstride);
 }
 
-int ds_attn_prefill(void* stream, const void* q, const void* ring, int ring_size, const void* pos, int W, int win_lo,
+int ds_attn_prefill(void* stream, const void* q, const void* ring, int ring_size, const void* pos, int W, const void* win_lo,
                     const void* ckv, const void* cidx, int C, const void* sink, float scale, void* out, int M, int H,
                     const void* lane, int64_t ring_lstride, int64_t ckv_lstride, const void* rows, int heads_per_block,
                     int ckv_fp4) {
@@ -3533,7 +3541,7 @@ int ds_attn_prefill(void* stream, const void* q, const void* ring, int ring_size
         if (e != cudaSuccess) return static_cast<int>(e);
         kern<<<dim3((H + hb_heads - 1) / hb_heads, M), 256, smem, static_cast<cudaStream_t>(stream)>>>(
             static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(ring), ring_size,
-            static_cast<const int*>(pos), W, win_lo, static_cast<const __nv_bfloat16*>(ckv), static_cast<const int*>(cidx),
+            static_cast<const int*>(pos), W, static_cast<const int*>(win_lo), static_cast<const __nv_bfloat16*>(ckv), static_cast<const int*>(cidx),
             C, scale, H, static_cast<const int*>(lane), ring_lstride, ckv_lstride, static_cast<const float*>(sink),
             static_cast<const int*>(rows), static_cast<__nv_bfloat16*>(out), ckv_fp4);
         return static_cast<int>(cudaGetLastError());

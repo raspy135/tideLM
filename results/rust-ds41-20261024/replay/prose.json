@@ -1,0 +1,114 @@
+{
+  "label": "rust-ds41-prose",
+  "workload": "prose",
+  "seed_salt": "flare-perf-http-20261021-prose",
+  "isl": null,
+  "osl": 1024,
+  "runs": 3,
+  "warmup": 1,
+  "thinking": false,
+  "effort": null,
+  "temperature": 0.6,
+  "ignore_eos": true,
+  "base": "http://127.0.0.1:8000",
+  "model": "deepseek",
+  "health": {
+    "status": "ok",
+    "engine": "tidelm-rust"
+  },
+  "ttft_ms_median": 700.3011,
+  "tpot_ms_median": 31.469,
+  "decode_tok_s_median": 31.7773,
+  "engine_median": {
+    "accept_len_mean": 1.8634,
+    "expert_hit_rate": null,
+    "nvme_gb": null,
+    "engram_rows": null
+  },
+  "raw": [
+    {
+      "ttft_ms": 700.3011319320649,
+      "tpot_ms": 32.163262147618454,
+      "decode_tok_s": 31.091373611617485,
+      "completion_tokens": 1024,
+      "reasoning_tokens": 0,
+      "finish_reason": "length",
+      "total_s": 33.603318308945745,
+      "x_engine_stats": {
+        "steps": 565,
+        "accept_len_mean": 1.8106194690265487,
+        "decode_tok_s": 31.09139034841485,
+        "ttft_s": 0.690492751,
+        "engine": "tidelm-rust",
+        "copy_steps": 0,
+        "copy_accepted": 0,
+        "prune_miss_request": {
+          "miss_rate": 0.0536493288590604,
+          "missed_slots": 19185,
+          "slots": 357600,
+          "score_miss_rate": 0.03447723528055304,
+          "prompt_miss_rate": 0.030648148148148147,
+          "decode_miss_rate": 0.05436562860438293
+        }
+      },
+      "prompt_tokens_actual": 45,
+      "completion_chars": 5218
+    },
+    {
+      "ttft_ms": 702.3290919605643,
+      "tpot_ms": 31.368414904168453,
+      "decode_tok_s": 31.879200879452572,
+      "completion_tokens": 1024,
+      "reasoning_tokens": 0,
+      "finish_reason": "length",
+      "total_s": 32.79221753892489,
+      "x_engine_stats": {
+        "steps": 541,
+        "accept_len_mean": 1.8909426987060998,
+        "decode_tok_s": 31.879225294081024,
+        "ttft_s": 0.693036903,
+        "engine": "tidelm-rust",
+        "copy_steps": 0,
+        "copy_accepted": 0,
+        "prune_miss_request": {
+          "miss_rate": 0.04110554788213628,
+          "missed_slots": 14285,
+          "slots": 347520,
+          "score_miss_rate": 0.0247470386639955,
+          "prompt_miss_rate": 0.025185185185185185,
+          "decode_miss_rate": 0.04161617961511048
+        }
+      },
+      "prompt_tokens_actual": 45,
+      "completion_chars": 5377
+    },
+    {
+      "ttft_ms": 675.062898080796,
+      "tpot_ms": 31.468960288356726,
+      "decode_tok_s": 31.777344749772123,
+      "completion_tokens": 1024,
+      "reasoning_tokens": 0,
+      "finish_reason": "length",
+      "total_s": 32.867809273069724,
+      "x_engine_stats": {
+        "steps": 549,
+        "accept_len_mean": 1.8633879781420766,
+        "decode_tok_s": 31.77736303770712,
+        "ttft_s": 0.666344341,
+        "engine": "tidelm-rust",
+        "copy_steps": 0,
+        "copy_accepted": 0,
+        "prune_miss_request": {
+          "miss_rate": 0.04354630253989661,
+          "missed_slots": 15499,
+          "slots": 355920,
+          "score_miss_rate": 0.02774644674450073,
+          "prompt_miss_rate": 0.021296296296296296,
+          "decode_miss_rate": 0.044242582290217894
+        }
+      },
+      "prompt_tokens_actual": 45,
+      "completion_chars": 5528
+    }
+  ]
+}
