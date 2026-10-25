@@ -1408,6 +1408,7 @@ __global__ void __launch_bounds__(256) attn_fd_kernel(
     float* l_run = m_run + kFdH;
     float* alpha = l_run + kFdH;
     int* valid = reinterpret_cast<int*>(alpha + kFdH);
+    int* idx_s = valid + kFdN;                                                  // [split's keys]
     const int m = blockIdx.z, split = blockIdx.y, h0 = blockIdx.x * kFdH;
     const int nh = min(kFdH, H - h0);
     const int NK = W + C;
@@ -1426,6 +1427,33 @@ __global__ void __launch_bounds__(256) attn_fd_kernel(
         *reinterpret_cast<uint4*>(Qs + hh * kFdKS + c * 8) = v;
     }
     if (tid < kFdH) { m_run[tid] = -1e30f; l_run[tid] = 0.f; }
+    // the split's compressed picks in shared memory, and the next tile's keys in registers
+    // while the tensor cores work on this one (attn_prefill_kernel's pipeline; the math and
+    // its order are unchanged)
+    const int s_lo = t0 * kFdN, s_hi = min(NK, t1 * kFdN);
+    for (int n = s_lo + tid; n < s_hi; n += blockDim.x)
+        if (n >= W) idx_s[n - s_lo] = cidx[(int64_t)m * C + (n - W)];
+    constexpr int KP = kFdN * (kFdD / 8) / 256;
+    uint4 kreg[KP];
+    bool kval[KP];
+    auto fetch = [&](int n0) {
+#pragma unroll
+        for (int u = 0; u < KP; ++u) {
+            const int n = n0 + tid / 64 + 4 * u, c = tid % 64;
+            const __nv_bfloat16* kr = nullptr;
+            if (n < W) {
+                const int kp = p - (W - 1 - n);
+                if (kp >= 0 && kp >= win_lo) kr = ring + (int64_t)(kp % ring_size) * kFdD;
+            } else if (n < NK) {
+                const int jj = idx_s[n - s_lo];
+                if (jj >= 0) kr = ckv + (int64_t)jj * kFdD;
+            }
+            kval[u] = kr != nullptr;
+            kreg[u] = kr ? reinterpret_cast<const uint4*>(kr)[c] : make_uint4(0, 0, 0, 0);
+        }
+    };
+    __syncthreads();  // idx_s
+    if (t0 < t1) fetch(t0 * kFdN);
     float acc[8][4];
 #pragma unroll
     for (int nt = 0; nt < 8; ++nt)
@@ -1433,23 +1461,15 @@ __global__ void __launch_bounds__(256) attn_fd_kernel(
         for (int i = 0; i < 4; ++i) acc[nt][i] = 0.f;
 
     for (int tile = t0; tile < t1; ++tile) {
-        const int n0 = tile * kFdN;
         __syncthreads();  // the previous tile's PV is done with Ks / Ps
-        for (int i = tid; i < kFdN * (kFdD / 8); i += blockDim.x) {
-            const int j = i / (kFdD / 8), c = i % (kFdD / 8);
-            const int n = n0 + j;
-            const __nv_bfloat16* kr = nullptr;
-            if (n < W) {
-                const int kp = p - (W - 1 - n);
-                if (kp >= 0 && kp >= win_lo) kr = ring + (int64_t)(kp % ring_size) * kFdD;
-            } else if (n < NK) {
-                const int jj = cidx[(int64_t)m * C + (n - W)];
-                if (jj >= 0) kr = ckv + (int64_t)jj * kFdD;
-            }
-            *reinterpret_cast<uint4*>(Ks + j * kFdKS + c * 8) = kr ? reinterpret_cast<const uint4*>(kr)[c] : make_uint4(0, 0, 0, 0);
-            if (c == 0) valid[j] = kr != nullptr;
+#pragma unroll
+        for (int u = 0; u < KP; ++u) {
+            const int j = tid / 64 + 4 * u, c = tid % 64;
+            *reinterpret_cast<uint4*>(Ks + j * kFdKS + c * 8) = kreg[u];
+            if (c == 0) valid[j] = kval[u];
         }
         __syncthreads();
+        if (tile + 1 < t1) fetch((tile + 1) * kFdN);
         // scores: warp w takes keys w*8 .. w*8+8 for all 16 heads
         {
             float c4[4] = {0.f, 0.f, 0.f, 0.f};
@@ -3188,7 +3208,8 @@ int ds_attn_decode(void* stream, const void* q, const void* ring, int ring_size,
         const int S = (n_tiles + tps - 1) / tps;
         float* po = static_cast<float*>(work);
         float* pml = po + (int64_t)M * S * H * kFdD;
-        const size_t smem = (size_t)(kFdH + kFdN) * kFdKS * 2 + (size_t)kFdH * kFdPS * 4 + 3 * kFdH * 4 + kFdN * 4;
+        const size_t smem = (size_t)(kFdH + kFdN) * kFdKS * 2 + (size_t)kFdH * kFdPS * 4 + 3 * kFdH * 4 + kFdN * 4 +
+                            (size_t)kFdSplitTiles * kFdN * 4;
         static bool configured = false;
         if (!configured) {
             const cudaError_t e = cudaFuncSetAttribute(attn_fd_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
