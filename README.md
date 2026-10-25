@@ -12,7 +12,8 @@ tide — so the engine gets better the more you use it.
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | `ds41-mxfp4`, Rust engine | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,000 / 15,360 (65.1%) | 2 x 512K | **31.8 tok/s** | **49.0 tok/s** | 4.8 s |
 | `ds41-mxfp4`, Python engine | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,452 / 15,360 (68%) | 512K | **25.6 tok/s** | **43.3 tok/s** | 7.3 s |
-| `glm53-exl3` | GLM-5.3 | EXL3 3.0 bpw | 12,500 / 19,200 (65.1%) | 256K | **15.2 tok/s** | **20.3 tok/s** | 18.5 s |
+| `glm53-exl3`, Rust engine | GLM-5.3 | EXL3 3.0 bpw | 12,500 / 19,200 (65.1%) | 256K | **17.2 tok/s** | **20.8 tok/s** | 19.5 s |
+| `glm53-exl3`, Python engine | GLM-5.3 | EXL3 3.0 bpw | 12,500 / 19,200 (65.1%) | 256K | **15.2 tok/s** | **20.3 tok/s** | 18.5 s |
 
 *Decode speed is `bench/bench.py`'s median over three measured runs after one warmup: 1,024
 output tokens at temperature 0.6, prose = an essay request, code = an LRU-cache request. The last
@@ -29,8 +30,12 @@ and 9.3 s (a second boot 30.7 / 50.1 and 8.0 s). Python DS was measured on 2026-
 split draft weights, an 8-token depth window and 10,452 residents at a 32K context allocation
 (the profile supports 512K): [raw runs](results/ds41-depth8-20261022/README.md). Its code median
 moves with each boot's acceptance (41.1-44.8 across that day's boots) and the 8K first token with
-its Engram phase (6.9-11.2 s across runs). GLM was measured on 2026-10-22 from its own EXL3
-checkpoint with FP8 kv_b, with 12,000 residents at 256K; the profile keeps 12,500:
+its Engram phase (6.9-11.2 s across runs). Rust GLM (`rust/crates/tidelm-glm`) was measured on
+2026-10-25 as the profile ships (12,500 residents, the calibrated MTP gate, copy rounds, the
+disk prefix store), from the Python server's current history (`db.pt`, not the 2026-10-22
+snapshot, which is gone): [raw runs](results/rust-glm53-20261025/README.md); its 8K prompt is
+slower than Python's on the prefill attention kernel. Python GLM was measured on 2026-10-22 from
+its own EXL3 checkpoint with FP8 kv_b, with 12,000 residents at 256K; the profile keeps 12,500:
 [raw runs](results/glm-native-perf-20261022/README.md), [comparison](docs/glm53-native-exl3.md). First requests after boot can be slower
 ([gotchas](docs/gotchas.md)).*
 

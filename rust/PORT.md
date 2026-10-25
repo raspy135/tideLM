@@ -1,4 +1,4 @@
-# Rust port of the DS v4.1 engine
+# Rust port of the DS v4.1 and GLM-5.3 engines
 
 Branch `rust-port`, workspace `rust/`. Goal: **no Python in the prefill/decode pipeline.**
 Python stays for build tooling (Triton AOT, pack builders) and offline tools.
@@ -454,6 +454,53 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
      `_combine` are in, unused), the server's Anthropic routes. (Tool calls are in: the checkpoint's encoding.py ported whole, DSML
      calls parsed strictly then tolerantly, as server/app.py does; its tool grammar is off in the profile.
      Images are in: below.)
+
+## GLM-5.3 (`crates/tidelm-glm`, 2026-10-25)
+
+The second engine on the same stack: engine/glm/tp.py's TP2 forward for the native EXL3
+checkpoint (GLM-5.3-EXL3-3.0bpw), served by `tidelm-server` when `--model-dir`'s config.json has
+`model_type: glm_moe_dsa` (`crates/tidelm-server/src/glm_main.rs`), launched by
+`scripts/rust-up.sh` from a GLM profile (`GLM_*` keys) with `TIDE_ENGINE=rust`.
+
+What is ported, by the DS port's feature list:
+- **TP2 pair**: RoCE one-shot gathers for decode, NCCL for prefill, rank 0 mirroring every call;
+  the boot guard compares config, binary, pack source and the serving flags both ranks act on.
+- **Forward** (`forward.rs`): absorbed MLA with FP8 kv_b, the DSA indexer (tensor-core scores,
+  ordered top-k, picks reused by "shared" layers), the KV split by position parity with the
+  split decode's two gathers and cross-rank merge, prefill on gathered spans; EXL3 everywhere
+  (tools/exl3_moe_cuda.cu compiled as-is; prefill's dense matrices unpacked for cuBLAS, 17-64
+  rows through the decode GEMV), the MTP layer on its own whole cache with its 4-bit arena.
+- **CUDA graphs** for decode passes (1-8 rows) and MTP passes, captured on first use, split
+  after every MoE layer's exact routing when hot reads are on; a side stream inside them.
+- **MTP speculation** (`serve.rs`): up to 7 drafts under the calibrated gate (mtp_cal.py's
+  table) or the flat one, exact acceptance greedy or sampled (each rank's top-1024 logits and
+  log-sum-exp; the whole row when they cannot prove the nucleus).
+- **Copy rounds**: lookup_draft.ExactDraftCache v2 (GLM_LOOKUP), not the DS copy drafter's rule.
+- **Adaptive residency** (`adapt.rs`): tp.adapt after the prefill and every 200 tokens, the
+  two-pass prefill, bg_step's victims, synchronous hot reads kept over victims; the history in
+  its own .npz (read at first boot from the Python server's db.pt).
+- **Prefix cache**: the live sequence's prefix in RAM, and the disk store (`prefix.rs`).
+- **Server**: the OpenAI routes, the Anthropic Messages route, tool calls (GLM's XML), the GLM
+  template and parser (`tidelm-text/src/glm.rs`, fixture-tested against glm_app.py).
+
+Not ported, and why: concurrency (the Python GLM server serves one request at a time too; two
+lanes would halve the 12,500 residents' share of memory per request), vision (GLM-5.3 has
+none), the bounded replay (GLM has no sliding window), GLM_MISS=stream, MXFP4 experts, FP4 KV.
+
+Kernels (`tidelm-kernels/cuda/glm.cu`, `tests/glm_gpu.rs` against CPU transcriptions): the EXL3
+unpack equals the numpy oracle's golden values on the real checkpoint; both EXL3 paths match
+fp64 at 2.1e-4 (Python's routed bar 3.5e-4); MLA attention 1.8e-3 in every mode (Python's kernel
+1.7e-3 against fp32).
+
+Where a decode pass goes (one row, graphs, the pair; nsys with node tracing): the EXL3 grouped
+GEMV ~60% (the same kernel as Python's; small matrices are DRAM-latency-bound when cold: q_b
+10.5 MB in 112 us, 95 GB/s, against the 357 MB head's 226 GB/s), the RoCE gathers ~8% (five a
+layer: the split attention's two, o_proj's sum, the MoE's two), the router's fp32 GEMV ~4%.
+Measured and not taken: split-K counts other than tp.py's (within 3%), trellis prefetch depth 2,
+4 n-tiles a warp; prefetching prefill attention's key tiles. The next levers: the EXL3 decode
+GEMV's cold-read latency (concurrency or an L2 prefetch of the next matrix), prefill attention
+(5.1 of an 8K prefill's 19.4 s: its 32-key tiles are bound by shared-memory work; Triton's
+64-key tiles were ~1.8x faster per pick).
 
 ## Rules carried over from the Python engine
 

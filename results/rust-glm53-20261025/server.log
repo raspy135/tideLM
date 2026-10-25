@@ -1,0 +1,39 @@
+boot: routing history /home/ryan/git/tidelm/results/glm-stats/db.pt 
+[glm] dense weights: layer 12 (2.0 GB, 4 s)
+[glm] dense weights: layer 25 (3.1 GB, 6 s)
+[glm] dense weights: layer 38 (4.1 GB, 7 s)
+[glm] dense weights: layer 51 (5.1 GB, 9 s)
+[glm] dense weights: layer 64 (6.2 GB, 11 s)
+[glm] dense weights: layer 77 (7.2 GB, 13 s)
+[glm] dense weights 7.33 GB a rank in 13 s
+[glm] 12500 routed experts resident (89.0 GB) in 9 s
+[glm] KV cache 7.28 GB a rank (262144 positions, split)
+boot: prefix store /home/ryan/tidelm-rust-state/glm-prefix/4170244a401916c1/rank-0 (0 segments, 20 GB)
+boot: warm-up 9.2 s
+engine up in 37.4s; serving glm-5.3 on 0.0.0.0:8000 (GLM, depth 7, calibrated gate 0.36)
+[glm] request 1: prompt 53, 65.8 s, 2.01 drafted / 1.08 accepted a round, copy rounds 0, hot reads 1721 (kept 1701), swaps 1792, fallbacks 0
+[glm] request: {"prompt_tokens":53,"reused_prefix":0,"completion_tokens":1024,"ttft_s":1.539,"decode_tok_s":15.92,"engine":"tidelm-rust","steps":493,"accept_len_mean":2.075050709939148,"copy_steps":0,"copy_accepted":0}
+[glm] request 2: prompt 53, 62.8 s, 1.89 drafted / 1.05 accepted a round, copy rounds 0, hot reads 424 (kept 417), swaps 1433, fallbacks 0
+[glm] request: {"prompt_tokens":53,"reused_prefix":13,"completion_tokens":1024,"ttft_s":0.867,"decode_tok_s":16.52,"engine":"tidelm-rust","steps":499,"accept_len_mean":2.0501002004008018,"copy_steps":0,"copy_accepted":0}
+[glm] request 3: prompt 53, 59.9 s, 1.77 drafted / 1.08 accepted a round, copy rounds 0, hot reads 354 (kept 354), swaps 240, fallbacks 0
+[glm] request: {"prompt_tokens":53,"reused_prefix":13,"completion_tokens":1024,"ttft_s":0.526,"decode_tok_s":17.23,"engine":"tidelm-rust","steps":491,"accept_len_mean":2.0835030549898166,"copy_steps":0,"copy_accepted":0}
+[glm] request 4: prompt 53, 58.6 s, 1.71 drafted / 1.11 accepted a round, copy rounds 0, hot reads 343 (kept 343), swaps 181, fallbacks 0
+[glm] request: {"prompt_tokens":53,"reused_prefix":13,"completion_tokens":1024,"ttft_s":0.522,"decode_tok_s":17.6,"engine":"tidelm-rust","steps":485,"accept_len_mean":2.109278350515464,"copy_steps":0,"copy_accepted":0}
+[glm] request 5: prompt 68, 52.9 s, 2.36 drafted / 1.91 accepted a round, copy rounds 3, hot reads 2976 (kept 2976), swaps 781, fallbacks 0
+[glm] request: {"prompt_tokens":68,"reused_prefix":12,"completion_tokens":1024,"ttft_s":1.292,"decode_tok_s":19.83,"engine":"tidelm-rust","steps":352,"accept_len_mean":2.90625,"copy_steps":3,"copy_accepted":4}
+[glm] request 6: prompt 68, 49.7 s, 2.38 drafted / 1.96 accepted a round, copy rounds 2, hot reads 1254 (kept 1254), swaps 358, fallbacks 0
+[glm] request: {"prompt_tokens":68,"reused_prefix":14,"completion_tokens":1024,"ttft_s":0.614,"decode_tok_s":20.84,"engine":"tidelm-rust","steps":346,"accept_len_mean":2.9566473988439306,"copy_steps":2,"copy_accepted":2}
+[glm] request 7: prompt 68, 50.2 s, 2.40 drafted / 1.93 accepted a round, copy rounds 2, hot reads 876 (kept 876), swaps 282, fallbacks 0
+[glm] request: {"prompt_tokens":68,"reused_prefix":14,"completion_tokens":1024,"ttft_s":0.603,"decode_tok_s":20.63,"engine":"tidelm-rust","steps":350,"accept_len_mean":2.922857142857143,"copy_steps":2,"copy_accepted":0}
+[glm] request 8: prompt 68, 49.6 s, 2.42 drafted / 1.96 accepted a round, copy rounds 1, hot reads 863 (kept 863), swaps 268, fallbacks 0
+[glm] request: {"prompt_tokens":68,"reused_prefix":14,"completion_tokens":1024,"ttft_s":0.611,"decode_tok_s":20.9,"engine":"tidelm-rust","steps":346,"accept_len_mean":2.9566473988439306,"copy_steps":1,"copy_accepted":1}
+[glm] request: {"prompt_tokens":8219,"reused_prefix":9,"completion_tokens":256,"ttft_s":19.581,"decode_tok_s":35.45,"engine":"tidelm-rust","steps":35,"accept_len_mean":7.285714285714286,"copy_steps":31,"copy_accepted":217}
+[prefix] saved [0, 8219) in 0.07 s
+[glm] request 9: prompt 8219, 26.8 s, 6.37 drafted / 6.31 accepted a round, copy rounds 31, hot reads 308 (kept 298), swaps 768, fallbacks 0
+[glm] request: {"prompt_tokens":8211,"reused_prefix":10,"completion_tokens":256,"ttft_s":19.474,"decode_tok_s":16.98,"engine":"tidelm-rust","steps":111,"accept_len_mean":2.2972972972972974,"copy_steps":0,"copy_accepted":0}
+[prefix] saved [0, 8211) in 0.03 s
+[glm] request 10: prompt 8211, 34.5 s, 1.83 drafted / 1.31 accepted a round, copy rounds 0, hot reads 1025 (kept 1021), swaps 768, fallbacks 0
+[glm] request: {"prompt_tokens":8225,"reused_prefix":11,"completion_tokens":256,"ttft_s":19.684,"decode_tok_s":15.17,"engine":"tidelm-rust","steps":133,"accept_len_mean":1.9172932330827068,"copy_steps":0,"copy_accepted":0}
+[prefix] saved [0, 8225) in 0.04 s
+[glm] request 11: prompt 8225, 36.5 s, 1.50 drafted / 0.92 accepted a round, copy rounds 0, hot reads 874 (kept 870), swaps 768, fallbacks 0
+[glm] request: {"prompt_tokens":8205,"reused_prefix":11,"completion_tokens":256,"ttft_s":19.329,"decode_tok_s":18.63,"engine":"tidelm-rust","steps":100,"accept_len_mean":2.55,"copy_steps":0,"copy_accepted":0}
