@@ -9,8 +9,8 @@ extern "C" {
                      vl: c_int, h: c_int, pos: *const c_void, out: *mut c_void) -> c_int;
     pub fn glm_sum2(stream: CudaStream, g: *const c_void, n: i64, out_bf16: *mut c_void, out_f32: *mut c_void) -> c_int;
     pub fn glm_f32_bf16(stream: CudaStream, x: *const c_void, y: *mut c_void, n: i64) -> c_int;
-    pub fn glm_unshard(stream: CudaStream, src: *const c_void, dst: *mut c_void, m: c_int, n: c_int, world: c_int,
-                       esz: c_int) -> c_int;
+    pub fn glm_unshard(stream: CudaStream, src: *const c_void, rank_stride: i64, dst: *mut c_void, m: c_int, n: c_int,
+                       world: c_int, esz: c_int) -> c_int;
     pub fn glm_rmsnorm(stream: CudaStream, h: *mut c_void, ldh: i64, a: *const c_void, lda: i64, w: *const c_void,
                        y: *mut c_void, ldy: i64, t: c_int, n: c_int, eps: f32) -> c_int;
     pub fn glm_rope(stream: CudaStream, x: *const c_void, xt: i64, xh: i64, y: *mut c_void, yt: i64, yh: i64, t: c_int,
@@ -61,4 +61,9 @@ extern "C" {
                            w: *mut c_void) -> c_int;
     pub fn glm_member_codes(stream: CudaStream, pair: *const c_void, n: c_int, k: c_int, out: *mut c_void) -> c_int;
     pub fn glm_count_live(stream: CudaStream, block_slot: *const c_void, nb: c_int, out: *mut c_void) -> c_int;
+    pub fn glm_quant_kvb(stream: CudaStream, w: *const c_void, rows: c_int, q: *mut c_void, s_rows: *mut c_void) -> c_int;
+    pub fn glm_quant_int8_rows(stream: CudaStream, x: *const c_void, rows: c_int, h: c_int, q: *mut c_void,
+                               s: *mut c_void) -> c_int;
+    pub fn glm_dup_rows(stream: CudaStream, x: *const c_void, ldx: i64, out: *mut c_void, t: c_int, k: c_int,
+                        g: c_int) -> c_int;
 }

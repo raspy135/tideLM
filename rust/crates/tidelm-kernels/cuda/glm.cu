@@ -153,15 +153,17 @@ __global__ void f32_bf16_kernel(const float* __restrict__ x, __nv_bfloat16* __re
 }
 
 // [world][M][n] (a gather of row-sharded columns) -> [M][world * n], elements of `esz` bytes.
+// rank_stride: elements between ranks' shards in src (M * n when packed).
 template <typename T>
-__global__ void unshard_kernel(const T* __restrict__ src, T* __restrict__ dst, int M, int n, int world) {
+__global__ void unshard_kernel(const T* __restrict__ src, int64_t rank_stride, T* __restrict__ dst, int M, int n,
+                               int world) {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t total = (int64_t)world * M * n;
     if (i >= total) return;
     const int w = (int)(i / ((int64_t)M * n));
     const int64_t r = i % ((int64_t)M * n);
     const int m = (int)(r / n), c = (int)(r % n);
-    dst[((int64_t)m * world + w) * n + c] = src[i];
+    dst[((int64_t)m * world + w) * n + c] = src[w * rank_stride + r];
 }
 
 // ------------------------------------------------------------------ RMSNorm
@@ -1159,6 +1161,65 @@ __global__ void count_live_kernel(const int* __restrict__ block_slot, int nb, in
     if (threadIdx.x == 0) out[0] = sum;
 }
 
+
+// ------------------------------------------------------------------ load-time quantization
+// weights._fp8_quant for one rank's kv_b rows (fp16 [rows][512], rows a multiple of 128): per
+// 128x128 block s = max(amax, 1e-12) / 448, q = fp8(w / s); the scales expanded to a row's four
+// blocks [rows][4] (kvb_fp8.HeadFP8.from_rows). One block per (128 rows, 128 columns).
+__global__ void __launch_bounds__(256) quant_kvb_kernel(const __half* __restrict__ w, uint8_t* __restrict__ q,
+                                                        float* __restrict__ s_rows) {
+    __shared__ float red[32];
+    const int rb = blockIdx.x, cb = blockIdx.y;
+    float am = 0.f;
+    for (int i = threadIdx.x; i < 128 * 128; i += blockDim.x) {
+        const int r = rb * 128 + i / 128, c = cb * 128 + i % 128;
+        am = fmaxf(am, fabsf(__half2float(w[(int64_t)r * kLat + c])));
+    }
+    am = warp_max(am);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = am;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : 0.f;
+        v = warp_max(v);
+        if (threadIdx.x == 0) red[0] = v;
+    }
+    __syncthreads();
+    const float sc = fmaxf(red[0], 1e-12f) / 448.f;
+    for (int i = threadIdx.x; i < 128 * 128; i += blockDim.x) {
+        const int r = rb * 128 + i / 128, c = cb * 128 + i % 128;
+        q[(int64_t)r * kLat + c] = to_e4m3(__half2float(w[(int64_t)r * kLat + c]) / sc);
+    }
+    if (threadIdx.x < 128) s_rows[(int64_t)(rb * 128 + threadIdx.x) * 4 + cb] = sc;
+}
+
+// tp._q8_rows(kind="int8"): per row and 128 values sc = max(amax / 127, 1e-12),
+// q = clamp(rint(x / sc), -127, 127). One warp per (row, 128 values).
+__global__ void quant_int8_rows_kernel(const __nv_bfloat16* __restrict__ x, int8_t* __restrict__ q,
+                                       float* __restrict__ s, int H) {
+    const int r = blockIdx.x, b = blockIdx.y, l = threadIdx.x;
+    const __nv_bfloat16* xr = x + (int64_t)r * H + b * 128 + 4 * l;
+    float v[4], am = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        v[i] = bf(xr[i]);
+        am = fmaxf(am, fabsf(v[i]));
+    }
+    am = warp_max(am);
+    const float sc = fmaxf(am / 127.f, 1e-12f);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) q[(int64_t)r * H + b * 128 + 4 * l + i] = (int8_t)fminf(fmaxf(rintf(v[i] / sc), -127.f), 127.f);
+    if (l == 0) s[(int64_t)r * (H / 128) + b] = sc;
+}
+
+// rows t of x -> rows t * G + g of out for every g (an Exl3Matrix of G groups over one input)
+__global__ void dup_rows_kernel(const __nv_bfloat16* __restrict__ x, int64_t ldx, __nv_bfloat16* __restrict__ out,
+                                int K, int G) {
+    const int t = blockIdx.x;
+    for (int c = threadIdx.x; c < K; c += blockDim.x) {
+        const __nv_bfloat16 v = x[(int64_t)t * ldx + c];
+        for (int g = 0; g < G; ++g) out[((int64_t)t * G + g) * K + c] = v;
+    }
+}
 }  // namespace
 
 // ---------------------------------------------------------------- C ABI
@@ -1186,11 +1247,12 @@ int glm_f32_bf16(void* stream, const void* x, void* y, int64_t n) {
     GRET;
 }
 
-int glm_unshard(void* stream, const void* src, void* dst, int M, int n, int world, int esz) {
+int glm_unshard(void* stream, const void* src, int64_t rank_stride, void* dst, int M, int n, int world, int esz) {
     const int64_t total = (int64_t)world * M * n;
     const unsigned g = (unsigned)((total + 255) / 256);
-    if (esz == 2) unshard_kernel<uint16_t><<<g, 256, 0, GST>>>(static_cast<const uint16_t*>(src), static_cast<uint16_t*>(dst), M, n, world);
-    else if (esz == 4) unshard_kernel<uint32_t><<<g, 256, 0, GST>>>(static_cast<const uint32_t*>(src), static_cast<uint32_t*>(dst), M, n, world);
+    if (!rank_stride) rank_stride = (int64_t)M * n;
+    if (esz == 2) unshard_kernel<uint16_t><<<g, 256, 0, GST>>>(static_cast<const uint16_t*>(src), rank_stride, static_cast<uint16_t*>(dst), M, n, world);
+    else if (esz == 4) unshard_kernel<uint32_t><<<g, 256, 0, GST>>>(static_cast<const uint32_t*>(src), rank_stride, static_cast<uint32_t*>(dst), M, n, world);
     else return (int)cudaErrorInvalidValue;
     GRET;
 }
@@ -1398,6 +1460,25 @@ int glm_member_codes(void* stream, const void* pair, int n, int K, void* out) {
 
 int glm_count_live(void* stream, const void* block_slot, int nb, void* out) {
     count_live_kernel<<<1, 1024, 0, GST>>>(static_cast<const int*>(block_slot), nb, static_cast<int*>(out));
+    GRET;
+}
+
+int glm_quant_kvb(void* stream, const void* w, int rows, void* q, void* s_rows) {
+    if (rows % 128) return (int)cudaErrorInvalidValue;
+    quant_kvb_kernel<<<dim3(rows / 128, kLat / 128), 256, 0, GST>>>(static_cast<const __half*>(w),
+                                                                  static_cast<uint8_t*>(q), static_cast<float*>(s_rows));
+    GRET;
+}
+
+int glm_quant_int8_rows(void* stream, const void* x, int rows, int H, void* q, void* s) {
+    if (H % 128) return (int)cudaErrorInvalidValue;
+    quant_int8_rows_kernel<<<dim3(rows, H / 128), 32, 0, GST>>>(static_cast<const __nv_bfloat16*>(x),
+                                                                static_cast<int8_t*>(q), static_cast<float*>(s), H);
+    GRET;
+}
+
+int glm_dup_rows(void* stream, const void* x, int64_t ldx, void* out, int T, int K, int G) {
+    dup_rows_kernel<<<T, 256, 0, GST>>>(static_cast<const __nv_bfloat16*>(x), ldx, static_cast<__nv_bfloat16*>(out), K, G);
     GRET;
 }
 

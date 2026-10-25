@@ -28,6 +28,7 @@ pub const CAPTURE_MODE_RELAXED: c_int = 2;
 
 extern "C" {
     pub fn cudaGetErrorString(error: cudaError_t) -> *const c_char;
+    pub fn cudaGetLastError() -> cudaError_t;
     pub fn cudaGetDeviceCount(count: *mut c_int) -> cudaError_t;
     pub fn cudaSetDevice(device: c_int) -> cudaError_t;
     pub fn cudaDeviceSynchronize() -> cudaError_t;

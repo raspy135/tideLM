@@ -25,6 +25,7 @@ pub struct NcclUniqueId {
 type NcclComm = *mut c_void;
 const NCCL_UINT8: c_int = 1;
 const NCCL_FLOAT32: c_int = 7;
+const NCCL_BFLOAT16: c_int = 9;
 const NCCL_SUM: c_int = 0;
 
 extern "C" {
@@ -61,6 +62,11 @@ impl Comm {
     /// With two ranks every element is one a + b, the same bits on both.
     pub fn allreduce_f32(&self, buf: *mut c_void, count: usize, stream: &Stream) -> Result<()> {
         nccl(unsafe { ncclAllReduce(buf, buf, count, NCCL_FLOAT32, NCCL_SUM, self.comm, stream.raw()) }, "all-reduce")
+    }
+
+    /// In-place bf16 sum over the pair (NCCL widens, adds, rounds: bf16(a + b) on both ranks).
+    pub fn allreduce_bf16(&self, buf: *mut c_void, count: usize, stream: &Stream) -> Result<()> {
+        nccl(unsafe { ncclAllReduce(buf, buf, count, NCCL_BFLOAT16, NCCL_SUM, self.comm, stream.raw()) }, "all-reduce")
     }
 
     /// out [world][nbytes] <- every rank's `nbytes` of `input`, in rank order, on `stream`: the

@@ -1,0 +1,18 @@
+[package]
+name = "tidelm-glm"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+description = "The GLM-5.3 engine (engine/glm/tp.py) on the Rust stack: EXL3 weights, split-KV MLA, MTP speculation, TP2"
+
+[dependencies]
+tidelm-core = { path = "../tidelm-core" }
+tidelm-cuda = { path = "../tidelm-cuda" }
+tidelm-kernels = { path = "../tidelm-kernels" }
+tidelm-model = { path = "../tidelm-model" }
+tidelm-comm = { path = "../tidelm-comm" }
+tidelm-text = { path = "../tidelm-text" }
+serde_json = "1"
+libc = "0.2"
+sha2 = "0.10"

@@ -1117,6 +1117,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tidelm-glm"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
+ "sha2",
+ "tidelm-comm",
+ "tidelm-core",
+ "tidelm-cuda",
+ "tidelm-kernels",
+ "tidelm-model",
+ "tidelm-text",
+]
+
+[[package]]
 name = "tidelm-image"
 version = "0.1.0"
 dependencies = [
