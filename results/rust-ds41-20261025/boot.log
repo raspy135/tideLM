@@ -1,0 +1,8 @@
+--- stopping both ranks (grace 5s, concurrent)
+--- waiting for ryan@10.0.0.2 to return >= 90 GiB: 
+--- waiting for this box to return >= 90 GiB: 
+--- this box: OK, 115 GiB
+--- ryan@10.0.0.2: OK, 116 GiB
+--- TideLM: rust engine, profile /tmp/claude-1000/-home-ryan-git-tidelm/ee5bdf57-c37e-4b07-b12d-be6b933bf449/scratchpad/bench-ds41.env
+engine up in 15.4s; serving deepseek on 0.0.0.0:8000 (2 lanes, depth Confidence)
+--- OpenAI API: http://127.0.0.1:8000/v1   Claude Code: claude --settings /home/ryan/git/tidelm/results/claude-code.json

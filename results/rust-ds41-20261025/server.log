@@ -1,0 +1,52 @@
+boot: tokenizer 0.4 s
+adapt: AdaptConfig { halflife: 10.0, prior: 4.0, gate: 0.010173269452189129, min_new: 32, decode_tokens: 600, swap_max: 512, min_gain: 0.005, floor: 6 }
+adapt: demand history /home/ryan/tidelm-rust-state/bench-20261025/seed-45ef7129.npz loaded
+boot: demand, residency, pair 0.6 s
+engine: 0.8 s before the resident load
+resident load: layers 6.4 s, embed + head by 7.1 s, drafter experts by 8.0 s; 10000 experts by 13.8 s (in parallel)
+boot: engine 15.3 s
+engine up in 15.4s; serving deepseek on 0.0.0.0:8000 (2 lanes, depth Confidence)
+adapt (probe, two-pass 45 of 45 tokens, predicted miss 0.1149): moved 216 experts (211 across layers; residents a layer 198-294, generation 1) in 0.30 s
+adapt (prompt of 45 tokens, miss rate 0.0502): moved 32 experts (32 across layers; residents a layer 199-294, generation 2) in 0.14 s
+adapt (output token 602, miss rate 0.1326 over the last 601 tokens): moved 154 experts (152 across layers; residents a layer 203-295, generation 3) in 0.23 s
+adapt (end of request): moved 22 experts (22 across layers; residents a layer 203-295, generation 4) in 0.11 s
+adapt (probe, two-pass 45 of 45 tokens, predicted miss 0.0427): moved 76 experts (74 across layers; residents a layer 205-294, generation 5) in 0.16 s
+adapt (prompt of 45 tokens, miss rate 0.0304): moved 6 experts (5 across layers; residents a layer 206-294, generation 6) in 0.08 s
+adapt (output token 601, miss rate 0.0557 over the last 600 tokens): moved 88 experts (86 across layers; residents a layer 206-293, generation 7) in 0.17 s
+adapt (end of request): moved 15 experts (15 across layers; residents a layer 205-293, generation 8) in 0.11 s
+adapt (probe, two-pass 45 of 45 tokens, predicted miss 0.0328): moved 62 experts (58 across layers; residents a layer 206-293, generation 9) in 0.15 s
+adapt (prompt of 45 tokens, miss rate 0.0251): moved 4 experts (4 across layers; residents a layer 207-293, generation 10) in 0.05 s
+adapt (output token 601, miss rate 0.0443 over the last 600 tokens): moved 76 experts (75 across layers; residents a layer 207-292, generation 11) in 0.17 s
+adapt (end of request): moved 14 experts (14 across layers; residents a layer 208-291, generation 12) in 0.11 s
+adapt (probe, two-pass 45 of 45 tokens, predicted miss 0.0254): moved 47 experts (46 across layers; residents a layer 208-291, generation 13) in 0.13 s
+adapt (prompt of 45 tokens, miss rate 0.0209): moved 8 experts (8 across layers; residents a layer 208-291, generation 14) in 0.11 s
+adapt (output token 601, miss rate 0.0401 over the last 600 tokens): moved 76 experts (72 across layers; residents a layer 209-291, generation 15) in 0.16 s
+adapt (end of request): moved 14 experts (13 across layers; residents a layer 207-289, generation 16) in 0.11 s
+adapt (probe, two-pass 62 of 62 tokens, predicted miss 0.0800): moved 122 experts (121 across layers; residents a layer 212-286, generation 17) in 0.22 s
+adapt (prompt of 62 tokens, miss rate 0.0349): moved 17 experts (17 across layers; residents a layer 211-286, generation 18) in 0.11 s
+adapt (output token 605, miss rate 0.0860 over the last 604 tokens): moved 167 experts (162 across layers; residents a layer 209-289, generation 19) in 0.25 s
+adapt (end of request): moved 46 experts (44 across layers; residents a layer 207-289, generation 20) in 0.14 s
+adapt (probe, two-pass 62 of 62 tokens, predicted miss 0.0309): moved 53 experts (52 across layers; residents a layer 209-287, generation 21) in 0.14 s
+adapt (prompt of 62 tokens, miss rate 0.0246): moved 4 experts (4 across layers; residents a layer 209-287, generation 22) in 0.06 s
+adapt (output token 601, miss rate 0.0467 over the last 600 tokens): moved 93 experts (91 across layers; residents a layer 207-289, generation 23) in 0.19 s
+adapt (end of request): moved 39 experts (37 across layers; residents a layer 209-291, generation 24) in 0.14 s
+adapt (probe, two-pass 62 of 62 tokens, predicted miss 0.0261): moved 50 experts (49 across layers; residents a layer 209-291, generation 25) in 0.14 s
+adapt (prompt of 62 tokens, miss rate 0.0211): moved 3 experts (2 across layers; residents a layer 209-291, generation 26) in 0.04 s
+adapt (output token 603, miss rate 0.0434 over the last 602 tokens): moved 78 experts (78 across layers; residents a layer 209-288, generation 27) in 0.18 s
+adapt (end of request): moved 25 experts (24 across layers; residents a layer 209-289, generation 28) in 0.13 s
+adapt (probe, two-pass 62 of 62 tokens, predicted miss 0.0213): moved 37 experts (36 across layers; residents a layer 210-289, generation 29) in 0.14 s
+adapt (prompt of 62 tokens, miss rate 0.0185): moved 2 experts (2 across layers; residents a layer 210-289, generation 30) in 0.03 s
+adapt (output token 605, miss rate 0.0345 over the last 604 tokens): moved 55 experts (54 across layers; residents a layer 210-289, generation 31) in 0.14 s
+adapt (end of request): moved 14 experts (12 across layers; residents a layer 210-289, generation 32) in 0.11 s
+adapt (probe, excerpt 64 of 8178 tokens, predicted miss 0.1762): moved 214 experts (208 across layers; residents a layer 209-290, generation 33) in 0.29 s
+adapt (prompt of 8178 tokens, miss rate 0.1303): moved 197 experts (193 across layers; residents a layer 214-288, generation 34) in 0.27 s
+adapt (end of request): moved 104 experts (98 across layers; residents a layer 215-288, generation 35) in 0.21 s
+adapt (probe, excerpt 64 of 8170 tokens, predicted miss 0.0840): moved 122 experts (118 across layers; residents a layer 217-290, generation 36) in 0.21 s
+adapt (prompt of 8170 tokens, miss rate 0.0567): moved 120 experts (118 across layers; residents a layer 220-290, generation 37) in 0.22 s
+adapt (end of request): moved 78 experts (75 across layers; residents a layer 219-287, generation 38) in 0.16 s
+adapt (probe, excerpt 64 of 8171 tokens, predicted miss 0.0598): moved 84 experts (82 across layers; residents a layer 219-290, generation 39) in 0.17 s
+adapt (prompt of 8171 tokens, miss rate 0.0395): moved 92 experts (90 across layers; residents a layer 221-286, generation 40) in 0.18 s
+adapt (end of request): moved 51 experts (50 across layers; residents a layer 221-287, generation 41) in 0.16 s
+adapt (probe, excerpt 64 of 8178 tokens, predicted miss 0.0615): moved 85 experts (82 across layers; residents a layer 219-288, generation 42) in 0.17 s
+adapt (prompt of 8178 tokens, miss rate 0.0319): moved 80 experts (78 across layers; residents a layer 219-287, generation 43) in 0.17 s
+adapt (end of request): moved 61 experts (59 across layers; residents a layer 218-291, generation 44) in 0.16 s
