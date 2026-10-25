@@ -3,9 +3,11 @@
 # MemAvailable drops below MIN_GB (polled every 50 ms): the Rust server's KEEP_FREE_GB. On
 # this unified-memory box the GPU's allocations are the system's, and a server that runs it out
 # of memory takes the desktop with it; a margin above zero leaves room for the GPU teardown,
-# which outlives SIGKILL.
+# which outlives SIGKILL. A SIGTERM or SIGINT is passed on to the group: in a container this is
+# process 1, and `docker stop` would otherwise wait out its timeout and SIGKILL the server.
 MIN=$(( $1 * 1048576 )); shift
 setsid "$@" & PID=$!
+trap 'kill -TERM -$PID 2>/dev/null' TERM INT
 LOW=999999999
 while kill -0 $PID 2>/dev/null; do
     A=$(awk '/MemAvailable/{print $2}' /proc/meminfo)

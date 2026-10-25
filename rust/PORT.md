@@ -157,7 +157,8 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
   its proxy torch-free behind a C ABI; 12-25 us a gather inside a step graph against ~150 us
   for an NCCL all-reduce there, examples/pair_step.rs). The small projections, routing and
   caches are computed identically on both ranks; the drafter runs whole on each. `tidelm-comm`
-  also links the engine image's NCCL 2.28.3 (~/.local/nccl) for the bring-up handshake. Rank 0
+  also links NCCL for the bring-up handshake (NCCL_HOME: the serving image's, torch's library;
+  a host build defaults to ~/.local/nccl, a copy of it). Rank 0
   mirrors every engine call to rank 1 over the control channel after a byte-for-byte boot
   config check. 4-layer truncation: the pair's logits digests equal one box's, plain and
   speculative. (An expert-parallel first cut ran before this and was replaced: its per-layer
@@ -461,7 +462,11 @@ The second engine on the same stack: engine/glm/tp.py's TP2 forward for the nati
 checkpoint (GLM-5.3-EXL3-3.0bpw), served by `tidelm-server` when `--model-dir`'s config.json has
 `model_type: glm_moe_dsa` (`crates/tidelm-server/src/glm_main.rs`), launched by
 `scripts/rust-up.sh` from a GLM profile (`GLM_*` keys); `scripts/tide-up.sh` picks the Rust engine
-for every profile it serves unless the profile sets `TIDE_ENGINE=python`.
+for every profile it serves unless the profile sets `TIDE_ENGINE=python`. Both models run in
+containers of the serving image (`tidelm-rank0`, `tidelm-rank1`): the Dockerfile's `rust` stage
+builds `tidelm-server`, and `rust-up.sh` refuses an image whose `tidelm.rust_sha` label is not
+the checkout's (`scripts/code_digest.sh --rust`). `RUST_BIN=rust/target/release/tidelm-server`
+runs a host build in the same containers while developing.
 
 What is ported, by the DS port's feature list:
 - **TP2 pair**: RoCE one-shot gathers for decode, NCCL for prefill, rank 0 mirroring every call;

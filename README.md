@@ -88,22 +88,24 @@ docker run --rm --gpus all -v <exl3 dir>:/models-exl3:ro -v <packs dir>:/packs -
   --source /models-exl3 --out /packs/glm-exl3-experts-r0of2.bin --rank 0
 ```
 
-**3. Build** the engine on the head, with a Rust toolchain and the CUDA toolkit
-(`scripts/rust-up.sh` copies the binary to the worker at every start):
+**3. Build the image** on the head; it is copied to the worker, and both models run from it:
 
 ```bash
-(cd rust && cargo build --release)
+scripts/tide.sh build .env.ds41-mxfp4    # any of your profiles: the image, shipped to its PEER
 ```
 
-The EXL3 pack tool (step 2) runs from the image, which `scripts/dual-build.sh .env.glm53-exl3`
-builds as `tidelm:local` and ships to the worker. The Rust engine serves DeepSeek's native scales;
-the lossless scale pack ([details](docs/lossless-scales.md)) is the Python engine's.
+It compiles the Rust engine inside the build, so the boxes need nothing but Docker. The engine
+refuses to start from an image built from other sources than the checkout: after `git pull`,
+run the same command again. The EXL3 pack tool (step 2) runs from this image too. The Rust
+engine serves DeepSeek's native scales; the lossless scale pack
+([details](docs/lossless-scales.md)) is the Python engine's.
 
 **4. Start and stop:**
 
 ```bash
-scripts/tide-up.sh .env.glm53-exl3     # stops whatever is serving, starts this profile
-scripts/tide-down.sh
+scripts/tide.sh start .env.glm53-exl3    # stops whatever is serving, starts this profile
+scripts/tide.sh logs -f                  # its log (--rank 1: the worker's)
+scripts/tide.sh stop
 ```
 
 The model follows from the profile (`GLM_MODEL_DIR` → GLM-5.3, `MODEL_DIR` → DeepSeek), and
@@ -147,14 +149,14 @@ DSV41_ABLIT_WOB=/models/dsv41-1017-wo-b-ablit/wo_b_l10_35_1017.safetensors
   interface (`HOST`).
 - Works with Open WebUI and other OpenAI clients; streamed responses end with `usage` and the
   engine's own statistics (`x_engine_stats`).
-- Logs: `~/tidelm-rust-state/server.log` on the head, `~/tidelm-rust-bin/server_rank1.log` on
-  the worker.
+- Logs: `scripts/tide.sh logs -f`, a line a request with its prefill and decode speeds
+  (`--rank 1` for the worker's).
 
 Thinking, reasoning effort, tool calls and images: [API reference](server/README.md).
 
 ## Settings worth knowing
 
-Edit the profile, then `scripts/tide-up.sh` it again. The examples in `configs/` are commented
+Edit the profile, then `scripts/tide.sh start` it again. The examples in `configs/` are commented
 with what each setting measured.
 
 | DeepSeek | GLM-5.3 | What it controls |

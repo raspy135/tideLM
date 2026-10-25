@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------------------
 # rust-up.sh ENV_FILE -- serve a DeepSeek V4.1 profile with the Rust engine (rust/, the
-# tidelm-server binary): rank 0 here, rank 1 on PEER. scripts/tide-up.sh runs this for every
-# profile the Rust engine can serve unless it sets TIDE_ENGINE=python; scripts/tide-down.sh
-# stops it.
+# tidelm-server binary): rank 0 here, rank 1 on PEER, each in a container of the serving image
+# (`tidelm-rank0`, `tidelm-rank1`; `scripts/tide.sh build` builds the binary into it and ships
+# it). `scripts/tide.sh start` (tide-up.sh) runs this for every profile the Rust engine can serve
+# unless it sets TIDE_ENGINE=python; `scripts/tide.sh stop` stops it.
 #
 # rust-up.sh --check ENV_FILE only validates: exit 0 if the Rust engine serves the profile, else
 # the reason on stderr and exit 1, with nothing started or stopped (tide-up.sh asks it first).
@@ -27,7 +28,15 @@
 #   RUST_PREFIX_DIR=~/tidelm-rust-state/prefix-cache     the prefix cache's disk tier
 #   RUST_EXPERT_TOPP         unset: off (DSV41_EXPERT_TOPP=0.90 measured slower in Rust, rust/PORT.md)
 #   RUST_COPY_DRAFT=1        the copy drafter (CPU prompt lookup in front of DSpark; 0 off)
-# Logs: ~/tidelm-rust-state/server.log here, ~/tidelm-rust-bin/server_rank1.log on the peer.
+#
+# Both models: the image is IMAGE (or GLM_IMAGE), else tidelm:local, as dual-build.sh names it.
+# Its tidelm.rust_sha label must match this checkout's Rust sources (scripts/code_digest.sh
+# --rust), and the worker must hold the same image id; a mismatch is refused with the command
+# that fixes it. RUST_BIN=path runs a binary built on this box instead (cargo build --release in
+# rust/, for development): mounted over the image's on both ranks, copied to the worker first.
+# The containers run as the calling user, with the model, its packs and ~/tidelm-rust-state
+# mounted at their own paths. Logs: `scripts/tide.sh logs -f` (one line a request: prefill and
+# decode speeds; --rank 1 the worker's).
 # ---------------------------------------------------------------------------------------
 #
 # A GLM-5.3 profile (GLM_MODEL_DIR, GLM_* keys as scripts/glm-up.sh reads them) runs the GLM
@@ -40,11 +49,10 @@ check=0
 f=${1:-${TIDE_ENV_FILE:-}}
 [[ -n "$f" && -f "$f" ]] || err "usage: scripts/rust-up.sh [--check] ENV_FILE"
 set -a; source "$f"; set +a
-BIN="$ROOT/rust/target/release/tidelm-server"
-[[ -x "$BIN" ]] || err "no $BIN: build it with (cd rust && cargo build --release)"
 STATE="$HOME/tidelm-rust-state"
-LOG="$STATE/server.log"
 mkdir -p "$STATE"
+# host paths the containers see at the same path: read-only, and read-write (created first)
+ro=() rw=("$STATE")
 
 # ---------------------------------------------------------------------------------------
 # GLM-5.3: the profile's GLM_* keys, as engine/glm/tp.py reads them (its defaults where the
@@ -82,8 +90,9 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
     pack=${pack/#\/packs/${GLM_EXL3_DIR:-/packs}}
     db=${GLM_STATS_DB:-}
     db=${db/#\/app/$ROOT}
-    [[ -n "$db" && -f "$db" ]] || db="$ROOT/profiles/glm53-experts-v1.pt"
+    if [[ -n "$db" && -f "$db" ]]; then ro+=("$(dirname "$db")"); else db=/app/profiles/glm53-experts-v1.pt; fi
     state=${RUST_GLM_STATE_DB:-$STATE/glm-stats-rust.npz}
+    ro+=("$MODEL_DIR" "$(dirname "${pack//\{rank\}/0}")") rw+=("$(dirname "$state")")
     depth=${GLM_MTP_DEPTH:-3}
     [[ "${GLM_MTP:-1}" == 0 ]] && depth=0
     gate=(--dyn "${GLM_MTP_DYN:-0}")
@@ -99,8 +108,11 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
           --adapt-decode "${GLM_ADAPT_DECODE_SWAPS:-256}" --bg-every "$bg" --loop-break "${GLM_LOOP_BREAK:-0}"
           --two-pass "${GLM_PREFILL_TWO_PASS:-0}" --two-pass-miss "${GLM_PREFILL_TWO_PASS_MISS:-0}")
     [[ "${GLM_GRAPHS:-1}" == 1 ]] && args+=(--graphs)
-    [[ "${GLM_PREFIX_DISK:-0}" == 1 ]] && args+=(--prefix-disk "${RUST_GLM_PREFIX_DIR:-$STATE/glm-prefix}"
-                                                 --prefix-disk-gb "${GLM_PREFIX_DISK_GB:-20}" --prefix-min "${GLM_PREFIX_DISK_MIN:-256}")
+    if [[ "${GLM_PREFIX_DISK:-0}" == 1 ]]; then
+        args+=(--prefix-disk "${RUST_GLM_PREFIX_DIR:-$STATE/glm-prefix}"
+               --prefix-disk-gb "${GLM_PREFIX_DISK_GB:-20}" --prefix-min "${GLM_PREFIX_DISK_MIN:-256}")
+        rw+=("${RUST_GLM_PREFIX_DIR:-$STATE/glm-prefix}")
+    fi
     envs=(NCCL_PROTO=Simple GLM_REASONING_EFFORT="${GLM_REASONING_EFFORT:-medium}"
           GLM_DEFAULT_MAX_TOKENS="${GLM_DEFAULT_MAX_TOKENS:-4096}")
     for v in NCCL_SOCKET_IFNAME NCCL_IB_HCA NCCL_IB_ADDR_FAMILY NCCL_IB_ADDR_RANGE NCCL_IB_ROCE_VERSION_NUM \
@@ -109,35 +121,8 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
     done
     guard=${KEEP_FREE_GB:-4}
     pair=()
-    if [[ -n "${PEER:-}" ]]; then
-        addr="${MASTER_ADDR:-10.0.0.1}:${RUST_GLM_PORT:-29655}"
-        pair=(--world 2 --addr "$addr")
-        ssh "$PEER" 'mkdir -p ~/tidelm-rust-bin ~/tidelm-rust-state'
-        rsync -a "$BIN" "$ROOT/scripts/memguard.sh" "$PEER:tidelm-rust-bin/"
-    fi
-    rank0=("${pair[@]}")
-    [[ -n "${PEER:-}" ]] && rank0+=(--rank 0)
-    (export "${envs[@]}"; exec setsid "$ROOT/scripts/memguard.sh" "$guard" "$BIN" "${args[@]}" "${rank0[@]}") \
-        > "$LOG" 2>&1 < /dev/null &
-    if [[ -n "${PEER:-}" ]]; then
-        sleep 1
-        ssh -n "$PEER" "cd ~/tidelm-rust-bin || exit 1; export $(printf '%q ' "${envs[@]}");
-            nohup ./memguard.sh $guard ./tidelm-server $(printf '%q ' "${args[@]}" "${pair[@]}") --rank 1 \
-            > server_rank1.log 2>&1 < /dev/null &"
-    fi
-    sleep 2
-    for _ in $(seq 600); do
-        grep -q "serving" "$LOG" && break
-        if grep -qiE "error|panicked|GUARD" "$LOG" || ! pgrep -x tidelm-server > /dev/null; then
-            tail -20 "$LOG" >&2
-            err "the Rust server did not come up (log: $LOG)"
-        fi
-        sleep 1
-    done
-    grep -q "serving" "$LOG" || err "the Rust server is still not up after 600 s (log: $LOG)"
-    grep -E "engine up" "$LOG"
-    exit 0
-fi
+    [[ -n "${PEER:-}" ]] && pair=(--world 2 --addr "${MASTER_ADDR:-10.0.0.1}:${RUST_GLM_PORT:-29655}")
+else   # DeepSeek V4.1, to the `fi` before the launch
 
 [[ -n "${MODEL_DIR:-}" ]] || err "$f sets no MODEL_DIR"
 
@@ -160,7 +145,7 @@ lanes=${RUST_LANES:-1}
 args=(--resident --graphs --model-dir "$MODEL_DIR" --served-model-name "${SERVED_MODEL_NAME:-deepseek}"
       --host "${HOST:-0.0.0.0}" --port "${PORT:-8000}" --max-seq "${MAX_SEQ:-32768}"
       --lanes "$lanes" --vision "${DSV41_VISION:-1}"
-      --adapt-db "$db" --trace "${RUST_TRACE:-$ROOT/results/trace-union/stats/coverage.json}"
+      --adapt-db "$db" --trace "${RUST_TRACE:-/app/results/trace-union/stats/coverage.json}"
       --budget "${RUST_BUDGET:-10000}" --adapt-sensitivity "${DSV41_ADAPT_SENSITIVITY:-high}"
       --adapt-prior "${DSV41_ADAPT_PRIOR:-4}" --adapt-decode-tokens "${DSV41_ADAPT_DECODE_TOKENS:-600}"
       --adapt-probe "${DSV41_PROBE_PREFILL:-1}"
@@ -176,7 +161,10 @@ fi
 if [[ "${DSV41_PREFIX_DISK:-1}" == 1 ]]; then
     args+=(--prefix-disk "${RUST_PREFIX_DIR:-$STATE/prefix-cache}" --prefix-disk-gb "${DSV41_PREFIX_DISK_GB:-20}"
            --prefix-disk-interval "${DSV41_PREFIX_DISK_MIN_INTERVAL_S:-300}" --prefix-disk-dedup "${DSV41_PREFIX_DISK_DEDUP:-1}")
+    rw+=("${RUST_PREFIX_DIR:-$STATE/prefix-cache}")
 fi
+ro+=("$MODEL_DIR") rw+=("$(dirname "$db")")
+[[ -n "${RUST_TRACE:-}" ]] && ro+=("$(dirname "$RUST_TRACE")")
 
 # what both ranks must run with (the boot guard compares it): RoCE, hot reads, packed KV
 envs=(NCCL_PROTO=Simple TIDELM_PACKED_KV="${DSV41_PACKED_KV:-1}" TIDELM_HOT_MIN="${DSV41_HOT_MIN:-0.3}"
@@ -190,34 +178,74 @@ guard=${KEEP_FREE_GB:-6}
 
 pair=()
 if [[ -n "${PEER:-}" ]]; then
-    [[ -n "${MASTER_ADDR:-}" ]] || err "$f sets PEER but no MASTER_ADDR"
-    addr="$MASTER_ADDR:${MASTER_PORT:-29960}"
-    pair=(--world 2 --addr "$addr")
-    # the same binary on both ranks (the boot guard compares them too)
-    ssh "$PEER" "mkdir -p ~/tidelm-rust-bin ~/tidelm-rust-state '$(dirname "$db")'"
-    rsync -a "$BIN" "$ROOT/scripts/memguard.sh" "$PEER:tidelm-rust-bin/"
+    pair=(--world 2 --addr "$MASTER_ADDR:${MASTER_PORT:-29960}")
+    # the history on both boxes
+    ssh "$PEER" "mkdir -p '$(dirname "$db")'"
     ssh "$PEER" "test -f '$db'" || scp -q "$db" "$PEER:$db"
+fi
+fi   # the model
+
+# ---------------------------------------------------------------------------------------
+# Both models: rank 0 here and rank 1 on PEER, each in a container of the serving image, as the
+# calling user, with every path the arguments name mounted at that path.
+# ---------------------------------------------------------------------------------------
+IMAGE=${IMAGE:-${GLM_IMAGE:-tidelm:local}}
+img=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null) \
+    || err "no image $IMAGE on this box: scripts/tide.sh build $f builds it and ships it to the worker"
+bin=() peer_bin=() envf=()
+if [[ -n "${RUST_BIN:-}" ]]; then
+    RUST_BIN=$(realpath "$RUST_BIN")
+    [[ -x "$RUST_BIN" ]] || err "RUST_BIN=$RUST_BIN is not an executable"
+    # a host build's rpath names ~/.local/nccl, which the container does not have
+    bin=(-v "$RUST_BIN:/usr/local/bin/tidelm-server:ro")
+    peer_bin=(-v "$HOME/tidelm-rust-bin/tidelm-server:/usr/local/bin/tidelm-server:ro")
+    envf=(-e LD_LIBRARY_PATH=/opt/nccl/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64)
+else
+    want=$("$ROOT/scripts/code_digest.sh" --rust "$ROOT")
+    have=$(docker image inspect -f '{{index .Config.Labels "tidelm.rust_sha"}}' "$IMAGE")
+    [[ "$have" == "$want" ]] || err "$IMAGE's Rust engine was built from other sources than this checkout \
+(image $have, checkout $want): scripts/tide.sh build $f rebuilds and ships it"
+fi
+for e in "${envs[@]}"; do envf+=(-e "$e"); done
+vols=() seen=" "
+for p in "${rw[@]}"; do [[ $seen == *" $p "* ]] && continue; seen+="$p "; vols+=(-v "$p:$p"); done
+for p in "${ro[@]}"; do [[ $seen == *" $p "* ]] && continue; seen+="$p "; vols+=(-v "$p:$p:ro"); done
+mkdir -p "${rw[@]}"   # docker would create a missing one as root
+dflags=(-d --network host --gpus all --device /dev/infiniband --cap-add IPC_LOCK --ipc host
+        --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=65536
+        --entrypoint /app/scripts/memguard.sh)
+if [[ -n "${PEER:-}" ]]; then
+    peer_img=$(ssh "$PEER" "docker image inspect -f '{{.Id}}' '$IMAGE'" 2>/dev/null) || peer_img="none"
+    [[ "$peer_img" == "$img" ]] || err "the worker's $IMAGE ($peer_img) is not this box's ($img): \
+scripts/tide.sh build $f ships it"
+    ssh "$PEER" "mkdir -p $(printf '%q ' "${rw[@]}") ~/tidelm-rust-bin"
+    [[ -n "${RUST_BIN:-}" ]] && rsync -a "$RUST_BIN" "$PEER:tidelm-rust-bin/tidelm-server"
 fi
 
 rank0=("${pair[@]}")
 [[ -n "${PEER:-}" ]] && rank0+=(--rank 0)
-(export "${envs[@]}"; exec setsid "$ROOT/scripts/memguard.sh" "$guard" "$BIN" "${args[@]}" "${rank0[@]}") \
-    > "$LOG" 2>&1 < /dev/null &
+docker rm -f tidelm-rank0 > /dev/null 2>&1 || true
+docker run "${dflags[@]}" --name tidelm-rank0 --user "$(id -u):$(id -g)" -e HOME="$HOME" \
+    --health-cmd "curl -fsS http://127.0.0.1:${PORT:-8000}/health || exit 1" --health-interval 30s \
+    --health-start-period 10m "${vols[@]}" "${envf[@]}" "${bin[@]}" \
+    "$IMAGE" "$guard" tidelm-server "${args[@]}" "${rank0[@]}" > /dev/null
 if [[ -n "${PEER:-}" ]]; then
-    sleep 1
-    # only the nohup is backgrounded, with its own stdio: ssh returns at once
-    ssh -n "$PEER" "cd ~/tidelm-rust-bin || exit 1; export $(printf '%q ' "${envs[@]}");
-        nohup ./memguard.sh $guard ./tidelm-server $(printf '%q ' "${args[@]}" "${pair[@]}") --rank 1 \
-        > server_rank1.log 2>&1 < /dev/null &"
+    ssh -n "$PEER" "docker rm -f tidelm-rank1 > /dev/null 2>&1; docker run $(printf '%q ' "${dflags[@]}") \
+        --name tidelm-rank1 --user \$(id -u):\$(id -g) -e HOME=\$HOME --no-healthcheck \
+        $(printf '%q ' "${vols[@]}" "${envf[@]}" "${peer_bin[@]}" "$IMAGE" "$guard" tidelm-server "${args[@]}" "${pair[@]}") \
+        --rank 1 > /dev/null"
 fi
-sleep 2
-for _ in $(seq 300); do
-    grep -q "serving" "$LOG" && break
-    if grep -qiE "error|panicked|GUARD" "$LOG" || ! pgrep -x tidelm-server > /dev/null; then
-        tail -20 "$LOG" >&2
-        err "the Rust server did not come up (log: $LOG)"
+running() { [[ $(docker inspect -f '{{.State.Running}}' tidelm-rank0 2>/dev/null) == true ]]; }
+for _ in $(seq 600); do
+    log=$(docker logs tidelm-rank0 2>&1)
+    grep -q "serving" <<< "$log" && break
+    if grep -qiE "error|panicked|GUARD" <<< "$log" || ! running; then
+        tail -20 <<< "$log" >&2
+        [[ -n "${PEER:-}" ]] && ssh "$PEER" 'docker logs --tail 10 tidelm-rank1 2>&1' | sed 's/^/rank 1: /' >&2
+        err "the Rust server did not come up (docker logs tidelm-rank0)"
     fi
     sleep 1
 done
-grep -q "serving" "$LOG" || err "the Rust server is still not up after 300 s (log: $LOG)"
-grep -E "engine up" "$LOG"
+grep -q "serving" <<< "$log" || err "the Rust server is still not up after 600 s (docker logs tidelm-rank0)"
+grep -E "engine up" <<< "$log"
+echo "--- logs: scripts/tide.sh logs -f${PEER:+   (--rank 1 for the worker)}"

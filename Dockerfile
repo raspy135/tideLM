@@ -26,10 +26,13 @@
 # image, and TRITON_PTXAS_PATH pinned at its ptxas. If you would rather trust the wheel,
 # swap the base for nvidia/cuda:13.0.2-runtime-ubuntu24.04 and drop TRITON_PTXAS_PATH;
 # everything else in this file is unchanged. Only the opt-in native FP4 experiment needs nvcc.
-FROM nvidia/cuda:13.0.2-devel-ubuntu24.04
+#
+# Three stages: `base` (CUDA, the RDMA stack, PyTorch), `rust` (base plus a Rust toolchain:
+# builds the Rust engine's tidelm-server), and the serving image (base, this repo, and that one
+# binary; no toolchain). See the `rust` stage below.
+FROM nvidia/cuda:13.0.2-devel-ubuntu24.04 AS base
 
 ARG TORCH_VERSION=2.13.0
-ARG RECIPE_VERSION=0.1.0-wip
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
@@ -89,8 +92,45 @@ RUN pip install \
         "ninja>=1.11" \
         "Pillow>=10.0"
 
+# NCCL where the Rust engine links it and finds it at run time (its rpath): the library torch
+# brought above, the one the Python engine runs, with the unversioned name the linker wants.
+RUN n=/opt/venv/lib/python3.12/site-packages/nvidia/nccl \
+    && mkdir -p /opt/nccl/lib && ln -s $n/include /opt/nccl/include \
+    && ln -s $n/lib/libnccl.so.2 /opt/nccl/lib/libnccl.so.2 && ln -s libnccl.so.2 /opt/nccl/lib/libnccl.so
+
+# ---------------------------------------------------------------------------------------
+# The Rust engine (rust/), the default for every profile scripts/tide-up.sh serves: built here
+# so a box needs nothing but Docker. Its build scripts compile the repo's CUDA and C++ sources
+# with this image's nvcc for sm_121a (rust/crates/tidelm-kernels, tidelm-comm), libjpeg-turbo
+# from source (cmake), and link this image's CUDA libraries, ibverbs and the NCCL above. The
+# cache mounts keep the crate downloads and the build tree between builds, so a source change
+# rebuilds what it touches. RUSTUP_TOOLCHAIN pins the compiler over rust-toolchain.toml's
+# "stable".
+# ---------------------------------------------------------------------------------------
+FROM base AS rust
+ARG RUST_VERSION=1.99.1
+RUN apt-get update && apt-get install -y --no-install-recommends cmake \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${RUST_VERSION}
+ENV PATH=/root/.cargo/bin:$PATH \
+    RUSTUP_TOOLCHAIN=${RUST_VERSION} \
+    NCCL_HOME=/opt/nccl
+WORKDIR /src
+COPY rust rust
+COPY tools/roce/roce.cu tools/roce/roce_common.h tools/roce/
+COPY tools/fp4_moe_cuda.cu tools/exl3_moe_cuda.cu tools/
+COPY engine/engram_gather.cpp engine/draft_vocab_ranking_v1.txt engine/
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/src/rust/target \
+    cd rust && cargo build --release --locked --bin tidelm-server \
+    && cp target/release/tidelm-server /usr/local/bin/tidelm-server
+
+FROM base
+ARG RECIPE_VERSION=0.1.0-wip
+
 WORKDIR /app
 COPY . /app
+COPY --from=rust /usr/local/bin/tidelm-server /usr/local/bin/tidelm-server
 RUN chmod +x /app/scripts/*.sh /app/run.sh 2>/dev/null || true \
     && echo "${RECIPE_VERSION}" > /app/VERSION \
     && mkdir -p /models /app/logs /app/results /app/.triton
@@ -100,7 +140,8 @@ RUN chmod +x /app/scripts/*.sh /app/run.sh 2>/dev/null || true \
 # build runner -- so the first real compile still happens on the box.
 RUN python -c "import torch, triton, transformers, tokenizers, safetensors, numpy, sympy; \
 print('torch', torch.__version__, 'triton', triton.__version__)" \
-    && python -c "import sys; sys.path.insert(0, '/app/tools'); import fp4_moe; print('fp4_moe ok')"
+    && python -c "import sys; sys.path.insert(0, '/app/tools'); import fp4_moe; print('fp4_moe ok')" \
+    && ! ldd /usr/local/bin/tidelm-server | grep 'not found'
 
 LABEL org.opencontainers.image.title="DeepSeek-V4.1-Flash on one DGX Spark" \
       org.opencontainers.image.description="Plain-PyTorch engine with a Triton FP4 MoE kernel and NVMe expert streaming" \

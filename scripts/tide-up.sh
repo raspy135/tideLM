@@ -12,7 +12,7 @@
 # profile the Rust engine does not serve (`scripts/rust-up.sh --check` says why: MXFP4 GLM
 # experts, FP4 KV, ...) falls back to Python with a note, unless it asked for TIDE_ENGINE=rust.
 # One pair fills both boxes, so whatever is serving is stopped first, after the checks.
-# scripts/tide-down.sh stops it again.
+# scripts/tide-down.sh stops it again. scripts/tide.sh start / stop runs both.
 #
 # Both engines serve the OpenAI API (/v1/chat/completions) and the Anthropic one (/v1/messages,
 # server/anthropic_api.py) on the same port. Once the server is up this also writes

@@ -17,6 +17,7 @@
 .github/
 
 # never in an image
+rust/target/
 .env
 .env.*
 *.env

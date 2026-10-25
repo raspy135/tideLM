@@ -12,7 +12,7 @@
 # The transfer is ~10 GB. Over the direct-attach link that is seconds; over WiFi it is not,
 # so this uses the same PEER address the engine does.
 #
-# Usage: scripts/dual-build.sh [ENV_FILE] [--local-only]
+# Usage: scripts/dual-build.sh [ENV_FILE] [--local-only]   (scripts/tide.sh build runs it)
 #
 #   scripts/dual-build.sh .env.ds41-mxfp4   build the image that profile runs (IMAGE, or GLM_IMAGE
 #                                           in a GLM-5.3 profile) and ship it to its PEER
@@ -56,12 +56,13 @@ $LOCAL_ONLY || [[ -n "$PEER" ]] || err "no PEER, so the worker would keep its ol
 # The engine code this image will run (scripts/code_digest.sh), stamped as a label so dual-up.sh
 # can refuse to boot an image built from older code than the checkout.
 CODE_SHA=$("$ROOT/scripts/code_digest.sh" "$ROOT")
+RUST_SHA=$("$ROOT/scripts/code_digest.sh" --rust "$ROOT")   # the Rust engine's sources (rust-up.sh checks it)
 GIT_DESC=$(git -C "$ROOT" describe --always --dirty 2>/dev/null || echo unknown)
 info "building $IMAGE from $GIT_DESC, code $CODE_SHA (this pulls the CUDA 13 devel base and the cu130 torch wheel)"
 # The Dockerfile writes /app/VERSION (the container's banner, the image label) from this build
 # argument; without it every image claimed its default, 0.1.0-wip.
 docker build --build-arg RECIPE_VERSION="$(cat "$ROOT/VERSION")" \
-    --label "dsv41.code_sha=$CODE_SHA" --label "dsv41.git=$GIT_DESC" -t "$IMAGE" .
+    --label "dsv41.code_sha=$CODE_SHA" --label "tidelm.rust_sha=$RUST_SHA" --label "dsv41.git=$GIT_DESC" -t "$IMAGE" .
 LOCAL_ID=$(docker image inspect -f '{{.Id}}' "$IMAGE")
 info "built $IMAGE  $LOCAL_ID"
 
