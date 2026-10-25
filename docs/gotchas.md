@@ -4431,3 +4431,28 @@ from a lane's RAM snapshot, decoded side by side in one step (frozen residents, 
 greedy), diverge by the fourth token. The engine at ee923cb gives the same two texts as this one,
 path for path, so the streamed bundle reproduces the old one; what differs between the two
 restores is not found.
+
+## Rust DS decode slowed with context: a 1 GB memset a step, and FMA scores (2026-10-25)
+
+A Claude Code session's log ran 60 ms a step under 20K tokens and 113 ms past 130K, which the
+Python engine did not. Two causes, both in the indexer:
+
+1. Decode scored on the FMA kernel, whose cost rises with every compressed key (Python's einsum
+   ran on the tensor cores). Fixed in c2386d8: tensor-core scores with the keys split over blocks.
+2. Layer 20's candidate mask was a prefill step's rows x max_seq bytes (2,048 x 524,289 = 1.07
+   GB), and every step past 16K tokens zeroed all of it: 5.4 ms (examples/bench_index_decode.rs),
+   whatever the step's rows or context. The later layers now score layer 20's block list
+   instead (ds_index_cand_scores, Python's DSV41_INDEX_CANDIDATES). Its candidates get the bits
+   the masked range gives them, so the selection is unchanged, and the mask and its 1 GB are
+   gone. The select also stops at each row's clen instead of the power-of-two bucket.
+
+A decode step's backbone time with TIDELM_STEP_SPLIT=1, about 3.9-4.1 rows a step:
+
+| context | before | after |
+| ---: | ---: | ---: |
+| 8.6K | 71.4-72.0 ms | 68.4 ms |
+| 64K | | 68.6 ms |
+| 148K | 83.6 ms | 68.9 ms |
+
+The lesson: a buffer sized for the worst step (prefill rows x max_seq) must not be cleared whole
+on every step. Zero the region a step uses, or drop the buffer.

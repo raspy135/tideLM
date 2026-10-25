@@ -634,6 +634,8 @@ impl RowCache {
 
 /// Keys a block of the decode indexer scores (ds_index_scores_mma_chunked): 64 blocks at 64K.
 const INDEX_DECODE_CHUNK: usize = 1024;
+/// Candidate blocks a block of ds_index_cand_scores takes (8 a warp): 32 blocks a row.
+const INDEX_CAND_PER_CTA: usize = 64;
 
 /// A raw pointer handed to a step's gather thread (see run_step).
 struct SendPtr(*mut u8);
@@ -781,7 +783,6 @@ struct Act {
     iwb: DeviceBuffer<u16>,
     iwf: DeviceBuffer<f32>,
     scores: DeviceBuffer<u16>,
-    cand: DeviceBuffer<u8>,
     bmax: DeviceBuffer<u16>,
     blocks: DeviceBuffer<i32>,
     topk: DeviceBuffer<i32>,
@@ -1379,8 +1380,10 @@ pub struct Engine {
     /// values bit for bit, read back by the attention kernels' key loads
     packed_kv: bool,
     selection: Selection,
-    /// the candidate-source layer's block mask is live for this step's later layers
+    /// the candidate-source layer's block lists (act.blocks, cand_kb a row) are live for this
+    /// step's later layers
     cand_live: bool,
+    cand_kb: usize,
     /// index-source layer passes in which the indexer actually ran
     pub indexed_layers: usize,
     /// sampled rows whose nucleus outgrew the device's window (recomputed on the host)
@@ -1694,7 +1697,6 @@ impl Engine {
             // the indexer's scores and block maxima for at most INDEX_SCORES (rows x keys) at a
             // time: a long context scores its step in row slices (Engine::index)
             scores: a((t * (max_seq + 1)).min(index_scores_budget()))?,
-            cand: DeviceBuffer::zeroed(t * (max_seq + 1))?,
             bmax: a((t * ((max_seq + 1).div_ceil(8) + 1)).min(index_scores_budget() / 8 + t))?,
             blocks: i(t * 2048)?,
             topk: i(t * cfg.index_topk)?,
@@ -1959,6 +1961,7 @@ impl Engine {
             packed_kv,
             selection: Selection::AllVisible,
             cand_live: false,
+            cand_kb: 0,
             indexed_layers: 0,
             nucleus_fallbacks: 0,
             expert_topp,
@@ -4331,7 +4334,6 @@ impl Engine {
         let a = &self.act;
         let ti = t as i32;
         let (ih, ihd, rd) = (cfg.index_n_heads, cfg.index_head_dim, cfg.rope_head_dim);
-        let nmax = self.max_seq + 1;
         gemm(sr, &a.mma_part, np(&a.qr), cfg.q_lora_rank, Wt::Fp8(&ix.wq_b), t, np(&a.iq), false, ih * ihd)?;
         // the indexer's queries always take the compressed-rope table (model.py: freqs_c[pos])
         ck(unsafe { ds_rope(sr, np(&a.iq), (ih * ihd) as i64, ti, ih as i32, ihd as i64, (ihd - rd) as i32, rd as i32, np(&a.pos), np(&self.rope_c), 0) }, "index q rope")?;
@@ -4341,7 +4343,13 @@ impl Engine {
         let src = cfg.kv_source_of(l).expect("compressed layer has a kv source");
         let clen = if r == 1 { &a.clen1 } else { &a.clen2 };
         let cand_src = cfg.candidate_source_layer;
-        let use_cand = self.cand_live && cand_src >= 0 && (l as i64) > cand_src;
+        // past the candidate source, a layer scores the source's 2,048 blocks alone (Python's
+        // DSV41_INDEX_CANDIDATES, there decode's): ds_index_cand_scores gives each candidate the
+        // bits the whole range gives it, so the selection is the masked range's (the test
+        // candidate_lists_select_what_the_masked_range_selects). The mask it replaces was a
+        // prefill step's rows x max_seq bytes (1.07 GB at 524,288), zeroed every step past
+        // 16K tokens: ~5 ms a decode step
+        let use_list = self.cand_live && cand_src >= 0 && (l as i64) > cand_src;
         // scores on the tensor cores (0.69 ms against the FMA kernel's 12.45 at 2,048 rows over
         // 2,240 keys, examples/bench_index.rs; the head sum's order kept, each dot accumulated
         // in the mma's order). A decode step's rows fill one 8-row block, so its keys are split
@@ -4352,39 +4360,48 @@ impl Engine {
         let block = 8usize;
         let topk_blocks = 2048usize;
         let cand_step = l as i64 == cand_src && shape.cand;
-        if cand_step {
-            a.cand.zero_async(st)?;
-        }
         let (nb, k, kw) = (n_c.div_ceil(block), cfg.index_topk.min(n_c), cfg.index_topk);
-        let kb = topk_blocks.min(nb);
+        let kb = if use_list { self.cand_kb } else { topk_blocks.min(nb) };
         // rows a slice: all of a step unless its scores would outgrow INDEX_SCORES (a whole
         // decode step is always one slice, so its graph is unchanged)
         let rc = (index_scores_budget() / n_c.max(1)).min(t).max(8.min(t));
         for r0 in (0..t).step_by(rc) {
             let m = rc.min(t - r0) as i32;
             let (q, keys, iw) = (a.iq.ptr_at(r0 * ih * ihd), np(&self.caches.ik[&src]), a.iwf.ptr_at(r0 * ih));
-            let cand = if use_cand { a.cand.ptr_at(r0 * nmax) } else { nul() };
             let kstride = (self.caches.crows[&src] * ihd) as i64;
+            if use_list {
+                let (cap, list) = (kb * block, a.blocks.ptr_at(r0 * kb));
+                ck(unsafe {
+                    ds_index_cand_scores(sr, q, keys, iw, clen.ptr_at(r0), list, kb as i32, n_c as i32, np(&a.scores), cap as i64, m,
+                                         a.lane.ptr_at(r0), kstride, INDEX_CAND_PER_CTA as i32)
+                }, "candidate scores")?;
+                ck(unsafe { ds_topk_select(sr, np(&a.scores), cap as i64, cap as i32, k.min(cap) as i32, a.topk.ptr_at(r0 * kw), kw as i32, m) }, "candidate topk")?;
+                ck(unsafe { ds_cand_positions(sr, list, kb as i32, a.topk.ptr_at(r0 * kw), kw as i32, m) }, "candidate positions")?;
+                continue;
+            }
             ck(unsafe {
                 if chunk == 0 {
-                    ds_index_scores_mma(sr, q, keys, iw, clen.ptr_at(r0), cand, nmax as i64, n_c as i32, np(&a.scores), n_c as i64, m,
+                    ds_index_scores_mma(sr, q, keys, iw, clen.ptr_at(r0), nul(), 0, n_c as i32, np(&a.scores), n_c as i64, m,
                                         a.lane.ptr_at(r0), kstride)
                 } else {
-                    ds_index_scores_mma_chunked(sr, q, keys, iw, clen.ptr_at(r0), cand, nmax as i64, n_c as i32, np(&a.scores),
-                                                n_c as i64, m, a.lane.ptr_at(r0), kstride, chunk as i32)
+                    ds_index_scores_mma_chunked(sr, q, keys, iw, clen.ptr_at(r0), nul(), 0, n_c as i32, np(&a.scores), n_c as i64, m,
+                                                a.lane.ptr_at(r0), kstride, chunk as i32)
                 }
             }, "index scores")?;
             if cand_step {
                 // model.py::_select_candidates: below topk_blocks blocks every block is kept,
-                // so the mask only exists where it can drop something
+                // so the list only exists where it can drop something
                 ck(unsafe { ds_candidate_blocks(sr, np(&a.scores), n_c as i64, n_c as i32, block as i32, clen.ptr_at(r0), np(&a.bmax), nb as i64, m) }, "candidate blocks")?;
                 ck(unsafe { ds_topk_select(sr, np(&a.bmax), nb as i64, nb as i32, kb as i32, a.blocks.ptr_at(r0 * kb), kb as i32, m) }, "candidate select")?;
-                ck(unsafe { ds_candidate_set(sr, a.blocks.ptr_at(r0 * kb), kb as i32, block as i32, n_c as i32, a.cand.ptr_at(r0 * nmax), nmax as i64, m) }, "candidate set")?;
             }
-            ck(unsafe { ds_topk_select(sr, np(&a.scores), n_c as i64, n_c as i32, k as i32, a.topk.ptr_at(r0 * kw), kw as i32, m) }, "index topk")?;
+            // a row's keys past its clen score -inf: the select reads up to clen, not the bucket
+            ck(unsafe {
+                ds_topk_select_lim(sr, np(&a.scores), n_c as i64, n_c as i32, k as i32, a.topk.ptr_at(r0 * kw), kw as i32, m, clen.ptr_at(r0))
+            }, "index topk")?;
         }
         if cand_step {
             self.cand_live = true;
+            self.cand_kb = kb;
         }
         self.selection = Selection::Indexed;
         self.indexed_layers += 1;

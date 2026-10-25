@@ -221,6 +221,21 @@ extern "C" {
         stream: CudaStream, s: *const c_void, ld_s: i64, n: c_int, k: c_int, out: *mut c_void,
         width: c_int, t: c_int,
     ) -> c_int;
+    /// ds_topk_select reading row r's first min(n, lim[r]) values alone (the rest -inf)
+    pub fn ds_topk_select_lim(
+        stream: CudaStream, s: *const c_void, ld_s: i64, n: c_int, k: c_int, out: *mut c_void,
+        width: c_int, t: c_int, lim: *const c_void,
+    ) -> c_int;
+    /// Per row: the scores of the `kb` 8-key blocks its list names (ascending block ids, -1
+    /// padded), column i its list's key i - ds_index_scores_mma's bits for each - and -inf
+    /// for padding and keys past clen; a block of 8 warps takes `per_cta` list blocks.
+    pub fn ds_index_cand_scores(
+        stream: CudaStream, q: *const c_void, k: *const c_void, w: *const c_void, clen: *const c_void,
+        blocks: *const c_void, kb: c_int, n: c_int, out: *mut c_void, ld_out: i64, t: c_int,
+        lane: *const c_void, k_lstride: i64, per_cta: c_int,
+    ) -> c_int;
+    /// In place, per row: selected list columns (ds_topk_select's) to their positions.
+    pub fn ds_cand_positions(stream: CudaStream, blocks: *const c_void, kb: c_int, sel: *mut c_void, width: c_int, t: c_int) -> c_int;
 
     pub fn ds_candidate_blocks(
         stream: CudaStream, s: *const c_void, ld_s: i64, n: c_int, block: c_int, clen: *const c_void,

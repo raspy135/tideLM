@@ -1145,6 +1145,64 @@ fn candidate_blocks_force_the_last_block_and_set_whole_blocks() {
     }
 }
 
+#[test]
+fn candidate_lists_select_what_the_masked_range_selects() {
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(73);
+    let (t, n, h, dd, block, kb, k) = (7usize, 3000usize, 32usize, 128usize, 8usize, 100usize, 64usize);
+    let nb = n / block;
+    let q = rng.bf16_vec(t * h * dd, 0.3);
+    // 37 distinct keys repeat across the range: equal scores at the threshold, whose lowest
+    // positions both paths must keep
+    let base = rng.bf16_vec(37 * dd, 0.3);
+    let k_all: Vec<u16> = (0..2 * n * dd).map(|i| base[(i / dd % 37) * dd + i % dd]).collect();
+    let w: Vec<f32> = (0..t * h).map(|_| rng.unif()).collect();
+    // full rows, partial last blocks, and rows with fewer visible blocks than the list holds
+    let clen: Vec<i32> = vec![3000, 2999, 1234, 803, 200, 17, 2500];
+    let lanes: Vec<i32> = (0..t).map(|r| (r % 3 == 1) as i32).collect();
+    let (dq, dk, dw, dc, dl) = (dev(&q), dev(&k_all), dev(&w), dev(&clen), dev(&lanes));
+    let ks = (n * dd) as i64;
+    let full = DeviceBuffer::<u16>::zeroed(t * n).unwrap();
+    ok(unsafe { ds_index_scores_mma(st.raw(), p(&dq), p(&dk), p(&dw), p(&dc), null(), 0, n as i32, p(&full), n as i64, t as i32, p(&dl), ks) });
+    let dbmax = DeviceBuffer::<u16>::zeroed(t * nb).unwrap();
+    ok(unsafe { ds_candidate_blocks(st.raw(), p(&full), n as i64, n as i32, block as i32, p(&dc), p(&dbmax), nb as i64, t as i32) });
+    let dblocks = DeviceBuffer::<i32>::zeroed(t * kb).unwrap();
+    ok(unsafe { ds_topk_select(st.raw(), p(&dbmax), nb as i64, nb as i32, kb as i32, p(&dblocks), kb as i32, t as i32) });
+    // the masked range: every key scored, the list's blocks kept
+    let dcand = DeviceBuffer::<u8>::zeroed(t * n).unwrap();
+    ok(unsafe { ds_candidate_set(st.raw(), p(&dblocks), kb as i32, block as i32, n as i32, p(&dcand), n as i64, t as i32) });
+    let masked = DeviceBuffer::<u16>::zeroed(t * n).unwrap();
+    ok(unsafe { ds_index_scores_mma(st.raw(), p(&dq), p(&dk), p(&dw), p(&dc), p(&dcand), n as i64, n as i32, p(&masked), n as i64, t as i32, p(&dl), ks) });
+    let (want, want_lim) = (DeviceBuffer::<i32>::zeroed(t * 512).unwrap(), DeviceBuffer::<i32>::zeroed(t * 512).unwrap());
+    ok(unsafe { ds_topk_select(st.raw(), p(&masked), n as i64, n as i32, k as i32, p(&want), 512, t as i32) });
+    ok(unsafe { ds_topk_select_lim(st.raw(), p(&masked), n as i64, n as i32, k as i32, p(&want_lim), 512, t as i32, p(&dc)) });
+    // the list alone, in blocks of 3 list entries (a ragged last one) and of the serving 64
+    for per_cta in [3, 64] {
+        let cs = DeviceBuffer::<u16>::zeroed(t * kb * block).unwrap();
+        ok(unsafe {
+            ds_index_cand_scores(st.raw(), p(&dq), p(&dk), p(&dw), p(&dc), p(&dblocks), kb as i32, n as i32, p(&cs), (kb * block) as i64,
+                                 t as i32, p(&dl), ks, per_cta)
+        });
+        let got = DeviceBuffer::<i32>::zeroed(t * 512).unwrap();
+        ok(unsafe { ds_topk_select(st.raw(), p(&cs), (kb * block) as i64, (kb * block) as i32, k as i32, p(&got), 512, t as i32) });
+        ok(unsafe { ds_cand_positions(st.raw(), p(&dblocks), kb as i32, p(&got), 512, t as i32) });
+        st.synchronize().unwrap();
+        let (blocks, m, c) = (dblocks.download().unwrap(), masked.download().unwrap(), cs.download().unwrap());
+        for r in 0..t {
+            for i in 0..kb * block {
+                let b = blocks[r * kb + i / block];
+                let j = b * block as i32 + (i % block) as i32;
+                let want_bits = if b >= 0 && j < clen[r] { m[r * n + j as usize] } else { 0xff80 };
+                assert_eq!(c[r * kb * block + i], want_bits, "row {r} column {i} (position {j}), per_cta {per_cta}");
+            }
+        }
+        let (w0, w1, g) = (want.download().unwrap(), want_lim.download().unwrap(), got.download().unwrap());
+        assert_eq!(w0, w1, "reading past clen changes no selection");
+        assert_eq!(g, w0, "per_cta {per_cta}");
+        assert!(g.chunks(512).filter(|r| r[k - 1] >= 0).count() >= 5 && g[5 * 512 + 16] >= 0 && g[5 * 512 + 17] == -1);
+    }
+}
+
 // ------------------------------------------------------------------ graph-safe step plumbing
 #[test]
 fn ring_scatter_visible_lists_and_lut() {

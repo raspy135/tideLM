@@ -2505,6 +2505,97 @@ __global__ void __launch_bounds__(256) index_scores_mma_kernel(
     }
 }
 
+// The layers after the candidate source score its blocks alone (model.py::_indexer with
+// Python's DSV41_INDEX_CANDIDATES): row t's list names `kb` blocks of 8 keys (ascending, -1
+// padded) and column i of its scores is the list's key i. A warp scores one block a pass from
+// its own staged copy of the block's keys with index_scores_mma_kernel's fragments, mma order
+// and head sum - each score depends on its key alone - so a candidate gets the bits the whole
+// range gives it, and the top-k of the list is the top-k of the range masked to the list.
+constexpr int kIcWarps = 8;
+
+__global__ void __launch_bounds__(kIcWarps * 32) index_cand_scores_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_base, const float* __restrict__ w,
+    const int* __restrict__ clen, const int* __restrict__ blocks, int kb, int n,
+    __nv_bfloat16* __restrict__ out, int64_t ld_out, const int* __restrict__ lane, int64_t k_lstride, int per_cta) {
+    __shared__ __align__(16) __nv_bfloat16 ks[kIcWarps][8 * kIsLD];
+    const int warp = threadIdx.x >> 5, l = threadIdx.x & 31, g = l >> 2, c = l & 3;
+    const int t = blockIdx.x;
+    const int lim = min(clen[t], n);
+    const __nv_bfloat16* kbase = k_base + (int64_t)(lane ? lane[t] : 0) * k_lstride;
+    uint32_t af[2][kIdxD / 16][4];
+    const uint32_t* qr = reinterpret_cast<const uint32_t*>(q + (int64_t)t * kIdxH * kIdxD);
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+        for (int kk = 0; kk < kIdxD / 16; ++kk) {
+            const int r0 = (mt * 16 + g) * kIdxD + kk * 16 + 2 * c, r1 = r0 + 8 * kIdxD;
+            af[mt][kk][0] = qr[r0 / 2];
+            af[mt][kk][1] = qr[r1 / 2];
+            af[mt][kk][2] = qr[(r0 + 8) / 2];
+            af[mt][kk][3] = qr[(r1 + 8) / 2];
+        }
+    float wv[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) wv[i] = w[(int64_t)t * kIdxH + g + 8 * i];
+    const int* brow = blocks + (int64_t)t * kb;
+    __nv_bfloat16* orow = out + (int64_t)t * ld_out;
+    const __nv_bfloat16 ninf = to_bf(-INFINITY);
+    __nv_bfloat16* mine = ks[warp];
+    const int b1 = min(kb, (blockIdx.y + 1) * per_cta);
+    for (int cb = blockIdx.y * per_cta + warp; cb < b1; cb += kIcWarps) {
+        const int j0 = brow[cb] * 8;
+        if (j0 < 0 || j0 >= lim) {
+            if (l < 8) orow[cb * 8 + l] = ninf;
+            continue;
+        }
+        // the block's 8 keys, 16 x 16 bytes each; keys past lim stage as zeros (their columns
+        // are -inf, and no other column reads them)
+        for (int i = l; i < 8 * kIdxD / 8; i += 32) {
+            const int rr = i / (kIdxD / 8), cc = (i % (kIdxD / 8)) * 8;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (j0 + rr < lim) v = *reinterpret_cast<const uint4*>(kbase + (int64_t)(j0 + rr) * kIdxD + cc);
+            *reinterpret_cast<uint4*>(&mine[rr * kIsLD + cc]) = v;
+        }
+        __syncwarp();
+        float acc[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
+#pragma unroll
+        for (int k2 = 0; k2 < kIdxD / 32; ++k2) {
+            uint32_t b[4];
+            ldsm_x4(b, &mine[(l & 7) * kIsLD + k2 * 32 + (l >> 3) * 8]);
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt) {
+                const uint32_t* a0 = af[mt][2 * k2];
+                const uint32_t* a1 = af[mt][2 * k2 + 1];
+                mma_bf16(acc[mt], a0[0], a0[1], a0[2], a0[3], b[0], b[1]);
+                mma_bf16(acc[mt], a1[0], a1[1], a1[2], a1[3], b[2], b[3]);
+            }
+        }
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+            const float h0 = fmaxf(bf(to_bf(acc[0][e])), 0.f) * wv[0];
+            const float h8 = fmaxf(bf(to_bf(acc[0][2 + e])), 0.f) * wv[1];
+            const float h16 = fmaxf(bf(to_bf(acc[1][e])), 0.f) * wv[2];
+            const float h24 = fmaxf(bf(to_bf(acc[1][2 + e])), 0.f) * wv[3];
+            float sum = (h0 + h16) + (h8 + h24);
+            sum += __shfl_xor_sync(0xffffffffu, sum, 16);
+            sum += __shfl_xor_sync(0xffffffffu, sum, 8);
+            sum += __shfl_xor_sync(0xffffffffu, sum, 4);
+            if (g == 0) orow[cb * 8 + 2 * c + e] = j0 + 2 * c + e < lim ? to_bf(sum) : ninf;
+        }
+        __syncwarp();
+    }
+}
+
+// A list's selected columns (topk_select's, ascending, -1 padded) back to positions in place:
+// column i is block list[i / 8]'s key i % 8, so an ascending list keeps them ascending.
+__global__ void cand_positions_kernel(const int* __restrict__ blocks, int kb, int* __restrict__ sel, int width) {
+    const int t = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= width) return;
+    int* s = sel + (int64_t)t * width;
+    const int col = s[i];
+    if (col >= 0) s[i] = blocks[(int64_t)t * kb + col / 8] * 8 + col % 8;
+}
+
 // Orderable key of a bf16 value: larger value -> larger key. -inf and NaN are not selectable.
 __device__ __forceinline__ bool bf16_key(uint16_t b, uint32_t& key) {
     if (b == 0xff80u || (b & 0x7f80u) == 0x7f80u && (b & 0x7fu)) return false;  // -inf, NaN
@@ -2523,7 +2614,10 @@ __device__ __forceinline__ bool bf16_key(uint16_t b, uint32_t& key) {
 constexpr int kSelThreads = 1024;
 
 __global__ void __launch_bounds__(kSelThreads) topk_select_kernel(
-    const __nv_bfloat16* __restrict__ s, int64_t ld_s, int n, int K, int* __restrict__ out, int width) {
+    const __nv_bfloat16* __restrict__ s, int64_t ld_s, int n, int K, int* __restrict__ out, int width,
+    const int* __restrict__ lim) {
+    // a row's values past lim[row] are -inf (the indexer's past clen): not read at all
+    if (lim) n = max(0, min(n, lim[blockIdx.x]));
     __shared__ int hist[256];
     __shared__ int whist[kSelThreads / 32][256];
     __shared__ int scan[kSelThreads];
@@ -3699,10 +3793,33 @@ int ds_index_scores_mma(void* stream, const void* q, const void* k, const void* 
                                        whole < kIdxTile ? kIdxTile : whole);
 }
 
-int ds_topk_select(void* stream, const void* s, int64_t ld_s, int n, int K, void* out, int width, int T) {
+int ds_topk_select_lim(void* stream, const void* s, int64_t ld_s, int n, int K, void* out, int width, int T,
+                       const void* lim) {
     if (K > width || n < 1) return cudaErrorInvalidValue;
     topk_select_kernel<<<T, kSelThreads, 0, static_cast<cudaStream_t>(stream)>>>(
-        static_cast<const __nv_bfloat16*>(s), ld_s, n, K, static_cast<int*>(out), width);
+        static_cast<const __nv_bfloat16*>(s), ld_s, n, K, static_cast<int*>(out), width, static_cast<const int*>(lim));
+    return static_cast<int>(cudaGetLastError());
+}
+
+int ds_topk_select(void* stream, const void* s, int64_t ld_s, int n, int K, void* out, int width, int T) {
+    return ds_topk_select_lim(stream, s, ld_s, n, K, out, width, T, nullptr);
+}
+
+int ds_index_cand_scores(void* stream, const void* q, const void* k, const void* w, const void* clen, const void* blocks,
+                         int kb, int n, void* out, int64_t ld_out, int T, const void* lane, int64_t k_lstride, int per_cta) {
+    if (n < 1 || T < 1 || kb < 1 || per_cta < 1 || ld_out < (int64_t)kb * 8) return cudaErrorInvalidValue;
+    dim3 grid(T, (kb + per_cta - 1) / per_cta);
+    index_cand_scores_kernel<<<grid, kIcWarps * 32, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(k), static_cast<const float*>(w),
+        static_cast<const int*>(clen), static_cast<const int*>(blocks), kb, n, static_cast<__nv_bfloat16*>(out), ld_out,
+        static_cast<const int*>(lane), k_lstride, per_cta);
+    return static_cast<int>(cudaGetLastError());
+}
+
+int ds_cand_positions(void* stream, const void* blocks, int kb, void* sel, int width, int T) {
+    dim3 grid((width + 255) / 256, T);
+    cand_positions_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const int*>(blocks), kb, static_cast<int*>(sel), width);
     return static_cast<int>(cudaGetLastError());
 }
 
