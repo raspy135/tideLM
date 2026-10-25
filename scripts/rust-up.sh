@@ -18,7 +18,7 @@
 #
 # The Rust engine's own, with their defaults:
 #   RUST_BUDGET=10000        resident experts (next to 512K tokens of context per lane)
-#   RUST_LANES=1             decode lanes (the profile serves 2); async hot reads past one are off
+#   RUST_LANES=1             decode lanes (the profile serves 2), sharing one hot-read ring
 #   RUST_DEPTH=confidence    speculation depth policy (window, confidence, or a fixed depth)
 #   RUST_ADAPT_DB=~/tidelm-rust-state/prune_demand_rust.npz
 #                            its own demand history: the first launch copies the Python server's
@@ -152,8 +152,7 @@ args=(--resident --graphs --model-dir "$MODEL_DIR" --served-model-name "${SERVED
       --prefix-cache "${DSV41_PREFIX_CACHE:-1}" --prefix-snapshots "${DSV41_PREFIX_SNAPSHOTS:-16}"
       --copy-draft "${RUST_COPY_DRAFT:-1}" --swa-replay "${DSV41_SWA_REPLAY:-1}")
 if [[ "${SPEC:-1}" == 0 ]]; then args+=(--depth plain); else args+=(--depth "${RUST_DEPTH:-confidence}"); fi
-# async hot reads plan from one lane's verify rows: on only with one lane
-if [[ "${DSV41_HOT_READS:-1}" == 1 && "${DSV41_HOT_ASYNC:-1}" == 1 && "$lanes" == 1 ]]; then
+if [[ "${DSV41_HOT_READS:-1}" == 1 && "${DSV41_HOT_ASYNC:-1}" == 1 ]]; then
     args+=(--hot-ring "${DSV41_HOT_RING:-128}")
 else
     args+=(--hot-ring 0)

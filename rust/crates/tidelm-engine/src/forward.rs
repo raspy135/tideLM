@@ -1786,13 +1786,13 @@ impl Engine {
         let eg_host = (0..n_eng).map(|_| PinnedBuffer::zeroed(t * eng_cols * ENGRAM_ROW)).collect::<std::result::Result<_, _>>()?;
         // and the probe lane, the scratch lane's caches (Engine::probe_lane)
         let lanes_v = (0..=max_lanes).map(|_| Lane { len: 0, hash: hash.fresh(), last: (0, 0, 0), step: u64::MAX }).collect();
-        // async hot reads: the backbone arena's spare slots are the ring
+        // async hot reads: the backbone arena's spare slots are the ring. One ring and one plan
+        // serve every lane: a decode step's router records the candidates of all its decode rows,
+        // whichever lane they are, and the ring's live experts are routable for the whole step.
+        // (The Python engine ran one decode path a lane, hence its DSV41_MAX_CONCURRENCY=1.)
         let hot = match (&resident, opts.hot_ring) {
             (_, 0) => None,
             (Some(res), ring) => {
-                if max_lanes != 1 {
-                    return Err("async hot reads plan from one lane's verify rows: --lanes 1 (DSV41_MAX_CONCURRENCY=1)".into());
-                }
                 if opts.keep.is_none() {
                     return Err("hot reads need pruned residency (a keep mask)".into());
                 }

@@ -339,7 +339,12 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
     residents): the heaviest missing picks of a decode step are read during the next and
     routable from the one after (marks on the LUT and keep mask around the step's graphs);
     both ranks plan alone from the same table, and rank 0 sends a digest of that state with
-    every step so a divergence stops the pair rather than routing garbage.
+    every step so a divergence stops the pair rather than routing garbage. Every lane's decode
+    rows feed the one table, so the ring serves any number of lanes (2026-10-25; the Python
+    engine's one-lane rule came from its one decode path a lane). Two lanes, two prose requests
+    at once, one boot an arm: 41.17 tok/s together with the ring, 40.62 without; 1,002 reads over
+    1,265 steps, 1.1 s waited. Its 128 slots cost rank 0 1.0 GiB of its lowest MemAvailable (6.45
+    -> 5.42), so the two-lane profile runs 9,872 residents.
   Moves read each rank's share on the io workers: 9-243 experts in 0.10-0.32 s a pass.
 
   The pair, bench.py's README prompts (sampled 0.6, 1,024 tokens, median of 3), adaptation +
