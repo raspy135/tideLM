@@ -34,11 +34,11 @@ fn main() {
             if let Some(hb) = prefill {
                 return ds_attn_prefill(s.raw(), q.raw(), ringb.raw(), ring as i32, pos.raw(), w as i32, 0, ckv.raw(), cidx.raw(),
                                        c as i32, sink.raw(), 0.04, out.raw(), m as i32, h as i32, std::ptr::null_mut(), 0, 0,
-                                       std::ptr::null_mut(), hb);
+                                       std::ptr::null_mut(), hb, 0);
             }
             ds_attn_decode(s.raw(), q.raw(), ringb.raw(), ring as i32, pos.raw(), w as i32, 0, ckv.raw(), cidx.raw(), c as i32,
                            sink.raw(), 0.04, out.raw(), m as i32, h as i32, std::ptr::null_mut(), 0, 0,
-                           if split { std::ptr::null_mut() } else { work.raw() }, if split { 0 } else { wb }, std::ptr::null_mut())
+                           if split { std::ptr::null_mut() } else { work.raw() }, if split { 0 } else { wb }, std::ptr::null_mut(), 0)
         };
         assert_eq!(launch(&stream), 0);
         stream.synchronize().unwrap();

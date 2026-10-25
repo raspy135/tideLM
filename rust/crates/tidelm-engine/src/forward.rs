@@ -62,6 +62,16 @@ fn ring_slots(window: usize) -> usize {
     (window + prefill_rows()).div_ceil(64) * 64
 }
 const ARENA_SLOTS: usize = 16;
+/// Indexer scores held at once (bf16, rows x keys): 512 MB. A step's rows are scored in slices
+/// of INDEX_SCORES / keys rows, so the buffer does not scale with max_seq x rows (2.15 GB at
+/// 524,288 tokens and 2,048 rows); a row's scores and top-k depend on no other row's.
+const INDEX_SCORES: usize = 256 << 20;
+/// INDEX_SCORES, or TIDELM_INDEX_SCORES (tests: a small budget slices a short context's steps).
+fn index_scores_budget() -> usize {
+    std::env::var("TIDELM_INDEX_SCORES").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n >= 1 << 16).unwrap_or(INDEX_SCORES)
+}
+/// A packed compressed-KV row: 512 FP4 codes (256 bytes) + 32 E4M3 scales (ds41.cu kPkRow).
+const PACKED_ROW: usize = 288;
 const HEAD_ROWS: usize = 8192;
 const HC_SPLITS: usize = 16;
 /// fp32 split-K partials of the tensor-core GEMM, splits x rows x outputs. The model's
@@ -378,14 +388,14 @@ impl Options {
         Ok(format!("tidelm-pair v3 tp | max_seq {} lanes {} spec {} resident {} graphs {} layers {:?} | keep {:x} \
                     dspark_keep {:x} record {} hot_ring {} | exe {:x} | config {:x} | draft vocab {listed:x} | env NO_QDQ={:?} ENGRAM_CACHE_MB={:?} \
                     DRAFT_HEAD_FMT={:?} TP_DRAFT={:?} EXPERT_TOPP={:?}/{:?} PREFILL_ROWS={} NO_SPLITK={:?} \
-                    HOT={:?}/{:?}/{:?}",
+                    HOT={:?}/{:?}/{:?} PACKED_KV={:?}",
                    self.max_seq, self.max_lanes, self.spec, self.resident, self.graphs, self.n_layers, keep_digest,
                    mask(&self.dspark_keep), self.record_demand, self.hot_ring, fnv(&exe), fnv(&cfg), std::env::var("TIDELM_NO_QDQ").ok(),
                    std::env::var("TIDELM_ENGRAM_CACHE_MB").ok(), std::env::var("TIDELM_DRAFT_HEAD_FMT").ok(),
                    std::env::var("TIDELM_TP_DRAFT").ok(), std::env::var("TIDELM_EXPERT_TOPP").ok(),
                    std::env::var("TIDELM_EXPERT_TOPP_MIN_K").ok(), prefill_rows(), std::env::var("TIDELM_NO_SPLITK").ok(),
                    std::env::var("TIDELM_HOT_MIN").ok(), std::env::var("TIDELM_HOT_MAX").ok(),
-                   std::env::var("TIDELM_HOT_PER_LAYER").ok())
+                   std::env::var("TIDELM_HOT_PER_LAYER").ok(), std::env::var("TIDELM_PACKED_KV").ok())
                    .into_bytes())
     }
 }
@@ -1215,6 +1225,10 @@ pub struct Engine {
     /// Single-lane steps only.
     pub dump_dir: Option<std::path::PathBuf>,
     no_qdq: bool,
+    /// TIDELM_PACKED_KV (on unless =0; the Python engine's DSV41_PACKED_KV=1): the compressed
+    /// KV stored as FP4 codes + E4M3 scales, 288 bytes a row instead of 1,024 - the QDQ'd bf16
+    /// values bit for bit, read back by the attention kernels' key loads
+    packed_kv: bool,
     selection: Selection,
     /// the candidate-source layer's block mask is live for this step's later layers
     cand_live: bool,
@@ -1526,9 +1540,11 @@ impl Engine {
             iq: a(t * cfg.index_n_heads * cfg.index_head_dim)?,
             iwb: a(t * cfg.index_n_heads)?,
             iwf: f(t * cfg.index_n_heads)?,
-            scores: a(t * (max_seq + 1))?,
+            // the indexer's scores and block maxima for at most INDEX_SCORES (rows x keys) at a
+            // time: a long context scores its step in row slices (Engine::index)
+            scores: a((t * (max_seq + 1)).min(index_scores_budget()))?,
             cand: DeviceBuffer::zeroed(t * (max_seq + 1))?,
-            bmax: a(t * ((max_seq + 1).div_ceil(8) + 1))?,
+            bmax: a((t * ((max_seq + 1).div_ceil(8) + 1)).min(index_scores_budget() / 8 + t))?,
             blocks: i(t * 2048)?,
             topk: i(t * cfg.index_topk)?,
             clen1: i(t)?,
@@ -1559,6 +1575,11 @@ impl Engine {
             dq_p: f(bsz * draft_lanes * DRAFT_NUCLEUS_K)?,
             dq_cnt: i(bsz * draft_lanes)?,
         };
+        let no_qdq = std::env::var("TIDELM_NO_QDQ").as_deref() == Ok("1");
+        let packed_kv = std::env::var("TIDELM_PACKED_KV").as_deref() != Ok("0");
+        if packed_kv && (no_qdq || cfg.head_dim != 512) {
+            return Err("packed KV stores the FP4-QDQ'd rows of 512-dim latents: set TIDELM_PACKED_KV=0 with TIDELM_NO_QDQ=1".into());
+        }
         let mut caches = Caches {
             ring: Vec::new(),
             ckv: BTreeMap::new(),
@@ -1584,7 +1605,8 @@ impl Engine {
             let r = cfg.compress_ratios[l];
             let rows = max_seq / r + 1;
             caches.crows.insert(l, rows);
-            caches.ckv.insert(l, a(lanes * rows * hd)?);
+            // packed: kPkRow bytes a row, held in the same u16 buffer type (ckv_ls counts u16s)
+            caches.ckv.insert(l, a(lanes * rows * if packed_kv { PACKED_ROW / 2 } else { hd })?);
             caches.ik.insert(l, a(lanes * rows * cfg.index_head_dim)?);
             if r > 1 {
                 caches.r2.insert(l, Ratio2 {
@@ -1740,7 +1762,8 @@ impl Engine {
             max_seq,
             times: StepTimes::default(),
             dump_dir: std::env::var_os("TIDELM_DUMP_DIR").map(std::path::PathBuf::from),
-            no_qdq: std::env::var("TIDELM_NO_QDQ").as_deref() == Ok("1"),
+            no_qdq,
+            packed_kv,
             selection: Selection::AllVisible,
             cand_live: false,
             indexed_layers: 0,
@@ -3107,6 +3130,8 @@ impl Engine {
         let table = if ratio > 0 { &self.rope_c } else { &self.rope_w };
         let a = &self.act;
         // (ring, per-row window end, extra keys, their per-row indices, width, extra keys' lane stride)
+        // the backbone's compressed rows may be packed; the draft block's keys never are
+        let fp4 = (self.packed_kv && matches!(ctx, Ctx::Main { .. })) as i32;
         let (ring, win_pos, ckv_ptr, cidx_ptr, c, ckv_ls) = match ctx {
             Ctx::Main { l, c1, c2 } => {
                 let ring = &self.caches.ring[l];
@@ -3117,7 +3142,8 @@ impl Engine {
                         Selection::AllVisible if ratio == 1 => (&a.cidx1, c1),
                         Selection::AllVisible => (&a.cidx2, c2),
                     };
-                    (ring, &a.pos, np(&self.caches.ckv[&src]), np(cidx), c, self.caches.crows[&src] * hd)
+                    let row = if self.packed_kv { PACKED_ROW / 2 } else { hd };
+                    (ring, &a.pos, np(&self.caches.ckv[&src]), np(cidx), c, self.caches.crows[&src] * row)
                 } else {
                     (ring, &a.pos, nul(), nul(), 0, 0)
                 }
@@ -3145,7 +3171,7 @@ impl Engine {
             ck(unsafe {
                 ds_attn_decode(sr, np(&a.q), np(ring), self.ring as i32, np(win_pos), cfg.window_size as i32, 0, ckv_ptr, cidx_ptr,
                                c as i32, np(&w.attn_sink), scale, np(&a.o), ti, h as i32, np(&a.lane), (self.ring * hd) as i64,
-                               ckv_ls as i64, np(&a.attn_work), a.attn_work.len() as i64, flags)
+                               ckv_ls as i64, np(&a.attn_work), a.attn_work.len() as i64, flags, fp4)
             }, "attention")?;
         }
         if prompt_rows {
@@ -3155,7 +3181,7 @@ impl Engine {
             ck(unsafe {
                 ds_attn_prefill(sr, np(&a.q), np(ring), self.ring as i32, np(win_pos), cfg.window_size as i32, 0, ckv_ptr, cidx_ptr,
                                 c as i32, np(&w.attn_sink), scale, np(&a.o), ti, h as i32, np(&a.lane), (self.ring * hd) as i64,
-                                ckv_ls as i64, flags, 32)
+                                ckv_ls as i64, flags, 32, fp4)
             }, "attention (prompt rows)")?;
         }
         ck(unsafe { ds_rope(sr, np(&a.o), (h * hd) as i64, ti, h as i32, hd as i64, (hd - rd) as i32, rd as i32, np(&a.pos), np(table), 1) }, "o rope")?;
@@ -3205,25 +3231,36 @@ impl Engine {
         // 2,048 rows over 2,240 keys, examples/bench_index.rs; the head sum's order kept, each
         // dot accumulated in the mma's order); decode keeps the FMA kernel's bits
         let scores = if self.eager_step { ds_index_scores_mma } else { ds_index_scores };
-        ck(unsafe {
-            scores(sr, np(&a.iq), np(&self.caches.ik[&src]), np(&a.iwf), np(clen), if use_cand { np(&a.cand) } else { nul() },
-                   nmax as i64, n_c as i32, np(&a.scores), n_c as i64, ti, np(&a.lane), (self.caches.crows[&src] * ihd) as i64)
-        }, "index scores")?;
         let block = 8usize;
         let topk_blocks = 2048usize;
-        if l as i64 == cand_src && shape.cand {
-            // model.py::_select_candidates: below topk_blocks blocks every block is kept, so
-            // the mask only exists where it can drop something
-            let nb = n_c.div_ceil(block);
-            let kb = topk_blocks.min(nb);
-            ck(unsafe { ds_candidate_blocks(sr, np(&a.scores), n_c as i64, n_c as i32, block as i32, np(clen), np(&a.bmax), nb as i64, ti) }, "candidate blocks")?;
-            ck(unsafe { ds_topk_select(sr, np(&a.bmax), nb as i64, nb as i32, kb as i32, np(&a.blocks), kb as i32, ti) }, "candidate select")?;
+        let cand_step = l as i64 == cand_src && shape.cand;
+        if cand_step {
             a.cand.zero_async(st)?;
-            ck(unsafe { ds_candidate_set(sr, np(&a.blocks), kb as i32, block as i32, n_c as i32, np(&a.cand), nmax as i64, ti) }, "candidate set")?;
+        }
+        let (nb, k, kw) = (n_c.div_ceil(block), cfg.index_topk.min(n_c), cfg.index_topk);
+        let kb = topk_blocks.min(nb);
+        // rows a slice: all of a step unless its scores would outgrow INDEX_SCORES (a whole
+        // decode step is always one slice, so its graph is unchanged)
+        let rc = (index_scores_budget() / n_c.max(1)).min(t).max(8.min(t));
+        for r0 in (0..t).step_by(rc) {
+            let m = rc.min(t - r0) as i32;
+            ck(unsafe {
+                scores(sr, a.iq.ptr_at(r0 * ih * ihd), np(&self.caches.ik[&src]), a.iwf.ptr_at(r0 * ih), clen.ptr_at(r0),
+                       if use_cand { a.cand.ptr_at(r0 * nmax) } else { nul() }, nmax as i64, n_c as i32, np(&a.scores), n_c as i64, m,
+                       a.lane.ptr_at(r0), (self.caches.crows[&src] * ihd) as i64)
+            }, "index scores")?;
+            if cand_step {
+                // model.py::_select_candidates: below topk_blocks blocks every block is kept,
+                // so the mask only exists where it can drop something
+                ck(unsafe { ds_candidate_blocks(sr, np(&a.scores), n_c as i64, n_c as i32, block as i32, clen.ptr_at(r0), np(&a.bmax), nb as i64, m) }, "candidate blocks")?;
+                ck(unsafe { ds_topk_select(sr, np(&a.bmax), nb as i64, nb as i32, kb as i32, a.blocks.ptr_at(r0 * kb), kb as i32, m) }, "candidate select")?;
+                ck(unsafe { ds_candidate_set(sr, a.blocks.ptr_at(r0 * kb), kb as i32, block as i32, n_c as i32, a.cand.ptr_at(r0 * nmax), nmax as i64, m) }, "candidate set")?;
+            }
+            ck(unsafe { ds_topk_select(sr, np(&a.scores), n_c as i64, n_c as i32, k as i32, a.topk.ptr_at(r0 * kw), kw as i32, m) }, "index topk")?;
+        }
+        if cand_step {
             self.cand_live = true;
         }
-        let k = cfg.index_topk.min(n_c);
-        ck(unsafe { ds_topk_select(sr, np(&a.scores), n_c as i64, n_c as i32, k as i32, np(&a.topk), cfg.index_topk as i32, ti) }, "index topk")?;
         self.selection = Selection::Indexed;
         self.indexed_layers += 1;
         Ok(())
@@ -3282,19 +3319,33 @@ impl Engine {
         // group's amax flips its E4M3 scale (12.5% steps) and requantizes all 16 values — 50
         // router flips instead of 8. Two correct implementations cannot be token-identical
         // through this cache; judge parity with QDQ off, and quality by NLL.
-        if !self.no_qdq {
-            ck(unsafe { ds_fp4_qdq_e4m3(sr, np(&a.latn), (t * hd) as i64) }, "comp qdq")?;
-        }
         let ckv = &self.caches.ckv[&l];
-        ck(unsafe {
-            ds_scatter_compressed(sr, np(&a.latn), hd as i64, np(ckv), np(&a.pos), r as i32, ti, hd as i32, np(&a.lane),
-                                  (rows * hd) as i64)
-        }, "ckv scatter")?;
+        if self.packed_kv {
+            // the same QDQ, stored as its codes and scales (engine/packed_kv.py's write)
+            ck(unsafe {
+                ds_scatter_compressed_fp4(sr, np(&a.latn), hd as i64, np(ckv), np(&a.pos), r as i32, ti, hd as i32, np(&a.lane),
+                                          (rows * PACKED_ROW) as i64)
+            }, "ckv scatter (packed)")?;
+        } else {
+            if !self.no_qdq {
+                ck(unsafe { ds_fp4_qdq_e4m3(sr, np(&a.latn), (t * hd) as i64) }, "comp qdq")?;
+            }
+            ck(unsafe {
+                ds_scatter_compressed(sr, np(&a.latn), hd as i64, np(ckv), np(&a.pos), r as i32, ti, hd as i32, np(&a.lane),
+                                      (rows * hd) as i64)
+            }, "ckv scatter")?;
+        }
         if let Some(dir) = &self.dump_dir {
             // lane 0's part (single-lane steps)
             let n = (self.lanes[0].len + self.live_rows) / r;
             let mut v = vec![0u16; n * hd];
-            ckv.download_async(0, &mut v, st)?;
+            if self.packed_kv {
+                let tmp = DeviceBuffer::<u16>::new(n.max(1) * hd)?;
+                ck(unsafe { ds_unpack_fp4_rows(sr, np(ckv), np(&tmp), n as i32) }, "ckv unpack")?;
+                tmp.download_async(0, &mut v, st)?;
+            } else {
+                ckv.download_async(0, &mut v, st)?;
+            }
             st.synchronize()?;
             dump_bf16(&dir.join(format!("ckv{l:02}.f32")), &v)?;
         }

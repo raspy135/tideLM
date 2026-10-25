@@ -731,14 +731,14 @@ fn attention_decode_matches_the_sinked_softmax_reference() {
         ok(unsafe {
             ds_attn_decode(st.raw(), p(&dq), p(&dring), ring_size as i32, p(&dpos), w as i32, 0, p(&dckv), p(&dcidx),
                            c as i32, p(&dsink), scale, p(&dout), m as i32, h as i32, null(), 0, 0, wp, wl,
-                           if mode == 3 { p(&decode_rows) } else { null() })
+                           if mode == 3 { p(&decode_rows) } else { null() }, 0)
         });
     }
     if mode >= 2 {
         ok(unsafe {
             ds_attn_prefill(st.raw(), p(&dq), p(&dring), ring_size as i32, p(&dpos), w as i32, 0, p(&dckv), p(&dcidx),
                             c as i32, p(&dsink), scale, p(&dout), m as i32, h as i32, null(), 0, 0,
-                            if mode == 3 { p(&decode_rows) } else { null() }, if mode == 4 { 32 } else { 16 })
+                            if mode == 3 { p(&decode_rows) } else { null() }, if mode == 4 { 32 } else { 16 }, 0)
         });
     }
     st.synchronize().unwrap();
@@ -788,6 +788,73 @@ fn attention_decode_matches_the_sinked_softmax_reference() {
             }
         }
     }
+    }
+}
+
+/// Packed KV (engine/packed_kv.py): rows written packed decode to exactly the QDQ'd bf16 rows -
+/// midpoints, both zeros, tiny and large groups included - and attention over packed rows
+/// (split-key and one-pass prompt kernels) gives the bf16 rows' bits.
+#[test]
+fn packed_kv_is_the_qdq_rows_and_attention_reads_it_bit_for_bit() {
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(71);
+    let d = 512usize;
+    let rows = 40usize;
+    // raw (pre-QDQ) rows: scales from 1e-7 to 100, every FP4 midpoint and both zeros
+    let mut raw: Vec<u16> = Vec::with_capacity(rows * d);
+    for r in 0..rows {
+        let scale = [1e-7f32, 1e-3, 0.01, 1.0, 16.0, 100.0][r % 6];
+        for i in 0..d {
+            let v = match (r, i % 16) {
+                (0..=5, j) => [0.25f32, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0, -0.25, -0.75, -1.25, -1.75, -2.5, -3.5, -5.0, -6.0][j] * scale,
+                (6, j) if j < 8 => 0.0,
+                (6, _) => -0.0,
+                _ => rng.normal() * scale,
+            };
+            raw.push(bf16_from_f32(v));
+        }
+    }
+    let qdq = dev(&raw);
+    ok(unsafe { ds_fp4_qdq_e4m3(st.raw(), p(&qdq), (rows * d) as i64) });
+    // pack: every row is its own compressed row (ratio 1, positions 0..rows)
+    let pos: Vec<i32> = (0..rows as i32).collect();
+    let (draw, dpos) = (dev(&raw), dev(&pos));
+    let packed = DeviceBuffer::<u8>::zeroed(rows * 288).unwrap();
+    ok(unsafe { ds_scatter_compressed_fp4(st.raw(), p(&draw), d as i64, p(&packed), p(&dpos), 1, rows as i32, d as i32, null(), 0) });
+    let back = DeviceBuffer::<u16>::zeroed(rows * d).unwrap();
+    ok(unsafe { ds_unpack_fp4_rows(st.raw(), p(&packed), p(&back), rows as i32) });
+    st.synchronize().unwrap();
+    let (want, got) = (qdq.download().unwrap(), back.download().unwrap());
+    for (i, (&a, &b)) in want.iter().zip(&got).enumerate() {
+        assert_eq!(a, b, "row {} [{}]: qdq {:#06x}, packed {:#06x}", i / d, i % d, a, b);
+    }
+    // attention over the QDQ'd bf16 rows and over the packed rows: the same bits
+    let (m, h, ring_size, w, c) = (3usize, 40usize, 256usize, 128usize, 24usize);
+    let q = rng.bf16_vec(m * h * d, 0.2);
+    let ring = rng.bf16_vec(ring_size * d, 1.0);
+    let positions = [60i32, 200, 300];
+    let cidx: Vec<i32> = (0..m * c).map(|i| if i % 7 == 3 { -1 } else { ((i * 5) % rows) as i32 }).collect();
+    let sink: Vec<f32> = (0..h).map(|_| rng.normal()).collect();
+    let scale = (d as f64).powf(-0.5) as f32;
+    let (dq, dring, dp, dc, ds) = (dev(&q), dev(&ring), dev(&positions), dev(&cidx), dev(&sink));
+    let wb = unsafe { ds_attn_work_bytes(m as i32, h as i32, (w + c) as i32) } as usize;
+    let work = DeviceBuffer::<u8>::zeroed(wb).unwrap();
+    let run = |ckv: *mut std::ffi::c_void, fp4: i32, prefill: bool| -> Vec<u16> {
+        let out = DeviceBuffer::<u16>::zeroed(m * h * d).unwrap();
+        ok(unsafe {
+            if prefill {
+                ds_attn_prefill(st.raw(), p(&dq), p(&dring), ring_size as i32, p(&dp), w as i32, 0, ckv, p(&dc), c as i32, p(&ds),
+                                scale, p(&out), m as i32, h as i32, null(), 0, 0, null(), 32, fp4)
+            } else {
+                ds_attn_decode(st.raw(), p(&dq), p(&dring), ring_size as i32, p(&dp), w as i32, 0, ckv, p(&dc), c as i32, p(&ds),
+                               scale, p(&out), m as i32, h as i32, null(), 0, 0, p(&work), wb as i64, null(), fp4)
+            }
+        });
+        st.synchronize().unwrap();
+        out.download().unwrap()
+    };
+    for prefill in [false, true] {
+        assert_eq!(run(p(&qdq), 0, prefill), run(p(&packed), 1, prefill), "attention over packed rows (prefill {prefill})");
     }
 }
 
@@ -1326,7 +1393,7 @@ fn lane_rows_read_and_write_only_their_own_caches() {
     let work = DeviceBuffer::<u8>::zeroed(wb).unwrap();
     ok(unsafe {
         ds_attn_decode(st.raw(), p(&dq), p(&drings), ring as i32, p(&dp), w as i32, 0, p(&dckvs), p(&dc), c as i32, p(&dsink),
-                       scale, p(&both), 3, h as i32, p(&dl), (ring * d) as i64, (n_ckv * d) as i64, p(&work), wb as i64, null())
+                       scale, p(&both), 3, h as i32, p(&dl), (ring * d) as i64, (n_ckv * d) as i64, p(&work), wb as i64, null(), 0)
     });
     st.synchronize().unwrap();
     let both = both.download().unwrap();
@@ -1337,7 +1404,7 @@ fn lane_rows_read_and_write_only_their_own_caches() {
         let one = DeviceBuffer::<u16>::zeroed(h * d).unwrap();
         ok(unsafe {
             ds_attn_decode(st.raw(), p(&dq1), p(&dr1), ring as i32, p(&dp1), w as i32, 0, p(&dk1), p(&dc1), c as i32, p(&dsink),
-                           scale, p(&one), 1, h as i32, null(), 0, 0, p(&work), wb as i64, null())
+                           scale, p(&one), 1, h as i32, null(), 0, 0, p(&work), wb as i64, null(), 0)
         });
         st.synchronize().unwrap();
         assert_eq!(&both[row * h * d..(row + 1) * h * d], &one.download().unwrap()[..], "attention row {row} (lane {ln})");

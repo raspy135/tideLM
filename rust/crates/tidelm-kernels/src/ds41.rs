@@ -123,7 +123,7 @@ extern "C" {
         pos: *const c_void, w: c_int, win_lo: c_int, ckv: *const c_void, cidx: *const c_void,
         c: c_int, sink: *const c_void, scale: f32, out: *mut c_void, m: c_int, h: c_int,
         lane: *const c_void, ring_lstride: i64, ckv_lstride: i64, work: *mut c_void, work_bytes: i64,
-        decode_rows: *const c_void,
+        decode_rows: *const c_void, ckv_fp4: c_int,
     ) -> c_int;
 
     /// ds_attn_decode's attention for prompt rows in one pass a row (no split, no workspace),
@@ -131,7 +131,7 @@ extern "C" {
     pub fn ds_attn_prefill(
         stream: CudaStream, q: *const c_void, ring: *const c_void, ring_size: c_int, pos: *const c_void, w: c_int, win_lo: c_int,
         ckv: *const c_void, cidx: *const c_void, c: c_int, sink: *const c_void, scale: f32, out: *mut c_void, m: c_int, h: c_int,
-        lane: *const c_void, ring_lstride: i64, ckv_lstride: i64, rows: *const c_void, heads_per_block: c_int,
+        lane: *const c_void, ring_lstride: i64, ckv_lstride: i64, rows: *const c_void, heads_per_block: c_int, ckv_fp4: c_int,
     ) -> c_int;
 
     /// Workspace ds_attn_decode's split-key kernel needs for m rows, h heads, at most nk keys
@@ -142,6 +142,15 @@ extern "C" {
         stream: CudaStream, kv_a: *const c_void, sc_a: *const c_void, kv_b: *const c_void,
         sc_b: *const c_void, out: *mut c_void, d: c_int,
     ) -> c_int;
+
+    /// ds_scatter_compressed into packed KV rows (engine/packed_kv.py): the step's
+    /// compressed rows quantized as ds_fp4_qdq_e4m3 would (lossless: a packed row decodes to
+    /// the QDQ'd bf16 row, bit for bit) and stored as D/2 code bytes + D/16 E4M3 scales.
+    /// `lstride_bytes`: a lane's part of `dst`.
+    pub fn ds_scatter_compressed_fp4(stream: CudaStream, src: *const c_void, ld_src: i64, dst: *mut c_void, pos: *const c_void,
+                                     r: c_int, t: c_int, d: c_int, lane: *const c_void, lstride_bytes: i64) -> c_int;
+    /// Packed 512-value KV rows back to bf16 rows.
+    pub fn ds_unpack_fp4_rows(stream: CudaStream, src: *const c_void, dst: *mut c_void, rows: c_int) -> c_int;
 
     pub fn ds_fp4_qdq_e4m3(stream: CudaStream, x: *mut c_void, n_values: i64) -> c_int;
 

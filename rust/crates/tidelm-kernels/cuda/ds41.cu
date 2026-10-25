@@ -1517,6 +1517,55 @@ __global__ void moe_finish_kernel(const float* __restrict__ routed, const __nv_b
 // Python kernel's PV_SPLIT). Each block writes an unnormalized partial (o, m, l); the combine
 // kernel adds the sink and normalizes. The key axis is split so a decode row fills the GPU
 // (the per-head kernel above walked keys serially: 328 us a layer at 1,024 indexed keys).
+// v41_ref.fp4_qdq(x, 16, "e4m3") for one 16-value group: the E4M3 scale byte and the 16
+// E2M1 codes (bit 3 the sign: t < 0, so a tiny negative that rounds to 0 keeps its sign and
+// -0.0 does not), element j in bits 4j..4j+3 of the 64-bit `codes`. The QDQ kernel and the
+// packed KV writer both quantize through this, so a packed row decodes to the QDQ'd bf16 row.
+__device__ __forceinline__ void fp4_quant16(const float* v, uint8_t& s8, uint64_t& codes) {
+    float amax = 0.f;
+    for (int i = 0; i < 16; ++i) amax = fmaxf(amax, fabsf(v[i]));
+    amax = fmaxf(amax, 6.f * 0.001953125f);  // clamp_min(6 * 2^-9)
+    s8 = __nv_cvt_float_to_fp8(amax / 6.f, __NV_NOSAT, __NV_E4M3);
+    const __half_raw hr = __nv_cvt_fp8_to_halfraw(s8, __NV_E4M3);
+    const float s = __half2float(*reinterpret_cast<const __half*>(&hr));
+    codes = 0;
+    for (int i = 0; i < 16; ++i) {
+        const float t = fminf(fmaxf(v[i] / s, -6.f), 6.f);
+        const float a = fabsf(t);
+        // torch.bucketize(|t|, midpoints) with right=False: a value equal to a midpoint
+        // takes the lower grid point
+        const uint32_t m = (a > 0.25f) + (a > 0.75f) + (a > 1.25f) + (a > 1.75f) + (a > 2.5f) + (a > 3.5f) + (a > 5.f);
+        codes |= (uint64_t)(m | (t < 0.f ? 8u : 0u)) << (4 * i);
+    }
+}
+
+// An E2M1 code times its group's E4M3 scale as bf16 bits: the product has at most 6
+// significant bits, so it is exact; the sign goes on after, keeping -0.
+__device__ __forceinline__ uint16_t fp4_value(uint32_t code, float s) {
+    const float g[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    const __nv_bfloat16 b = to_bf(g[code & 7] * s);
+    return *reinterpret_cast<const uint16_t*>(&b) | (uint16_t)((code & 8) << 12);
+}
+
+__device__ __forceinline__ float e4m3_float(uint8_t s8) {
+    const __half_raw hr = __nv_cvt_fp8_to_halfraw(s8, __NV_E4M3);
+    return __half2float(*reinterpret_cast<const __half*>(&hr));
+}
+
+// Packed KV rows (engine/packed_kv.py, DSV41_PACKED_KV=1): a D-value row is D/2 code bytes
+// (element e in byte e/2, low nibble when e is even) then D/16 E4M3 scale bytes (group g in
+// byte D/2 + g) - 288 bytes for D = 512. Values 8c..8c+7 of a packed 512-row as bf16x8.
+constexpr int kPkRow = 288;
+__device__ __forceinline__ uint4 fp4_unpack8(const uint8_t* row, int c) {
+    const uint32_t w = *reinterpret_cast<const uint32_t*>(row + 4 * c);
+    const float s = e4m3_float(row[256 + c / 2]);
+    uint32_t o[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+        o[i] = (uint32_t)fp4_value((w >> (8 * i)) & 15, s) | ((uint32_t)fp4_value((w >> (8 * i + 4)) & 15, s) << 16);
+    return make_uint4(o[0], o[1], o[2], o[3]);
+}
+
 constexpr int kFdH = 16, kFdN = 64, kFdD = 512, kFdKS = kFdD + 8, kFdPS = kFdN + 4;
 // Keys a split covers. Fixed in key space - never chosen from the row count - so a row's
 // partials, and its bits, do not depend on what else shares its step: a verify block's rows
@@ -1533,7 +1582,7 @@ __global__ void __launch_bounds__(256) attn_fd_kernel(
     const int* __restrict__ pos, int W, int win_lo, const __nv_bfloat16* __restrict__ ckv_base,
     const int* __restrict__ cidx, int C, float scale, int H, const int* __restrict__ row_lane,
     int64_t ring_lstride, int64_t ckv_lstride, int tiles_per_split, int S, float* __restrict__ part_o,
-    float* __restrict__ part_ml, const int* __restrict__ decode_rows) {
+    float* __restrict__ part_ml, const int* __restrict__ decode_rows, int ckv_fp4) {
     // a prompt row of a mixed step is attn_prefill_kernel's
     if (decode_rows && !decode_rows[blockIdx.z]) return;
     extern __shared__ __align__(16) unsigned char fd_smem[];
@@ -1552,6 +1601,8 @@ __global__ void __launch_bounds__(256) attn_fd_kernel(
     const int ln = row_lane ? row_lane[m] : 0;
     const __nv_bfloat16* ring = ring_base + (int64_t)ln * ring_lstride;
     const __nv_bfloat16* ckv = ckv_base ? ckv_base + (int64_t)ln * ckv_lstride : nullptr;
+    // packed KV: the same lane offset (ckv_lstride counts bf16 units), rows of kPkRow bytes
+    const uint8_t* ckp = ckv_fp4 && ckv ? reinterpret_cast<const uint8_t*>(ckv) : nullptr;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, r = lane >> 2, qd = lane & 3;
     const int n_tiles = (NK + kFdN - 1) / kFdN;
     const int t0 = split * tiles_per_split, t1 = min(n_tiles, t0 + tiles_per_split);
@@ -1582,7 +1633,14 @@ __global__ void __launch_bounds__(256) attn_fd_kernel(
                 if (kp >= 0 && kp >= win_lo) kr = ring + (int64_t)(kp % ring_size) * kFdD;
             } else if (n < NK) {
                 const int jj = idx_s[n - s_lo];
-                if (jj >= 0) kr = ckv + (int64_t)jj * kFdD;
+                if (jj >= 0) {
+                    if (ckp) {
+                        kval[u] = true;
+                        kreg[u] = fp4_unpack8(ckp + (int64_t)jj * kPkRow, c);
+                        continue;
+                    }
+                    kr = ckv + (int64_t)jj * kFdD;
+                }
             }
             kval[u] = kr != nullptr;
             kreg[u] = kr ? reinterpret_cast<const uint4*>(kr)[c] : make_uint4(0, 0, 0, 0);
@@ -1716,7 +1774,7 @@ __global__ void __launch_bounds__(256) attn_prefill_kernel(
     const int* __restrict__ pos, int W, int win_lo, const __nv_bfloat16* __restrict__ ckv_base,
     const int* __restrict__ cidx, int C, float scale, int H, const int* __restrict__ row_lane,
     int64_t ring_lstride, int64_t ckv_lstride, const float* __restrict__ sink, const int* __restrict__ rows,
-    __nv_bfloat16* __restrict__ out) {
+    __nv_bfloat16* __restrict__ out, int ckv_fp4) {
     constexpr int HB = 16 * MT, PS = NT + 4;
     static_assert(NT == 32 || NT == 64, "a softmax lane takes one or two keys");
     extern __shared__ __align__(16) unsigned char fp_smem[];
@@ -1736,6 +1794,8 @@ __global__ void __launch_bounds__(256) attn_prefill_kernel(
     const int ln = row_lane ? row_lane[m] : 0;
     const __nv_bfloat16* ring = ring_base + (int64_t)ln * ring_lstride;
     const __nv_bfloat16* ckv = ckv_base ? ckv_base + (int64_t)ln * ckv_lstride : nullptr;
+    // packed KV: the same lane offset (ckv_lstride counts bf16 units), rows of kPkRow bytes
+    const uint8_t* ckp = ckv_fp4 && ckv ? reinterpret_cast<const uint8_t*>(ckv) : nullptr;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, r = lane >> 2, qd = lane & 3;
     const int n_tiles = (NK + NT - 1) / NT;
 
@@ -1764,7 +1824,14 @@ __global__ void __launch_bounds__(256) attn_prefill_kernel(
                 if (kp >= 0 && kp >= win_lo) kr = ring + (int64_t)(kp % ring_size) * kFdD;
             } else if (n < NK) {
                 const int jj = idx_s[n - W];
-                if (jj >= 0) kr = ckv + (int64_t)jj * kFdD;
+                if (jj >= 0) {
+                    if (ckp) {
+                        kval[u] = true;
+                        kreg[u] = fp4_unpack8(ckp + (int64_t)jj * kPkRow, c);
+                        continue;
+                    }
+                    kr = ckv + (int64_t)jj * kFdD;
+                }
             }
             kval[u] = kr != nullptr;
             kreg[u] = kr ? reinterpret_cast<const uint4*>(kr)[c] : make_uint4(0, 0, 0, 0);
@@ -2086,29 +2153,43 @@ __global__ void fp4_qdq_e4m3_kernel(__nv_bfloat16* x, int64_t n_groups) {
     if (g >= n_groups) return;
     __nv_bfloat16* p = x + g * 16;
     float v[16];
-    float amax = 0.f;
-    for (int i = 0; i < 16; ++i) { v[i] = bf(p[i]); amax = fmaxf(amax, fabsf(v[i])); }
-    amax = fmaxf(amax, 6.f * 0.001953125f);  // clamp_min(6 * 2^-9)
-    const __nv_fp8_storage_t s8 = __nv_cvt_float_to_fp8(amax / 6.f, __NV_NOSAT, __NV_E4M3);
-    const __half_raw hr = __nv_cvt_fp8_to_halfraw(s8, __NV_E4M3);
-    const float s = __half2float(*reinterpret_cast<const __half*>(&hr));
+    for (int i = 0; i < 16; ++i) v[i] = bf(p[i]);
+    uint8_t s8;
+    uint64_t codes;
+    fp4_quant16(v, s8, codes);
+    const float s = e4m3_float(s8);
     for (int i = 0; i < 16; ++i) {
-        float t = fminf(fmaxf(v[i] / s, -6.f), 6.f);
-        const float a = fabsf(t);
-        // torch.bucketize(|t|, midpoints) with right=False: a value equal to a midpoint
-        // takes the lower grid point
-        float q;
-        if (a <= 0.25f) q = 0.f;
-        else if (a <= 0.75f) q = 0.5f;
-        else if (a <= 1.25f) q = 1.f;
-        else if (a <= 1.75f) q = 1.5f;
-        else if (a <= 2.5f) q = 2.f;
-        else if (a <= 3.5f) q = 3.f;
-        else if (a <= 5.f) q = 4.f;
-        else q = 6.f;
-        const float sign = t > 0.f ? 1.f : (t < 0.f ? -1.f : 0.f);
-        p[i] = to_bf(q * sign * s);
+        const uint16_t b = fp4_value((uint32_t)(codes >> (4 * i)) & 15, s);
+        p[i] = *reinterpret_cast<const __nv_bfloat16*>(&b);
     }
+}
+
+// ds_scatter_compressed into packed rows: the compressed rows of a step (rows whose
+// (pos + 1) % r == 0), quantized as fp4_qdq_e4m3 would and stored packed at their lane's
+// row (pos + 1) / r - 1. One block a row, one thread a 16-value group. `lstride` in bytes.
+__global__ void scatter_compressed_fp4_kernel(const __nv_bfloat16* __restrict__ src, int64_t ld_src, uint8_t* __restrict__ dst,
+                                              const int* __restrict__ pos, int r, int D, const int* __restrict__ lane,
+                                              int64_t lstride) {
+    const int t = blockIdx.x, g = threadIdx.x;
+    if (g >= D / 16 || (pos[t] + 1) % r != 0) return;
+    float v[16];
+    const __nv_bfloat16* x = src + (int64_t)t * ld_src + 16 * g;
+    for (int i = 0; i < 16; ++i) v[i] = bf(x[i]);
+    uint8_t s8;
+    uint64_t codes;
+    fp4_quant16(v, s8, codes);
+    uint8_t* row = dst + (int64_t)(lane ? lane[t] : 0) * lstride + (int64_t)((pos[t] + 1) / r - 1) * (D / 2 + D / 16);
+    *reinterpret_cast<uint2*>(row + 8 * g) = make_uint2((uint32_t)codes, (uint32_t)(codes >> 32));
+    row[D / 2 + g] = s8;
+}
+
+// Packed rows back to bf16 rows (tests, dumps): rows x D values.
+__global__ void unpack_fp4_rows_kernel(const uint8_t* __restrict__ src, __nv_bfloat16* __restrict__ dst, int rows) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)rows * 64) return;
+    const int64_t r = i / 64;
+    const int c = (int)(i % 64);
+    *reinterpret_cast<uint4*>(dst + r * 512 + 8 * c) = fp4_unpack8(src + r * kPkRow, c);
 }
 
 // ------------------------------------------------------------------ engram
@@ -3362,7 +3443,7 @@ int64_t ds_attn_work_bytes(int M, int H, int NK) {
 int ds_attn_decode(void* stream, const void* q, const void* ring, int ring_size, const void* pos, int W,
                    int win_lo, const void* ckv, const void* cidx, int C, const void* sink, float scale, void* out,
                    int M, int H, const void* lane, int64_t ring_lstride, int64_t ckv_lstride, void* work,
-                   int64_t work_bytes, const void* decode_rows) {
+                   int64_t work_bytes, const void* decode_rows, int ckv_fp4) {
     const int* dr = static_cast<const int*>(decode_rows);
     if (work && work_bytes >= ds_attn_work_bytes(M, H, W + C)) {
         const int hb = (H + kFdH - 1) / kFdH;
@@ -3382,12 +3463,13 @@ int ds_attn_decode(void* stream, const void* q, const void* ring, int ring_size,
         attn_fd_kernel<<<dim3(hb, S, M), 256, smem, static_cast<cudaStream_t>(stream)>>>(
             static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(ring), ring_size,
             static_cast<const int*>(pos), W, win_lo, static_cast<const __nv_bfloat16*>(ckv), static_cast<const int*>(cidx),
-            C, scale, H, static_cast<const int*>(lane), ring_lstride, ckv_lstride, tps, S, po, pml, dr);
+            C, scale, H, static_cast<const int*>(lane), ring_lstride, ckv_lstride, tps, S, po, pml, dr, ckv_fp4);
         attn_fd_combine_kernel<<<dim3(H, M), 256, 0, static_cast<cudaStream_t>(stream)>>>(
             po, pml, S, H, static_cast<const float*>(sink), static_cast<__nv_bfloat16*>(out), dr);
         return static_cast<int>(cudaGetLastError());
     }
-    if (H % kAttnHG || dr) return cudaErrorInvalidValue;
+    // the per-head kernel reads bf16 rows only
+    if (H % kAttnHG || dr || ckv_fp4) return cudaErrorInvalidValue;
     // about two blocks an SM: more heads a block re-read the (shared, MQA) keys fewer times,
     // fewer heads a block fill the GPU at decode sizes
     const int want = M * H / 96;
@@ -3399,7 +3481,8 @@ int ds_attn_decode(void* stream, const void* q, const void* ring, int ring_size,
 
 int ds_attn_prefill(void* stream, const void* q, const void* ring, int ring_size, const void* pos, int W, int win_lo,
                     const void* ckv, const void* cidx, int C, const void* sink, float scale, void* out, int M, int H,
-                    const void* lane, int64_t ring_lstride, int64_t ckv_lstride, const void* rows, int heads_per_block) {
+                    const void* lane, int64_t ring_lstride, int64_t ckv_lstride, const void* rows, int heads_per_block,
+                    int ckv_fp4) {
     if (M < 1) return cudaSuccess;
     auto go = [&](auto kern, int hb_heads, int nt) -> int {
         const size_t smem = (size_t)(hb_heads + nt) * kFdKS * 2 + (size_t)hb_heads * (nt + 4) * 4 + 3 * hb_heads * 4 + nt * 4 +
@@ -3410,7 +3493,7 @@ int ds_attn_prefill(void* stream, const void* q, const void* ring, int ring_size
             static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(ring), ring_size,
             static_cast<const int*>(pos), W, win_lo, static_cast<const __nv_bfloat16*>(ckv), static_cast<const int*>(cidx),
             C, scale, H, static_cast<const int*>(lane), ring_lstride, ckv_lstride, static_cast<const float*>(sink),
-            static_cast<const int*>(rows), static_cast<__nv_bfloat16*>(out));
+            static_cast<const int*>(rows), static_cast<__nv_bfloat16*>(out), ckv_fp4);
         return static_cast<int>(cudaGetLastError());
     };
     if (heads_per_block == 32) return go(attn_prefill_kernel<2, 32>, 32, 32);
@@ -3423,6 +3506,24 @@ int ds_compress_pair(void* stream, const void* kv_a, const void* sc_a, const voi
     compress_pair_kernel<<<(D + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
         static_cast<const float*>(kv_a), static_cast<const float*>(sc_a), static_cast<const float*>(kv_b),
         static_cast<const float*>(sc_b), static_cast<__nv_bfloat16*>(out), D);
+    return static_cast<int>(cudaGetLastError());
+}
+
+int ds_scatter_compressed_fp4(void* stream, const void* src, int64_t ld_src, void* dst, const void* pos, int r, int T,
+                              int D, const void* lane, int64_t lstride_bytes) {
+    if (D % 128 || D / 16 > 1024) return cudaErrorInvalidValue;
+    if (T < 1) return cudaSuccess;
+    scatter_compressed_fp4_kernel<<<T, D / 16, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16*>(src), ld_src, static_cast<uint8_t*>(dst), static_cast<const int*>(pos), r, D,
+        static_cast<const int*>(lane), lstride_bytes);
+    return static_cast<int>(cudaGetLastError());
+}
+
+int ds_unpack_fp4_rows(void* stream, const void* src, void* dst, int rows) {
+    if (rows < 1) return cudaSuccess;
+    const int64_t n = (int64_t)rows * 64;
+    unpack_fp4_rows_kernel<<<(unsigned)((n + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const uint8_t*>(src), static_cast<__nv_bfloat16*>(dst), rows);
     return static_cast<int>(cudaGetLastError());
 }
 
