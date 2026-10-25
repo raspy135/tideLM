@@ -460,7 +460,8 @@ skinny GEMM streams 214-266 GB/s on the decode shapes against a 246 GB/s D2D cop
 The second engine on the same stack: engine/glm/tp.py's TP2 forward for the native EXL3
 checkpoint (GLM-5.3-EXL3-3.0bpw), served by `tidelm-server` when `--model-dir`'s config.json has
 `model_type: glm_moe_dsa` (`crates/tidelm-server/src/glm_main.rs`), launched by
-`scripts/rust-up.sh` from a GLM profile (`GLM_*` keys) with `TIDE_ENGINE=rust`.
+`scripts/rust-up.sh` from a GLM profile (`GLM_*` keys); `scripts/tide-up.sh` picks the Rust engine
+for every profile it serves unless the profile sets `TIDE_ENGINE=python`.
 
 What is ported, by the DS port's feature list:
 - **TP2 pair**: RoCE one-shot gathers for decode, NCCL for prefill, rank 0 mirroring every call;

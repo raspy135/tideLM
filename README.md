@@ -139,12 +139,13 @@ scripts/tide-up.sh .env.glm53-exl3     # stops whatever is serving, starts this 
 scripts/tide-down.sh
 ```
 
-The engine follows from the profile (`GLM_MODEL_DIR` → GLM-5.3, `MODEL_DIR` → DeepSeek, and
-`MODEL_DIR` with `TIDE_ENGINE=rust` → DeepSeek on the Rust engine). The Rust engine runs from the
-checkout rather than the image: build it once with `(cd rust && cargo build --release)` on the
-head (`scripts/rust-up.sh` copies the binary to the worker), and see the profile's `RUST_*`
-settings. It serves the OpenAI API with tool calls and images; the Anthropic route (Claude Code)
-is the Python engine's only for now. Boot
+The model follows from the profile (`GLM_MODEL_DIR` → GLM-5.3, `MODEL_DIR` → DeepSeek). Both
+run on the Rust engine by default; `TIDE_ENGINE=python` in the profile (or the environment)
+selects the Python containers, and a profile the Rust engine does not serve (MXFP4 GLM experts,
+FP4 KV) falls back to them with a note. The Rust engine runs from the checkout rather than the
+image: build it once with `(cd rust && cargo build --release)` on the head (`scripts/rust-up.sh`
+copies the binary to the worker), and see the profile's `RUST_*` settings. It serves the OpenAI
+API with tool calls (and images, DeepSeek) and the Anthropic route for Claude Code. Boot
 takes 1-5 minutes; the first requests after a boot are slower while adaptation catches up with
 your traffic. One profile serves at a time: each fills both boxes.
 
