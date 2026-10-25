@@ -124,6 +124,9 @@ fn heap_gone(p: *mut u8) {
 /// With TIDELM_MEM_LOG_MB set: the watched heap still live, by where it was made (the top
 /// `n`), for the request log - what keeps growing past the boot footprint.
 pub fn heap_live_top(n: usize) -> Option<String> {
+    if !tidelm_cuda::mem::heap_watch(usize::MAX) {
+        return None;
+    }
     let _guard = IN_LOG.try_with(|inside| inside.replace(true)).ok()?;
     let mut by: std::collections::HashMap<String, (usize, usize)> = Default::default();
     if let Some(m) = LIVE.lock().unwrap().as_ref() {
