@@ -108,11 +108,15 @@ impl Stream {
         let mut graph: ffi::cudaGraph_t = std::ptr::null_mut();
         check(unsafe { ffi::cudaStreamEndCapture(self.0, &mut graph) }, "cudaStreamEndCapture")?;
         let mut exec: ffi::cudaGraphExec_t = std::ptr::null_mut();
+        let (before, heap) = (mem_get_info().map(|(f, _)| f).unwrap_or(0), mem::heap_in_use());
         let instantiated =
             check(unsafe { ffi::cudaGraphInstantiate(&mut exec, graph, 0) }, "cudaGraphInstantiate");
         unsafe { ffi::cudaGraphDestroy(graph) };
         instantiated?;
-        Ok(GraphExec(exec))
+        let took = before.saturating_sub(mem_get_info().map(|(f, _)| f).unwrap_or(before));
+        let host = mem::heap_in_use().saturating_sub(heap);
+        mem::graph_made(took, host);
+        Ok(GraphExec(exec, (took, host)))
     }
 
     /// Capture everything queued on this stream inside `record` into an executable graph.
@@ -131,11 +135,15 @@ impl Stream {
         recorded?;
         ended?;
         let mut exec: ffi::cudaGraphExec_t = std::ptr::null_mut();
+        let (before, heap) = (mem_get_info().map(|(f, _)| f).unwrap_or(0), mem::heap_in_use());
         let instantiated =
             check(unsafe { ffi::cudaGraphInstantiate(&mut exec, graph, 0) }, "cudaGraphInstantiate");
         unsafe { ffi::cudaGraphDestroy(graph) };
         instantiated?;
-        Ok(GraphExec(exec))
+        let took = before.saturating_sub(mem_get_info().map(|(f, _)| f).unwrap_or(before));
+        let host = mem::heap_in_use().saturating_sub(heap);
+        mem::graph_made(took, host);
+        Ok(GraphExec(exec, (took, host)))
     }
 }
 
@@ -146,7 +154,9 @@ impl Drop for Stream {
 }
 
 /// An instantiated, replayable CUDA graph.
-pub struct GraphExec(ffi::cudaGraphExec_t);
+/// The free memory its instantiation took (cudaMemGetInfo before and after) and the driver heap
+/// it took (mallinfo2), for mem::report.
+pub struct GraphExec(ffi::cudaGraphExec_t, (usize, usize));
 
 unsafe impl Send for GraphExec {}
 
@@ -158,6 +168,9 @@ impl GraphExec {
 
 impl Drop for GraphExec {
     fn drop(&mut self) {
+        mem::GRAPHS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        mem::GRAPH_BYTES.fetch_sub(self.1.0, std::sync::atomic::Ordering::Relaxed);
+        mem::GRAPH_HOST.fetch_sub(self.1.1, std::sync::atomic::Ordering::Relaxed);
         unsafe { ffi::cudaGraphExecDestroy(self.0) };
     }
 }
@@ -218,18 +231,22 @@ pub struct DeviceBuffer<T: Copy> {
 unsafe impl<T: Copy> Send for DeviceBuffer<T> {}
 
 impl<T: Copy> DeviceBuffer<T> {
+    #[track_caller]
     pub fn new(len: usize) -> Result<Self> {
         let mut ptr: *mut c_void = std::ptr::null_mut();
         check(unsafe { ffi::cudaMalloc(&mut ptr, len * size_of::<T>()) }, "cudaMalloc")?;
+        mem::alloc("device memory", &mem::DEVICE, len * size_of::<T>(), std::panic::Location::caller());
         Ok(DeviceBuffer { ptr, len, _marker: PhantomData })
     }
 
+    #[track_caller]
     pub fn zeroed(len: usize) -> Result<Self> {
         let buf = Self::new(len)?;
         check(unsafe { ffi::cudaMemset(buf.ptr, 0, len * size_of::<T>()) }, "cudaMemset")?;
         Ok(buf)
     }
 
+    #[track_caller]
     pub fn from_slice(data: &[T]) -> Result<Self> {
         let buf = Self::new(data.len())?;
         buf.upload(data)?;
@@ -341,6 +358,7 @@ pub use ffi::{MEMCPY_DEVICE_TO_DEVICE, MEMCPY_DEVICE_TO_HOST, MEMCPY_HOST_TO_DEV
 
 impl<T: Copy> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
+        mem::DEVICE.fetch_sub(self.len * size_of::<T>(), std::sync::atomic::Ordering::Relaxed);
         unsafe { ffi::cudaFree(self.ptr) };
     }
 }
@@ -355,9 +373,11 @@ pub struct PinnedBuffer<T: Copy> {
 unsafe impl<T: Copy> Send for PinnedBuffer<T> {}
 
 impl<T: Copy> PinnedBuffer<T> {
+    #[track_caller]
     pub fn zeroed(len: usize) -> Result<Self> {
         let mut ptr: *mut c_void = std::ptr::null_mut();
         check(unsafe { ffi::cudaMallocHost(&mut ptr, len * size_of::<T>()) }, "cudaMallocHost")?;
+        mem::alloc("pinned host memory", &mem::PINNED, len * size_of::<T>(), std::panic::Location::caller());
         unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, len * size_of::<T>()) };
         Ok(PinnedBuffer { ptr: ptr as *mut T, len })
     }
@@ -370,9 +390,11 @@ impl<T: Copy> PinnedBuffer<T> {
 impl PinnedBuffer<u8> {
     /// Allocate pinned memory without touching it (cudaMallocHost pages are already
     /// page-aligned, which O_DIRECT needs); contents are unspecified.
+    #[track_caller]
     pub fn uninit(len: usize) -> Result<Self> {
         let mut ptr: *mut c_void = std::ptr::null_mut();
         check(unsafe { ffi::cudaMallocHost(&mut ptr, len) }, "cudaMallocHost")?;
+        mem::alloc("pinned host memory", &mem::PINNED, len, std::panic::Location::caller());
         Ok(PinnedBuffer { ptr: ptr as *mut u8, len })
     }
 }
@@ -392,7 +414,105 @@ impl<T: Copy> std::ops::DerefMut for PinnedBuffer<T> {
 
 impl<T: Copy> Drop for PinnedBuffer<T> {
     fn drop(&mut self) {
+        mem::PINNED.fetch_sub(self.len * size_of::<T>(), std::sync::atomic::Ordering::Relaxed);
         unsafe { ffi::cudaFreeHost(self.ptr as *mut c_void) };
+    }
+}
+
+/// What the process holds through this crate: every DeviceBuffer's and PinnedBuffer's bytes and
+/// every instantiated graph. Once the server calls `mark_up` (it is serving), an allocation of at
+/// least `LATE_MB` is logged with its caller, and `report` says how far the process has grown
+/// past its boot footprint. On the Spark's unified memory both kinds are the system's memory.
+pub mod mem {
+    use std::panic::Location;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+
+    /// the smallest allocation after launch that is logged (TIDELM_MEM_LOG_MB at mark_up)
+    pub const LATE_MB: usize = 8;
+    static LATE: AtomicUsize = AtomicUsize::new(LATE_MB << 20);
+    /// TIDELM_MEM_LOG_MB set: the heap's late allocations are logged too (the server's allocator)
+    static HEAP_LOG: AtomicBool = AtomicBool::new(false);
+
+    /// A heap allocation of `bytes` the server's allocator should log (`heap_watch` is on the
+    /// allocation path: two relaxed loads).
+    pub fn heap_watch(bytes: usize) -> bool {
+        HEAP_LOG.load(Relaxed) && bytes >= LATE.load(Relaxed)
+    }
+    pub(crate) static DEVICE: AtomicUsize = AtomicUsize::new(0);
+    pub(crate) static PINNED: AtomicUsize = AtomicUsize::new(0);
+    pub(crate) static GRAPHS: AtomicUsize = AtomicUsize::new(0);
+    pub(crate) static GRAPH_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static UP: AtomicBool = AtomicBool::new(false);
+    static AT_UP: [AtomicUsize; 3] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
+
+    pub(crate) fn alloc(kind: &str, live: &AtomicUsize, bytes: usize, at: &Location) {
+        live.fetch_add(bytes, Relaxed);
+        if UP.load(Relaxed) && bytes >= LATE.load(Relaxed) {
+            eprintln!("memory: {:.1} MB of {kind} allocated after launch, at {}:{}", bytes as f64 / 1e6, at.file(), at.line());
+        }
+    }
+
+    pub(crate) static GRAPH_HOST: AtomicUsize = AtomicUsize::new(0);
+    /// graphs instantiated in all (GRAPHS is the ones alive)
+    pub(crate) static GRAPHS_MADE: AtomicUsize = AtomicUsize::new(0);
+
+    /// A graph instantiated: the free memory it took, and the driver's heap for it (mallinfo2).
+    pub(crate) fn graph_made(bytes: usize, host: usize) {
+        GRAPHS.fetch_add(1, Relaxed);
+        GRAPHS_MADE.fetch_add(1, Relaxed);
+        GRAPH_BYTES.fetch_add(bytes, Relaxed);
+        GRAPH_HOST.fetch_add(host, Relaxed);
+    }
+
+    pub(crate) fn heap_in_use() -> usize {
+        let mi = unsafe { mallinfo2() };
+        mi.uordblks + mi.hblkhd
+    }
+
+    /// The boot footprint: what `report` measures growth from.
+    pub fn mark_up() {
+        if let Some(mb) = std::env::var("TIDELM_MEM_LOG_MB").ok().and_then(|v| v.parse::<f64>().ok()) {
+            LATE.store((mb * (1 << 20) as f64) as usize, Relaxed);
+            HEAP_LOG.store(true, Relaxed);
+        }
+        for (a, l) in AT_UP.iter().zip([&DEVICE, &PINNED, &GRAPHS_MADE]) {
+            a.store(l.load(Relaxed), Relaxed);
+        }
+        UP.store(true, Relaxed);
+    }
+
+    /// glibc's mallinfo2: what the heap hands out, and what it holds freed
+    #[repr(C)]
+    struct MallInfo2 {
+        arena: usize,
+        ordblks: usize,
+        smblks: usize,
+        hblks: usize,
+        hblkhd: usize,
+        usmblks: usize,
+        fsmblks: usize,
+        uordblks: usize,
+        fordblks: usize,
+        keepcost: usize,
+    }
+    extern "C" {
+        fn mallinfo2() -> MallInfo2;
+    }
+
+    pub fn report() -> String {
+        let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+        let mi = unsafe { mallinfo2() };
+        let d = |i: usize, l: &AtomicUsize| gib(l.load(Relaxed)) - gib(AT_UP[i].load(Relaxed));
+        // the process's resident pages by kind (/proc/self/status, kB): anonymous ones are memory
+        // it holds; file-backed ones (the mapped Engram tables) are page cache the kernel can drop
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let kb = |k: &str| status.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse::<usize>().ok()).unwrap_or(0) << 10;
+        format!("device {:.2} GiB ({:+.2} since up), pinned {:.2} GiB ({:+.2}), graphs {} ({} made since up; {:.2} GiB, heap {:.2}), host anon {:.2} GiB \
+                 (heap in use {:.2}, held free {:.2}), file-backed {:.2} GiB",
+                gib(DEVICE.load(Relaxed)), d(0, &DEVICE), gib(PINNED.load(Relaxed)), d(1, &PINNED), GRAPHS.load(Relaxed),
+                GRAPHS_MADE.load(Relaxed) - AT_UP[2].load(Relaxed), gib(GRAPH_BYTES.load(Relaxed)), gib(GRAPH_HOST.load(Relaxed)), gib(kb("RssAnon:")),
+                gib(mi.uordblks + mi.hblkhd), gib(mi.fordblks), gib(kb("RssFile:")))
     }
 }
 

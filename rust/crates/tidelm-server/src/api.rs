@@ -90,7 +90,13 @@ pub fn sink(id: u64, prompt: usize, tx: mpsc::Sender<Event>) -> Box<dyn FnMut(Ev
                 }
                 n += t.len();
             }
-            Event::Done(f, g) => eprintln!("{}", request_line(id, prompt, n, [t0, first.unwrap_or(t0), Instant::now()], first.is_some(), f, g)),
+            Event::Done(f, g) => {
+                eprintln!("{}", request_line(id, prompt, n, [t0, first.unwrap_or(t0), Instant::now()], first.is_some(), f, g));
+                eprintln!("memory: {}", tidelm_cuda::mem::report());
+                if let Some(top) = crate::heap_live_top(6) {
+                    eprintln!("memory: heap still live since launch: {top}");
+                }
+            }
         }
         let _ = tx.send(ev);
     })

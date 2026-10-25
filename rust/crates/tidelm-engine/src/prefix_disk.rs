@@ -7,13 +7,16 @@
 //! that change what is stored keeps a rebuild from loading another build's state.
 //!
 //! Writes run on a thread of their own (temporary file, fsync, rename, index, eviction to the
-//! byte budget, least recently used first); a load checks the file's size and checksum before
-//! any of it reaches the device. Each rank of a pair keeps its own copy of every bundle under
-//! the same id (rank 0 decides; Engine mirrors).
+//! byte budget, least recently used first). The engine streams a bundle both ways through a
+//! pool of CHUNKS chunks of CHUNK bytes made when the tier opens (save_parts, BundleReader), so
+//! a save or load holds the pool and nothing more however long the prompt is; a load checks the
+//! file's size and checksum before the engine commits any of it. Each rank of a pair keeps its
+//! own copy of every bundle under the same id (rank 0 decides; Engine mirrors).
 
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use crate::Result;
@@ -45,19 +48,182 @@ pub struct Bundle {
 }
 
 // 2: snapshots carry the bounded replay's kept rows and window floor
-const MAGIC: &[u8; 8] = b"TIDEPFX2";
+pub const MAGIC: &[u8; 8] = b"TIDEPFX2";
 
 /// A 64-bit checksum of the file's bytes, fast enough to run on every load (several GB/s).
 pub fn checksum(b: &[u8]) -> u64 {
-    let mut h = 0x243f_6a88_85a3_08d3u64 ^ b.len() as u64;
-    let mut it = b.chunks_exact(8);
-    for c in &mut it {
-        h = (h.rotate_left(5) ^ u64::from_le_bytes(c.try_into().unwrap())).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut c = Checksum::new(b.len());
+    c.update(b);
+    c.finish()
+}
+
+/// `checksum` over bytes that arrive in pieces; `len` is the whole input's length.
+pub struct Checksum {
+    h: u64,
+    carry: [u8; 8],
+    nc: usize,
+}
+
+impl Checksum {
+    pub fn new(len: usize) -> Self {
+        Checksum { h: 0x243f_6a88_85a3_08d3u64 ^ len as u64, carry: [0; 8], nc: 0 }
     }
-    for &x in it.remainder() {
-        h = (h.rotate_left(5) ^ x as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+
+    fn mix(&mut self, w: u64) {
+        self.h = (self.h.rotate_left(5) ^ w).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     }
-    h ^ (h >> 29)
+
+    pub fn update(&mut self, mut b: &[u8]) {
+        if self.nc > 0 {
+            let k = (8 - self.nc).min(b.len());
+            self.carry[self.nc..self.nc + k].copy_from_slice(&b[..k]);
+            self.nc += k;
+            b = &b[k..];
+            if self.nc < 8 {
+                return;
+            }
+            self.mix(u64::from_le_bytes(self.carry));
+            self.nc = 0;
+        }
+        let mut it = b.chunks_exact(8);
+        for c in &mut it {
+            self.mix(u64::from_le_bytes(c.try_into().unwrap()));
+        }
+        let r = it.remainder();
+        self.carry[..r.len()].copy_from_slice(r);
+        self.nc = r.len();
+    }
+
+    pub fn finish(mut self) -> u64 {
+        for i in 0..self.nc {
+            let x = self.carry[i];
+            self.mix(x as u64);
+        }
+        self.h ^ (self.h >> 29)
+    }
+}
+
+/// The chunk pool's shape: 4 x 16 MB, allocated (and its pages written) when the tier opens.
+pub const CHUNK: usize = 16 << 20;
+pub const CHUNKS: usize = 4;
+
+/// One run of a bundle's bytes in `encode`'s order: bytes on the host, or `len` bytes at a
+/// device address that save_parts' `copy` fetches.
+pub enum Part {
+    Bytes(Vec<u8>),
+    Device { ptr: usize, len: usize },
+}
+
+impl Part {
+    fn len(&self) -> usize {
+        match self {
+            Part::Bytes(b) => b.len(),
+            Part::Device { len, .. } => *len,
+        }
+    }
+}
+
+/// A chunk on its way to the writer thread, or the end of the bundle (or its abandonment).
+enum Msg {
+    Chunk(Vec<u8>, usize),
+    Done,
+    Abort,
+}
+
+/// `encode`'s little-endian field writers, for the engine's header parts.
+pub fn le_u64(o: &mut Vec<u8>, v: u64) {
+    o.extend_from_slice(&v.to_le_bytes());
+}
+
+/// A bundle read back in `encode`'s order through one of the pool's chunks; its checksum is
+/// computed on the way and compared by `finish`, which the caller runs before it commits
+/// anything it read.
+pub struct BundleReader {
+    file: std::fs::File,
+    buf: Vec<u8>,
+    have: usize,
+    at: usize,
+    /// body bytes not yet read into `buf`
+    left: usize,
+    sum: Option<Checksum>,
+    want: u64,
+    back: Sender<Vec<u8>>,
+}
+
+impl BundleReader {
+    fn refill(&mut self) -> Result<()> {
+        let n = self.left.min(self.buf.len());
+        if n == 0 {
+            return Err("prefix bundle: truncated".into());
+        }
+        self.file.read_exact(&mut self.buf[..n])?;
+        self.sum.as_mut().unwrap().update(&self.buf[..n]);
+        (self.have, self.at, self.left) = (n, 0, self.left - n);
+        Ok(())
+    }
+
+    /// The next `n` bytes, through `each(piece, offset)` in the pieces the chunk holds.
+    pub fn stream(&mut self, mut n: usize, each: &mut dyn FnMut(&[u8], usize) -> Result<()>) -> Result<()> {
+        let mut off = 0;
+        while n > 0 {
+            if self.at == self.have {
+                self.refill()?;
+            }
+            let k = n.min(self.have - self.at);
+            each(&self.buf[self.at..self.at + k], off)?;
+            (self.at, off, n) = (self.at + k, off + k, n - k);
+        }
+        Ok(())
+    }
+
+    pub fn skip(&mut self, n: usize) -> Result<()> {
+        self.stream(n, &mut |_, _| Ok(()))
+    }
+
+    pub fn u64(&mut self) -> Result<u64> {
+        let mut v = [0u8; 8];
+        self.stream(8, &mut |b, off| {
+            v[off..off + b.len()].copy_from_slice(b);
+            Ok(())
+        })?;
+        Ok(u64::from_le_bytes(v))
+    }
+
+    /// A length-prefixed field of `T`s into a host vector (the small ones: id, tokens, state).
+    pub fn vec<T: Copy + Default>(&mut self) -> Result<Vec<T>> {
+        let n = self.u64()? as usize;
+        let sz = n.checked_mul(std::mem::size_of::<T>()).ok_or("prefix bundle: bad length")?;
+        if sz > self.left + (self.have - self.at) {
+            return Err("prefix bundle: truncated".into());
+        }
+        let mut v = vec![T::default(); n];
+        let dst = v.as_mut_ptr() as *mut u8;
+        self.stream(sz, &mut |b, off| {
+            unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), dst.add(off), b.len()) };
+            Ok(())
+        })?;
+        Ok(v)
+    }
+
+    /// Every byte read, and the checksum the file ends with matches them.
+    pub fn finish(mut self) -> Result<()> {
+        if self.at != self.have || self.left != 0 {
+            return Err("prefix bundle: trailing bytes".into());
+        }
+        let mut c = [0u8; 8];
+        self.file.read_exact(&mut c)?;
+        let sum = self.sum.take().unwrap().finish();
+        if sum != u64::from_le_bytes(c) || sum != self.want {
+            return Err("prefix bundle: checksum mismatch".into());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BundleReader {
+    fn drop(&mut self) {
+        let _ = self.back.send(std::mem::take(&mut self.buf));
+    }
 }
 
 /// FNV-1a over the tokens' little-endian bytes, at every length: `out[n]` hashes tokens[..n].
@@ -199,13 +365,15 @@ fn now_s() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
 
-/// A rank's bundle directory, its index and the one write in flight.
+/// A rank's bundle directory, its index, the one write in flight and the chunk pool.
 pub struct Disk {
     pub cfg: DiskConfig,
     dir: PathBuf,
     index: Arc<Mutex<Vec<Entry>>>,
     writer: Option<std::thread::JoinHandle<Result<()>>>,
     pub last_save: Option<std::time::Instant>,
+    free: Receiver<Vec<u8>>,
+    free_tx: Sender<Vec<u8>>,
 }
 
 impl Disk {
@@ -234,7 +402,16 @@ impl Disk {
                 let _ = std::fs::remove_file(f.path());
             }
         }
-        let d = Disk { cfg, dir, index: Arc::new(Mutex::new(index)), writer: None, last_save: None };
+        let (free_tx, free) = channel();
+        for _ in 0..CHUNKS {
+            let mut c = vec![0u8; CHUNK];
+            // committed now, not on the first save
+            for i in (0..CHUNK).step_by(4096) {
+                unsafe { std::ptr::write_volatile(c.as_mut_ptr().add(i), 0) };
+            }
+            free_tx.send(c).map_err(|_| "prefix disk: the chunk pool")?;
+        }
+        let d = Disk { cfg, dir, index: Arc::new(Mutex::new(index)), writer: None, last_save: None, free, free_tx };
         let mut idx = d.index.lock().unwrap();
         evict(&d.dir, &mut idx, d.cfg.budget);
         write_index(&d.dir, &idx)?;
@@ -283,39 +460,144 @@ impl Disk {
         let _ = write_index(&self.dir, &idx);
     }
 
-    /// Write `b` on the writer thread (after the previous write), then index it and evict.
+    /// Write `b` (a test's, or a caller with the bundle on the host): save_parts with one part.
     pub fn save(&mut self, b: Bundle) {
+        let bytes = encode(&b);
+        let hs = prefix_hashes(&b.tokens);
+        let prefixes = b.snaps.iter().map(|s| (s.n, hs[s.n])).collect();
+        let body = Part::Bytes(bytes[..bytes.len() - 8].to_vec());
+        if let Err(e) = self.save_parts(&b.id, b.namespace, prefixes, &[body], &mut |_, _, _| Ok(())) {
+            eprintln!("prefix disk: {e}");
+        }
+    }
+
+    /// Write a bundle laid out as `parts` (`encode`'s bytes less the checksum): host parts are
+    /// copied into the pool's chunks and device ones by `copy(dst, src, len)`, which returns
+    /// once the bytes are there; the writer thread writes each full chunk and hands it back,
+    /// then sums, renames, indexes and evicts. The caller waits only for a free chunk, so a save
+    /// holds the pool's bytes and no more. `prefixes`: (length, prefix_hashes) it restores.
+    pub fn save_parts(&mut self, id: &str, namespace: u64, prefixes: Vec<(usize, u64)>, parts: &[Part],
+                      copy: &mut dyn FnMut(*mut u8, usize, usize) -> Result<()>) -> Result<()> {
         self.join();
-        let (dir, index, budget) = (self.dir.clone(), self.index.clone(), self.cfg.budget);
+        let body: usize = parts.iter().map(Part::len).sum();
+        if (body + 8) as u64 > self.cfg.budget {
+            return Err(format!("bundle {id} is {} bytes, over the budget", body + 8).into());
+        }
+        let (tx, rx) = channel::<Msg>();
+        let (dir, index, budget, back, id_s) = (self.dir.clone(), self.index.clone(), self.cfg.budget, self.free_tx.clone(), id.to_string());
         self.writer = Some(std::thread::spawn(move || -> Result<()> {
-            let bytes = encode(&b);
-            if bytes.len() as u64 > budget {
-                return Err(format!("bundle {} is {} bytes, over the budget", b.id, bytes.len()).into());
+            let tmp = dir.join(format!(".writing-{id_s}"));
+            let path = dir.join(format!("{id_s}.bin"));
+            let mut f = std::fs::File::create(&tmp);
+            let mut sum = Checksum::new(body);
+            let mut failed: Option<String> = f.as_ref().err().map(|e| e.to_string());
+            let mut done = false;
+            // every chunk goes back to the pool, whatever happened to the file
+            while let Ok(m) = rx.recv() {
+                match m {
+                    Msg::Chunk(c, n) => {
+                        if failed.is_none() {
+                            match f.as_mut().unwrap().write_all(&c[..n]) {
+                                Ok(()) => sum.update(&c[..n]),
+                                Err(e) => failed = Some(e.to_string()),
+                            }
+                        }
+                        let _ = back.send(c);
+                    }
+                    Msg::Done => {
+                        done = true;
+                        break;
+                    }
+                    Msg::Abort => break,
+                }
             }
-            let tmp = dir.join(format!(".writing-{}", b.id));
-            let path = dir.join(format!("{}.bin", b.id));
-            {
-                let mut f = std::fs::File::create(&tmp)?;
-                f.write_all(&bytes)?;
+            let c = sum.finish();
+            let finished = (|| -> Result<()> {
+                if let Some(e) = failed {
+                    return Err(e.into());
+                }
+                if !done {
+                    return Err("the save was abandoned".into());
+                }
+                let mut f = f.map_err(|e| e.to_string())?;
+                f.write_all(&c.to_le_bytes())?;
                 f.sync_all()?;
+                Ok(())
+            })();
+            if let Err(e) = finished {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(format!("bundle {id_s}: {e}").into());
             }
             std::fs::rename(&tmp, &path)?;
             std::fs::File::open(&dir)?.sync_all()?;
-            let hs = prefix_hashes(&b.tokens);
-            let entry = Entry {
-                id: b.id.clone(),
-                namespace: b.namespace,
-                size: bytes.len() as u64,
-                checksum: checksum(&bytes[..bytes.len() - 8]),
-                used: now_s(),
-                prefixes: b.snaps.iter().map(|s| (s.n, hs[s.n])).collect(),
-            };
+            let entry = Entry { id: id_s, namespace, size: (body + 8) as u64, checksum: c, used: now_s(), prefixes };
             let mut idx = index.lock().unwrap();
             idx.retain(|e| e.id != entry.id);
             idx.push(entry);
             evict(&dir, &mut idx, budget);
             write_index(&dir, &idx)
         }));
+        let mut cur: Option<(Vec<u8>, usize)> = None;
+        let mut fill = || -> Result<()> {
+            for p in parts {
+                let mut done = 0;
+                while done < p.len() {
+                    if cur.is_none() {
+                        cur = Some((self.free.recv().map_err(|_| "prefix disk: the chunk pool is gone")?, 0));
+                    }
+                    let (c, at) = cur.as_mut().unwrap();
+                    let k = (p.len() - done).min(c.len() - *at);
+                    match p {
+                        Part::Bytes(b) => c[*at..*at + k].copy_from_slice(&b[done..done + k]),
+                        Part::Device { ptr, .. } => copy(c[*at..].as_mut_ptr(), ptr + done, k)?,
+                    }
+                    (*at, done) = (*at + k, done + k);
+                    if *at == c.len() {
+                        let (c, n) = cur.take().unwrap();
+                        tx.send(Msg::Chunk(c, n)).map_err(|_| "prefix disk: the writer is gone")?;
+                    }
+                }
+            }
+            if let Some((c, n)) = cur.take() {
+                tx.send(Msg::Chunk(c, n)).map_err(|_| "prefix disk: the writer is gone")?;
+            }
+            Ok(())
+        };
+        match fill() {
+            Ok(()) => {
+                let _ = tx.send(Msg::Done);
+                Ok(())
+            }
+            Err(e) => {
+                let _ = tx.send(Msg::Abort);
+                Err(e)
+            }
+        }
+    }
+
+    /// Bundle `id` to stream back (its size checked against the index; its checksum by
+    /// BundleReader::finish), through one of the pool's chunks.
+    pub fn open_bundle(&mut self, id: &str) -> Result<BundleReader> {
+        self.join();
+        let entry = self.index.lock().unwrap().iter().find(|e| e.id == id).cloned().ok_or_else(|| format!("prefix disk: no bundle {id}"))?;
+        let file = std::fs::File::open(self.dir.join(format!("{id}.bin")))?;
+        let size = file.metadata()?.len();
+        if size != entry.size || size < 16 {
+            return Err(format!("prefix disk: bundle {id} is {size} bytes, the index says {}", entry.size).into());
+        }
+        let buf = self.free.recv().map_err(|_| "prefix disk: the chunk pool is gone")?;
+        let body = size as usize - 8;
+        let mut r = BundleReader { file, buf, have: 0, at: 0, left: body, sum: Some(Checksum::new(body)), want: entry.checksum,
+                                   back: self.free_tx.clone() };
+        let mut magic = [0u8; 8];
+        r.stream(8, &mut |b, off| {
+            magic[off..off + b.len()].copy_from_slice(b);
+            Ok(())
+        })?;
+        if &magic != MAGIC {
+            return Err(format!("prefix disk: bundle {id} is not a bundle").into());
+        }
+        Ok(r)
     }
 
     /// Bundle `id`, checked (size, checksum, namespace) before it is used.
@@ -383,6 +665,68 @@ mod tests {
         assert_eq!(decode(&bytes).unwrap(), b);
         bytes[40] ^= 1;
         assert!(decode(&bytes).unwrap_err().to_string().contains("checksum"));
+    }
+
+    #[test]
+    fn the_streamed_checksum_is_the_whole_one_at_any_split() {
+        let b: Vec<u8> = (0..1000u32).map(|i| (i * 7 % 251) as u8).collect();
+        for split in [0, 1, 7, 8, 9, 333, 999, 1000] {
+            let mut c = Checksum::new(b.len());
+            c.update(&b[..split]);
+            for piece in b[split..].chunks(5) {
+                c.update(piece);
+            }
+            assert_eq!(c.finish(), checksum(&b), "split {split}");
+        }
+    }
+
+    #[test]
+    fn a_streamed_bundle_is_encode_byte_for_byte_and_reads_back() {
+        let dir = std::env::temp_dir().join(format!("tidelm-pfx-stream-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut d = Disk::open(DiskConfig { dir: dir.clone(), budget: 1 << 30, min_interval_s: 0.0, dedup: false }, 0).unwrap();
+        // past one chunk, so a field straddles chunks on the way out and back
+        let mut b = bundle("s1", (0..10).collect());
+        b.ckv[1].1 = (0..CHUNK + 12_345).map(|i| (i % 253) as u8).collect();
+        d.save(b.clone());
+        d.join();
+        let on_disk = std::fs::read(dir.join("rank-0/s1.bin")).unwrap();
+        assert!(on_disk == encode(&b), "the file is encode's bytes");
+        let mut r = d.open_bundle("s1").unwrap();
+        assert_eq!((r.u64().unwrap(), r.vec::<u8>().unwrap()), (b.namespace, b"s1".to_vec()));
+        assert_eq!(r.vec::<u32>().unwrap(), b.tokens);
+        assert_eq!(r.u64().unwrap() as usize, b.snaps.len());
+        for sh in &b.snaps {
+            assert_eq!((r.u64().unwrap() as usize, r.u64().unwrap() as usize), (sh.n, sh.w));
+            assert_eq!(r.vec::<u16>().unwrap(), sh.rows);
+            assert_eq!(r.vec::<f32>().unwrap(), sh.pending);
+            assert_eq!(r.vec::<i32>().unwrap(), sh.flags);
+            assert_eq!(r.vec::<u16>().unwrap(), sh.rep_h);
+            assert_eq!(r.vec::<f32>().unwrap(), sh.rep_pre);
+            assert_eq!(r.u64().unwrap() as i64, sh.floor);
+        }
+        for part in [&b.ckv, &b.ik] {
+            assert_eq!(r.u64().unwrap() as usize, part.len());
+            for (l, bytes) in part {
+                assert_eq!(r.u64().unwrap() as usize, *l);
+                let n = r.u64().unwrap() as usize;
+                let mut got = vec![0u8; n];
+                r.stream(n, &mut |piece, off| {
+                    got[off..off + piece.len()].copy_from_slice(piece);
+                    Ok(())
+                }).unwrap();
+                assert!(&got == bytes);
+            }
+        }
+        r.finish().unwrap();
+        // a flipped byte: everything reads, the checksum does not hold
+        let mut bad = on_disk.clone();
+        bad[100] ^= 1;
+        std::fs::write(dir.join("rank-0/s1.bin"), &bad).unwrap();
+        let mut r = d.open_bundle("s1").unwrap();
+        r.skip(bad.len() - 16).unwrap();
+        assert!(r.finish().unwrap_err().to_string().contains("checksum"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

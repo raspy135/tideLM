@@ -157,6 +157,8 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         }
     }
     if rank == 1 {
+        tidelm_cuda::mem::mark_up();
+        eprintln!("memory at boot: {}", tidelm_cuda::mem::report());
         eng.follow()?;
         return Ok(());
     }
@@ -194,6 +196,8 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
     let listener = TcpListener::bind(&addr)?;
     eprintln!("engine up in {:.1}s; serving {} on {addr} (GLM, depth {}, {})", t0.elapsed().as_secs_f64(), ctx.model,
               srv.opt.depth, match srv.opt.cal { Some(t) => format!("calibrated gate {t}"), None => format!("flat gate {}", srv.opt.dyn_gate) });
+    tidelm_cuda::mem::mark_up();
+    eprintln!("memory at boot: {}", tidelm_cuda::mem::report());
     {
         let ctx = ctx.clone();
         std::thread::spawn(move || {

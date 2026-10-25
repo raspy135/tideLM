@@ -71,7 +71,113 @@ pub struct Ctx {
     pub memo: anthropic::ReasoningMemo,
 }
 
+
+/// The process's heap, watched: with TIDELM_MEM_LOG_MB set, an allocation of at least that many
+/// MB after launch is logged with the engine lines that made it (tidelm_cuda::mem logs the
+/// device and pinned ones) - what the engine still allocates past its boot footprint.
+struct Heap;
+
+thread_local! {
+    static IN_LOG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The watched allocations still live, by address: their size and where they were made.
+static LIVE: std::sync::Mutex<Option<std::collections::HashMap<usize, (usize, String)>>> = std::sync::Mutex::new(None);
+
+fn heap_seen(p: *mut u8, bytes: usize) {
+    if p.is_null() || !tidelm_cuda::mem::heap_watch(bytes) {
+        return;
+    }
+    // the backtrace and the map allocate: not again from inside them
+    let _ = IN_LOG.try_with(|inside| {
+        if inside.replace(true) {
+            return;
+        }
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        let at: Vec<&str> = bt.lines().map(str::trim)
+            .filter(|l| l.starts_with("at ") && l.contains("crates/tidelm-") && !l.contains("tidelm-server/src/main.rs"))
+            .map(|l| &l[l.find("crates/").unwrap_or(0)..]).take(3).collect();
+        let at = at.join(" < ");
+        if bytes >= tidelm_cuda::mem::LATE_MB << 20 {
+            eprintln!("memory: {:.1} MB of heap allocated after launch, at {at}", bytes as f64 / 1e6);
+        }
+        LIVE.lock().unwrap().get_or_insert_with(Default::default).insert(p as usize, (bytes, at));
+        inside.set(false);
+    });
+}
+
+fn heap_gone(p: *mut u8) {
+    if !tidelm_cuda::mem::heap_watch(usize::MAX) {
+        return;
+    }
+    let _ = IN_LOG.try_with(|inside| {
+        if inside.replace(true) {
+            return;
+        }
+        if let Some(m) = LIVE.lock().unwrap().as_mut() {
+            m.remove(&(p as usize));
+        }
+        inside.set(false);
+    });
+}
+
+/// With TIDELM_MEM_LOG_MB set: the watched heap still live, by where it was made (the top
+/// `n`), for the request log - what keeps growing past the boot footprint.
+pub fn heap_live_top(n: usize) -> Option<String> {
+    let _guard = IN_LOG.try_with(|inside| inside.replace(true)).ok()?;
+    let mut by: std::collections::HashMap<String, (usize, usize)> = Default::default();
+    if let Some(m) = LIVE.lock().unwrap().as_ref() {
+        for (bytes, at) in m.values() {
+            let e = by.entry(at.clone()).or_default();
+            (e.0, e.1) = (e.0 + bytes, e.1 + 1);
+        }
+    }
+    let mut v: Vec<_> = by.into_iter().collect();
+    v.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    let s = v.iter().take(n).map(|(at, (b, c))| format!("{:.1} MB in {c} at {at}", *b as f64 / 1e6)).collect::<Vec<_>>().join("; ");
+    let _ = IN_LOG.try_with(|inside| inside.set(false));
+    Some(s)
+}
+
+unsafe impl std::alloc::GlobalAlloc for Heap {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        let p = unsafe { std::alloc::System.alloc(l) };
+        heap_seen(p, l.size());
+        p
+    }
+    unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
+        let p = unsafe { std::alloc::System.alloc_zeroed(l) };
+        heap_seen(p, l.size());
+        p
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        heap_gone(p);
+        unsafe { std::alloc::System.dealloc(p, l) }
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, n: usize) -> *mut u8 {
+        heap_gone(p);
+        let q = unsafe { std::alloc::System.realloc(p, l, n) };
+        heap_seen(q, n);
+        q
+    }
+}
+
+#[global_allocator]
+static HEAP: Heap = Heap;
+
+extern "C" {
+    fn mallopt(param: i32, value: i32) -> i32;
+}
+
 fn main() -> tidelm_engine::Result<()> {
+    // glibc's heap: a fixed mmap threshold (M_MMAP_THRESHOLD, -3) puts every allocation of 1 MiB
+    // or more in its own mapping, unmapped when it is freed - the default raises the threshold
+    // past each large free and then keeps such buffers in arenas that do not shrink - and at
+    // most four arenas (M_ARENA_MAX, -8) hold the small ones of every thread
+    unsafe {
+        mallopt(-3, 1 << 20);
+        mallopt(-8, 4);
+    }
     let args: Vec<String> = std::env::args().collect();
     if let Some(dir) = arg(&args, "--model-dir").map(PathBuf::from) {
         if glm_main::is_glm(&dir) {
@@ -206,9 +312,17 @@ fn main() -> tidelm_engine::Result<()> {
             dedup: arg(&args, "--prefix-disk-dedup").as_deref() != Some("0"),
         })?;
     }
+    // the RAM prefix cache's snapshots, on both ranks: a lane keeps --prefix-snapshots of them,
+    // its prompt's own and one restored from disk, all allocated now rather than while serving
+    if arg(&args, "--prefix-cache").as_deref() != Some("0") {
+        let keep: usize = arg(&args, "--prefix-snapshots").map(|v| v.parse()).transpose()?.unwrap_or(16);
+        engine.reserve_snapshots(lanes * (keep + 2))?;
+    }
     if engine.is_paired() {
         if engine.rank() == 1 {
             eprintln!("rank 1: engine up in {:.1}s, following rank 0", t0.elapsed().as_secs_f64());
+            tidelm_cuda::mem::mark_up();
+            eprintln!("memory at boot: {}", tidelm_cuda::mem::report());
             engine.follow()?;
             std::process::exit(0);
         }
@@ -268,6 +382,8 @@ fn main() -> tidelm_engine::Result<()> {
     let listener = TcpListener::bind(&addr)?;
     eprintln!("engine up in {:.1}s; serving {} on {addr} ({lanes} lane{}, depth {depth:?})", t0.elapsed().as_secs_f64(),
               ctx.model, if lanes == 1 { "" } else { "s" });
+    tidelm_cuda::mem::mark_up();
+    eprintln!("memory at boot: {}", tidelm_cuda::mem::report());
     {
         let ctx = ctx.clone();
         std::thread::spawn(move || {

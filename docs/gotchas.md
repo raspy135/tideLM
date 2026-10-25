@@ -4395,3 +4395,39 @@ Artifacts: `results/mtp-cal-20261023/` (`A*`-calibrated, `B*`-flat, `C*`-ladder)
 One boot an arm is not proof, and this run is a reminder: the first calibrated boot (before the
 other arms) measured code 18.4 tok/s at 2.3 drafts a round; two runs on a second boot of the same
 arm both agreed at 20.2. The 18.4 is unexplained and is why the calibrated row has two numbers.
+
+## The Rust DeepSeek server allocated while serving until the memory guard stopped it (2026-10-25)
+
+A Claude Code session on the two-lane profile (two conversations, one growing to 56,837 tokens)
+ended at request 68 with `GUARD: killed at MemAvailable 4 GiB (KEEP_FREE_GB 5)` on rank 0; boot
+had left ~8.1 GiB. Nothing leaked in the usual sense: the engine kept allocating as content
+arrived. `tidelm_cuda::mem` now counts every device and pinned buffer and graph, the server's
+allocator can log heap allocations after launch with their source lines (`TIDELM_MEM_LOG_MB`),
+and each request logs a `memory:` line. Measured over two growing conversations, rank 0:
+
+| source | grew | fix |
+| --- | --- | --- |
+| Engram row cache, calloc'd pages committed as rows arrive | to 0.5 GB | pages written at boot |
+| RAM prefix snapshots, 10.8 MB allocated per snapshot | +0.34 GB device | a pool for every lane's snapshots, reserved at boot |
+| expert-move staging, 8 x 18.8 MB pinned allocated and freed per adaptation pass | churn | one pool made with the expert set |
+| disk prefix bundle: the KV downloaded, copied to bytes, then encoded | ~3 x a lane's KV (~350 MB at 56K, GBs at 512K) | streamed through 4 x 16 MB chunks made when the tier opens |
+| step graphs, ~4-8 MB each (device and the driver's heap), a new one per new step shape | 38 in 16 requests, no bound | an LRU of TIDELM_GRAPH_CACHE (128) |
+| shard headers, parsed as adaptation first reaches a shard | to 48 headers | all opened at boot |
+| glibc keeping freed large buffers in arenas | 0.15 GB held free | mallopt: a fixed 1 MiB mmap threshold, 4 arenas |
+
+After: device and pinned memory +0.00 after boot over the 16 requests, no allocation of 8 MB or
+more after launch, MemAvailable at boot 6.6 GiB (the reservations now show there). The heap still
+takes ~0.15 GB on the first request; the file-backed pages that grow are the mapped Engram tables,
+page cache the kernel can drop.
+
+The pool's first version reused snapshots without zeroing their pending state. ds_pending_snapshot
+writes only the flag at an even length and nothing for a position outside the chunk memory, so a
+reused slot restored its last owner's pending row: after a 4-turn session code fell 46.9 -> 33.7
+tok/s, drafts accepted 3.26 -> 1.89 a step (a fresh boot was unaffected). Zeroed on take: 47.87
+tok/s, 3.81 a step, on the same session.
+
+Open, and older than this work: a prompt restored from the disk tier and the same prompt restored
+from a lane's RAM snapshot, decoded side by side in one step (frozen residents, no hot reads,
+greedy), diverge by the fourth token. The engine at ee923cb gives the same two texts as this one,
+path for path, so the streamed bundle reproduces the old one; what differs between the two
+restores is not found.

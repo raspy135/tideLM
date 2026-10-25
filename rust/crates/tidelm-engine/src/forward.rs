@@ -34,7 +34,7 @@ use std::ffi::c_void;
 use std::time::Instant;
 
 use tidelm_core::engram_hash::{EngramLayout, NgramHashState};
-use tidelm_cuda::{memcpy_async, DeviceBuffer, GraphExec, PinnedBuffer, Stream, MEMCPY_HOST_TO_DEVICE};
+use tidelm_cuda::{memcpy_async, DeviceBuffer, GraphExec, PinnedBuffer, Stream, MEMCPY_DEVICE_TO_HOST, MEMCPY_HOST_TO_DEVICE};
 use tidelm_kernels::ds41::*;
 use tidelm_kernels::{engram as eg, fp4};
 use tidelm_model::{Checkpoint, ExpertReader, STAGE_BYTES};
@@ -555,17 +555,29 @@ impl Drop for EngramTable {
 struct RowCache {
     keys: Vec<i64>,
     data: Vec<u8>,
+    /// a call's misses, where they go, and their rows as read: kept, so a step allocates nothing
+    /// once these have grown to the largest step's
+    miss: Vec<i64>,
+    at: Vec<usize>,
+    buf: Vec<u8>,
 }
 
 impl RowCache {
     fn new(budget: usize) -> Self {
         let cap = (budget / 272).max(1);
-        RowCache { keys: vec![-1; cap], data: vec![0; cap * ENGRAM_ROW] }
+        let mut data = vec![0u8; cap * ENGRAM_ROW];
+        // calloc'd pages are committed on first write: write one byte a page now, so the cache's
+        // memory is taken at boot and not as it fills while serving
+        for i in (0..data.len()).step_by(4096) {
+            unsafe { std::ptr::write_volatile(data.as_mut_ptr().add(i), 0) };
+        }
+        RowCache { keys: vec![-1; cap], data, miss: Vec::new(), at: Vec::new(), buf: Vec::new() }
     }
 
     fn gather(&mut self, ids: &[i64], out: &mut [u8], read: &mut dyn FnMut(&[i64], &mut [u8]) -> i32) -> i32 {
         let cap = self.keys.len() as i64;
-        let (mut miss, mut at) = (Vec::new(), Vec::new());
+        let (miss, at, buf) = (&mut self.miss, &mut self.at, &mut self.buf);
+        (miss.clear(), at.clear());
         for (i, &id) in ids.iter().enumerate() {
             let slot = id.rem_euclid(cap) as usize;
             if self.keys[slot] == id {
@@ -578,12 +590,14 @@ impl RowCache {
         if miss.is_empty() {
             return 0;
         }
-        let mut buf = vec![0u8; miss.len() * ENGRAM_ROW];
-        let rc = read(&miss, &mut buf);
+        // zeroed like the fresh buffer it replaces: the read may leave a row untouched
+        buf.clear();
+        buf.resize(miss.len() * ENGRAM_ROW, 0);
+        let rc = read(miss, buf);
         if rc != 0 {
             return rc;
         }
-        for (j, (&id, &i)) in miss.iter().zip(&at).enumerate() {
+        for (j, (&id, &i)) in miss.iter().zip(at.iter()).enumerate() {
             let row = &buf[j * ENGRAM_ROW..(j + 1) * ENGRAM_ROW];
             out[i * ENGRAM_ROW..(i + 1) * ENGRAM_ROW].copy_from_slice(row);
             let slot = id.rem_euclid(cap) as usize;
@@ -596,12 +610,16 @@ impl RowCache {
     /// Reads the rows of `ids` (unique) the cache misses into it, nothing out: a prefetch.
     fn warm(&mut self, ids: &[i64], read: &mut dyn FnMut(&[i64], &mut [u8]) -> i32) -> i32 {
         let cap = self.keys.len() as i64;
-        let miss: Vec<i64> = ids.iter().copied().filter(|&id| self.keys[id.rem_euclid(cap) as usize] != id).collect();
+        let (miss, buf) = (&mut self.miss, &mut self.buf);
+        miss.clear();
+        miss.extend(ids.iter().copied().filter(|&id| self.keys[id.rem_euclid(cap) as usize] != id));
         if miss.is_empty() {
             return 0;
         }
-        let mut buf = vec![0u8; miss.len() * ENGRAM_ROW];
-        let rc = read(&miss, &mut buf);
+        // zeroed like the fresh buffer it replaces: the read may leave a row untouched
+        buf.clear();
+        buf.resize(miss.len() * ENGRAM_ROW, 0);
+        let rc = read(miss, buf);
         if rc != 0 {
             return rc;
         }
@@ -939,6 +957,9 @@ struct ExpertSet {
     tp: Option<Tp>,
     /// one past the arena's slots: the FP4 kernels read no weights for it
     null_slot: i32,
+    /// the read workers' streams and pinned staging buffers (io_threads() of them), made with
+    /// the set and reused by every read, so an adaptation pass allocates nothing
+    workers: std::sync::Mutex<Vec<(Stream, PinnedBuffer<u8>)>>,
 }
 
 impl ExpertSet {
@@ -961,6 +982,8 @@ impl ExpertSet {
             base,
             tp,
             null_slot: n_slots as i32,
+            workers: std::sync::Mutex::new(
+                (0..io_threads()).map(|_| Ok((Stream::new()?, PinnedBuffer::<u8>::uninit(STAGE_BYTES)?))).collect::<Result<_>>()?),
         };
         let mut jobs = Vec::with_capacity(n_res);
         for b in 0..blocks {
@@ -995,13 +1018,18 @@ impl ExpertSet {
         let next = AtomicUsize::new(0);
         let failed: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
         let threads = io_threads().min(jobs.len()).max(1);
+        let workers = &self.workers;
         std::thread::scope(|s| {
             for _ in 0..threads {
                 s.spawn(|| {
-                    let work = || -> Result<()> {
+                    let mut held = None;
+                    let mut work = || -> Result<()> {
                         tidelm_cuda::set_device(0)?;
-                        let stream = Stream::new()?;
-                        let mut stage = PinnedBuffer::<u8>::uninit(STAGE_BYTES)?;
+                        let taken = workers.lock().unwrap().pop();
+                        let (stream, stage) = match taken {
+                            Some(w) => held.insert(w),
+                            None => held.insert((Stream::new()?, PinnedBuffer::<u8>::uninit(STAGE_BYTES)?)),
+                        };
                         let reader = ExpertReader::new(ckpt);
                         loop {
                             if failed.lock().unwrap().is_some() {
@@ -1010,13 +1038,13 @@ impl ExpertSet {
                             let i = next.fetch_add(1, Ordering::Relaxed);
                             let Some(&(_, b, x)) = jobs.get(i) else { return Ok(()) };
                             let prefix = format!("{base}{b}.ffn.experts.{x}.");
-                            let views = reader.read_expert_share_into(&mut stage, &prefix, rank, world)?;
+                            let views = reader.read_expert_share_into(stage, &prefix, rank, world)?;
                             for (&(off, len), &(dst, n)) in views.iter().zip(dsts[i].iter()) {
                                 if len != n {
                                     return Err(format!("{prefix}: a share of {len} bytes, the arena expects {n}").into());
                                 }
                                 let src = unsafe { stage.as_ptr().add(off) } as *const c_void;
-                                unsafe { memcpy_async(dst as *mut c_void, src, n, MEMCPY_HOST_TO_DEVICE, &stream)? };
+                                unsafe { memcpy_async(dst as *mut c_void, src, n, MEMCPY_HOST_TO_DEVICE, stream)? };
                             }
                             // the staging buffer is reused by this worker's next expert
                             stream.synchronize()?;
@@ -1024,6 +1052,9 @@ impl ExpertSet {
                     };
                     if let Err(e) = work() {
                         failed.lock().unwrap().get_or_insert(e.to_string());
+                    }
+                    if let Some(w) = held {
+                        workers.lock().unwrap().push(w);
                     }
                 });
             }
@@ -1094,6 +1125,7 @@ impl Hot {
         let (tx, rx) = std::sync::mpsc::channel::<HotJob>();
         let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
         let ckpt = std::sync::Arc::new(Checkpoint::open(model_dir)?);
+        ckpt.open_all()?;
         for _ in 0..cfg.cap.max(1) {
             let (rx, ckpt) = (rx.clone(), ckpt.clone());
             std::thread::spawn(move || {
@@ -1260,6 +1292,10 @@ pub struct Engine {
     /// the RAM prefix cache's snapshots, by (lane, id) (decode.rs decides; both ranks hold
     /// the same ones)
     snaps: HashMap<(usize, u64), LaneSnap>,
+    /// snapshots' buffers not in use, each sized for a whole window (reserve_snapshots fills it
+    /// at boot; a dropped snapshot's go back), and the window's row indices they gather by
+    snap_free: Vec<LaneSnap>,
+    snap_idx: DeviceBuffer<i32>,
     /// the prefix cache's disk tier (enable_prefix_disk) and its namespace
     disk: Option<crate::prefix_disk::Disk>,
     disk_ns: u64,
@@ -1319,7 +1355,12 @@ pub struct Engine {
     live_rows: usize,
     use_graphs: bool,
     /// per (shape, segment): segments split the step at the engram layers (run_step)
-    graphs: HashMap<(StepShape, usize), GraphExec>,
+    /// step graphs by (shape, segment), each with its last use: at most graph_cap of them
+    /// (TIDELM_GRAPH_CACHE, default 128: a session and two README runs used 85), the least
+    /// recently used replaced past that
+    graphs: HashMap<(StepShape, usize), (GraphExec, u64)>,
+    graph_tick: u64,
+    graph_cap: usize,
     /// steps served by a graph replay / by a capture
     pub graph_replays: usize,
     pub graph_captures: usize,
@@ -1444,6 +1485,8 @@ impl Engine {
         let pmax = prefill_rows();
         let n_layers = opts.n_layers.unwrap_or(cfg.n_layers).min(cfg.n_layers);
         let ckpt = Checkpoint::open(model_dir)?;
+        // every shard's header now: adaptation reads reach shards the boot load did not
+        ckpt.open_all()?;
         let stream = Stream::new()?;
         let (d, hc, rd) = (cfg.dim, cfg.hc_mult, cfg.rope_head_dim);
         let flat = |t: Vec<[f32; 2]>| -> Vec<f32> { t.into_iter().flatten().collect() };
@@ -1867,6 +1910,8 @@ impl Engine {
             hot,
             peer_hot: None,
             snaps: HashMap::new(),
+            snap_free: Vec::new(),
+            snap_idx: DeviceBuffer::zeroed(cfg_w.max(1))?,
             disk: None,
             disk_ns: 0,
             vis_delims,
@@ -1900,6 +1945,8 @@ impl Engine {
             live_rows: 0,
             use_graphs: opts.graphs && opts.resident,
             graphs: HashMap::new(),
+            graph_tick: 0,
+            graph_cap: std::env::var("TIDELM_GRAPH_CACHE").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n >= 1).unwrap_or(128),
             graph_replays: 0,
             graph_captures: 0,
             max_seq,
@@ -2313,21 +2360,20 @@ impl Engine {
         if n == 0 || n > l.len || (n < l.len && n < l.last.0) {
             return Err(format!("snapshot({n}) of lane {lane}: its length is {}, its last segment from {}", l.len, l.last.0).into());
         }
+        let lane_len = l.len;
         let (hd, w) = (self.cfg.head_dim, n.min(self.cfg.window_size));
+        let mut snap = self.snap_take()?;
         let st = &self.stream;
         let sr = st.raw();
         let ring = self.ring;
         let rings: Vec<*mut c_void> = self.caches.ring.iter().chain(self.caches.mtp_ring.iter()).map(np).collect();
-        let idx = DeviceBuffer::from_slice(&(n - w..n).map(|p| (lane * ring + p % ring) as i32).collect::<Vec<_>>())?;
-        let rows = DeviceBuffer::<u16>::new((rings.len() * w * hd).max(1))?;
+        self.snap_idx.upload_async(0, &(n - w..n).map(|p| (lane * ring + p % ring) as i32).collect::<Vec<_>>(), st)?;
+        let (rows, pending, flags) = (&snap.rows, &snap.pending, &snap.flags);
         for (k, &rg) in rings.iter().enumerate() {
-            ck(unsafe { ds_gather_rows_u16(sr, rg, np(&idx), rows.ptr_at(k * w * hd), w as i32, hd as i32) }, "snapshot rows")?;
+            ck(unsafe { ds_gather_rows_u16(sr, rg, np(&self.snap_idx), rows.ptr_at(k * w * hd), w as i32, hd as i32) }, "snapshot rows")?;
         }
-        let nr = self.caches.r2.len().max(1);
-        let pending = DeviceBuffer::<f32>::zeroed(nr * 2 * hd)?;
-        let flags = DeviceBuffer::<i32>::zeroed(nr)?;
         for (i, r2) in self.caches.r2.values().enumerate() {
-            if n == l.len {
+            if n == lane_len {
                 pending.copy_from(i * 2 * hd, &r2.pkv, lane * hd, hd, st)?;
                 pending.copy_from(i * 2 * hd + hd, &r2.psc, lane * hd, hd, st)?;
                 flags.copy_from(i, &r2.flag, lane, 1, st)?;
@@ -2339,24 +2385,62 @@ impl Engine {
                 }, "snapshot pending")?;
             }
         }
-        let (rep_h, rep_pre) = self.lane_rep_copy(lane)?;
-        // `idx` is freed at the end of this call: the gathers must be done with it
+        if self.swa_replay {
+            // the lane's kept replay rows
+            let (w, hc, d) = (self.cfg.window_size, self.cfg.hc_mult, self.cfg.dim);
+            snap.rep_h.copy_from(0, &self.rep_h, lane * w * hc * d, w * hc * d, st)?;
+            snap.rep_pre.copy_from(0, &self.rep_pre, lane * w * hc, w * hc, st)?;
+        }
+        // the index buffer is the next snapshot's: the gathers must be done with it
         self.stream.synchronize()?;
-        let floor = self.floors[lane];
-        self.snaps.insert((lane, id), LaneSnap { n, w, rows, pending, flags, rep_h, rep_pre, floor });
+        (snap.n, snap.w, snap.floor) = (n, w, self.floors[lane]);
+        self.snap_put((lane, id), snap);
         Ok(())
     }
 
-    /// A copy of lane `lane`'s kept replay rows (one-element buffers without the replay).
-    fn lane_rep_copy(&self, lane: usize) -> Result<(DeviceBuffer<u16>, DeviceBuffer<f32>)> {
-        if !self.swa_replay {
-            return Ok((DeviceBuffer::zeroed(1)?, DeviceBuffer::zeroed(1)?));
+    /// One snapshot's buffers, sized for a whole window (snapshots of shorter lanes use the
+    /// front of each ring's block: row k * w * hd on).
+    fn snap_alloc(&self) -> Result<LaneSnap> {
+        let (hd, w, hc, d) = (self.cfg.head_dim, self.cfg.window_size, self.cfg.hc_mult, self.cfg.dim);
+        let rings = self.caches.ring.len() + self.caches.mtp_ring.len();
+        let nr = self.caches.r2.len().max(1);
+        let rep = if self.swa_replay { (w * hc * d, w * hc) } else { (1, 1) };
+        Ok(LaneSnap { n: 0, w: 0, rows: DeviceBuffer::zeroed((rings * w * hd).max(1))?, pending: DeviceBuffer::zeroed(nr * 2 * hd)?,
+                      flags: DeviceBuffer::zeroed(nr)?, rep_h: DeviceBuffer::zeroed(rep.0)?, rep_pre: DeviceBuffer::zeroed(rep.1)?,
+                      floor: 0 })
+    }
+
+    /// Allocate `n` snapshots' buffers now (at boot: the RAM prefix cache's lanes x (kept
+    /// snapshots + the prompt's own + a restore's)), so the cache takes no memory while serving.
+    pub fn reserve_snapshots(&mut self, n: usize) -> Result<()> {
+        while self.snap_free.len() < n {
+            let s = self.snap_alloc()?;
+            self.snap_free.push(s);
         }
-        let (w, hc, d) = (self.cfg.window_size, self.cfg.hc_mult, self.cfg.dim);
-        let (h, p) = (DeviceBuffer::<u16>::new(w * hc * d)?, DeviceBuffer::<f32>::new(w * hc)?);
-        h.copy_from(0, &self.rep_h, lane * w * hc * d, w * hc * d, &self.stream)?;
-        p.copy_from(0, &self.rep_pre, lane * w * hc, w * hc, &self.stream)?;
-        Ok((h, p))
+        Ok(())
+    }
+
+    /// A snapshot's buffers from the free list, its pending state zeroed: ds_pending_snapshot
+    /// writes only the flag at an even length and nothing for a position outside the chunk
+    /// memory, so a reused slot would otherwise restore the last owner's pending row (a fresh
+    /// snapshot's was zero; reusing them unzeroed measured code 46.9 -> 33.7 tok/s after a
+    /// session, drafts accepted 3.5 -> 1.9 a step).
+    fn snap_take(&mut self) -> Result<LaneSnap> {
+        match self.snap_free.pop() {
+            Some(s) => {
+                s.pending.zero_async(&self.stream)?;
+                s.flags.zero_async(&self.stream)?;
+                Ok(s)
+            }
+            None => self.snap_alloc(),
+        }
+    }
+
+    /// Keep `snap` as `key`; a snapshot it replaces goes back to the free list.
+    fn snap_put(&mut self, key: (usize, u64), snap: LaneSnap) {
+        if let Some(old) = self.snaps.insert(key, snap) {
+            self.snap_free.push(old);
+        }
     }
 
     /// Restore lane `lane` to snapshot `id`: its window rows and pending state back, its length
@@ -2376,9 +2460,9 @@ impl Engine {
         let sr = st.raw();
         let ring = self.ring;
         let rings: Vec<*mut c_void> = self.caches.ring.iter().chain(self.caches.mtp_ring.iter()).map(np).collect();
-        let idx = DeviceBuffer::from_slice(&(n - w..n).map(|p| (lane * ring + p % ring) as i32).collect::<Vec<_>>())?;
+        self.snap_idx.upload_async(0, &(n - w..n).map(|p| (lane * ring + p % ring) as i32).collect::<Vec<_>>(), st)?;
         for (k, &rg) in rings.iter().enumerate() {
-            ck(unsafe { ds_scatter_rows_u16(sr, snap.rows.ptr_at(k * w * hd), np(&idx), rg, w as i32, hd as i32) }, "restore rows")?;
+            ck(unsafe { ds_scatter_rows_u16(sr, snap.rows.ptr_at(k * w * hd), np(&self.snap_idx), rg, w as i32, hd as i32) }, "restore rows")?;
         }
         for (i, r2) in self.caches.r2.values().enumerate() {
             r2.pkv.copy_from(lane * hd, &snap.pending, i * 2 * hd, hd, st)?;
@@ -2459,41 +2543,60 @@ impl Engine {
         if self.disk.is_none() {
             return Ok(());
         }
-        let st = &self.stream;
-        let mut snaps = Vec::new();
+        // the bundle as `encode` lays it out: header fields on the host, the snapshots' and the
+        // compressed rows' bytes where they are on the device (save_parts streams them)
+        use crate::prefix_disk::{le_u64, Part};
+        let (hd, ihd) = (self.cfg.head_dim, self.cfg.index_head_dim);
+        let rings = self.caches.ring.len() + self.caches.mtp_ring.len();
+        let mut parts: Vec<Part> = Vec::new();
+        let mut head = crate::prefix_disk::MAGIC.to_vec();
+        let dev = |parts: &mut Vec<Part>, head: &mut Vec<u8>, ptr: *mut c_void, n: usize, size: usize| {
+            le_u64(head, n as u64);
+            parts.push(Part::Bytes(std::mem::take(head)));
+            parts.push(Part::Device { ptr: ptr as usize, len: n * size });
+        };
+        le_u64(&mut head, self.disk_ns);
+        le_u64(&mut head, id.len() as u64);
+        head.extend_from_slice(id.as_bytes());
+        le_u64(&mut head, tokens.len() as u64);
+        head.extend(tokens.iter().flat_map(|t| t.to_le_bytes()));
+        le_u64(&mut head, snap_ids.len() as u64);
+        let mut n_max = 0;
+        let mut ns = Vec::new();
         for &sid in snap_ids {
             let sn = self.snaps.get(&(lane, sid)).ok_or_else(|| format!("disk save: lane {lane} has no snapshot {sid}"))?;
-            let mut h = crate::prefix_disk::SnapHost { n: sn.n, w: sn.w, rows: vec![0; sn.rows.len()], pending: vec![0.0; sn.pending.len()],
-                                                       flags: vec![0; sn.flags.len()], rep_h: Vec::new(), rep_pre: Vec::new(),
-                                                       floor: sn.floor as i64 };
-            sn.rows.download_async(0, &mut h.rows, st)?;
-            sn.pending.download_async(0, &mut h.pending, st)?;
-            sn.flags.download_async(0, &mut h.flags, st)?;
-            if self.swa_replay {
-                (h.rep_h, h.rep_pre) = (vec![0; sn.rep_h.len()], vec![0.0; sn.rep_pre.len()]);
-                sn.rep_h.download_async(0, &mut h.rep_h, st)?;
-                sn.rep_pre.download_async(0, &mut h.rep_pre, st)?;
-            }
-            snaps.push(h);
+            n_max = n_max.max(sn.n);
+            ns.push(sn.n);
+            le_u64(&mut head, sn.n as u64);
+            le_u64(&mut head, sn.w as u64);
+            dev(&mut parts, &mut head, sn.rows.ptr_at(0), (rings * sn.w * hd).max(1), 2);
+            dev(&mut parts, &mut head, sn.pending.ptr_at(0), sn.pending.len(), 4);
+            dev(&mut parts, &mut head, sn.flags.ptr_at(0), sn.flags.len(), 4);
+            let rep = if self.swa_replay { (sn.rep_h.len(), sn.rep_pre.len()) } else { (0, 0) };
+            dev(&mut parts, &mut head, sn.rep_h.ptr_at(0), rep.0, 2);
+            dev(&mut parts, &mut head, sn.rep_pre.ptr_at(0), rep.1, 4);
+            le_u64(&mut head, sn.floor as i64 as u64);
         }
-        let n_max = snaps.iter().map(|s| s.n).max().unwrap_or(0);
-        let (hd, ihd) = (self.cfg.head_dim, self.cfg.index_head_dim);
         let row = if self.packed_kv { PACKED_ROW / 2 } else { hd };
-        let (mut ckv, mut ik) = (Vec::new(), Vec::new());
-        for (&l, buf) in &self.caches.ckv {
-            let (r, rows) = (self.cfg.compress_ratios[l], self.caches.crows[&l]);
-            let k = n_max / r;
-            let mut v = vec![0u16; k * row];
-            buf.download_async(lane * rows * row, &mut v, st)?;
-            let mut iv = vec![0u16; k * ihd];
-            self.caches.ik[&l].download_async(lane * rows * ihd, &mut iv, st)?;
-            ckv.push((l, v.iter().flat_map(|x| x.to_le_bytes()).collect()));
-            ik.push((l, iv.iter().flat_map(|x| x.to_le_bytes()).collect()));
+        for (caches, width) in [(&self.caches.ckv, row), (&self.caches.ik, ihd)] {
+            le_u64(&mut head, caches.len() as u64);
+            for (&l, buf) in caches {
+                let (r, rows) = (self.cfg.compress_ratios[l], self.caches.crows[&l]);
+                le_u64(&mut head, l as u64);
+                // stored as bytes (encode's Vec<u8>): the length is a byte count
+                dev(&mut parts, &mut head, buf.ptr_at(lane * rows * width), (n_max / r) * width * 2, 1);
+            }
         }
-        st.synchronize()?;
-        let b = crate::prefix_disk::Bundle { id: id.to_string(), namespace: self.disk_ns, tokens: tokens.to_vec(), snaps, ckv, ik };
+        parts.push(Part::Bytes(head));
+        let hs = crate::prefix_disk::prefix_hashes(tokens);
+        let prefixes = ns.iter().map(|&n| (n, hs[n])).collect();
+        let st = &self.stream;
+        let mut copy = |dst: *mut u8, src: usize, len: usize| -> Result<()> {
+            unsafe { memcpy_async(dst as *mut c_void, src as *const c_void, len, MEMCPY_DEVICE_TO_HOST, st)? };
+            Ok(st.synchronize()?)
+        };
         let d = self.disk.as_mut().unwrap();
-        d.save(b);
+        d.save_parts(id, self.disk_ns, prefixes, &parts, &mut copy)?;
         d.last_save = Some(Instant::now());
         Ok(())
     }
@@ -2534,54 +2637,124 @@ impl Engine {
     }
 
     fn disk_load_inner(&mut self, lane: usize, id: &str, n: usize, snap: u64) -> Result<Vec<u32>> {
+        if lane >= self.max_lanes {
+            return Err(format!("bundle {id}: lane {lane} of {}", self.max_lanes).into());
+        }
+        let mut s = self.snap_take()?;
+        match self.disk_stream_in(lane, id, n, &mut s) {
+            Ok(tokens) => {
+                self.snap_put((lane, snap), s);
+                self.disk_load_commit(lane, snap, &tokens, n)?;
+                Ok(tokens)
+            }
+            Err(e) => {
+                self.snap_free.push(s);
+                Err(e)
+            }
+        }
+    }
+
+    /// Bundle `id` into lane `lane`'s caches (its first n / ratio compressed rows a layer) and
+    /// the snapshot at `n` into `s`, through the disk tier's chunk; the file's checksum is
+    /// checked before this returns, and nothing else is committed until then.
+    fn disk_stream_in(&mut self, lane: usize, id: &str, n: usize, s: &mut LaneSnap) -> Result<Vec<u32>> {
         let ns = self.disk_ns;
-        let b = self.disk.as_mut().ok_or("no prefix disk tier")?.load(id, ns)?;
-        let sh = b.snaps.iter().find(|s| s.n == n).ok_or_else(|| format!("bundle {id} has no snapshot at {n}"))?;
-        if n > b.tokens.len() || lane >= self.max_lanes {
-            return Err(format!("bundle {id}: snapshot {n} past its {} tokens", b.tokens.len()).into());
+        let mut r = self.disk.as_mut().ok_or("no prefix disk tier")?.open_bundle(id)?;
+        if r.u64()? != ns || r.vec::<u8>()? != id.as_bytes() {
+            return Err(format!("prefix disk: bundle {id} is another build's").into());
+        }
+        let tokens: Vec<u32> = r.vec()?;
+        if n > tokens.len() {
+            return Err(format!("bundle {id}: snapshot {n} past its {} tokens", tokens.len()).into());
         }
         let (hd, ihd) = (self.cfg.head_dim, self.cfg.index_head_dim);
-        let row = if self.packed_kv { PACKED_ROW / 2 } else { hd };
-        let st = &self.stream;
-        let words = |v: &[u8]| -> Vec<u16> { v.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect() };
-        for (&l, buf) in &self.caches.ckv {
-            let (r, rows) = (self.cfg.compress_ratios[l], self.caches.crows[&l]);
-            let k = n / r;
-            let cv = b.ckv.iter().find(|x| x.0 == l).map(|x| words(&x.1)).ok_or_else(|| format!("bundle {id} has no layer {l}"))?;
-            let iv = b.ik.iter().find(|x| x.0 == l).map(|x| words(&x.1)).ok_or_else(|| format!("bundle {id} has no layer {l} keys"))?;
-            if cv.len() < k * row || iv.len() < k * ihd {
-                return Err(format!("bundle {id}: layer {l} holds fewer rows than {n} tokens need").into());
-            }
-            buf.upload_async(lane * rows * row, &cv[..k * row], st)?;
-            self.caches.ik[&l].upload_async(lane * rows * ihd, &iv[..k * ihd], st)?;
-        }
+        let (w_full, hc, d) = (self.cfg.window_size, self.cfg.hc_mult, self.cfg.dim);
         let rings = self.caches.ring.len() + self.caches.mtp_ring.len();
-        if sh.rows.len() != rings * sh.w * hd {
-            return Err(format!("bundle {id}: snapshot rows for another model shape").into());
-        }
-        let snapv = LaneSnap {
-            n: sh.n,
-            w: sh.w,
-            rows: DeviceBuffer::from_slice(&sh.rows)?,
-            pending: DeviceBuffer::from_slice(if sh.pending.is_empty() { &[0f32][..] } else { &sh.pending })?,
-            flags: DeviceBuffer::from_slice(if sh.flags.is_empty() { &[0i32][..] } else { &sh.flags })?,
-            rep_h: DeviceBuffer::from_slice(if sh.rep_h.is_empty() { &[0u16][..] } else { &sh.rep_h })?,
-            rep_pre: DeviceBuffer::from_slice(if sh.rep_pre.is_empty() { &[0f32][..] } else { &sh.rep_pre })?,
-            floor: sh.floor as i32,
+        let st = &self.stream;
+        // `len` bytes of the stream to device address `dst` (the pinned path is the driver's)
+        let up = |r: &mut crate::prefix_disk::BundleReader, dst: *mut c_void, len: usize| -> Result<()> {
+            r.stream(len, &mut |b, off| {
+                unsafe { memcpy_async((dst as *mut u8).add(off) as *mut c_void, b.as_ptr() as *const c_void, b.len(), MEMCPY_HOST_TO_DEVICE, st)? };
+                Ok(st.synchronize()?)
+            })
         };
-        let (w, hc, d) = (self.cfg.window_size, self.cfg.hc_mult, self.cfg.dim);
-        if self.swa_replay && (snapv.rep_h.len() != w * hc * d || snapv.rep_pre.len() != w * hc) {
-            return Err(format!("bundle {id}: no replay rows for this engine").into());
+        let mut found = false;
+        for _ in 0..r.u64()? {
+            let (sn, sw) = (r.u64()? as usize, r.u64()? as usize);
+            let field = |r: &mut crate::prefix_disk::BundleReader| -> Result<usize> { Ok(r.u64()? as usize) };
+            if sn != n || found {
+                for size in [2, 4, 4, 2, 4] {
+                    let k = field(&mut r)?;
+                    r.skip(k * size)?;
+                }
+                r.u64()?;
+                continue;
+            }
+            let rows = field(&mut r)?;
+            if rows != (rings * sw * hd).max(1) || sw > w_full {
+                return Err(format!("bundle {id}: snapshot rows for another model shape").into());
+            }
+            up(&mut r, s.rows.ptr_at(0), rows * 2)?;
+            for (ptr, len) in [(s.pending.ptr_at(0), s.pending.len()), (s.flags.ptr_at(0), s.flags.len())] {
+                let k = field(&mut r)?;
+                if k != 0 && k != len {
+                    return Err(format!("bundle {id}: snapshot state for another model shape").into());
+                }
+                up(&mut r, ptr, k * 4)?;
+            }
+            for (buf, size, want) in [(s.rep_h.ptr_at(0), 2usize, w_full * hc * d), (s.rep_pre.ptr_at(0), 4, w_full * hc)] {
+                let k = field(&mut r)?;
+                if self.swa_replay && k != want {
+                    return Err(format!("bundle {id}: no replay rows for this engine").into());
+                }
+                if self.swa_replay {
+                    up(&mut r, buf, k * size)?;
+                } else {
+                    r.skip(k * size)?;
+                }
+            }
+            (s.n, s.w, s.floor) = (sn, sw, r.u64()? as i64 as i32);
+            found = true;
         }
-        st.synchronize()?;
-        self.snaps.insert((lane, snap), snapv);
+        if !found {
+            return Err(format!("bundle {id} has no snapshot at {n}").into());
+        }
+        let row = if self.packed_kv { PACKED_ROW / 2 } else { hd };
+        for (caches, width, what) in [(&self.caches.ckv, row, "layer"), (&self.caches.ik, ihd, "layer keys")] {
+            let mut seen = 0;
+            for _ in 0..r.u64()? {
+                let l = r.u64()? as usize;
+                let bytes = r.u64()? as usize;
+                let Some(buf) = caches.get(&l) else {
+                    r.skip(bytes)?;
+                    continue;
+                };
+                let (ratio, rows) = (self.cfg.compress_ratios[l], self.caches.crows[&l]);
+                let need = (n / ratio) * width * 2;
+                if bytes < need {
+                    return Err(format!("bundle {id}: {what} {l} holds fewer rows than {n} tokens need").into());
+                }
+                up(&mut r, buf.ptr_at(lane * rows * width), need)?;
+                r.skip(bytes - need)?;
+                seen += 1;
+            }
+            if seen != caches.len() {
+                return Err(format!("bundle {id} lacks a {what}").into());
+            }
+        }
+        r.finish()?;
+        Ok(tokens)
+    }
+
+    /// A streamed bundle's snapshot restored (disk_load_inner, after its checksum).
+    fn disk_load_commit(&mut self, lane: usize, snap: u64, tokens: &[u32], n: usize) -> Result<()> {
         self.restore_inner(lane, snap)?;
         // the n-gram history of the restored prefix, as the hashing would have written it
         // (a bundle's tokens are prefix keys: an image's positions hash as dead)
-        let (ids, mask) = crate::vision::split_key(&b.tokens[..n], self.cfg.image_token_id);
+        let (ids, mask) = crate::vision::split_key(&tokens[..n], self.cfg.image_token_id);
         let l = &mut self.lanes[lane];
         l.hash.hash(&ids, 0, mask.as_deref());
-        Ok(b.tokens)
+        Ok(())
     }
 
     /// Forget lane `lane`'s snapshots `ids`.
@@ -2596,7 +2769,9 @@ impl Engine {
             }
         })?;
         for id in ids {
-            self.snaps.remove(&(lane, *id));
+            if let Some(s) = self.snaps.remove(&(lane, *id)) {
+                self.snap_free.push(s);
+            }
         }
         Ok(())
     }
@@ -3093,18 +3268,31 @@ impl Engine {
             return self.device_step(shape, l0, l1);
         }
         let key = (shape, k);
+        self.graph_tick += 1;
         if !self.graphs.contains_key(&key) {
+            // an instantiated step graph holds ~8 MB (its device part and the driver's heap), and
+            // a long session keeps meeting new shapes: past graph_cap the least recently used
+            // goes (a graph destroyed while it runs is freed when it completes), so the graphs
+            // hold a fixed budget instead of growing with the session
+            if self.graphs.len() >= self.graph_cap {
+                if let Some(old) = self.graphs.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| *k) {
+                    self.graphs.remove(&old);
+                }
+            }
             // capture records the segment without running it; the launch below runs it once
             self.stream.begin_capture()?;
             let rec = self.device_step(shape, l0, l1);
             let graph = self.stream.end_capture();
             rec?;
-            self.graphs.insert(key, graph?);
+            self.graphs.insert(key, (graph?, self.graph_tick));
             self.graph_captures += 1;
         } else {
             self.graph_replays += 1;
         }
-        self.graphs[&key].launch(&self.stream)?;
+        let tick = self.graph_tick;
+        let g = self.graphs.get_mut(&key).unwrap();
+        g.1 = tick;
+        g.0.launch(&self.stream)?;
         Ok(())
     }
 

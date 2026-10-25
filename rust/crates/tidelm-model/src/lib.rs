@@ -79,6 +79,19 @@ impl Checkpoint {
         &self.index.model_dir
     }
 
+    /// Every shard opened now (its header parsed and kept for the process), so no read made
+    /// while serving opens one and the cache's memory is the boot's.
+    pub fn open_all(&self) -> io::Result<()> {
+        let mut one: HashMap<&String, &String> = HashMap::new();
+        for (tensor, file) in &self.index.weight_map {
+            one.entry(file).or_insert(tensor);
+        }
+        for tensor in one.values() {
+            self.shard(tensor)?;
+        }
+        Ok(())
+    }
+
     pub fn has(&self, tensor: &str) -> bool {
         self.index.weight_map.contains_key(tensor)
     }
