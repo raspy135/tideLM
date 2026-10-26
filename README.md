@@ -12,7 +12,12 @@ tide — so the engine gets better the more you use it.
 | `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,000 / 15,360 (65.1%) | 1M (2 lanes, 1.5M shared) | **31.8 tok/s** | **49.0 tok/s** | 4.8 s |
 | `glm53-exl3` | GLM-5.3 | EXL3 3.0 bpw | 12,500 / 19,200 (65.1%) | 256K | **17.2 tok/s** | **20.8 tok/s** | 19.5 s |
 
-Adaptive expert loading also allows flexible memory configration.
+*Medians of three `bench/bench.py` runs after a warmup, 1,024 tokens at temperature 0.6 (raw runs:
+[DeepSeek](results/rust-ds41-20261024/README.md), [GLM-5.3](results/rust-glm53-20261025/README.md)).
+The DeepSeek row was measured with two 512K lanes; 1M measured within noise of it
+([runs](results/rust-ds41-20261026-1m/README.md)).*
+
+Adaptive expert loading also allows flexible memory configuration.
 Memory for expert resident and context length are the big levers. You can run other services
 by reducing expert resident or context length.
 
