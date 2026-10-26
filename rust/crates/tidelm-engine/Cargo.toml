@@ -15,6 +15,7 @@ tidelm-text = { path = "../tidelm-text" }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 
 [[bin]]
 name = "tidelm-generate"

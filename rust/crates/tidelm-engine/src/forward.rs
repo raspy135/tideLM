@@ -392,8 +392,11 @@ impl Options {
         // differently with nothing in the log
         let vocab = Config::load(model_dir)?.vocab_size;
         let listed = crate::draft_vocab::from_env(vocab)?.map(|ids| crate::draft_vocab::digest(&ids)).unwrap_or(0);
+        // the abliteration overlay by content: a rank serving the stock wo_b beside one serving the
+        // overlay emits different tokens with nothing in the log
+        let ablit = crate::ablit::digest()?;
         Ok(format!("tidelm-pair v3 tp | max_seq {} lanes {} spec {} resident {} graphs {} layers {:?} | keep {:x} \
-                    dspark_keep {:x} record {} hot_ring {} vision {} replay {} | exe {:x} | config {:x} | draft vocab {listed:x} | env NO_QDQ={:?} ENGRAM_CACHE_MB={:?} \
+                    dspark_keep {:x} record {} hot_ring {} vision {} replay {} | exe {:x} | config {:x} | draft vocab {listed:x} | ablit {ablit:?} | env NO_QDQ={:?} ENGRAM_CACHE_MB={:?} \
                     DRAFT_HEAD_FMT={:?} TP_DRAFT={:?} EXPERT_TOPP={:?}/{:?} PREFILL_ROWS={} NO_SPLITK={:?} \
                     HOT={:?}/{:?}/{:?} PACKED_KV={:?}",
                    self.max_seq, self.max_lanes, self.spec, self.resident, self.graphs, self.n_layers, keep_digest,
@@ -1128,7 +1131,7 @@ impl Hot {
         let dsts = slots.iter().map(|&s| (s, set.arena.slot_dsts(s, rank).map(|(d, _, n)| (d as usize, n)))).collect();
         let (tx, rx) = std::sync::mpsc::channel::<HotJob>();
         let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
-        let ckpt = std::sync::Arc::new(Checkpoint::open(model_dir)?);
+        let ckpt = std::sync::Arc::new(crate::ablit::open(model_dir)?);
         ckpt.open_all()?;
         for _ in 0..cfg.cap.max(1) {
             let (rx, ckpt) = (rx.clone(), ckpt.clone());
@@ -1490,7 +1493,12 @@ impl Engine {
         let ring = ring_slots(cfg.window_size);
         let pmax = prefill_rows();
         let n_layers = opts.n_layers.unwrap_or(cfg.n_layers).min(cfg.n_layers);
-        let ckpt = Checkpoint::open(model_dir)?;
+        // TIDELM_ABLIT_WOB: layers 10-35's attn.wo_b from the abliteration overlay (crate::ablit)
+        let ckpt = crate::ablit::open(model_dir)?;
+        if let Some(p) = crate::ablit::path() {
+            eprintln!("ablit: layers {}-{} attn.wo_b from {} (sha256 {})", crate::ablit::FIRST, crate::ablit::LAST, p.display(),
+                      crate::ablit::digest()?);
+        }
         // every shard's header now: adaptation reads reach shards the boot load did not
         ckpt.open_all()?;
         let stream = Stream::new()?;
@@ -2491,16 +2499,17 @@ impl Engine {
     }
 
     /// The prefix cache's disk tier in `cfg.dir/rank-R` (both ranks of a pair, after the join):
-    /// its namespace is this executable, the model's config and the settings that change what
-    /// a bundle holds.
+    /// its namespace is this executable, the model's config, the abliteration overlay (it changes
+    /// the weights, so every cached row) and the settings that change what a bundle holds.
     pub fn enable_prefix_disk(&mut self, cfg: crate::prefix_disk::DiskConfig) -> Result<()> {
         let fnv = |h: u64, bytes: &[u8]| bytes.iter().fold(h, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3));
         let exe = std::fs::read("/proc/self/exe")?;
         let mut h = fnv(0xcbf29ce484222325, &exe);
         let cfg_json = std::fs::read(self.ckpt.model_dir().join("inference/config.json")).or_else(|_| std::fs::read(self.ckpt.model_dir().join("config.json")))?;
         h = fnv(h, &cfg_json);
-        let settings = format!("layers {} spec {} packed {} qdq {} ring {} window {} rank {} replay {}", self.n_layers, self.dspark.is_some(),
-                               self.packed_kv, !self.no_qdq, self.ring, self.cfg.window_size, self.rank(), self.swa_replay);
+        let settings = format!("layers {} spec {} packed {} qdq {} ring {} window {} rank {} replay {} ablit {:?}", self.n_layers,
+                               self.dspark.is_some(), self.packed_kv, !self.no_qdq, self.ring, self.cfg.window_size, self.rank(),
+                               self.swa_replay, crate::ablit::digest()?);
         h = fnv(h, settings.as_bytes());
         self.disk_ns = h;
         self.disk = Some(crate::prefix_disk::Disk::open(cfg, self.rank())?);

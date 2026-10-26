@@ -62,6 +62,8 @@ pub fn aligned_len(lo: u64, hi: u64) -> usize {
 pub struct Checkpoint {
     index: WeightIndex,
     shards: Mutex<HashMap<String, &'static Shard>>,
+    /// tensors served from an overlay file instead of their shard (`overlay`)
+    overlay: HashMap<String, &'static Shard>,
     /// Aligned piece size for parallel reads (the Python DSV41_READ_CHUNK_MB=4).
     pub read_chunk: usize,
 }
@@ -71,8 +73,32 @@ impl Checkpoint {
         Ok(Checkpoint {
             index: WeightIndex::load(model_dir)?,
             shards: Mutex::new(HashMap::new()),
+            overlay: HashMap::new(),
             read_chunk: 4 * 1024 * 1024 / ALIGN * ALIGN,
         })
+    }
+
+    /// Serve every tensor of the safetensors file `path` from it instead of its shard (the
+    /// abliteration overlay, tidelm-engine's ablit): each must be a checkpoint tensor of the same
+    /// dtype and shape, so an overlay replaces values and never adds, drops or reshapes a tensor.
+    /// Every read resolves through `shard`, so every load and reader of this checkpoint sees the
+    /// overlay's bytes; the checkpoint's files are never written. Returns the names, sorted.
+    pub fn overlay(&mut self, path: &Path) -> io::Result<Vec<String>> {
+        let shard: &'static Shard = Box::leak(Box::new(Shard::open(path)?));
+        let mut names: Vec<String> = shard.names().map(str::to_string).collect();
+        names.sort();
+        for name in &names {
+            let (have, want) = (shard.meta(name)?, self.meta(name)?);
+            if (&have.dtype, &have.shape) != (&want.dtype, &want.shape) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                    "{name} is {} {:?} in {} but {} {:?} in the checkpoint", have.dtype, have.shape, path.display(),
+                    want.dtype, want.shape)));
+            }
+        }
+        for name in &names {
+            self.overlay.insert(name.clone(), shard);
+        }
+        Ok(names)
     }
 
     pub fn model_dir(&self) -> &Path {
@@ -97,6 +123,9 @@ impl Checkpoint {
     }
 
     pub fn shard(&self, tensor: &str) -> io::Result<&'static Shard> {
+        if let Some(&s) = self.overlay.get(tensor) {
+            return Ok(s);
+        }
         let file = self.index.weight_map.get(tensor).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("{tensor} not in the weight index"))
         })?;
@@ -362,6 +391,48 @@ mod tests {
         let mut want = vec![0u8; 5120 * 2];
         ckpt.shard("embed.weight").unwrap().file.pread_buffered(&mut want, meta.lo + row as u64).unwrap();
         assert_eq!(&buf[off..off + 5120 * 2], &want[..]);
+    }
+
+    /// A safetensors file of `(name, dtype, shape, bytes)`, in that order.
+    fn write_st(path: &Path, tensors: &[(&str, &str, Vec<usize>, Vec<u8>)]) {
+        let (mut header, mut data) = (serde_json::Map::new(), Vec::new());
+        for (name, dtype, shape, bytes) in tensors {
+            header.insert(name.to_string(), serde_json::json!({"dtype": dtype, "shape": shape,
+                                                               "data_offsets": [data.len(), data.len() + bytes.len()]}));
+            data.extend_from_slice(bytes);
+        }
+        let hdr = serde_json::to_vec(&header).unwrap();
+        std::fs::write(path, [&(hdr.len() as u64).to_le_bytes()[..], &hdr[..], &data[..]].concat()).unwrap();
+    }
+
+    #[test]
+    fn an_overlay_serves_its_tensors_and_refuses_new_or_reshaped_ones() {
+        let dir = std::env::temp_dir().join(format!("tidelm-overlay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stock = |n: usize, v: u8| vec![v; n];
+        write_st(&dir.join("model-1.safetensors"), &[("a.weight", "F8_E4M3", vec![4, 8], stock(32, 1)),
+                                                     ("a.scale", "F8_E8M0", vec![4, 1], stock(4, 2)),
+                                                     ("b.weight", "BF16", vec![3], stock(6, 3))]);
+        std::fs::write(dir.join("model.safetensors.index.json"),
+                       r#"{"weight_map": {"a.weight": "model-1.safetensors", "a.scale": "model-1.safetensors",
+                                          "b.weight": "model-1.safetensors"}}"#).unwrap();
+        let ov = dir.join("overlay.safetensors");
+        write_st(&ov, &[("a.weight", "F8_E4M3", vec![4, 8], stock(32, 9)), ("a.scale", "F8_E8M0", vec![4, 1], stock(4, 8))]);
+        let mut ckpt = Checkpoint::open(&dir).unwrap();
+        assert_eq!(ckpt.overlay(&ov).unwrap(), vec!["a.scale".to_string(), "a.weight".to_string()]);
+        assert_eq!(ckpt.read_tensor_vec("a.weight").unwrap().0, stock(32, 9));
+        assert_eq!(ckpt.read_tensor_vec("a.scale").unwrap().0, stock(4, 8));
+        assert_eq!(ckpt.read_tensor_vec("b.weight").unwrap().0, stock(6, 3), "a tensor the overlay lacks stays the checkpoint's");
+        assert_eq!(ckpt.shard("a.weight").unwrap().path, ov);
+        // another shape, another dtype, or a tensor the checkpoint lacks: refused, nothing applied
+        for bad in [("a.weight", "F8_E4M3", vec![8, 4], stock(32, 9)), ("a.weight", "BF16", vec![4, 4], stock(32, 9)),
+                    ("c.weight", "BF16", vec![3], stock(6, 9))] {
+            write_st(&ov, &[bad.clone()]);
+            let mut ckpt = Checkpoint::open(&dir).unwrap();
+            assert!(ckpt.overlay(&ov).is_err(), "{} {} {:?} accepted", bad.0, bad.1, bad.2);
+            assert_eq!(ckpt.read_tensor_vec("a.weight").unwrap().0, stock(32, 1));
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

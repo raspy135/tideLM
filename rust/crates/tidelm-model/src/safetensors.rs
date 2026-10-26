@@ -84,6 +84,11 @@ impl Shard {
         Ok(Shard { path: path.to_path_buf(), base, tensors, file, runs: Mutex::new(HashMap::new()) })
     }
 
+    /// Every tensor's name, in no order.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.tensors.keys().map(String::as_str)
+    }
+
     pub fn meta(&self, name: &str) -> io::Result<&TensorMeta> {
         self.tensors.get(name).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("{name} not in {}", self.path.display()))

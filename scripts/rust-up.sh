@@ -14,7 +14,8 @@
 # KEEP_FREE_GB (the memory guard), DSV41_ADAPT_SENSITIVITY / _PRIOR / _DECODE_TOKENS,
 # DSV41_PROBE_PREFILL, DSV41_PREFIX_CACHE / _SNAPSHOTS / _DISK / _DISK_GB /
 # _DISK_MIN_INTERVAL_S / _DISK_DEDUP, DSV41_VISION, DSV41_HOT_READS / _ASYNC / _MIN / _MAX /
-# _RING, DSV41_PACKED_KV, DSV41_SWA_REPLAY. The Python kernels' other DSV41_* knobs mean nothing here.
+# _RING, DSV41_PACKED_KV, DSV41_SWA_REPLAY, DSV41_ABLIT_WOB (the abliteration overlay, a host
+# path). The Python kernels' other DSV41_* knobs mean nothing here.
 #
 # The Rust engine's own, with their defaults:
 #   RUST_BUDGET=10000        resident experts (next to 512K tokens of context per lane)
@@ -139,6 +140,13 @@ if [[ ! -f "$db" ]]; then
     fi
 fi
 [[ -z "${PEER:-}" || -n "${MASTER_ADDR:-}" ]] || err "$f sets PEER but no MASTER_ADDR"
+# the abliteration overlay (README): a host path, mounted at that path on both ranks. A Python
+# profile's /models/... container path is not one, and leaves the profile to the Python engine.
+ablit=${DSV41_ABLIT_WOB:-}
+if [[ -n "$ablit" ]]; then
+    [[ -f "$ablit" ]] || err "DSV41_ABLIT_WOB=$ablit is not a file on this box (the Rust engine reads the host path)"
+    [[ -z "${PEER:-}" ]] || ssh -n "$PEER" "test -f '$ablit'" || err "DSV41_ABLIT_WOB=$ablit is not a file on $PEER"
+fi
 [[ $check == 1 ]] && exit 0
 
 lanes=${RUST_LANES:-1}
@@ -173,6 +181,8 @@ for v in NCCL_SOCKET_IFNAME NCCL_IB_HCA NCCL_IB_ADDR_FAMILY NCCL_IB_ADDR_RANGE N
     [[ -n "${!v:-}" ]] && envs+=("$v=${!v}")
 done
 [[ -n "${RUST_EXPERT_TOPP:-}" ]] && envs+=(TIDELM_EXPERT_TOPP="$RUST_EXPERT_TOPP")
+# both ranks hash it into the boot guard and refuse to pair over different files
+[[ -n "$ablit" ]] && { envs+=(TIDELM_ABLIT_WOB="$ablit"); ro+=("$(dirname "$ablit")"); }
 guard=${KEEP_FREE_GB:-6}
 
 pair=()

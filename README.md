@@ -117,16 +117,18 @@ fills both boxes. `TIDE_ENGINE=python` still starts the Python containers, from 
 their settings (the examples as of `a6ec917`), and a profile the Rust engine does not serve
 (MXFP4 GLM experts, FP4 KV) goes to them with a note.
 
-## Abliterated overlay (DeepSeek V4.1, Python engine only)
+## Abliterated overlay (DeepSeek V4.1)
 
-Abliterated overlay is supported for DeepSeek v4.1 flash on the Python engine; the Rust engine
-does not load it yet.
+Both engines serve an abliterated DeepSeek V4.1 Flash from a 1.1 GB sidecar that replaces layers
+10-35's attention output projection (`attn.wo_b`); every other weight stays the checkpoint's, and
+the checkpoint is never written.
 
 https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated
 
 Accept the repository's access terms on Hugging Face and authenticate `hf` first.
-Download only the native FP8 sidecar on **both nodes**, under the parent of `MODEL_DIR`
-(mounted at `/models`):
+Download only the native FP8 sidecar on **both nodes**, at the same path. The Python engine
+needs it under the parent of `MODEL_DIR` (its containers mount that at `/models`); the Rust
+engine reads any host path:
 
 ```bash
 hf download drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated \
@@ -135,8 +137,20 @@ hf download drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated \
 echo '88324ceaa2c0754a2bdb4ef6bb388a088438e352358343e6c2c882009cdde864  '"$HOME/models/dsv41-1017-wo-b-ablit/wo_b_l10_35_1017.safetensors" | sha256sum -c -
 ```
 
-Set this **container path** in a Python DeepSeek profile (`TIDE_ENGINE=python`, the example as
-of `a6ec917`), then start that profile:
+For the Rust engine, set its **host path** in the DeepSeek profile and start it
+(`scripts/tide.sh start .env.ds41-mxfp4`); the log shows
+`ablit: layers 10-35 attn.wo_b from ... (sha256 88324cea...)`:
+
+```bash
+DSV41_ABLIT_WOB=/home/you/models/dsv41-1017-wo-b-ablit/wo_b_l10_35_1017.safetensors
+```
+
+The engine refuses a file that is not exactly those 52 tensors in the checkpoint's names, dtypes
+and shapes, both ranks refuse to pair over different files (the sha256 is in the boot guard), and
+prompts cached on disk under the stock weights are not restored into the abliterated model (or back).
+
+For the Python engine, set the **container path** instead in a Python DeepSeek profile
+(`TIDE_ENGINE=python`, the example as of `a6ec917`), then start that profile:
 
 ```bash
 DSV41_ABLIT_WOB=/models/dsv41-1017-wo-b-ablit/wo_b_l10_35_1017.safetensors

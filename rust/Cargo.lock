@@ -1109,6 +1109,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tidelm-comm",
  "tidelm-core",
  "tidelm-cuda",
