@@ -1,0 +1,12 @@
+== rust-ds41-code-512k: workload=code isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=62 ttft=    556.3 ms  tpot=  20.18 ms  decode= 49.55 tok/s  out=1024 (length)
+          accept_len=3.679856115107914  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=62 ttft=    566.0 ms  tpot=  20.73 ms  decode= 48.23 tok/s  out=1024 (length)
+          accept_len=3.41  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=62 ttft=    560.1 ms  tpot=  20.27 ms  decode= 49.33 tok/s  out=1024 (length)
+          accept_len=3.614840989399293  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=62 ttft=    572.3 ms  tpot=  21.27 ms  decode= 47.02 tok/s  out=1024 (length)
+          accept_len=3.3874172185430464  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=565.9767 ms  tpot=20.7343 ms  decode=48.2292 tok/s
+  -> ENGINE  accept_len=3.41  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /tmp/claude-1000/-home-ryan-git-tidelm/ee5bdf57-c37e-4b07-b12d-be6b933bf449/scratchpad/bench1m/512k-code.json

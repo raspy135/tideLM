@@ -1,0 +1,12 @@
+== rust-ds41-code-1m: workload=code isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=62 ttft=    852.3 ms  tpot=  19.68 ms  decode= 50.82 tok/s  out=1024 (length)
+          accept_len=3.875  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=62 ttft=    569.1 ms  tpot=  20.68 ms  decode= 48.36 tok/s  out=1024 (length)
+          accept_len=3.576923076923077  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=62 ttft=    555.5 ms  tpot=  19.67 ms  decode= 50.83 tok/s  out=1024 (length)
+          accept_len=3.7472527472527473  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=62 ttft=    554.3 ms  tpot=  19.36 ms  decode= 51.67 tok/s  out=1024 (length)
+          accept_len=3.8171641791044775  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=555.509 ms  tpot=19.6732 ms  decode=50.8307 tok/s
+  -> ENGINE  accept_len=3.7473  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /tmp/claude-1000/-home-ryan-git-tidelm/ee5bdf57-c37e-4b07-b12d-be6b933bf449/scratchpad/bench1m/1m-code.json

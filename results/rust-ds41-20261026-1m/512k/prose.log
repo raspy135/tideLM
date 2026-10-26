@@ -1,0 +1,12 @@
+== rust-ds41-prose-512k: workload=prose isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=45 ttft=   1006.1 ms  tpot=  30.77 ms  decode= 32.49 tok/s  out=1024 (length)
+          accept_len=1.9229323308270676  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=45 ttft=    515.7 ms  tpot=  31.08 ms  decode= 32.17 tok/s  out=1024 (length)
+          accept_len=1.870201096892139  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=45 ttft=    517.8 ms  tpot=  32.90 ms  decode= 30.39 tok/s  out=1024 (length)
+          accept_len=1.7791304347826087  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=45 ttft=    507.2 ms  tpot=  30.84 ms  decode= 32.42 tok/s  out=1024 (length)
+          accept_len=1.8979591836734695  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=515.7334 ms  tpot=31.0812 ms  decode=32.1738 tok/s
+  -> ENGINE  accept_len=1.8702  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /tmp/claude-1000/-home-ryan-git-tidelm/ee5bdf57-c37e-4b07-b12d-be6b933bf449/scratchpad/bench1m/512k-prose.json

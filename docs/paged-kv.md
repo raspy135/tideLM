@@ -33,12 +33,12 @@ cache, measured at 35-110 us a chunk on GB10.
 
 | Config (a rank) | Fixed lanes | Paged |
 | --- | ---: | ---: |
-| 2 lanes x 512K (the shipped profile) | 2.14 GB | 1.48 GB (704 chunks) |
-| `MAX_SEQ=1048576`, `RUST_KV_TOKENS=1572864` | 4.28 GB | 2.19 GB (1,044 chunks) |
+| 2 lanes x 512K (the profile before 2026-10-26) | 2.14 GB | 1.48 GB (704 chunks) |
+| `MAX_SEQ=1048576`, `RUST_KV_TOKENS=1572864` (the shipped profile) | 4.28 GB | 2.19 GB (1,044 chunks) |
 
-Boot memory with the shipped profile: 103.22 -> 102.60 GiB device a rank. The second row lets one
-lane reach 1M while the other holds 512K, for ~50 MB more than the shipped profile's caches (RoPE
-tables for 1M positions add 0.27 GB on top).
+Boot memory with 2 x 512K: 103.22 -> 102.60 GiB device a rank. The second row lets one lane reach
+1M while the other holds 512K, for ~50 MB more than two fixed 512K lanes' caches (RoPE tables for
+1M positions add 0.27 GB on top): 103.51 GiB device a rank, measured.
 
 ## When the pool is overcommitted
 
@@ -75,6 +75,11 @@ same tokens), greedy:
   6,000 out) and B (48,608, 4,000 out) overlapped; B was swapped out once at 51,337 tokens (39
   chunks back) and brought back once A ended. Both texts are the ones A and B give run one after
   the other: all 6,000 and 4,000 tokens, B's ~1,270 after its restore included.
+- **1M costs no speed** (the pair, the README protocol: `bench/bench.py`, the seed history
+  `45ef7129`, an empty prefix cache, one boot an arm; `MAX_SEQ=1048576` with the 1.5M pool
+  against `MAX_SEQ=524288` with no pool limit): prose 31.24 vs 32.17 tok/s, code 50.83 vs 48.23,
+  the 8K prompt's first token 4.29 vs 4.30 s. Each arm wins one decode workload: boot noise.
+  Minimum MemAvailable over the runs: 6.47 / 7.26 GiB (rank 0 / 1) against 7.75 / 7.49.
 - With speculative decoding the overlapped and the one-at-a-time runs differ for reasons that
   predate paging: a step above 16 rows (B's copy-drafted blocks are ~27) runs other kernels, so a
   lane's tokens depend on what shares its steps. The same overlap without any swap diverged at the

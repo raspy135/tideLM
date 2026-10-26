@@ -1,0 +1,12 @@
+== rust-ds41-random8k-1m: workload=random isl=8192 osl=256 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=8178 ttft=   4969.4 ms  tpot=  26.11 ms  decode= 38.30 tok/s  out=256 (length)
+          accept_len=2.7419354838709675  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=8170 ttft=   4326.3 ms  tpot=  24.22 ms  decode= 41.29 tok/s  out=256 (length)
+          accept_len=3.1097560975609757  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=8171 ttft=   4289.4 ms  tpot=  26.57 ms  decode= 37.64 tok/s  out=256 (length)
+          accept_len=2.65625  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=8178 ttft=   4291.8 ms  tpot=  28.52 ms  decode= 35.06 tok/s  out=256 (length)
+          accept_len=2.4285714285714284  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=4291.7592 ms  tpot=26.5676 ms  decode=37.6399 tok/s
+  -> ENGINE  accept_len=2.6562  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /tmp/claude-1000/-home-ryan-git-tidelm/ee5bdf57-c37e-4b07-b12d-be6b933bf449/scratchpad/bench1m/1m-random8k.json

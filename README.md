@@ -10,13 +10,16 @@ tide — so the engine gets better the more you use it.
 
 | Profile | Model | Routed experts | Resident | Context | Prose | Code | 8K-token prompt, first token |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,000 / 15,360 (65.1%) | 2 x 512K | **31.8 tok/s** | **49.0 tok/s** | 4.8 s |
+| `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,000 / 15,360 (65.1%) | 1M (2 lanes, 1.5M shared) | **31.8 tok/s** | **49.0 tok/s** | 4.8 s |
 | `glm53-exl3` | GLM-5.3 | EXL3 3.0 bpw | 12,500 / 19,200 (65.1%) | 256K | **17.2 tok/s** | **20.8 tok/s** | 19.5 s |
 
 *Decode speed is `bench/bench.py`'s median over three measured runs after one warmup: 1,024
 output tokens at temperature 0.6, prose = an essay request, code = an LRU-cache request. The last
 column is the median time to first token of a fresh ~8,200-token prompt (no prefix reused). Raw
-runs: [DeepSeek](results/rust-ds41-20261024/README.md), [GLM-5.3](results/rust-glm53-20261025/README.md).*
+runs: [DeepSeek](results/rust-ds41-20261024/README.md), [GLM-5.3](results/rust-glm53-20261025/README.md).
+The DeepSeek row was measured with two 512K lanes; at 1M, the same protocol gave 31.2 / 50.8 tok/s
+and 4.3 s, and 512K on the same build 32.2 / 48.2 tok/s and 4.3 s
+([runs](results/rust-ds41-20261026-1m/README.md)).*
 
 ## How adaptive expert loading works
 
@@ -178,7 +181,7 @@ with what each setting measured.
 | DeepSeek | GLM-5.3 | What it controls |
 | --- | --- | --- |
 | `RUST_BUDGET=9872` | `GLM_SLOTS=12500` | How many experts stay resident (GLM: slots a rank). Fewer, more memory for context. |
-| `MAX_SEQ=524288` | `GLM_MAX_SEQ=262144` | Context allocation (DeepSeek: a lane), generated tokens included. Less context, more experts. |
+| `MAX_SEQ=1048576`, `RUST_KV_TOKENS=1572864` | `GLM_MAX_SEQ=262144` | Context, generated tokens included (DeepSeek: the most one lane reaches, out of a pool of `RUST_KV_TOKENS` the lanes share). Less context, more experts. |
 | `DSV41_ADAPT_SENSITIVITY=high` | `GLM_ADAPT=1`, `GLM_ADAPT_EVERY=200` | How fast the resident set follows new traffic. |
 | `RUST_ADAPT_DB` | `RUST_GLM_STATE_DB` | The learned history, under `~/tidelm-rust-state`. With none yet, the first boot starts from the bundled one in `profiles/`. |
 | `DSV41_HOT_READS=1`, `DSV41_HOT_ASYNC=1`, `DSV41_HOT_RING=128` | `GLM_HOT=1`, `GLM_HOT_KEEP=32` | Hot reads (above). |
