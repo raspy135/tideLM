@@ -445,3 +445,46 @@ draft head remain off, with confidence depth enabled.
 Exact samples, both rank reports and the summary are retained under
 `results/decode-ideas-20261004/model-gate/` and
 `results/decode-ideas-20261004/summary.json`.
+
+## Rust engine: fixed depths and a confidence bias, 2026-10-26
+
+Why it was tried: on MiaAI-Lab's `tools/bench.py` decode prompt (temperature 0, 256 tokens) the
+Rust pair emitted 2.0 tokens a step against the ~2.2-2.4 a round TensorFold reports for its EXL3
+build, and verified 2.8 rows a step (`TIDELM_STEP_SPLIT`). The question was whether the confidence
+policy drafts too shallow.
+
+Fixed depths, the live profile with only `RUST_DEPTH` changed, one boot an arm, median of three
+(their prompt; bench/bench.py prose and code at temperature 0.6, 1,024 tokens, after a warmup):
+
+| tok/s | confidence | fixed 2 | fixed 3 |
+| --- | ---: | ---: | ---: |
+| their decode prompt | **33.17** | 31.33 | 30.52 |
+| prose | **31.50** | 30.21 | 30.28 |
+| code | **50.12** | 41.38 | 46.33 |
+
+What a row costs, from the same runs' forward times: 52.5-55 ms a step at 2.5-2.8 rows, 55.5 at 3,
+60.5-64 at 4, 66-70 at 4.3-4.6, so ~5-6 ms (about a tenth of the step) for each row past the
+first few. At a fixed depth our drafts are accepted less often than the policy's selected ones
+suggest: depth 2 gave 1.82-1.96 tokens a step (~0.45 a draft), depth 3 1.94-2.09 (~0.34).
+
+A confidence bias (a constant added to each draft's acceptance probability, clamped to [0, 1],
+`--conf-bias`, since removed). A first sweep on the live demand history put +0.1 ahead of 0 by
+4-5% on all three workloads and -0.1 behind, but its bias-0 arm was 2-3% under the fixed-depth
+sweep's confidence arm, and each arm's requests changed the history the next one booted from.
+The replicate gave every arm the same frozen copy of the history and an empty prefix cache, in
+rotated order:
+
+| tok/s | r1: +0.1 | r2: 0 | r3: +0.2 |
+| --- | ---: | ---: | ---: |
+| their decode prompt | 33.18 | 33.64 | 33.07 |
+| prose | 30.84 | **31.65** | 30.02 |
+| code | 49.36 | 48.99 | 50.75 |
+
++0.1 and +0.2 are inside the boot-to-boot spread of no bias (prose a little lower, code a little
+higher); -0.1 was the one clear loss (code 42.67 against 49.28 in the first sweep). Not adopted,
+and the flag was removed rather than kept unused. Two arms planned for the replicate (a second
++0.1 and a second 0) were not run once the first three showed no gain.
+
+For the next A/B on the live profile: give each arm the same frozen history (`RUST_ADAPT_DB` and
+`RUST_PREFIX_DIR` pointed at per-arm copies on both nodes). Arms run on the live history feed one
+another, and the greedy texts of such arms differ from character ~100 for that reason alone.
