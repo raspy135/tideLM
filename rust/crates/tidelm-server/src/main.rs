@@ -189,11 +189,11 @@ fn main() -> tidelm_engine::Result<()> {
     }
     // an unknown flag is an error: a test flag the server ignores (--keep-first once) loaded
     // every expert and ran the box out of memory
-    const VALUED: [&str; 32] = ["--swa-replay", "--copy-draft", "--bench-width", "--vision", "--model-dir", "--max-seq", "--lanes", "--depth", "--step-rows", "--keep-db", "--budget",
+    const VALUED: [&str; 33] = ["--swa-replay", "--copy-draft", "--bench-width", "--vision", "--model-dir", "--max-seq", "--lanes", "--depth", "--step-rows", "--keep-db", "--budget",
                                 "--keep-first", "--layers", "--served-model-name", "--effort", "--host", "--port", "--world",
                                 "--rank", "--adapt-db", "--trace", "--adapt-sensitivity", "--adapt-prior", "--adapt-decode-tokens", "--adapt-probe", "--hot-ring", "--prefix-cache",
                                 "--prefix-snapshots", "--prefix-disk", "--prefix-disk-gb", "--prefix-disk-interval",
-                                "--prefix-disk-dedup"];
+                                "--prefix-disk-dedup", "--kv-tokens"];
     const FLAGS: [&str; 3] = ["--resident", "--graphs", "--thinking"];
     let mut i = 1;
     while i < args.len() {
@@ -289,6 +289,10 @@ fn main() -> tidelm_engine::Result<()> {
         // the decoder SWA bounded replay (DSV41_SWA_REPLAY=1): --swa-replay 0 runs every layer
         // over every prompt row
         swa_replay: arg(&args, "--swa-replay").as_deref() != Some("0"),
+        // the compressed caches' page pool, in tokens over all lanes (RUST_KV_TOKENS): unset,
+        // every lane at max_seq together; less overcommits, and a lane that runs out swaps
+        // another to the prefix cache's disk tier (decode.rs)
+        kv_tokens: arg(&args, "--kv-tokens").map(|v| v.parse()).transpose()?,
     };
     // rank 1 of an adapting pair needs rank 0's residents before it loads them: it joins first
     let pair = match &pair_args {
@@ -300,6 +304,12 @@ fn main() -> tidelm_engine::Result<()> {
         None => None,
     };
     eprintln!("boot: demand, residency, pair {:.1} s", t0.elapsed().as_secs_f64());
+    // an overcommitted page pool (--kv-tokens under lanes x max_seq): a lane short of pages swaps
+    // the newest request out to the disk tier, so the tier must be there to keep it
+    let kv_swap = opts.kv_tokens.is_some_and(|t| t < lanes * max_seq);
+    if kv_swap && arg(&args, "--prefix-disk").is_none() {
+        return Err("--kv-tokens under lanes x max_seq needs --prefix-disk: swapped-out requests are kept there".into());
+    }
     let mut engine = Engine::new(&model_dir, token_map, opts)?;
     eprintln!("boot: engine {:.1} s", t0.elapsed().as_secs_f64());
     if let Some(p) = pair {
@@ -337,6 +347,7 @@ fn main() -> tidelm_engine::Result<()> {
     }
     // a step no lane decodes in prefills up to the engine's prefill rows (TIDELM_PREFILL_ROWS)
     let mut sched = Scheduler::new(&engine, SchedOptions { depth, step_rows, prefill_rows: Some(engine.pmax), logits: false })?;
+    sched.set_kv_swap(kv_swap);
     // the RAM prefix cache (DSV41_PREFIX_CACHE=1, DSV41_PREFIX_SNAPSHOTS=16): --prefix-cache 0 off
     if arg(&args, "--prefix-cache").as_deref() != Some("0") {
         sched.set_prefix_cache(arg(&args, "--prefix-snapshots").map(|v| v.parse()).transpose()?.unwrap_or(16));

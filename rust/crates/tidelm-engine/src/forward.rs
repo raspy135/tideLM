@@ -371,12 +371,16 @@ pub struct Options {
     /// (layers 0..=candidate_source_layer) and the decoder half replays a prompt's last window
     /// rows once (engine/model.py::decoder_replay)
     pub swa_replay: bool,
+    /// compressed-cache tokens the lanes hold at once (crate::kv's page pool, RUST_KV_TOKENS);
+    /// None: max_lanes x max_seq, every lane at max_seq together. At least max_seq: one lane
+    /// always reaches it.
+    pub kv_tokens: Option<usize>,
 }
 
 impl Options {
     pub fn streaming(max_seq: usize, spec: bool) -> Self {
         Options { max_seq, max_lanes: 1, spec, resident: false, graphs: false, n_layers: None, keep: None, dspark_keep: None,
-                  tp: None, record_demand: false, hot_ring: 0, vision: false, swa_replay: false }
+                  tp: None, record_demand: false, hot_ring: 0, vision: false, swa_replay: false, kv_tokens: None }
     }
 
     /// The bytes both ranks of a pair must agree on before they start (tidelm_comm::join):
@@ -396,11 +400,11 @@ impl Options {
         // overlay emits different tokens with nothing in the log
         let ablit = crate::ablit::digest()?;
         Ok(format!("tidelm-pair v3 tp | max_seq {} lanes {} spec {} resident {} graphs {} layers {:?} | keep {:x} \
-                    dspark_keep {:x} record {} hot_ring {} vision {} replay {} | exe {:x} | config {:x} | draft vocab {listed:x} | ablit {ablit:?} | env NO_QDQ={:?} ENGRAM_CACHE_MB={:?} \
+                    dspark_keep {:x} record {} hot_ring {} vision {} replay {} kv {:?} | exe {:x} | config {:x} | draft vocab {listed:x} | ablit {ablit:?} | env NO_QDQ={:?} ENGRAM_CACHE_MB={:?} \
                     DRAFT_HEAD_FMT={:?} TP_DRAFT={:?} EXPERT_TOPP={:?}/{:?} PREFILL_ROWS={} NO_SPLITK={:?} \
                     HOT={:?}/{:?}/{:?} PACKED_KV={:?}",
                    self.max_seq, self.max_lanes, self.spec, self.resident, self.graphs, self.n_layers, keep_digest,
-                   mask(&self.dspark_keep), self.record_demand, self.hot_ring, self.vision, self.swa_replay, fnv(&exe), fnv(&cfg), std::env::var("TIDELM_NO_QDQ").ok(),
+                   mask(&self.dspark_keep), self.record_demand, self.hot_ring, self.vision, self.swa_replay, self.kv_tokens, fnv(&exe), fnv(&cfg), std::env::var("TIDELM_NO_QDQ").ok(),
                    std::env::var("TIDELM_ENGRAM_CACHE_MB").ok(), std::env::var("TIDELM_DRAFT_HEAD_FMT").ok(),
                    std::env::var("TIDELM_TP_DRAFT").ok(), std::env::var("TIDELM_EXPERT_TOPP").ok(),
                    std::env::var("TIDELM_EXPERT_TOPP_MIN_K").ok(), prefill_rows(), std::env::var("TIDELM_NO_SPLITK").ok(),
@@ -426,6 +430,7 @@ const OP_DISK_SAVE: u32 = 13;
 const OP_DISK_LOAD: u32 = 14;
 const OP_VISION: u32 = 15;
 const OP_REPLAY: u32 = 16;
+const OP_KV_RELEASE: u32 = 17;
 
 /// This engine's half of a tensor-parallel pair: the RoCE one-shot gather every sharded
 /// output goes through, the NCCL communicator, and the control channel. Rank 0 (the
@@ -919,11 +924,14 @@ struct Ratio2 {
 struct Caches {
     /// per layer `[lanes][RING][hd]`
     ring: Vec<DeviceBuffer<u16>>,
-    /// per kv source `[lanes][rows][hd]` / `[lanes][rows][index_hd]`
-    ckv: BTreeMap<usize, DeviceBuffer<u16>>,
-    ik: BTreeMap<usize, DeviceBuffer<u16>>,
-    /// per kv source: compressed rows per lane (max_seq / ratio + 1)
+    /// per kv source `[lanes][rows][hd]` / `[lanes][rows][index_hd]`: ranges of `kv`
+    ckv: BTreeMap<usize, crate::kv::KvBuf>,
+    ik: BTreeMap<usize, crate::kv::KvBuf>,
+    /// per kv source: compressed rows a lane's part (max_seq / ratio + 1, rounded up to whole
+    /// chunks of both caches)
     crows: BTreeMap<usize, usize>,
+    /// the pages behind ckv and ik (crate::kv)
+    kv: crate::kv::PagedKv,
     r2: BTreeMap<usize, Ratio2>,
     /// per DSpark block `[lanes][RING][hd]`
     mtp_ring: Vec<DeviceBuffer<u16>>,
@@ -1741,17 +1749,53 @@ impl Engine {
         if packed_kv && (no_qdq || cfg.head_dim != 512) {
             return Err("packed KV stores the FP4-QDQ'd rows of 512-dim latents: set TIDELM_PACKED_KV=0 with TIDELM_NO_QDQ=1".into());
         }
+        // the compressed caches (crate::kv): per kv source this engine runs, its packed rows and
+        // its index keys, a lane's part whole chunks of both
+        let sources: Vec<usize> = cfg.kv_source_layers.iter().copied().filter(|&l| l < n_layers).collect();
+        let (row_ckv, row_ik) = (if packed_kv { PACKED_ROW } else { hd * 2 }, cfg.index_head_dim * 2);
+        let gran = crate::kv::PagedKv::gran()?;
+        let mut specs = Vec::new();
+        for &l in &sources {
+            let r = cfg.compress_ratios[l];
+            let rows = crate::kv::PagedKv::padded_rows(gran, max_seq / r + 1, &[row_ckv, row_ik]);
+            specs.push((crate::kv::Spec { ratio: r, row_bytes: row_ckv }, rows));
+            specs.push((crate::kv::Spec { ratio: r, row_bytes: row_ik }, rows));
+        }
+        let one = |tokens: usize| -> usize { specs.iter().map(|&(s, rows)| crate::kv::PagedKv::chunks_for(gran, s, rows, tokens)).sum() };
+        let kv_tokens = opts.kv_tokens.unwrap_or(max_lanes * max_seq);
+        if kv_tokens < max_seq {
+            return Err(format!("kv tokens {kv_tokens} under max_seq {max_seq}: one lane must always reach it").into());
+        }
+        // the probe lane keeps its filler and excerpt rows for good
+        let probe_floor = ring + 1;
+        // kv_tokens' rows, one part-filled chunk a cache a lane, the probe lane's floor; never
+        // less than one lane at max_seq
+        let pool = specs.iter().map(|&(s, _)| (kv_tokens / s.ratio * s.row_bytes).div_ceil(gran)).sum::<usize>()
+            + max_lanes * specs.len();
+        let pool = pool.max(one(max_seq)) + one(probe_floor);
+        let mut kv = crate::kv::PagedKv::new(lanes, &specs, pool)?;
+        kv.set_floor(max_lanes, probe_floor)?;
+        if opts.kv_tokens.is_some() {
+            eprintln!("kv: {pool} chunks of {} MB ({:.2} GB) for {kv_tokens} tokens over {max_lanes} lanes of {max_seq}", gran >> 20,
+                      (pool * gran) as f64 / 1e9);
+        }
         let mut caches = Caches {
             ring: Vec::new(),
             ckv: BTreeMap::new(),
             ik: BTreeMap::new(),
             crows: BTreeMap::new(),
+            kv,
             r2: BTreeMap::new(),
             mtp_ring: Vec::new(),
             dkv: a(lanes * bsz * hd)?,
             n_dev: i(lanes)?,
             rb_lane: i(lanes)?,
         };
+        for (j, &l) in sources.iter().enumerate() {
+            caches.crows.insert(l, specs[2 * j].1);
+            caches.ckv.insert(l, caches.kv.buf(2 * j));
+            caches.ik.insert(l, caches.kv.buf(2 * j + 1));
+        }
         for _ in 0..n_layers {
             caches.ring.push(a(lanes * ring * hd)?);
         }
@@ -1762,13 +1806,8 @@ impl Engine {
         }
         // only the compressors this engine runs: a state for a layer past a truncation would
         // never see a chunk, and rollback would read its never-written chunk memory
-        for &l in cfg.kv_source_layers.iter().filter(|&&l| l < n_layers) {
+        for &l in &sources {
             let r = cfg.compress_ratios[l];
-            let rows = max_seq / r + 1;
-            caches.crows.insert(l, rows);
-            // packed: kPkRow bytes a row, held in the same u16 buffer type (ckv_ls counts u16s)
-            caches.ckv.insert(l, a(lanes * rows * if packed_kv { PACKED_ROW / 2 } else { hd })?);
-            caches.ik.insert(l, a(lanes * rows * cfg.index_head_dim)?);
             if r > 1 {
                 caches.r2.insert(l, Ratio2 {
                     pkv: f(lanes * hd)?,
@@ -2131,6 +2170,10 @@ impl Engine {
                     let n = r.u32()? as usize;
                     let ids: Vec<u64> = (0..n).map(|_| r.u64()).collect::<std::result::Result<_, _>>()?;
                     self.prefix_drop(lane, &ids)?;
+                }
+                OP_KV_RELEASE => {
+                    let lane = r.u32()? as usize;
+                    self.kv_release(lane)?;
                 }
                 OP_VISION => {
                     let lane = r.u32()? as usize;
@@ -2655,6 +2698,8 @@ impl Engine {
         if lane >= self.max_lanes {
             return Err(format!("bundle {id}: lane {lane} of {}", self.max_lanes).into());
         }
+        // the pages its rows land in (a pool too full is a miss, on both ranks alike)
+        self.caches.kv.ensure(lane, n)?;
         let mut s = self.snap_take()?;
         match self.disk_stream_in(lane, id, n, &mut s) {
             Ok(tokens) => {
@@ -2789,6 +2834,43 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Give lane `lane`'s cache pages back to the pool (crate::kv): its snapshots go and it is
+    /// reset, as nothing it held is left. Rank 0 mirrors it. Returns the chunks freed.
+    pub fn kv_release(&mut self, lane: usize) -> Result<usize> {
+        if lane > self.max_lanes {
+            return Err(format!("lane {lane} of {}", self.max_lanes).into());
+        }
+        self.mirror(|m| {
+            m.u32(OP_KV_RELEASE).u32(lane as u32);
+        })?;
+        let ids: Vec<u64> = self.snaps.keys().filter(|k| k.0 == lane).map(|k| k.1).collect();
+        for id in ids {
+            if let Some(s) = self.snaps.remove(&(lane, id)) {
+                self.snap_free.push(s);
+            }
+        }
+        let freed = self.caches.kv.release(lane)?;
+        // the lane holds nothing now; rank 1 resets from the reset_lane this mirrors
+        if self.leader || self.pair.is_none() {
+            self.reset_lane(lane)?;
+        }
+        Ok(freed)
+    }
+
+    /// Cache pages lane `lane` still needs for positions below `end`, the pool's free ones, and
+    /// the ones the lane holds (crate::kv).
+    pub fn kv_need(&self, lane: usize, end: usize) -> usize {
+        self.caches.kv.need(lane, end)
+    }
+
+    pub fn kv_free(&self) -> usize {
+        self.caches.kv.free_chunks()
+    }
+
+    pub fn kv_held(&self, lane: usize) -> usize {
+        self.caches.kv.held(lane)
     }
 
     /// The backbone's resident experts, [layer][expert] (resident mode).
@@ -3333,6 +3415,12 @@ impl Engine {
                 return Err(format!("lane {}: context {end} exceeds max_seq {}", sg.lane, self.max_seq).into());
             }
             rows += sg.ids.len();
+        }
+        // the pages the step writes into (the scheduler made room: Engine::kv_need); both
+        // ranks map the same, as they run the same steps
+        for sg in segs {
+            let end = self.lanes[sg.lane].len + sg.ids.len();
+            self.caches.kv.ensure(sg.lane, end)?;
         }
         // past TMAX only prompt rows: a step that large runs eager, and its head rows (the
         // segments' wanted rows) still fit the decode step's head
@@ -4265,7 +4353,7 @@ impl Engine {
                         Selection::AllVisible => (&a.cidx2, c2),
                     };
                     let row = if self.packed_kv { PACKED_ROW / 2 } else { hd };
-                    (ring, &a.pos, np(&self.caches.ckv[&src]), np(cidx), c, self.caches.crows[&src] * row)
+                    (ring, &a.pos, self.caches.ckv[&src].raw(), np(cidx), c, self.caches.crows[&src] * row)
                 } else {
                     (ring, &a.pos, nul(), nul(), 0, 0)
                 }
@@ -4376,7 +4464,7 @@ impl Engine {
         let rc = (index_scores_budget() / n_c.max(1)).min(t).max(8.min(t));
         for r0 in (0..t).step_by(rc) {
             let m = rc.min(t - r0) as i32;
-            let (q, keys, iw) = (a.iq.ptr_at(r0 * ih * ihd), np(&self.caches.ik[&src]), a.iwf.ptr_at(r0 * ih));
+            let (q, keys, iw) = (a.iq.ptr_at(r0 * ih * ihd), self.caches.ik[&src].raw(), a.iwf.ptr_at(r0 * ih));
             let kstride = (self.caches.crows[&src] * ihd) as i64;
             if use_list {
                 let (cap, list) = (kb * block, a.blocks.ptr_at(r0 * kb));
@@ -4457,7 +4545,7 @@ impl Engine {
             ck(unsafe { ds_rmsnorm(sr, np(&a.kidx), ihd as i64, np(&key.k_norm), np(&a.kidxn), ihd as i64, ti, ihd as i32, cfg.norm_eps) }, "index k_norm")?;
             ck(unsafe { ds_rope(sr, np(&a.kidxn), ihd as i64, ti, 1, ihd as i64, (ihd - rd) as i32, rd as i32, np(cpos), np(&self.rope_c), 0) }, "index k rope")?;
             ck(unsafe {
-                ds_scatter_compressed(sr, np(&a.kidxn), ihd as i64, np(&self.caches.ik[&l]), np(&a.pos), r as i32, ti, ihd as i32,
+                ds_scatter_compressed(sr, np(&a.kidxn), ihd as i64, self.caches.ik[&l].raw(), np(&a.pos), r as i32, ti, ihd as i32,
                                       np(&a.lane), (rows * ihd) as i64)
             }, "index k scatter")?;
         }
@@ -4470,11 +4558,11 @@ impl Engine {
         // group's amax flips its E4M3 scale (12.5% steps) and requantizes all 16 values — 50
         // router flips instead of 8. Two correct implementations cannot be token-identical
         // through this cache; judge parity with QDQ off, and quality by NLL.
-        let ckv = &self.caches.ckv[&l];
+        let ckv = self.caches.ckv[&l];
         if self.packed_kv {
             // the same QDQ, stored as its codes and scales (engine/packed_kv.py's write)
             ck(unsafe {
-                ds_scatter_compressed_fp4(sr, np(&a.latn), hd as i64, np(ckv), np(&a.pos), r as i32, ti, hd as i32, np(&a.lane),
+                ds_scatter_compressed_fp4(sr, np(&a.latn), hd as i64, ckv.raw(), np(&a.pos), r as i32, ti, hd as i32, np(&a.lane),
                                           (rows * PACKED_ROW) as i64)
             }, "ckv scatter (packed)")?;
         } else {
@@ -4482,7 +4570,7 @@ impl Engine {
                 ck(unsafe { ds_fp4_qdq_e4m3(sr, np(&a.latn), (t * hd) as i64) }, "comp qdq")?;
             }
             ck(unsafe {
-                ds_scatter_compressed(sr, np(&a.latn), hd as i64, np(ckv), np(&a.pos), r as i32, ti, hd as i32, np(&a.lane),
+                ds_scatter_compressed(sr, np(&a.latn), hd as i64, ckv.raw(), np(&a.pos), r as i32, ti, hd as i32, np(&a.lane),
                                       (rows * hd) as i64)
             }, "ckv scatter")?;
         }
@@ -4492,7 +4580,7 @@ impl Engine {
             let mut v = vec![0u16; n * hd];
             if self.packed_kv {
                 let tmp = DeviceBuffer::<u16>::new(n.max(1) * hd)?;
-                ck(unsafe { ds_unpack_fp4_rows(sr, np(ckv), np(&tmp), n as i32) }, "ckv unpack")?;
+                ck(unsafe { ds_unpack_fp4_rows(sr, ckv.raw(), np(&tmp), n as i32) }, "ckv unpack")?;
                 tmp.download_async(0, &mut v, st)?;
             } else {
                 ckv.download_async(0, &mut v, st)?;

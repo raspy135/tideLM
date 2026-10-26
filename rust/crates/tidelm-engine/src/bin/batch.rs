@@ -83,6 +83,7 @@ fn main() -> tidelm_engine::Result<()> {
     let opts = Options {
         vision: false,
         swa_replay: false,
+        kv_tokens: None,
         max_seq: num("--max-seq", 1024),
         max_lanes: lanes,
         spec,

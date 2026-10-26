@@ -29,6 +29,10 @@
 #   RUST_PREFIX_DIR=~/tidelm-rust-state/prefix-cache     the prefix cache's disk tier
 #   RUST_EXPERT_TOPP         unset: off (DSV41_EXPERT_TOPP=0.90 measured slower in Rust, rust/PORT.md)
 #   RUST_COPY_DRAFT=1        the copy drafter (CPU prompt lookup in front of DSpark; 0 off)
+#   RUST_KV_TOKENS           unset: every lane can reach MAX_SEQ at once. Set: the compressed
+#                            caches' page pool, in tokens over all lanes (at least MAX_SEQ: one lane
+#                            always reaches it); under RUST_LANES x MAX_SEQ a lane short of pages
+#                            swaps the newest request out to the prefix disk tier (DSV41_PREFIX_DISK)
 #
 # Both models: the image is IMAGE (or GLM_IMAGE), else tidelm:local, as dual-build.sh names it.
 # Its tidelm.rust_sha label must match this checkout's Rust sources (scripts/code_digest.sh
@@ -159,6 +163,7 @@ args=(--resident --graphs --model-dir "$MODEL_DIR" --served-model-name "${SERVED
       --adapt-probe "${DSV41_PROBE_PREFILL:-1}"
       --prefix-cache "${DSV41_PREFIX_CACHE:-1}" --prefix-snapshots "${DSV41_PREFIX_SNAPSHOTS:-16}"
       --copy-draft "${RUST_COPY_DRAFT:-1}" --swa-replay "${DSV41_SWA_REPLAY:-1}")
+[[ -n "${RUST_KV_TOKENS:-}" ]] && args+=(--kv-tokens "$RUST_KV_TOKENS")
 if [[ "${SPEC:-1}" == 0 ]]; then args+=(--depth plain); else args+=(--depth "${RUST_DEPTH:-confidence}"); fi
 if [[ "${DSV41_HOT_READS:-1}" == 1 && "${DSV41_HOT_ASYNC:-1}" == 1 ]]; then
     args+=(--hot-ring "${DSV41_HOT_RING:-128}")

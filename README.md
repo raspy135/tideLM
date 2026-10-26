@@ -52,8 +52,10 @@ experts. TideLM decides which share, keeps deciding, and cheaply covers the rest
 
 Around that core: speculative decoding with each model's own drafter (DeepSeek's DSpark heads,
 GLM's MTP layer, both with a dynamic draft depth), prompt caching in RAM and on disk, FP8 KV caches
-split across the ranks (GLM), image input (DeepSeek), tool calls, thinking and reasoning-effort
-control through an OpenAI-compatible API.
+split across the ranks (GLM), DeepSeek's context caches paged out of one pool the lanes share (one
+lane can run to 1M while another holds less; when the pool runs short the newest request waits on
+disk and resumes exactly, [details](docs/paged-kv.md)), image input (DeepSeek), tool calls,
+thinking and reasoning-effort control through an OpenAI-compatible API.
 
 ## Quick start
 

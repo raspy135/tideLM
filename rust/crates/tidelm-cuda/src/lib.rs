@@ -8,6 +8,7 @@
 //! decides what is fatal.
 
 pub mod ffi;
+pub mod vmm;
 
 use std::ffi::CStr;
 use std::marker::PhantomData;

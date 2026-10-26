@@ -15,6 +15,7 @@ pub mod decode;
 pub mod draft_vocab;
 pub mod forward;
 pub mod hot;
+pub mod kv;
 pub mod keep;
 pub mod pair;
 pub mod prefix_disk;

@@ -423,6 +423,9 @@ pub struct BatchStats {
     /// the copy drafter: steps it drafted, and the copied tokens they accepted
     pub copy_steps: usize,
     pub copy_accepted: usize,
+    /// cache pages ran short (crate::kv): requests swapped out to the disk tier, and back
+    pub kv_swaps: usize,
+    pub kv_resumes: usize,
 }
 
 /// How the scheduler picks each decoding lane's verify depth.
@@ -510,6 +513,24 @@ struct Slot {
     /// its last row runs every layer against the restored decoder windows, which are the replay
     /// it would redo (Engine::swa_replay)
     shortcut: bool,
+    /// admission order (kv_room swaps out the newest first)
+    seq: u64,
+    /// back from the disk tier with its last token pending: its next step verifies that token
+    /// alone, which seeds the drafter (a restore brings no drafter state)
+    resumed: bool,
+}
+
+/// Tokens every running request must still be able to grow before another is admitted or
+/// resumed beside it with an overcommitted cache pool (Scheduler::kv_headroom).
+const KV_HEADROOM: usize = 4096;
+
+/// A request swapped out to the prefix cache's disk tier when the cache pages ran short
+/// (Scheduler::kv_room): its slot as it stood, the bundle that holds its rows, and the tokens the
+/// bundle holds (as many as its lane held).
+struct Parked {
+    slot: Slot,
+    bundle: String,
+    tokens: Vec<u32>,
 }
 
 /// A request's probe: the prompt rows it feeds and the lane they go to - the request's own
@@ -581,6 +602,13 @@ pub struct Scheduler {
     next_snap: u64,
     /// the copy drafter's rule (None: DSpark drafts every step)
     copy: Option<crate::copy::CopyConfig>,
+    /// requests swapped out for cache pages, oldest first (kv_room); they come back before
+    /// any queued request starts
+    parked: std::collections::VecDeque<Parked>,
+    /// whether a lane short of cache pages may swap another out (set_kv_swap: the engine's pool
+    /// is overcommitted and the disk tier holds what is swapped)
+    kv_swap: bool,
+    admitted: u64,
 }
 
 impl Scheduler {
@@ -627,6 +655,9 @@ impl Scheduler {
             prefix: (0..lanes).map(|_| LanePrefix::default()).collect(),
             next_snap: 1,
             copy: None,
+            parked: Default::default(),
+            kv_swap: false,
+            admitted: 0,
         })
     }
 
@@ -643,6 +674,12 @@ impl Scheduler {
     /// that it shares, at least its last token short of its own end.
     pub fn set_prefix_cache(&mut self, snapshots: usize) {
         self.prefix_snaps = Some(snapshots);
+    }
+
+    /// Let a lane short of cache pages swap the newest request out to the disk tier (the engine's
+    /// pool holds fewer tokens than every lane at max_seq; Engine::kv_need).
+    pub fn set_kv_swap(&mut self, on: bool) {
+        self.kv_swap = on;
     }
 
     fn new_snap(&mut self) -> u64 {
@@ -883,7 +920,7 @@ impl Scheduler {
     }
 
     pub fn idle(&self) -> bool {
-        self.queue.is_empty() && self.slots.iter().all(|s| s.is_none())
+        self.queue.is_empty() && self.parked.is_empty() && self.slots.iter().all(|s| s.is_none())
     }
 
     pub fn active(&self) -> usize {
@@ -914,6 +951,130 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Cache pages `lane` could have at once (crate::kv): the pool's free ones and every other
+    /// idle lane's, which kv_room hands back first.
+    fn kv_avail(&self, engine: &Engine, lane: usize) -> usize {
+        let idle: usize = (0..self.slots.len()).filter(|&l| l != lane && self.slots[l].is_none()).map(|l| engine.kv_held(l)).sum();
+        engine.kv_free() + idle
+    }
+
+    /// Pages the running requests need to grow KV_HEADROOM tokens each: what a request admitted or
+    /// resumed beside them must leave, or the newest is swapped out again within a few steps.
+    fn kv_headroom(&self, engine: &Engine) -> usize {
+        (0..self.slots.len()).filter(|&l| self.slots[l].is_some()).map(|l| engine.kv_need(l, engine.lane_len(l) + KV_HEADROOM)).sum()
+    }
+
+    /// An idle lane's cache pages back to the pool; its RAM prefix goes with them.
+    fn kv_reclaim(&mut self, engine: &mut Engine, lane: usize) -> Result<usize> {
+        let lp = std::mem::take(&mut self.prefix[lane]);
+        let ids: Vec<u64> = lp.bounds.values().copied().chain(lp.full.map(|(_, id)| id)).collect();
+        engine.prefix_drop(lane, &ids)?;
+        engine.kv_release(lane)
+    }
+
+    /// Room for `need` cache pages for a step over lanes `step`: idle lanes' cached prefixes
+    /// first, the largest first, then (kv_swap) the newest request goes to the disk tier, vLLM's
+    /// preemption order but kept rather than recomputed. True: a request left the step, which
+    /// is planned again.
+    fn kv_room(&mut self, engine: &mut Engine, need: usize, step: &[usize]) -> Result<bool> {
+        let mut idle: Vec<usize> =
+            (0..self.slots.len()).filter(|&l| self.slots[l].is_none() && !step.contains(&l) && engine.kv_held(l) > 0).collect();
+        idle.sort_by_key(|&l| std::cmp::Reverse(engine.kv_held(l)));
+        for l in idle {
+            if engine.kv_free() >= need {
+                break;
+            }
+            let n = self.kv_reclaim(engine, l)?;
+            eprintln!("kv: lane {l}'s cached prefix gave back {n} chunks");
+        }
+        if engine.kv_free() >= need {
+            return Ok(false);
+        }
+        if !self.kv_swap {
+            return Err(format!("kv pool: a step needs {need} chunks, {} free, and nothing may be swapped out", engine.kv_free()).into());
+        }
+        // a probing lane is mid-way through a pass it would have to redo; the pool holds one
+        // lane at max_seq, so some other request always qualifies
+        let victim = (0..self.slots.len())
+            .filter(|&l| matches!(&self.slots[l], Some(s) if s.probe.is_none()) && engine.lane_len(l) > 0)
+            .max_by_key(|&l| self.slots[l].as_ref().unwrap().seq);
+        let Some(v) = victim else {
+            return Err(format!("kv pool: a step needs {need} chunks, {} free, and no request can be swapped out", engine.kv_free()).into());
+        };
+        self.park(engine, v)?;
+        Ok(true)
+    }
+
+    /// Swap `lane`'s request out to the disk tier (kv_room): its rows and state at its length as
+    /// a bundle, its pages back to the pool, the request parked until its rows fit again.
+    fn park(&mut self, engine: &mut Engine, lane: usize) -> Result<()> {
+        let n = engine.lane_len(lane);
+        let s = self.slots[lane].as_ref().unwrap();
+        // what the lane holds: the prompt's key as far as it is fed, then every emitted token but
+        // the pending last one
+        let key = s.job.key.as_deref().unwrap_or(&s.job.prompt);
+        let mut tokens: Vec<u32> = key[..s.fed.min(key.len())].to_vec();
+        if s.tok.is_some() {
+            tokens.extend_from_slice(&s.gen.tokens[..s.gen.tokens.len().saturating_sub(1)]);
+        }
+        if tokens.len() != n {
+            return Err(format!("kv: request {} holds {n} tokens in its lane, {} by its history", s.job.id, tokens.len()).into());
+        }
+        let id = self.new_snap();
+        engine.prefix_snapshot(lane, n, id)?;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+        let bundle = format!("swap{now:016x}{:08x}", id as u32);
+        engine.prefix_disk_save(lane, &bundle, &tokens, &[id])?;
+        if let Some(adapt) = self.adapt.as_mut() {
+            let d = engine.lane_demand(lane, true)?;
+            adapt.fold(&d);
+            let s = self.slots[lane].as_mut().unwrap();
+            for (a, b) in s.gen.miss.iter_mut().zip(&d.miss) {
+                *a += b;
+            }
+        }
+        let lp = std::mem::take(&mut self.prefix[lane]);
+        let ids: Vec<u64> = lp.bounds.values().copied().chain(lp.full.map(|(_, i)| i)).chain([id]).collect();
+        engine.prefix_drop(lane, &ids)?;
+        let freed = engine.kv_release(lane)?;
+        let slot = self.slots[lane].take().unwrap();
+        eprintln!("kv: request {} swapped out at {n} tokens to bundle {bundle} ({freed} chunks back)", slot.job.id);
+        self.stats.kv_swaps += 1;
+        self.parked.push_back(Parked { slot, bundle, tokens });
+        Ok(())
+    }
+
+    /// A parked request back into `lane` from its bundle, exactly as it was swapped out; if the
+    /// bundle cannot be restored it ends with an error.
+    fn resume(&mut self, engine: &mut Engine, lane: usize, p: Parked) -> Result<()> {
+        let Parked { mut slot, bundle, tokens } = p;
+        let n = tokens.len();
+        engine.reset_lane(lane)?;
+        let lp = std::mem::take(&mut self.prefix[lane]);
+        let old: Vec<u64> = lp.bounds.values().copied().chain(lp.full.map(|(_, i)| i)).collect();
+        engine.prefix_drop(lane, &old)?;
+        let snap = self.new_snap();
+        if !engine.prefix_disk_load(lane, &bundle, n, snap, &tokens)? {
+            eprintln!("kv: request {} could not come back from bundle {bundle}", slot.job.id);
+            let gen = std::mem::take(&mut slot.gen);
+            (slot.job.sink)(Event::Done(Finish::Error(format!("swapped out at {n} tokens; the disk tier could not restore it")), gen));
+            return Ok(());
+        }
+        self.prefix[lane] = LanePrefix { tokens, bounds: [(n, snap)].into(), full: None };
+        // the images its prefill still reaches (none once it decodes)
+        engine.set_images(lane, &slot.job.images, n)?;
+        match &mut self.policies[lane] {
+            LanePolicy::Window(p) => p.reset_request(),
+            LanePolicy::Confidence(p) => p.reset_request(),
+            LanePolicy::None => {}
+        }
+        (slot.resumed, slot.shortcut) = (slot.tok.is_some(), false);
+        eprintln!("kv: request {} back at {n} tokens from bundle {bundle}", slot.job.id);
+        self.stats.kv_resumes += 1;
+        self.slots[lane] = Some(slot);
+        Ok(())
+    }
+
     /// One backbone step (admitting, drafting, verifying, emitting), or nothing when idle.
     pub fn step(&mut self, engine: &mut Engine) -> Result<()> {
         // cancellations: queued jobs end unrun, running ones at this boundary
@@ -928,6 +1089,16 @@ impl Scheduler {
                 }
             }
             self.queue = keep;
+            let mut kept = std::collections::VecDeque::new();
+            while let Some(mut p) = self.parked.pop_front() {
+                if cancelled.contains(&p.slot.job.id) {
+                    let gen = std::mem::take(&mut p.slot.gen);
+                    (p.slot.job.sink)(Event::Done(Finish::Cancelled, gen));
+                } else {
+                    kept.push_back(p);
+                }
+            }
+            self.parked = kept;
             for lane in 0..self.slots.len() {
                 if matches!(&self.slots[lane], Some(s) if cancelled.contains(&s.job.id)) {
                     self.finish(engine, lane, Finish::Cancelled)?;
@@ -935,7 +1106,30 @@ impl Scheduler {
             }
         }
         let lanes = self.slots.len();
+        let blk = engine.cfg.dspark_block_size;
         for lane in 0..lanes {
+            if self.slots[lane].is_some() {
+                continue;
+            }
+            // a swapped-out request comes back first, once its rows fit (kv_room)
+            if let Some(p) = self.parked.front() {
+                let need = engine.kv_need(lane, p.tokens.len() + blk + 2);
+                if need + self.kv_headroom(engine) > self.kv_avail(engine, lane) {
+                    break;
+                }
+                let p = self.parked.pop_front().unwrap();
+                self.kv_room(engine, need, &[lane])?;
+                self.resume(engine, lane, p)?;
+                continue;
+            }
+            // with an overcommitted pool a queued request waits until its prompt's rows fit
+            if self.kv_swap
+                && self.queue.front().is_some_and(|j| {
+                    engine.kv_need(lane, j.prompt.len() + 1) + self.kv_headroom(engine) > self.kv_avail(engine, lane)
+                })
+            {
+                break;
+            }
             if self.slots[lane].is_none() {
                 if let Some(mut job) = self.queue.pop_front() {
                     engine.reset_lane(lane)?;
@@ -982,8 +1176,11 @@ impl Scheduler {
                     let skip = (!job.images.is_empty()).then_some(engine.cfg.image_token_id);
                     let copy = self.copy.clone().filter(|_| job.copy_draft).map(|c| crate::copy::CopyDraft::new(&job.prompt, c, skip));
                     let shortcut = engine.swa_replay() && from_full && restored + 1 == job.prompt.len();
+                    let seq = self.admitted;
+                    self.admitted += 1;
                     self.slots[lane] = Some(Slot {
                         job, fed: restored, tok: None, gen, rng, q: Vec::new(), mark: (1, 0.0, 0.0), probe, restored, copy, shortcut,
+                        seq, resumed: false,
                     });
                 }
             }
@@ -1026,7 +1223,12 @@ impl Scheduler {
                 (_, LanePolicy::Window(w)) => w.decide(),
                 _ => b,
             };
-            let copy = self.slots[lane].as_ref().unwrap().copy.as_ref().map(|c| c.propose()).filter(|p| !p.is_empty() && room > p.len());
+            // a resumed lane verifies its pending token alone (an empty "copy": no DSpark draft)
+            let copy = if self.slots[lane].as_ref().unwrap().resumed {
+                Some(Vec::new())
+            } else {
+                self.slots[lane].as_ref().unwrap().copy.as_ref().map(|c| c.propose()).filter(|p| !p.is_empty() && room > p.len())
+            };
             let d = copy.as_ref().map_or(d, |p| p.len());
             if room > d && decode.len() < max_decode {
                 decode.push((lane, d));
@@ -1064,6 +1266,21 @@ impl Scheduler {
             prefill.retain(|e| whole(self, e));
         }
         let encoder = replay && !prefill.is_empty() && decode.is_empty() && !prefill.iter().any(|e| whole(self, e));
+        // the cache pages this step writes into (crate::kv): when the pool cannot cover them,
+        // idle lanes' cached prefixes go first, then the newest request to the disk tier, and the
+        // step is planned again without it
+        let mut ends: Vec<(usize, usize)> = decode.iter().map(|&(l, d)| (l, engine.lane_len(l) + 1 + d)).collect();
+        for &(lane, c, probing) in &prefill {
+            let l = if probing { self.slots[lane].as_ref().unwrap().probe.as_ref().unwrap().lane } else { lane };
+            ends.push((l, engine.lane_len(l) + c));
+        }
+        let need: usize = ends.iter().map(|&(l, e)| engine.kv_need(l, e)).sum();
+        if need > engine.kv_free() {
+            let step: Vec<usize> = ends.iter().map(|e| e.0).collect();
+            if self.kv_room(engine, need, &step)? {
+                return Ok(());
+            }
+        }
         // the prefix cache's boundary snapshots: a prompt chunk past position 0 starts where
         // its lane stands now
         for &(lane, _, probing) in &prefill {
@@ -1227,7 +1444,11 @@ impl Scheduler {
                 seeds.push((lane, a + 1));
                 s.gen.accepted.push(a);
                 s.gen.depths.push(d);
-                if copies[i].is_some() {
+                if s.resumed {
+                    // the resumed lane's lone verify: no draft for the policies or the copy drafter
+                    s.resumed = false;
+                    emits.push((lane, emitted, None, false));
+                } else if copies[i].is_some() {
                     // the depth policies model DSpark's drafts: a copy step is not theirs to see
                     s.copy.as_mut().unwrap().observe(a);
                     (s.gen.copy_steps, s.gen.copy_accepted) = (s.gen.copy_steps + 1, s.gen.copy_accepted + a);
