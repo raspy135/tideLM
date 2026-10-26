@@ -377,7 +377,33 @@ __device__ __forceinline__ float ordered_chain(const float *part, const float *s
     return acc;
 }
 
-template <bool PACKED = false>
+// STREAM loads the weights with __ldcs (evict-first: they are read once a step, so they leave L2 to
+// the activations every warp re-reads per routed pair), and ROWS_FIRST swaps the grid to (rows,
+// blocks) so consecutive blocks walk one expert's rows instead of every expert's first rows at once.
+// Neither changes what a block computes. rust/crates/tidelm-kernels/examples/bench_moe_bw.rs, the
+// serving pair's per-rank shapes (up 1,152 x 5,120, down 2,560 x 2,304), a cold 3 GB arena, routing
+// spread uniformly, three runs (2026-10-25), GB/s of the touched experts' bytes, up + down:
+//   rows / experts   plain v2    STREAM    ROWS_FIRST   both
+//   4 / 23           225-229     245-250   200-205      257-258
+//   6 / 35           228-231     251       200-203      256-260
+//   10 / 53          228-231     246-247   192-193      247-248
+//   16 / 88          227-230     233-238   190-192      235-238
+// In the engine the screen did not carry over. bench/bench.py on the pair (prose / code, seed 42,
+// --ignore-eos, a fresh seed history per arm, TIDELM_STEP_SPLIT forward ms a step at the rows shown):
+//   plain v2     prose 53.7-55.0 at 2.5-2.6 rows   code 67.1-70.4 at 4.2-4.4 rows
+//   STREAM       prose 53.2-54.4 at 2.5-2.6        code 65.9-66.9 at 4.2-4.4    (~2 ms, ~3%)
+//   both         prose 53.8-56.2 at 2.4-2.6        code 65.7-66.7 at 3.7-3.9    (slower at equal rows;
+//                the depth policy, which reads step times, then drafted shallower: 3.2 tokens a
+//                step on code against 3.5)
+// So the serving fp4_moe_cuda_{up,down}_v2 take STREAM alone, over the (blocks, rows) grid; ROWS_FIRST
+// stays a benchmark switch. The scale pack entries (PACKED, the Python engine's) keep plain loads.
+template <bool STREAM>
+__device__ __forceinline__ uint4 load_w(const uint8_t *row, int g) {
+    if constexpr (STREAM) return __ldcs(reinterpret_cast<const uint4 *>(row) + g);
+    else return reinterpret_cast<const uint4 *>(row)[g];
+}
+
+template <bool PACKED = false, bool STREAM = false, bool ROWS_FIRST = false>
 __global__ void moe_up_bm16_v2(
     const __nv_bfloat16 *__restrict__ x,
     const uint8_t *__restrict__ w1, const uint8_t *__restrict__ s1,
@@ -392,9 +418,10 @@ __global__ void moe_up_bm16_v2(
     __shared__ float chain_s[kWarps][8];
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
-    const int slot_i = block_slot[blockIdx.x];
+    const int bx = ROWS_FIRST ? blockIdx.y : blockIdx.x, by = ROWS_FIRST ? blockIdx.x : blockIdx.y;
+    const int slot_i = block_slot[bx];
     if (slot_i < 0 || slot_i == null_slot) return;
-    const int out_n = (static_cast<int>(blockIdx.y) << kWarpsShift) + warp;
+    const int out_n = (by << kWarpsShift) + warp;
     if (out_n >= n) return;
     const int groups = k >> 5;
     const int64_t row = static_cast<int64_t>(slot_i) * n + out_n;
@@ -406,14 +433,14 @@ __global__ void moe_up_bm16_v2(
     for (int r = 0; r < kPerLane; ++r) {
         const int g = lane + 32 * r;
         if (g < groups) {
-            p1[r] = reinterpret_cast<const uint4 *>(w1_row)[g];
-            p3[r] = reinterpret_cast<const uint4 *>(w3_row)[g];
+            p1[r] = load_w<STREAM>(w1_row, g);
+            p3[r] = load_w<STREAM>(w3_row, g);
             scale_s[warp][0][g] = ue8m0(scale_byte<PACKED>(s1, slot_i, out_n * groups + g, n * groups, scale_stride));
             scale_s[warp][1][g] = ue8m0(scale_byte<PACKED>(s3, slot_i, out_n * groups + g, n * groups, scale_stride));
         }
     }
     for (int m = 0; m < kBlockM; ++m) {
-        const int route = block_pair[(static_cast<int64_t>(blockIdx.x) << 4) + m];
+        const int route = block_pair[(static_cast<int64_t>(bx) << 4) + m];
         if (route < 0) break;
         const int pair = route & 0xffff;
         const __nv_bfloat16 *x_row = x + static_cast<int64_t>(route >> 16) * stride_x;
@@ -447,7 +474,7 @@ __global__ void moe_up_bm16_v2(
     }
 }
 
-template <bool PACKED = false>
+template <bool PACKED = false, bool STREAM = false, bool ROWS_FIRST = false>
 __global__ void moe_down_bm16_v2(
     const __nv_bfloat16 *__restrict__ h,
     const uint8_t *__restrict__ w2, const uint8_t *__restrict__ s2,
@@ -460,9 +487,10 @@ __global__ void moe_down_bm16_v2(
     __shared__ float chain_s[kWarps][4];
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
-    const int slot_i = block_slot[blockIdx.x];
+    const int bx = ROWS_FIRST ? blockIdx.y : blockIdx.x, by = ROWS_FIRST ? blockIdx.x : blockIdx.y;
+    const int slot_i = block_slot[bx];
     if (slot_i < 0) return;
-    const int out_n = (static_cast<int>(blockIdx.y) << kWarpsShift) + warp;
+    const int out_n = (by << kWarpsShift) + warp;
     if (out_n >= n) return;
     const int groups = k >> 5;
     const int64_t row = static_cast<int64_t>(slot_i) * n + out_n;
@@ -474,13 +502,13 @@ __global__ void moe_down_bm16_v2(
         for (int r = 0; r < kPerLane; ++r) {
             const int g = lane + 32 * r;
             if (g < groups) {
-                pw[r] = reinterpret_cast<const uint4 *>(w2_row)[g];
+                pw[r] = load_w<STREAM>(w2_row, g);
                 scale_s[warp][g] = ue8m0(scale_byte<PACKED>(s2, slot_i, out_n * groups + g, n * groups, scale_stride));
             }
         }
     }
     for (int m = 0; m < kBlockM; ++m) {
-        const int pair = block_pair[(static_cast<int64_t>(blockIdx.x) << 4) + m];
+        const int pair = block_pair[(static_cast<int64_t>(bx) << 4) + m];
         if (pair < 0) break;
         float acc = 0.0f;
         if (real) {
@@ -1019,11 +1047,13 @@ extern "C" int fp4_moe_cuda_up_v2(
     int64_t stride_x, int64_t stride_h, float limit, int topk, int n, int k, int nb,
     int null_slot) {
     if (k > (kV2MaxGroups << 5) || (k & 31)) return static_cast<int>(cudaErrorInvalidValue);
-    dim3 grid(nb, (n + kWarps - 1) >> kWarpsShift);
 #if FP4_V2_PAIR_BATCH == 2
+    dim3 grid(nb, (n + kWarps - 1) >> kWarpsShift);
     moe_up_bm16_v2_pairbatch<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
 #else
-    moe_up_bm16_v2<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+    // __ldcs weights (load_w): v2's bits, ~2 ms a 4-row decode step on the pair
+    dim3 grid(nb, (n + kWarps - 1) >> kWarpsShift);
+    moe_up_bm16_v2<false, true, false><<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
 #endif
         static_cast<const __nv_bfloat16 *>(x), static_cast<const uint8_t *>(w1),
         static_cast<const uint8_t *>(s1), static_cast<const uint8_t *>(w3),
@@ -1039,16 +1069,67 @@ extern "C" int fp4_moe_cuda_down_v2(
     const void *block_slot, const void *block_pair, int64_t stride_h, int64_t stride_y,
     int topk, int n, int k, int ntok, int nb, int null_slot, int partial, int parts_world) {
     if (k > (kV2MaxGroups << 5) || (k & 31)) return static_cast<int>(cudaErrorInvalidValue);
-    dim3 grid(nb, (n + kWarps - 1) >> kWarpsShift);
 #if FP4_V2_PAIR_BATCH == 2
+    dim3 grid(nb, (n + kWarps - 1) >> kWarpsShift);
     moe_down_bm16_v2_pairbatch<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
 #else
-    moe_down_bm16_v2<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+    dim3 grid(nb, (n + kWarps - 1) >> kWarpsShift);
+    moe_down_bm16_v2<false, true, false><<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
 #endif
         static_cast<const __nv_bfloat16 *>(h), static_cast<const uint8_t *>(w2),
         static_cast<const uint8_t *>(s2), static_cast<float *>(y),
         static_cast<const int32_t *>(block_slot), static_cast<const int32_t *>(block_pair),
         stride_h, stride_y, topk, n, k, ntok, null_slot, partial, parts_world);
+    return static_cast<int>(cudaGetLastError());
+}
+
+// fp4_moe_cuda_{up,down}_v2 with either switch (load_w): variant bit 1 = STREAM (__ldcs weights),
+// bit 2 = ROWS_FIRST (grid (rows, blocks)); 1 is what the serving entries launch. Benchmark only.
+extern "C" int fp4_moe_cuda_up_v2x(
+    void *stream, const void *x, const void *w1, const void *s1, const void *w3, const void *s3,
+    void *h, const void *route_weight, const void *block_slot, const void *block_pair,
+    int64_t stride_x, int64_t stride_h, float limit, int topk, int n, int k, int nb,
+    int null_slot, int variant) {
+    if (k > (kV2MaxGroups << 5) || (k & 31) || variant < 0 || variant > 3) return static_cast<int>(cudaErrorInvalidValue);
+    const int rows = (n + kWarps - 1) >> kWarpsShift;
+    const dim3 grid = variant & 2 ? dim3(rows, nb) : dim3(nb, rows);
+#define FP4_UP_V2X(S, R)                                                                         \
+    moe_up_bm16_v2<false, S, R><<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(       \
+        static_cast<const __nv_bfloat16 *>(x), static_cast<const uint8_t *>(w1),                 \
+        static_cast<const uint8_t *>(s1), static_cast<const uint8_t *>(w3),                      \
+        static_cast<const uint8_t *>(s3), static_cast<__nv_bfloat16 *>(h),                       \
+        static_cast<const float *>(route_weight), static_cast<const int32_t *>(block_slot),     \
+        static_cast<const int32_t *>(block_pair), stride_x, stride_h, limit, topk, n, k, null_slot)
+    switch (variant) {
+    case 0: FP4_UP_V2X(false, false); break;
+    case 1: FP4_UP_V2X(true, false); break;
+    case 2: FP4_UP_V2X(false, true); break;
+    default: FP4_UP_V2X(true, true); break;
+    }
+#undef FP4_UP_V2X
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int fp4_moe_cuda_down_v2x(
+    void *stream, const void *h, const void *w2, const void *s2, void *y,
+    const void *block_slot, const void *block_pair, int64_t stride_h, int64_t stride_y,
+    int topk, int n, int k, int ntok, int nb, int null_slot, int partial, int parts_world, int variant) {
+    if (k > (kV2MaxGroups << 5) || (k & 31) || variant < 0 || variant > 3) return static_cast<int>(cudaErrorInvalidValue);
+    const int rows = (n + kWarps - 1) >> kWarpsShift;
+    const dim3 grid = variant & 2 ? dim3(rows, nb) : dim3(nb, rows);
+#define FP4_DOWN_V2X(S, R)                                                                       \
+    moe_down_bm16_v2<false, S, R><<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(     \
+        static_cast<const __nv_bfloat16 *>(h), static_cast<const uint8_t *>(w2),                 \
+        static_cast<const uint8_t *>(s2), static_cast<float *>(y),                               \
+        static_cast<const int32_t *>(block_slot), static_cast<const int32_t *>(block_pair),      \
+        stride_h, stride_y, topk, n, k, ntok, null_slot, partial, parts_world)
+    switch (variant) {
+    case 0: FP4_DOWN_V2X(false, false); break;
+    case 1: FP4_DOWN_V2X(true, false); break;
+    case 2: FP4_DOWN_V2X(false, true); break;
+    default: FP4_DOWN_V2X(true, true); break;
+    }
+#undef FP4_DOWN_V2X
     return static_cast<int>(cudaGetLastError());
 }
 

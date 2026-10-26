@@ -140,6 +140,23 @@ pub mod fp4 {
             parts_world: c_int,
         ) -> c_int;
 
+        /// v2 up / down with the bandwidth screen's switches (examples/bench_moe_bw.rs): `variant`
+        /// bit 1 loads the weights with __ldcs, bit 2 swaps the grid to (rows, blocks). Same bits
+        /// as v2; benchmark only.
+        pub fn fp4_moe_cuda_up_v2x(
+            stream: CudaStream, x: *const c_void, w1: *const c_void, s1: *const c_void, w3: *const c_void,
+            s3: *const c_void, h: *mut c_void, route_weight: *const c_void, block_slot: *const c_void,
+            block_pair: *const c_void, stride_x: i64, stride_h: i64, limit: f32, topk: c_int, n: c_int, k: c_int,
+            nb: c_int, null_slot: c_int, variant: c_int,
+        ) -> c_int;
+
+        pub fn fp4_moe_cuda_down_v2x(
+            stream: CudaStream, h: *const c_void, w2: *const c_void, s2: *const c_void, y: *mut c_void,
+            block_slot: *const c_void, block_pair: *const c_void, stride_h: i64, stride_y: i64, topk: c_int,
+            n: c_int, k: c_int, ntok: c_int, nb: c_int, null_slot: c_int, partial: c_int, parts_world: c_int,
+            variant: c_int,
+        ) -> c_int;
+
         /// v3 down: `rows_per_warp` in {1, 2, 4}; same bits as v2.
         pub fn fp4_moe_cuda_down_v3(
             stream: CudaStream,

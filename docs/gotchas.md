@@ -4456,3 +4456,23 @@ A decode step's backbone time with TIDELM_STEP_SPLIT=1, about 3.9-4.1 rows a ste
 
 The lesson: a buffer sized for the worst step (prefill rows x max_seq) must not be cleared whole
 on every step. Zero the region a step uses, or drop the buffer.
+
+## A 12% MoE kernel gain was within noise in the engine, and half of it lost (2026-10-25)
+
+A plain read sweep reached ~260 GB/s on GB10 with `__ldcs` streaming loads, so the decode MoE
+(bm16 v2 up + down, tools/fp4_moe_cuda.cu) got two switches: STREAM (`__ldcs` on the weights) and
+ROWS_FIRST (a (rows, blocks) grid that walks one expert's rows instead of every expert's first
+rows at once). Both keep the bits. examples/bench_moe_bw.rs at the pair's per-rank shapes, a cold
+3 GB arena, 4-6 rows: plain 225-231 GB/s, STREAM 245-251, ROWS_FIRST 200-205, both 256-260.
+
+In the engine (bench/bench.py prose and code, seed 42, a fresh seed history per boot,
+TIDELM_STEP_SPLIT forward ms a step): STREAM took ~2 ms off a 4.3-row code step (68.5 -> 66.5)
+and nothing measurable off prose; both together were slower than plain at equal rows, and the
+depth policy, which reads step times, then drafted shallower (3.2 tokens a step on code against
+3.5). And two boots of identical code differed by 2-3.5 ms a step, as much as the effect.
+
+Serving keeps STREAM alone. The lessons: a kernel micro-benchmark that replays one call in a graph
+can rank layouts the engine ranks the other way, and an end-to-end A/B at the few-percent level
+needs more than one boot an arm: residency, hot reads and the step-time-driven depth policy move
+a step by as much. `__ldcs` on the dense FP8 decode GEMV changed nothing (x is staged in shared
+memory, so nothing in L2 needs protecting); a comment at the load records it.

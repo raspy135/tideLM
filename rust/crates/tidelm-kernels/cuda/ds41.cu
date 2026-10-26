@@ -179,6 +179,10 @@ __global__ void __launch_bounds__(kThreads) skinny_kernel(
 #pragma unroll
             for (int r = 0; r < ROWS; ++r) {
                 const int n = n0 + r;
+                // __ldcs (evict-first) here: no change (bench_skinny 2026-10-25, three runs, M = 1/6/16
+                // within run-to-run noise). x is staged in shared memory, so there is nothing in L2
+                // for streaming weights to evict; the MoE decode kernels, which re-read every
+                // pair's activations from L2, gain ~9% from it (bench_moe_bw).
                 raw[r] = n < N ? *reinterpret_cast<const uint4*>(w + ((int64_t)n * K + k) * ESZ)
                                : make_uint4(0, 0, 0, 0);
                 scale[r] = 1.f;
