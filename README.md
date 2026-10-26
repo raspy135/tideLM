@@ -1,8 +1,7 @@
 # TideLM
 
-**Mixture-of-experts models too big for your memory, served from two DGX Sparks.** 
+**Adaptive expert loading enables running higher quant models on two DGX Sparks.** 
 
-Normally it requires heavy quantization, however TideLM took different approach.
 TideLM keeps the experts your traffic actually uses resident in the two boxes' unified memory, learns which
 ones those are from the router's own demand while it serves, and reads the misses that matter
 most from NVMe as decoding goes on. The resident set rises and falls with what you ask it — the
@@ -13,13 +12,10 @@ tide — so the engine gets better the more you use it.
 | `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,000 / 15,360 (65.1%) | 1M (2 lanes, 1.5M shared) | **31.8 tok/s** | **49.0 tok/s** | 4.8 s |
 | `glm53-exl3` | GLM-5.3 | EXL3 3.0 bpw | 12,500 / 19,200 (65.1%) | 256K | **17.2 tok/s** | **20.8 tok/s** | 19.5 s |
 
-*Decode speed is `bench/bench.py`'s median over three measured runs after one warmup: 1,024
-output tokens at temperature 0.6, prose = an essay request, code = an LRU-cache request. The last
-column is the median time to first token of a fresh ~8,200-token prompt (no prefix reused). Raw
-runs: [DeepSeek](results/rust-ds41-20261024/README.md), [GLM-5.3](results/rust-glm53-20261025/README.md).
-The DeepSeek row was measured with two 512K lanes; at 1M, the same protocol gave 31.2 / 50.8 tok/s
-and 4.3 s, and 512K on the same build 32.2 / 48.2 tok/s and 4.3 s
-([runs](results/rust-ds41-20261026-1m/README.md)).*
+Adaptive expert loading also allows flexible memory configration.
+Memory for expert resident and context length are the big levers. You can run other services
+by reducing expert resident or context length.
+
 
 ## How adaptive expert loading works
 
