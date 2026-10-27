@@ -4613,7 +4613,7 @@ Follow-up turns repeat ideas, not text: a long copy (6 matched, 6 to copy) was a
 of rounds. Where text is repeated verbatim, the long copier above takes it past the MTP's depth
 of 7, and that is where the gain was. Greedy only; sampled requests were not measured.
 
-## RedHatAI's GLM-5.3 DSpark drafter accepts what our MTP does: not ported (2026-10-27)
+## RedHatAI's GLM-5.3 DSpark drafter against our MTP, across harnesses: not ported (2026-10-27)
 
 `RedHatAI/GLM-5.3-speculator.dspark` (2.5 GB BF16: a DFlash-style block drafter, 3 dense Qwen3
 layers over GLM's layers 2/20/39/58/75, 8 tokens a pass, Markov head rank 256, confidence head)
@@ -4635,6 +4635,17 @@ Sparks a verified row costs 15-25 ms (eight new experts a layer), so a drafter p
 acceptance, and this one's is not higher. The three-Spark numbers come from bandwidth and
 residency, not the drafter. Different texts (its datasets, ours), and the card does not give its
 sampling temperature; not downloaded or ported.
+
+Correction, the same day: that compares a card against our logs on other texts, and the
+same-harness numbers disagree. `incoai/GLM-5.3-DFlash2`'s card (a 6-layer block drafter over 6 of
+GLM's layers, a top-16 path selector) against GLM-5.3's own MTP, 7 drafts both, temperature 1:
+tokens a verify step HumanEval 4.85 -> 5.48, MBPP 4.34 -> 4.95, MT-Bench 3.81 -> 4.19, GSM8K /
+MATH 5.1 -> 5.9-6.0 (+10-19%); Mia's recipe, DSpark against the MTP head on code, 37.1 -> 39.5-40.4
+tok/s. A block drafter does accept more than MTP, ~10-15%. On this pair the gain would be
+smaller (a verified row costs 15-25 ms, so the best depth stays at 3-4): an estimate of +5-10%
+decode, memory about neutral if it replaced the MTP layer's 4-bit arena. Neither drafter was
+trained on these EXL3 weights; incoai's is CC BY-NC-ND, modal-labs/GLM-5.3-NVFP4-DFlash (the same
+architecture) is under the GLM-5.3 license but trained against an NVFP4 target. Not ported.
 
 ## GLM-5.3 with Mia's 2-4-bit experts: 13,320 residents in the same 89 GB, NLL at parity (2026-10-27)
 
