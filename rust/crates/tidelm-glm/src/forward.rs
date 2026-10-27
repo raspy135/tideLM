@@ -759,15 +759,17 @@ impl Engine {
     }
 
     /// The MoE layer's router over rows [r0, r0 + n) of xn and its exact (unmasked) top-k: the
-    /// demand, miss counters and hot-read candidates come from these.
+    /// demand, miss counters and hot-read candidates (decode rows only: a prefill's are never
+    /// read, and its rows would overrun the candidates' buffer) come from these.
     fn moe_exact(&self, l: usize, r0: usize, n: usize) -> Result<()> {
         let (cfg, a) = (&self.cfg, &self.act);
         let Mlp::Moe { router, bias, .. } = &self.w.layers[l].mlp else { return Err("moe_exact on a dense layer".into()) };
         let (e, h) = (cfg.experts, cfg.hidden);
         let allowed = self.allowed_ptr(l);
+        let hot = if n <= MAX_ROWS { np(&a.hot) } else { std::ptr::null_mut() };
         self.linear_f32w(at(&a.xn, r0 * h), h, router, n, e, h, np(&a.logits), if n <= MAX_ROWS { 6 } else { 1 })?;
         ck(unsafe { glm_router(self.st.raw(), np(&a.logits), np(bias), std::ptr::null(), std::ptr::null(), n as i32,
-                               cfg.topk as i32, cfg.routed_scaling, np(&a.eids), np(&a.ew), allowed, np(&a.hot), std::ptr::null(),
+                               cfg.topk as i32, cfg.routed_scaling, np(&a.eids), np(&a.ew), allowed, hot, std::ptr::null(),
                                std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null()) }, "router (exact)")
     }
 
