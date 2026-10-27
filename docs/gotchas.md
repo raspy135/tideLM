@@ -4612,3 +4612,26 @@ congestion control -> slow start): 6 requests, 1,312 rounds, 2.32 of 7 drafts ac
 Follow-up turns repeat ideas, not text: a long copy (6 matched, 6 to copy) was available in 0-6%
 of rounds. Where text is repeated verbatim, the long copier above takes it past the MTP's depth
 of 7, and that is where the gain was. Greedy only; sampled requests were not measured.
+
+## RedHatAI's GLM-5.3 DSpark drafter accepts what our MTP does: not ported (2026-10-27)
+
+`RedHatAI/GLM-5.3-speculator.dspark` (2.5 GB BF16: a DFlash-style block drafter, 3 dense Qwen3
+layers over GLM's layers 2/20/39/58/75, 8 tokens a pass, Markov head rank 256, confidence head)
+is what Mia's AI Lab serves GLM-5.3 with (40 / 30 tok/s code / prose on three Sparks). Its card's
+per-position acceptance against our MTP's, logged with every round drafting 7 (greedy, the six
+requests of the short-match study above):
+
+| | pos 0 | 1 | 2 | 3 | tokens a step |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| MTP, prose turns (jazz, TCP) | 74-78% | 50-52% | 28-31% | 12-21% | 2.8-3.1 |
+| DSpark card, writing / qa | 73-75% | 49-52% | 33-35% | 23% | 3.1 |
+| MTP, code turns (CSV parser) | 87-89% | 62-75% | 45-62% | 36-49% | 4.0-4.6 |
+| DSpark card, HumanEval | 85% | 70% | 57% | 46% | 4.6 (4.8 at 8) |
+
+Priced with this pair's verify by rows (bench-width at 2.5K) at each one's best fixed depth, both
+come to ~16.5 tok/s on prose and 19-22 on code; one draft pass instead of MTP's 3.2 ms a draft is
+worth a few percent, and the calibrated gate already does the confidence head's job. On two
+Sparks a verified row costs 15-25 ms (eight new experts a layer), so a drafter pays only through
+acceptance, and this one's is not higher. The three-Spark numbers come from bandwidth and
+residency, not the drafter. Different texts (its datasets, ours), and the card does not give its
+sampling temperature; not downloaded or ported.
