@@ -88,7 +88,6 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
     want GLM_EMBED_8BIT "" int8
     want GLM_MISS substitute substitute
     want GLM_PF 0 0
-    want GLM_HOT_ASYNC 0 0
     want GLM_INDEX_BUCKETS 0 0
     [[ "${GLM_PREFILL_REDUCE:-fp32}" == bf16 || "${GLM_PREFILL_REDUCE:-fp32}" == fp32 ]] \
         || err "the Rust GLM engine sums prefill partials in bf16 or fp32 only (profile: GLM_PREFILL_REDUCE=$GLM_PREFILL_REDUCE)"
@@ -111,11 +110,13 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
           --served-model-name "${SERVED_MODEL_NAME:-glm-5.3}" --host "${HOST:-0.0.0.0}" --port "${PORT:-8000}"
           --slots "${GLM_SLOTS:-12500}" --max-seq "${GLM_MAX_SEQ:-32768}" --chunk "${GLM_CHUNK:-1024}"
           --kv-split "${GLM_KV_SPLIT:-0}" --reduce "${GLM_PREFILL_REDUCE:-fp32}"
-          --hot "${GLM_HOT:-0}" --hot-keep "${GLM_HOT_KEEP:-0}" --depth "$depth" "${gate[@]}" --lookup "${GLM_LOOKUP:-0}"
+          --hot "${GLM_HOT:-0}" --hot-async "${GLM_HOT_ASYNC:-0}" --hot-keep "${GLM_HOT_KEEP:-0}" --depth "$depth" "${gate[@]}" --lookup "${GLM_LOOKUP:-0}"
           --adapt "${GLM_ADAPT:-1}" --adapt-every "${GLM_ADAPT_EVERY:-200}" --adapt-prefill "${GLM_ADAPT_PREFILL_SWAPS:-2048}"
           --adapt-decode "${GLM_ADAPT_DECODE_SWAPS:-256}" --bg-every "$bg" --loop-break "${GLM_LOOP_BREAK:-0}"
           --two-pass "${GLM_PREFILL_TWO_PASS:-0}" --two-pass-miss "${GLM_PREFILL_TWO_PASS_MISS:-0}")
     [[ "${GLM_GRAPHS:-1}" == 1 ]] && args+=(--graphs)
+    # the long prompt copier, on unless GLM_COPY=0 (the server's default)
+    [[ -n "${GLM_COPY:-}" ]] && args+=(--copy "$GLM_COPY")
     if [[ "${GLM_PREFIX_DISK:-0}" == 1 ]]; then
         args+=(--prefix-disk "${RUST_GLM_PREFIX_DIR:-$STATE/glm-prefix}"
                --prefix-disk-gb "${GLM_PREFIX_DISK_GB:-20}" --prefix-min "${GLM_PREFIX_DISK_MIN:-256}")
@@ -210,6 +211,8 @@ fi   # the model
 # Both models: rank 0 here and rank 1 on PEER, each in a container of the serving image, as the
 # calling user, with every path the arguments name mounted at that path.
 # ---------------------------------------------------------------------------------------
+# RUST_ARGS: more tidelm-server arguments for both ranks (development: --bench-width, A/B flags)
+[[ -n "${RUST_ARGS:-}" ]] && read -ra extra <<< "$RUST_ARGS" && args+=("${extra[@]}")
 IMAGE=${IMAGE:-${GLM_IMAGE:-tidelm:local}}
 img=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null) \
     || err "no image $IMAGE on this box: scripts/tide.sh build $f builds it and ships it to the worker"
@@ -229,8 +232,10 @@ else
 fi
 # TIDELM_MEM_LOG_MB: log every allocation of at least that many MB made after launch (default 8);
 # TIDELM_GRAPH_CACHE: how many step graphs the engine keeps (default 128, ~4-8 MB each);
-# TIDELM_STEP_SPLIT: a line per request splitting its decode step's time
-for v in TIDELM_MEM_LOG_MB TIDELM_GRAPH_CACHE TIDELM_STEP_SPLIT; do [[ -n "${!v:-}" ]] && envs+=("$v=${!v}"); done
+# TIDELM_STEP_SPLIT: a line per request splitting its decode step's time;
+# TIDELM_GLM_WIDE_DECODE_FROM: GLM, the position from which a 17-33-row verify runs the decode path
+# instead of a prefill chunk (default 32768, docs/gotchas.md)
+for v in TIDELM_MEM_LOG_MB TIDELM_GRAPH_CACHE TIDELM_STEP_SPLIT TIDELM_GLM_WIDE_DECODE_FROM; do [[ -n "${!v:-}" ]] && envs+=("$v=${!v}"); done
 for e in "${envs[@]}"; do envf+=(-e "$e"); done
 vols=() seen=" "
 for p in "${rw[@]}"; do [[ $seen == *" $p "* ]] && continue; seen+="$p "; vols+=(-v "$p:$p"); done

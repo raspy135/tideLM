@@ -191,6 +191,12 @@ impl Arena {
         Ok(())
     }
 
+    /// Where a record's nine tensors go in `slot`, as (device address, bytes) in pack order: a
+    /// reader thread copies into them without touching the arena.
+    pub fn slot_dsts(&self, slot: usize) -> [(usize, usize); 9] {
+        std::array::from_fn(|i| (self.pools[i].ptr_at(slot * self.sizes[i]) as usize, self.sizes[i]))
+    }
+
     /// Device copy of slot `src` over slot `dst` (a kept hot read leaving its transient slot).
     pub fn copy_slot(&self, dst: usize, src: usize, st: &Stream) -> Result<()> {
         for (i, &b) in self.sizes.iter().enumerate() {

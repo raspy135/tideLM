@@ -13,12 +13,20 @@
 //!   computed exactly (one a layer, 16 a step paced evenly over the layers); after the layer it
 //!   takes the next queued victim's slot or is dropped. Both ranks decide from the same
 //!   replicated routing, so they read the same experts without a message.
+//! - async hot reads (GLM_HOT_ASYNC, tp.py's _hot_plan / _hot_install), in place of those: after
+//!   a decode pass, per MoE layer its heaviest missed pick at or above the same threshold, the
+//!   heaviest of those up to the same step cap, each into the next queued victim's slot on the
+//!   reader threads while the next round drafts; routable from the next decoder pass. The token
+//!   that missed the expert keeps its substitute (KL 0.086 -> 0.137 in Python, docs/gotchas.md).
 
+use std::os::raw::c_void;
+use std::sync::mpsc;
 use std::time::Instant;
 
-use tidelm_cuda::PinnedBuffer;
+use tidelm_cuda::{PinnedBuffer, Stream};
+use tidelm_model::direct_io::DirectFile;
 
-use crate::arena::align_up;
+use crate::arena::{align_up, Pack};
 use crate::forward::Engine;
 use crate::{ck, Result};
 
@@ -57,6 +65,8 @@ pub struct ResStats {
     pub hot_kept: usize,
     pub hot_unkept: usize,
     pub hot_s: f64,
+    /// async: host seconds waiting for a round's reads before the next decoder pass
+    pub hot_wait_s: f64,
 }
 
 /// Synchronous hot reads' settings and per-step state.
@@ -71,12 +81,69 @@ pub struct Hot {
     reads: usize,
     /// the read installed for the layer being computed: (layer, expert)
     live: Option<(usize, usize)>,
+    /// GLM_HOT_ASYNC's state (None: the synchronous reads above)
+    pub asynch: Option<HotAsync>,
 }
 
 impl Hot {
     pub fn new(slot: usize, max_record: usize, rows: usize, topk: usize) -> Result<Self> {
         Ok(Hot { min_share: 0.2, per_step: 16, slot, host: PinnedBuffer::zeroed(rows * topk * 2)?,
-                 buf: PinnedBuffer::uninit(align_up(max_record))?, reads: 0, live: None })
+                 buf: PinnedBuffer::uninit(align_up(max_record))?, reads: 0, live: None, asynch: None })
+    }
+}
+
+/// Async hot reads: the last decode pass's candidates, the reads in flight, the reader threads.
+pub struct HotAsync {
+    /// [MoE layer][MAX_ROWS * topk][2] (share, expert), copied behind the head of every decode pass
+    pub table: PinnedBuffer<f32>,
+    jobs: mpsc::Sender<ReadJob>,
+    /// planned reads: (slot, layer, expert, done)
+    pending: Vec<(usize, usize, usize, mpsc::Receiver<std::result::Result<(), String>>)>,
+}
+
+/// One record for a reader thread: where it is in the pack, where its nine tensors go.
+struct ReadJob {
+    off: u64,
+    nbytes: usize,
+    dsts: [(usize, usize); 9],
+    done: mpsc::Sender<std::result::Result<(), String>>,
+}
+
+impl HotAsync {
+    /// `threads` readers, each with its own O_DIRECT handle, staging buffer and stream (made
+    /// here, so a reader that cannot start fails the boot, not a read).
+    fn new(pack: &Pack, threads: usize, table_len: usize) -> Result<Self> {
+        let (tx, rx) = mpsc::channel::<ReadJob>();
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        for _ in 0..threads {
+            let rx = rx.clone();
+            let data0 = pack.data0;
+            let file = DirectFile::open(&pack.path)?;
+            let st = Stream::new()?;
+            let mut buf = PinnedBuffer::<u8>::uninit(align_up(pack.max_record))?;
+            std::thread::spawn(move || {
+                let dev = tidelm_cuda::set_device(0).map_err(|e| e.to_string());
+                loop {
+                    let Ok(job) = rx.lock().unwrap().recv() else { return };
+                    let mut run = || -> Result<()> {
+                        dev.clone()?;
+                        file.pread_exact(&mut buf[..align_up(job.nbytes)], data0 + job.off, job.nbytes)?;
+                        let mut off = 0;
+                        for &(dst, n) in &job.dsts {
+                            unsafe {
+                                tidelm_cuda::memcpy_async(dst as *mut c_void, buf[off..].as_ptr() as *const c_void, n,
+                                                          tidelm_cuda::ffi::MEMCPY_HOST_TO_DEVICE, &st)?;
+                            }
+                            off += n;
+                        }
+                        st.synchronize()?;
+                        Ok(())
+                    };
+                    let _ = job.done.send(run().map_err(|e| e.to_string()));
+                }
+            });
+        }
+        Ok(HotAsync { table: PinnedBuffer::zeroed(table_len)?, jobs: tx, pending: vec![] })
     }
 }
 
@@ -134,6 +201,7 @@ impl Engine {
     /// swaps toward it; both ranks apply the plan.
     pub fn adapt(&mut self, max_swaps: usize) -> Result<usize> {
         let t0 = Instant::now();
+        self.hot_install()?;
         let demand = self.read_demand()?;
         if let Some(m) = self.res.db_mass.as_mut() {
             for (a, d) in m.iter_mut().zip(&demand) {
@@ -166,6 +234,7 @@ impl Engine {
     }
 
     pub(crate) fn follow_adapt(&mut self, r: &mut tidelm_comm::Reader) -> Result<()> {
+        self.hot_install()?;
         let plan: Vec<(usize, usize, usize, usize)> =
             r.u32s()?.chunks(4).map(|c| (c[0] as usize, c[1] as usize, c[2] as usize, c[3] as usize)).collect();
         self.adapt_apply(&plan)
@@ -355,10 +424,98 @@ impl Engine {
         }
     }
 
-    pub fn enable_hot(&mut self, keep: bool) -> Result<()> {
+    /// Async (both ranks), after a decode pass of `t` rows: per MoE layer its heaviest missed
+    /// pick at or above the threshold (ties to the lower expert), the heaviest of those (ties to
+    /// the lower layer) up to the step cap, each taking the next queued victim that still holds
+    /// its slot. The victim stops being routable now; the reads start on the reader threads.
+    pub(crate) fn hot_plan(&mut self, t: usize) -> Result<()> {
+        let (e, k) = (self.cfg.experts, self.cfg.topk);
+        let Some(h) = self.hot.as_ref() else { return Ok(()) };
+        let Some(a) = h.asynch.as_ref() else { return Ok(()) };
+        let w = crate::weights::MAX_ROWS * k * 2;
+        let mut cands: Vec<(f32, usize, usize)> = Vec::new();
+        for (i, &l) in self.moe_layers().iter().enumerate() {
+            let row = &a.table[i * w..i * w + t * k * 2];
+            let mut best: Option<(f32, usize)> = None;
+            for j in 0..t * k {
+                let (v, x) = (row[2 * j], row[2 * j + 1] as usize);
+                if v >= h.min_share && self.lut_h[l * e + x] < 0 && best.is_none_or(|(bv, bx)| v > bv || (v == bv && x < bx)) {
+                    best = Some((v, x));
+                }
+            }
+            if let Some((v, x)) = best {
+                cands.push((v, l, x));
+            }
+        }
+        cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap()); // stable: equal shares keep layer order
+        cands.truncate(h.per_step);
+        for (_, l, x) in cands {
+            let victim = loop {
+                match self.res.hot_q.pop() {
+                    Some((vl, ve, vs)) if self.res.owner[vs] == Some((vl, ve)) => break Some((vl, ve, vs)),
+                    Some(_) => continue,
+                    None => break None,
+                }
+            };
+            let Some((vl, ve, vs)) = victim else {
+                self.res.stats.hot_unkept += 1;
+                continue;
+            };
+            let r = self.pack.record(l, x)?;
+            if r.bits != self.arena.bits {
+                return Err(format!("hot read: expert ({l}, {x}) is {} bits, the arena {}", r.bits, self.arena.bits).into());
+            }
+            self.lut_h[vl * e + ve] = -1;
+            self.allowed_h[vl * e + ve] = 0;
+            self.lut_entry(vl * e + ve)?;
+            self.res.owner[vs] = Some((l, x));
+            let (tx, rx) = mpsc::channel();
+            let job = ReadJob { off: r.off, nbytes: r.nbytes, dsts: self.arena.slot_dsts(vs), done: tx };
+            let a = self.hot.as_mut().unwrap().asynch.as_mut().unwrap();
+            a.jobs.send(job).map_err(|_| "hot read: the reader threads are gone")?;
+            a.pending.push((vs, l, x, rx));
+            self.res.stats.hot_reads += 1;
+        }
+        Ok(())
+    }
+
+    /// Async (both ranks), before a decoder pass or an adaptation: the planned reads waited for
+    /// and made routable, protected from the next background periods as a kept read is.
+    pub(crate) fn hot_install(&mut self) -> Result<()> {
+        let e = self.cfg.experts;
+        let Some(a) = self.hot.as_mut().and_then(|h| h.asynch.as_mut()) else { return Ok(()) };
+        if a.pending.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut a.pending);
+        let t0 = Instant::now();
+        for (_, l, x, rx) in &pending {
+            // a read that failed on one rank would leave the pair routing differently: fatal
+            rx.recv().map_err(|_| "hot read: the reader threads are gone")?
+                .map_err(|err| format!("hot read ({l}, {x}): {err}"))?;
+        }
+        self.res.stats.hot_wait_s += t0.elapsed().as_secs_f64();
+        for (vs, l, x, _) in pending {
+            let i = l * e + x;
+            self.lut_h[i] = vs as i32;
+            self.allowed_h[i] = 1;
+            self.lut_entry(i)?;
+            self.res.bg_until[i] = self.res.bg_period + BG_PROTECT;
+            self.res.stats.hot_kept += 1;
+        }
+        Ok(())
+    }
+
+    /// Hot reads on: synchronous between a decode pass's segments, or `asynch` (both need the
+    /// background period's victims to keep a read).
+    pub fn enable_hot(&mut self, asynch: bool) -> Result<()> {
         let rows = crate::forward::VERIFY_ROWS;
-        self.hot = Some(Hot::new(self.opt.slots, self.pack.max_record, rows, self.cfg.topk)?);
-        let _ = keep;
+        let mut h = Hot::new(self.opt.slots, self.pack.max_record, rows, self.cfg.topk)?;
+        if asynch {
+            let len = self.moe_layers().len() * crate::weights::MAX_ROWS * self.cfg.topk * 2;
+            h.asynch = Some(HotAsync::new(&self.pack, h.per_step.min(8), len)?);
+        }
+        self.hot = Some(h);
         ck(0, "")
     }
 }

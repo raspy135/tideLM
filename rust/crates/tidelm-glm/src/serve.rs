@@ -1,14 +1,16 @@
 //! The serving loop (engine/glm/tp.py::_stream) for one request at a time on rank 0: prefix
 //! reuse of the live sequence, the prefill (two-pass for a short miss-heavy suffix), then
-//! rounds of MTP drafting under the calibrated gate (or a copy of the prompt / answer, GLM's
-//! lookup), one verify, exact acceptance (greedy, or rejection sampling against each draft's
-//! nucleus), the MTP cache refilled for what was accepted; adaptive residency between them.
-//! Every engine call it makes is mirrored to rank 1, which decides nothing.
+//! rounds of MTP drafting under the calibrated gate (or a copy: of the prompt, up to 32 tokens
+//! by the DS engine's rule, else of the prompt or answer by GLM's lookup), one verify, exact
+//! acceptance (greedy, or rejection sampling against each draft's nucleus), the MTP cache
+//! refilled for what was accepted; adaptive residency between them. Every engine call it makes
+//! is mirrored to rank 1, which decides nothing.
 
 use std::collections::HashMap;
 use std::time::Instant;
 
 use tidelm_core::numpy_rng::Pcg64;
+use tidelm_engine::copy::{CopyConfig, CopyDraft};
 use tidelm_engine::decode::{Event, Finish, Generation, Job};
 
 use crate::forward::{Engine, Hidden, RowCands};
@@ -148,6 +150,17 @@ impl Lookup {
     }
 }
 
+/// The copy drafter's sizes on GLM: the DS engine's rule (copy.rs: from the prompt, after a 6-token
+/// match, the next copy 2 x the last one's accepted + 2) with the shortest copy 7, the longest
+/// MTP draft, so a short copy verifies in a graphed 8-row pass. TIDELM_COPY_* override.
+pub fn glm_copy_config() -> Result<CopyConfig> {
+    let c = CopyConfig::with_env(CopyConfig { match_len: 6, min_copy: 6, min_cap: 7, max_cap: 32, start: 16 })?;
+    if c.max_cap + 1 > crate::forward::HEAD_ROWS {
+        return Err(format!("TIDELM_COPY_MAX: at most {}", crate::forward::HEAD_ROWS - 1).into());
+    }
+    Ok(c)
+}
+
 /// A row's sampling distribution: (token, probability) by probability descending.
 pub type Dist = Vec<(u32, f32)>;
 
@@ -226,6 +239,9 @@ pub struct ServeOptions {
     pub dyn_gate: f64,
     /// GLM_LOOKUP: copy rounds from a match of this many tokens (0 off)
     pub lookup: usize,
+    /// GLM_COPY: longer copies of the prompt (tidelm_engine::copy's rule, glm_copy_config's
+    /// sizes) ahead of the lookup's; a request's x_copy_draft=false leaves only the lookup
+    pub copy: Option<CopyConfig>,
     pub adapt: bool,
     pub adapt_every: usize,
     pub adapt_prefill: usize,
@@ -246,6 +262,8 @@ pub struct Stats {
     pub accepted: usize,
     pub copy_rounds: usize,
     pub copy_accepted: usize,
+    /// copy rounds that copied the prompt by the long rule (GLM_COPY)
+    pub long_copies: usize,
     pub fallbacks: usize,
     pub loop_breaks: usize,
     pub two_pass: usize,
@@ -390,14 +408,16 @@ impl Server {
             self.eng.adapt(opt.adapt_prefill)?;
         }
         let last = self.eng.last_rows - 1;
-        // a decode-path forward returns every row's argmax: the suffix's next token is its last
-        // row's (a prefill chunk's head ran on that row alone: row 0)
+        // a forward returns every row's argmax up to HEAD_ROWS: the suffix's next token is its
+        // last row's (a prefill chunk's head ran on that row alone: row 0)
         let arow = first.len() - 1;
         let mut anchor = if greedy { first[arow] } else { draw(&self.dist(arow, temp, top_p)?, &mut rng) };
         let mut z_anchor: Option<Dist> = None; // the anchor's distribution, for a loop break
         let mut anchor_row = arow; // the anchor's row in the last decoder pass
         self.eng.keep_hidden(last)?;
         let mut lookup = (opt.lookup > 0 && depth > 0).then(|| Lookup::new(&prompt, opt.lookup));
+        let mut copier = opt.copy.clone().filter(|_| job.copy_draft && depth > 0).map(|c| CopyDraft::new(&prompt, c, None));
+        let mut copied = 0;
         let mut out: Vec<u32> = vec![];
         let mut synced = 0;
         let mut next_adapt = opt.adapt_every;
@@ -457,12 +477,25 @@ impl Server {
                 g.steps += 1;
                 continue;
             }
-            // a copy round, or MTP drafts under the gate
+            // a copy round (a long copy of the prompt, else the lookup's), or MTP drafts under the gate
             let mut copy = None;
+            let mut long = false;
+            if let Some(cd) = copier.as_mut() {
+                cd.push(&out[copied..]);
+                copied = out.len();
+                let mut c = cd.propose();
+                c.truncate(room);
+                if !c.is_empty() {
+                    copy = Some(c);
+                    long = true;
+                }
+            }
             if let Some(lk) = lookup.as_mut() {
                 lk.extend(&out[synced..]);
                 synced = out.len();
-                copy = lk.propose(dmax);
+                if copy.is_none() {
+                    copy = lk.propose(dmax);
+                }
             }
             let mut drafts: Vec<u32> = vec![];
             let mut qs: Vec<Option<Dist>> = vec![];
@@ -557,6 +590,10 @@ impl Server {
             self.stats.accepted += n_acc;
             g.accepted.push(n_acc);
             g.depths.push(nd);
+            if long {
+                copier.as_mut().unwrap().observe(n_acc);
+                self.stats.long_copies += 1;
+            }
             if copy.is_some() {
                 self.stats.copy_rounds += 1;
                 self.stats.copy_accepted += n_acc;

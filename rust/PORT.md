@@ -486,10 +486,15 @@ What is ported, by the DS port's feature list:
 - **MTP speculation** (`serve.rs`): up to 7 drafts under the calibrated gate (mtp_cal.py's
   table) or the flat one, exact acceptance greedy or sampled (each rank's top-1024 logits and
   log-sum-exp; the whole row when they cannot prove the nucleus).
-- **Copy rounds**: lookup_draft.ExactDraftCache v2 (GLM_LOOKUP), not the DS copy drafter's rule.
+- **Copy rounds**: the DS copy drafter's rule (tidelm-engine copy.rs, `GLM_COPY`, on) for copies
+  of the prompt of 7-32 tokens, verified in one pass of up to 33 rows (a prefill chunk below
+  32,768 positions, the decode path from there); lookup_draft.ExactDraftCache v2 (`GLM_LOOKUP`)
+  behind it. A file rewrite 36.7 -> 56.2 tok/s, a re-run tool call 33.5 -> 39.5 (2026-10-27,
+  docs/gotchas.md).
 - **Adaptive residency** (`adapt.rs`): tp.adapt after the prefill and every 200 tokens, the
-  two-pass prefill, bg_step's victims, synchronous hot reads kept over victims; the history in
-  its own .npz (read at first boot from the Python server's db.pt).
+  two-pass prefill, bg_step's victims, hot reads kept over victims, synchronous or read during the
+  next round (`GLM_HOT_ASYNC`, opt-in: 5-7% faster a round, at the quality cost Python measured);
+  the history in its own .npz (read at first boot from the Python server's db.pt).
 - **Prefix cache**: the live sequence's prefix in RAM, and the disk store (`prefix.rs`).
 - **Server**: the OpenAI routes, the Anthropic Messages route, tool calls (GLM's XML), the GLM
   template and parser (`tidelm-text/src/glm.rs`, fixture-tested against glm_app.py).

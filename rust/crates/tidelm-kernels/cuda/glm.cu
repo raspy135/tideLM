@@ -582,7 +582,7 @@ __global__ void __launch_bounds__(kTk) split_share_kernel(const uint8_t* __restr
 // kvb_fp8.absorb_q for decode rows: q_lat[t, h, c] = sum_n q_nope[t, h, n] * Wuk[h, n, c], the
 // FP8 kv_b's effective weight bf16(fp8 * s) (s its 128x128 block's scale, expanded per row), fp32
 // accumulation, bf16 out. kv_b rows of head h: h * 448 + n, n < 192 the key half. A block takes
-// one head's 128 output columns; its threads split n in two halves. T <= 16.
+// one head's 128 output columns; its threads split n in two halves. T <= 8 a launch.
 constexpr int kKvRows = 448, kNope = 192, kLat = 512, kVd = 256;
 
 __global__ void __launch_bounds__(256) absorb_q_kernel(const __nv_bfloat16* __restrict__ q, int64_t ldq_t,
@@ -1430,7 +1430,7 @@ int glm_split_share(void* stream, const void* g, int64_t rank_stride, int64_t ro
 
 int glm_absorb_q(void* stream, const void* q, int64_t ldq_t, int64_t ldq_h, const void* w, const void* ws, void* out,
                  int64_t ldo_t, int64_t ldo_h, int T, int hl) {
-    if (T < 1 || T > 16) return (int)cudaErrorInvalidValue;
+    if (T < 1) return (int)cudaErrorInvalidValue;
     for (int t0 = 0; t0 < T; t0 += 8)
         absorb_q_kernel<<<dim3(hl, kLat / 128), 256, 0, GST>>>(static_cast<const __nv_bfloat16*>(q) + t0 * ldq_t, ldq_t, ldq_h,
                                                                static_cast<const uint8_t*>(w), static_cast<const float*>(ws),
@@ -1441,10 +1441,13 @@ int glm_absorb_q(void* stream, const void* q, int64_t ldq_t, int64_t ldq_h, cons
 
 int glm_absorb_o(void* stream, const void* o, int64_t ldo_t, int64_t ldo_h, const void* w, const void* ws, void* out,
                  int64_t ld_out, int T, int hl) {
-    if (T < 1 || T > 16) return (int)cudaErrorInvalidValue;
-    absorb_o_kernel<<<dim3(hl, kVd / kAbsV), 256, 0, GST>>>(static_cast<const __nv_bfloat16*>(o), ldo_t, ldo_h,
-                                                        static_cast<const uint8_t*>(w), static_cast<const float*>(ws),
-                                                        static_cast<__nv_bfloat16*>(out), ld_out, T);
+    if (T < 1) return (int)cudaErrorInvalidValue;
+    // 16 rows a launch (the kernel stages them in shared memory); each row's sums are its own
+    for (int t0 = 0; t0 < T; t0 += 16)
+        absorb_o_kernel<<<dim3(hl, kVd / kAbsV), 256, 0, GST>>>(static_cast<const __nv_bfloat16*>(o) + t0 * ldo_t, ldo_t,
+                                                            ldo_h, static_cast<const uint8_t*>(w), static_cast<const float*>(ws),
+                                                            static_cast<__nv_bfloat16*>(out) + t0 * ld_out, ld_out,
+                                                            T - t0 < 16 ? T - t0 : 16);
     GRET;
 }
 

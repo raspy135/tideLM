@@ -37,7 +37,11 @@ impl Default for CopyConfig {
 
 impl CopyConfig {
     pub fn from_env() -> crate::Result<Self> {
-        let mut c = CopyConfig::default();
+        Self::with_env(CopyConfig::default())
+    }
+
+    /// `base` with the TIDELM_COPY_* overrides (the GLM engine's own defaults).
+    pub fn with_env(mut c: CopyConfig) -> crate::Result<Self> {
         for (k, v) in [("TIDELM_COPY_MATCH", &mut c.match_len), ("TIDELM_COPY_MIN", &mut c.min_copy),
                        ("TIDELM_COPY_MIN_CAP", &mut c.min_cap), ("TIDELM_COPY_MAX", &mut c.max_cap),
                        ("TIDELM_COPY_START", &mut c.start)] {

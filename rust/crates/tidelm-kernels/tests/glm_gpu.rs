@@ -600,7 +600,7 @@ fn mla_attention_direct_split_and_cross_rank_merge() {
 fn absorb_and_router() {
     let Some(st) = setup() else { return };
     let mut rng = Rng(9);
-    let (t, hl) = (3usize, 4usize);
+    let hl = 4usize;
     let rows = hl * 448;
     let w: Vec<u8> = (0..rows * 512).map(|_| loop {
         let b = (rng.next() >> 32) as u8;
@@ -610,27 +610,29 @@ fn absorb_and_router() {
     }).collect();
     let ws: Vec<f32> = (0..rows * 4).map(|_| 1e-3 * (1.0 + rng.unif())).collect();
     let wf = |r: usize, c: usize| bf(e4m3(w[r * 512 + c]) * ws[r * 4 + c / 128]) as f64;
-    let q = rng.bf16_vec(t * hl * 256, 1.0);
-    let (d_w, d_ws, d_q) = (dev(&w), dev(&ws), dev(&q));
-    let d_out = DeviceBuffer::<u16>::zeroed(t * hl * 576).unwrap();
-    ok(unsafe { glm_absorb_q(st.raw(), p(&d_q), (hl * 256) as i64, 256, p(&d_w), p(&d_ws), p(&d_out), (hl * 576) as i64, 576, t as i32, hl as i32) });
-    let got: Vec<f32> = d_out.download().unwrap().iter().map(|&v| f32_from_bf16(v)).collect();
-    let mut gq = vec![];
-    let mut wq = vec![];
-    for r in 0..t {
-        for h in 0..hl {
-            for c in 0..512 {
-                let mut a = 0f64;
-                for n in 0..192 {
-                    a += f32_from_bf16(q[(r * hl + h) * 256 + n]) as f64 * wf(h * 448 + n, c);
+    // 33 rows: past the 8 / 16 rows a launch (a copy round's verify)
+    for t in [3usize, 33] {
+        let q = rng.bf16_vec(t * hl * 256, 1.0);
+        let (d_w, d_ws, d_q) = (dev(&w), dev(&ws), dev(&q));
+        let d_out = DeviceBuffer::<u16>::zeroed(t * hl * 576).unwrap();
+        ok(unsafe { glm_absorb_q(st.raw(), p(&d_q), (hl * 256) as i64, 256, p(&d_w), p(&d_ws), p(&d_out), (hl * 576) as i64, 576, t as i32, hl as i32) });
+        let got: Vec<f32> = d_out.download().unwrap().iter().map(|&v| f32_from_bf16(v)).collect();
+        let mut gq = vec![];
+        let mut wq = vec![];
+        for r in 0..t {
+            for h in 0..hl {
+                for c in 0..512 {
+                    let mut a = 0f64;
+                    for n in 0..192 {
+                        a += f32_from_bf16(q[(r * hl + h) * 256 + n]) as f64 * wf(h * 448 + n, c);
+                    }
+                    wq.push(a);
+                    gq.push(got[(r * hl + h) * 576 + c]);
                 }
-                wq.push(a);
-                gq.push(got[(r * hl + h) * 576 + c]);
             }
-        }
     }
     let e = rel_err(&gq, &wq);
-    assert!(e < 5e-3, "absorb_q {e}");
+    assert!(e < 5e-3, "absorb_q {e} at {t} rows");
     let o = rng.bf16_vec(t * hl * 512, 1.0);
     let d_o = dev(&o);
     let d_y = DeviceBuffer::<u16>::zeroed(t * hl * 256).unwrap();
@@ -649,7 +651,8 @@ fn absorb_and_router() {
         }
     }
     let e = rel_err(&got, &wo);
-    assert!(e < 5e-3, "absorb_o {e}");
+    assert!(e < 5e-3, "absorb_o {e} at {t} rows");
+    }
 
     // router: sigmoid + bias, top-8 over allowed (descending, ties low), renormalized x 2.5
     let tt = 3usize;

@@ -71,7 +71,7 @@ fn main() -> Result<()> {
     log(&format!("[glm] engine up in {:.0} s", t0.elapsed().as_secs_f64()));
     eng.graphs = args.iter().any(|a| a == "--graphs");
     if args.iter().any(|a| a == "--hot") {
-        eng.enable_hot(true)?;
+        eng.enable_hot(false)?;
     }
     if rank == 1 {
         return eng.follow();

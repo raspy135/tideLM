@@ -4517,3 +4517,74 @@ bytes - gate+up 10.9-11.8 ms, down 5.3-5.4 - a quarter of what the loads can str
 probe kernels of 2026-10-23 found (the consume side is the floor). The evict-first L2 policy on
 its 4-byte `cp.async` (`createpolicy` + `.L2::cache_hint`; a 4-byte copy has no `.cg`) raised an
 illegal instruction on GB10 and was dropped.
+
+## Async hot reads in the Rust GLM engine: 5-7% faster a round, the Python quality cost (2026-10-27)
+
+`GLM_HOT_ASYNC=1` in the Rust engine (`crates/tidelm-glm/src/adapt.rs` hot_plan / hot_install)
+is tp.py's design: the decode pass is one graph that leaves every MoE layer's exact candidates in
+its own region of `act.hot` and copies them to the host behind the head; after the pass, per MoE
+layer the heaviest missed pick at or above 0.2, the heaviest 16 of those, each into the next
+queued victim's slot (the victim stops being routable at the plan), read on reader threads while
+the next round drafts; routable from the next decoder pass, which waits for them first (so does
+an adaptation). README protocol (bench/bench.py prose / code, 3 runs, temperature 0.6), one boot an
+arm from the same copy of the routing history, prefix disk off, 12,500 slots, 256K:
+
+| | prose tok/s | code tok/s | ms a round, prose / code | reads a round | waited |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| sync (the profile) | 16.73 | 20.84 | 128 / 144 | ~3.5 | -- |
+| async | 17.64 | 22.24 | 121 / 135 | ~3.5 | 0.2-0.8 s a request |
+
+The same tokens a round in both arms: the gain is the round, 7-9 ms of reads leaving it (Python
+measured ~5 ms). Its quality was measured in Python on the same design (2026-10-19 above): KL to
+exact 0.086 -> 0.137, top-1 94.0% -> 92.4%. Opt-in, off in the example; it needs `GLM_BG=1` and
+`GLM_HOT_KEEP` for its victims.
+
+## GLM copy rounds: the DS copier's long copies, verified as a prefill chunk below 32K (2026-10-27)
+
+GLM's lookup (`GLM_LOOKUP=8`, 2026-10-23 above) copies exactly the MTP depth, 7 tokens a round. The
+DS copier (`tidelm_engine::copy`: from the prompt after a 6-token match, the next copy 2 x the last
+one's accepted + 2) now runs ahead of it with copies of 7-32 tokens (`GLM_COPY=1`, the default;
+`x_copy_draft: false` per request leaves the lookup). What a wide verify costs on the pair
+(`tidelm-server --bench-width`, 2,500 tokens of code as context, ms; 17+ rows then a prefill chunk):
+
+| rows | 1 | 2 | 4 | 8 | 9 | 16 | 17 | 24 | 33 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| verify | 89 | 115 | 150 | 200 | 238 | 315 | 358 | 389 | 465 |
+
+All accepted, a copied token costs 25 ms at 8 rows, 21 at 17 and 14 at 33, against ~48 ms a token
+for MTP rounds on code (an MTP draft pass is 3.2 ms). Rows past 8 run eagerly (a whole-pass graph
+is ~24 MB; 16 of them were 0.38 GiB).
+
+A prefill chunk of 17-33 rows gathers a split cache's every position in every layer; the decode
+path's split attention sends only the rows' queries. Raising the decode path to 33 rows took two
+kernels past 16 (absorb_q's launcher check, absorb_o's shared staging: both loop over row blocks
+now, glm_gpu.rs at 3 and 33 rows). Both paths by context, one boot each (decode / prefill, ms):
+
+| context | 17 rows | 24 rows | 33 rows |
+| --- | ---: | ---: | ---: |
+| 2.5K | 346 / 361 | 399 / 394 | 499 / 479 |
+| 10K | 384 / 410 | 466 / 473 | 587 / 568 |
+| 20K | 370 / 407 | 427 / 450 | 531 / 538 |
+| 30K | 389 / 446 | 454 / 498 | 556 / 571 |
+
+Real copy rounds put the crossover later than this bench: the file rewrite below, the same greedy
+text both arms, ran 50.6 tok/s on the decode path against 53.9 / 54.5 as a prefill chunk at ~3K
+context, and drew even at 35.6K (48.9 / 50.7 against 49.1 at the same tokens a round). So wide
+verifies run as a prefill chunk below 32,768 positions and on the decode path from there
+(`TIDELM_GLM_WIDE_DECODE_FROM`, in the boot guard); past 32K the prefill chunk keeps growing with
+the cache it gathers. The MTP fill after a long copy stays a prefill pass (the MTP cache is whole).
+
+One boot, greedy, 600 tokens, off / on interleaved twice (off = MTP and the 7-token lookup), ~3K
+context, sync hot reads:
+
+| prompt | off tok/s | on tok/s | tokens a round |
+| --- | ---: | ---: | ---: |
+| rewrite a file, one rename | 36.5 / 36.9 | 55.9 / 56.5 | 7.7 -> 26.0 |
+| re-run a tool call, one flag changed | 32.1 / 34.9 | 39.3 / 39.7 | 6.8 -> 13.7 |
+| quote a function line by line | 20.1 / 21.8 | 20.4 / 20.6 | 3.2 -> 3.3 |
+| fresh code | 22.2 / 22.0 | 22.5 / 22.3 | no long copy |
+| prose | 16.0 / 16.0 | 16.1 / 16.6 | no copy |
+
+Off and on emitted the same greedy text where an off/off pair did (hash `8f0f02b95081`, and
+`bab7872d97f4` in the crossover run): the copies are exact. Two boots of identical code put the
+rewrite's off arm at 34.2-36.9 tok/s; compare within a boot.

@@ -4,7 +4,7 @@
 //!
 //!   tidelm-server --model-dir DIR --pack PACK_r{rank}of2.bin --db HISTORY [--world 2 --rank R
 //!                 --addr H:P] [--slots 12500] [--max-seq 262144] [--chunk 4096] [--graphs]
-//!                 [--hot 1] [--hot-keep 32] [--depth 7] [--cal 0.36 | --dyn 0.9] [--lookup 8]
+//!                 [--hot 1] [--hot-async 0] [--hot-keep 32] [--depth 7] [--cal 0.36 | --dyn 0.9] [--lookup 8] [--copy 1]
 //!                 [--adapt 1] [--adapt-every 200] [--adapt-prefill 512] [--adapt-decode 256]
 //!                 [--bg-every 2] [--loop-break 12] [--two-pass 512] [--two-pass-miss 0.15]
 //!                 [--state-db FILE] [--host 0.0.0.0] [--port 8000] [--served-model-name glm-5.3]
@@ -34,7 +34,7 @@ pub fn is_glm(model_dir: &std::path::Path) -> bool {
 }
 
 pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
-    const VALUED: [&str; 34] = ["--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
+    const VALUED: [&str; 39] = ["--bench-widths", "--copy", "--hot-async", "--bench-width", "--bench-ctx", "--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
                                 "--max-seq", "--chunk", "--hot", "--hot-keep", "--depth", "--cal", "--dyn", "--lookup",
                                 "--adapt", "--adapt-every", "--adapt-prefill", "--adapt-decode", "--bg-every", "--loop-break",
                                 "--two-pass", "--two-pass-miss", "--host", "--port", "--served-model-name", "--moe-rows",
@@ -67,9 +67,9 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         prefill_reduce_bf16: arg(args, "--reduce").as_deref() != Some("fp32"),
         moe_rows: num("--moe-rows", 2048.0)? as usize,
         pack: PathBuf::from(&pack),
-        guard_extra: format!("graphs {} hot {} prefix {} gb {}", args.iter().any(|a| a == "--graphs"),
-                             arg(args, "--hot").unwrap_or_else(|| "1".into()), arg(args, "--prefix-disk").is_some(),
-                             arg(args, "--prefix-disk-gb").unwrap_or_default()),
+        guard_extra: format!("graphs {} hot {} async {} prefix {} gb {}", args.iter().any(|a| a == "--graphs"),
+                             arg(args, "--hot").unwrap_or_else(|| "1".into()), arg(args, "--hot-async").unwrap_or_default(),
+                             arg(args, "--prefix-disk").is_some(), arg(args, "--prefix-disk-gb").unwrap_or_default()),
     };
     tidelm_cuda::set_device(0)?;
     let cfg = tidelm_glm::config::GlmConfig::load(&model_dir)?;
@@ -115,8 +115,15 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
     };
     let mut eng = Engine::load(&model_dir, opt, rank, world, pair, &residents, &log)?;
     eng.graphs = arg(args, "--graphs").is_some() || args.iter().any(|a| a == "--graphs");
+    // async hot reads (GLM_HOT_ASYNC) go into the background period's victims, and have none
+    // without it (tp.py's rule)
+    let hot_async = num("--hot-async", 0.0)? > 0.0;
+    if hot_async && (num("--hot", 1.0)? == 0.0 || num("--bg-every", 2.0)? == 0.0 || num("--hot-keep", 32.0)? == 0.0
+                     || num("--adapt", 1.0)? == 0.0) {
+        return Err("--hot-async 1 needs --hot 1, --adapt 1 and the background period's victims (--bg-every, --hot-keep)".into());
+    }
     if num("--hot", 1.0)? > 0.0 {
-        eng.enable_hot(true)?;
+        eng.enable_hot(hot_async)?;
     }
     if rank == 0 {
         if let Some(p) = state_db.parent() {
@@ -130,6 +137,7 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         cal: arg(args, "--cal").map(|v| v.parse()).transpose().map_err(|e| format!("--cal: {e}"))?,
         dyn_gate: num("--dyn", 0.9)?,
         lookup: num("--lookup", 8.0)? as usize,
+        copy: if num("--copy", 1.0)? > 0.0 { Some(tidelm_glm::serve::glm_copy_config()?) } else { None },
         adapt: num("--adapt", 1.0)? > 0.0,
         adapt_every: num("--adapt-every", 200.0)? as usize,
         adapt_prefill: num("--adapt-prefill", 512.0)? as usize,
@@ -168,6 +176,17 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         let tw = Instant::now();
         srv.warmup()?;
         eprintln!("boot: warm-up {:.1} s", tw.elapsed().as_secs_f64());
+    }
+    // --bench-width TEXT (rank 0, instead of serving): verify passes of each width timed on the
+    // file's own continuation - what a longer copy costs - then rank 1 is released
+    if let Some(path) = arg(args, "--bench-width") {
+        let text = Text::load(&model_dir)?;
+        let list = |k: &str, d: &str| -> tidelm_engine::Result<Vec<usize>> {
+            Ok(arg(args, k).unwrap_or_else(|| d.into()).split(',').map(|v| v.trim().parse()).collect::<std::result::Result<_, _>>()
+                .map_err(|e| format!("{k}: {e}"))?)
+        };
+        return bench_width(&mut srv.eng, &path, &list("--bench-ctx", "2500")?, &list("--bench-widths", "1,2,4,6,8,9,12,16,17,24,32,33")?,
+                           &text);
     }
     let text = Text::load(&model_dir)?;
     let family = Family::load(&model_dir, &text)?;
@@ -258,13 +277,69 @@ fn engine_loop(mut srv: Server, rx: mpsc::Receiver<Cmd>) -> tidelm_engine::Resul
         }
         let (s1, r1) = (&srv.stats, &srv.eng.res.stats);
         let rounds = (s1.rounds - s0.rounds).max(1) as f64;
-        eprintln!("request {id}, GLM: {:.2} drafted / {:.2} accepted a round, copy rounds {}, \
-                   hot reads {} (kept {}), swaps {}, fallbacks {}",
+        eprintln!("request {id}, GLM: {:.2} drafted / {:.2} accepted a round, copy rounds {} ({} long, {} accepted), \
+                   hot reads {} (kept {}, {:.2} s waited), swaps {}, fallbacks {}",
                   (s1.drafted - s0.drafted) as f64 / rounds, (s1.accepted - s0.accepted) as f64 / rounds,
-                  s1.copy_rounds - s0.copy_rounds, r1.hot_reads - r0.hot_reads, r1.hot_kept - r0.hot_kept, r1.swaps - r0.swaps,
-                  s1.fallbacks - s0.fallbacks);
+                  s1.copy_rounds - s0.copy_rounds, s1.long_copies - s0.long_copies, s1.copy_accepted - s0.copy_accepted,
+                  r1.hot_reads - r0.hot_reads,
+                  r1.hot_kept - r0.hot_kept, r1.hot_wait_s - r0.hot_wait_s, r1.swaps - r0.swaps, s1.fallbacks - s0.fallbacks);
     }
     srv.eng.stop_follower()?;
+    Ok(())
+}
+
+/// The verify cost by width: each of --bench-ctx's lengths (ascending) of a text file as context,
+/// then passes of --bench-widths rows of its continuation, each rolled back (20 timed after 5
+/// warm; past 16 rows the path wide_decode_from() picks), and the MTP draft pass a copy round
+/// skips.
+fn bench_width(eng: &mut Engine, path: &str, ctxs: &[usize], widths: &[usize], text: &Text) -> tidelm_engine::Result<()> {
+    let ids = text.encode(&std::fs::read_to_string(path)?).map_err(|e| format!("{path}: {e:?}"))?;
+    let wmax = widths.iter().copied().max().unwrap_or(1);
+    eng.set_pos(0)?;
+    for &ctx in ctxs {
+        if ids.len() < ctx + wmax || ctx <= eng.pos {
+            return Err(format!("{path}: {} tokens; contexts must ascend and leave {wmax}", ids.len()).into());
+        }
+        eng.forward(&ids[eng.pos..ctx], false)?;
+        eng.keep_hidden(eng.last_rows - 1)?;
+        bench_widths(eng, &ids, ctx, widths)?;
+    }
+    eng.stop_follower()?;
+    Ok(())
+}
+
+fn bench_widths(eng: &mut Engine, ids: &[u32], ctx: usize, widths: &[usize]) -> tidelm_engine::Result<()> {
+    let base = eng.pos;
+    let median = |mut ts: Vec<f64>| -> (f64, f64, f64) {
+        ts.sort_by(f64::total_cmp);
+        (ts[ts.len() / 2], ts[0], ts[ts.len() - 1])
+    };
+    eprintln!("bench-width: context {base} tokens");
+    for &w in widths {
+        let block = &ids[ctx..ctx + w];
+        let mut ts = Vec::new();
+        for i in 0..25 {
+            let t = Instant::now();
+            eng.forward(block, false)?;
+            let dt = t.elapsed().as_secs_f64() * 1e3;
+            eng.set_pos(base)?;
+            if i >= 5 {
+                ts.push(dt);
+            }
+        }
+        let (m, lo, hi) = median(ts);
+        eprintln!("bench-width: {w:2} rows: verify {m:.2} ms (min {lo:.2}, max {hi:.2})");
+    }
+    let mut ts = Vec::new();
+    for i in 0..25 {
+        let t = Instant::now();
+        eng.mtp(&[ids[ctx]], tidelm_glm::forward::Hidden::Last, base - 1, true)?;
+        if i >= 5 {
+            ts.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+    let (m, lo, hi) = median(ts);
+    eprintln!("bench-width: MTP draft pass {m:.2} ms (min {lo:.2}, max {hi:.2})");
     Ok(())
 }
 

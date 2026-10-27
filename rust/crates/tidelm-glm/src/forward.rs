@@ -29,6 +29,19 @@ use crate::{ck, Result};
 
 /// Decode rows a graph or a verify step carries at most (MTP depth 7 + the anchor).
 pub const VERIFY_ROWS: usize = 8;
+/// A forward of up to this many rows returns every row's argmax (and, sampled, candidates): a
+/// copy round's verify, the anchor and up to 32 copied tokens. Past MAX_ROWS such a pass runs as
+/// one prefill chunk below wide_decode_from() positions and on the decode path from there: the
+/// prefill chunk gathers a split cache's every position in every layer (gigabytes a pass at 100K
+/// context) where the decode path's split attention sends only the rows' queries, but on a short
+/// context its rows are cheaper (docs/gotchas.md, 2026-10-27).
+pub const HEAD_ROWS: usize = 33;
+
+/// The position from which a pass of MAX_ROWS + 1 ..= HEAD_ROWS rows runs the decode path
+/// (TIDELM_GLM_WIDE_DECODE_FROM overrides; it is in the boot guard).
+pub fn wide_decode_from() -> usize {
+    std::env::var("TIDELM_GLM_WIDE_DECODE_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(32768)
+}
 /// Up to this many rows an EXL3 matrix runs the decode GEMV in 16-row blocks (gate/up then come
 /// back interleaved [rows][2N]); more unpack the trellis for cuBLAS ([2][rows][N]).
 const GEMV_ROWS: usize = 64;
@@ -85,7 +98,7 @@ impl Options {
              pack_source {}\nenv {}\nflags {}\n",
             sha2::Sha256::digest(&cfg), sha2::Sha256::digest(&exe), self.max_seq, self.chunk, self.slots, self.kv_split,
             self.prefill_reduce_bf16, self.moe_rows, pack.source_sha256,
-            ["TIDELM_GLM_HOT", "NCCL_PROTO"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
+            ["TIDELM_GLM_HOT", "TIDELM_GLM_WIDE_DECODE_FROM", "NCCL_PROTO"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
                 .collect::<Vec<_>>().join(" "), self.guard_extra);
         Ok(s.into_bytes())
     }
@@ -260,6 +273,8 @@ pub struct Engine {
     graphs_map: std::collections::HashMap<GraphKey, tidelm_cuda::GraphExec>,
     /// synchronous hot reads between a decode pass's segments (None: off)
     pub hot: Option<crate::adapt::Hot>,
+    /// wide_decode_from(), read once at load
+    wide_from: usize,
     pub res: crate::adapt::Res,
     h_ids: tidelm_cuda::PinnedBuffer<i32>,
     h_pos: tidelm_cuda::PinnedBuffer<i32>,
@@ -390,17 +405,18 @@ impl Engine {
             graphs: false,
             graphs_map: std::collections::HashMap::new(),
             hot: None,
+            wide_from: wide_decode_from(),
             res: crate::adapt::Res::new(nl, e, opt_slots, moe_layers_res, residents),
             h_ids: tidelm_cuda::PinnedBuffer::zeroed(opt_chunk.max(MAX_ROWS))?,
             h_pos: tidelm_cuda::PinnedBuffer::zeroed(2)?,
-            h_tok: tidelm_cuda::PinnedBuffer::zeroed(MAX_ROWS)?,
+            h_tok: tidelm_cuda::PinnedBuffer::zeroed(HEAD_ROWS)?,
             prefix_dir: None,
             stage: None,
             sampled: false,
             temp: DeviceBuffer::from_slice(&[1.0f32])?,
             h_temp: tidelm_cuda::PinnedBuffer::zeroed(1)?,
-            cand: DeviceBuffer::new(MAX_ROWS * CROW)?,
-            h_cand: tidelm_cuda::PinnedBuffer::zeroed(world * MAX_ROWS * CROW)?,
+            cand: DeviceBuffer::new(HEAD_ROWS * CROW)?,
+            h_cand: tidelm_cuda::PinnedBuffer::zeroed(world * HEAD_ROWS * CROW)?,
             cand_rows: 0,
         };
         engine.st.synchronize()?;
@@ -758,6 +774,13 @@ impl Engine {
         }
     }
 
+    /// MoE layer l's hot-read candidates for decode rows: [MAX_ROWS * topk][2] of act.hot, one
+    /// region a decoder MoE layer (the async table is all of them) and one for the MTP layer.
+    fn hot_region(&self, l: usize) -> *mut c_void {
+        let i = self.moe_layers.binary_search(&l).unwrap_or(self.moe_layers.len());
+        at(&self.act.hot, i * MAX_ROWS * self.cfg.topk * 2)
+    }
+
     /// The MoE layer's router over rows [r0, r0 + n) of xn and its exact (unmasked) top-k: the
     /// demand, miss counters and hot-read candidates (decode rows only: a prefill's are never
     /// read, and its rows would overrun the candidates' buffer) come from these.
@@ -766,7 +789,7 @@ impl Engine {
         let Mlp::Moe { router, bias, .. } = &self.w.layers[l].mlp else { return Err("moe_exact on a dense layer".into()) };
         let (e, h) = (cfg.experts, cfg.hidden);
         let allowed = self.allowed_ptr(l);
-        let hot = if n <= MAX_ROWS { np(&a.hot) } else { std::ptr::null_mut() };
+        let hot = if n <= MAX_ROWS { self.hot_region(l) } else { std::ptr::null_mut() };
         self.linear_f32w(at(&a.xn, r0 * h), h, router, n, e, h, np(&a.logits), if n <= MAX_ROWS { 6 } else { 1 })?;
         ck(unsafe { glm_router(self.st.raw(), np(&a.logits), np(bias), std::ptr::null(), std::ptr::null(), n as i32,
                                cfg.topk as i32, cfg.routed_scaling, np(&a.eids), np(&a.ew), allowed, hot, std::ptr::null(),
@@ -923,13 +946,13 @@ impl Engine {
 
     /// The embedding rows of the staged ids (zeroed at position 0 for the MTP layer) -> bf16
     /// at `out`, summed over the pair's vocabulary halves.
-    fn embed(&self, t: usize, mtp: bool, out: *mut c_void) -> Result<()> {
+    fn embed(&self, t: usize, mtp: bool, out: *mut c_void, prefill: bool) -> Result<()> {
         let a = &self.act;
         let h = self.cfg.hidden;
         ck(unsafe { glm_embed(self.st.raw(), np(&a.tok), t as i32, np(&self.w.embed_q), np(&self.w.embed_s),
                               (self.rank * self.vl) as i32, self.vl as i32, h as i32,
                               if mtp { np(&a.mpos) } else { std::ptr::null_mut() }, np(&a.f32buf)) }, "embed")?;
-        self.allreduce(np(&a.f32buf), t * h, out, t > MAX_ROWS)
+        self.allreduce(np(&a.f32buf), t * h, out, prefill)
     }
 
     fn norm(&self, x: *mut c_void, add: bool, w: &DeviceBuffer<u16>, y: *mut c_void, t: usize) -> Result<()> {
@@ -949,10 +972,9 @@ impl Engine {
     }
 
     /// The decoder layers over `t` rows (staged) at self.pos: the final norm into hn.
-    fn layers(&self, t: usize) -> Result<()> {
-        let prefill = t > MAX_ROWS;
+    fn layers(&self, t: usize, prefill: bool) -> Result<()> {
         self.positions(t, false)?;
-        self.embed(t, false, np(&self.act.h))?;
+        self.embed(t, false, np(&self.act.h), prefill)?;
         for l in 0..self.cfg.layers {
             self.layer_pre(l, t, prefill)?;
             self.mlp(l, t, prefill)?;
@@ -968,7 +990,7 @@ impl Engine {
         let moe = &self.moe_layers;
         let start = if seg == 0 {
             self.positions(t, false)?;
-            self.embed(t, false, np(&self.act.h))?;
+            self.embed(t, false, np(&self.act.h), false)?;
             0
         } else {
             let l = moe[seg - 1];
@@ -983,16 +1005,32 @@ impl Engine {
         if seg < moe.len() {
             self.layer_pre(end, t, false)?;
             self.moe_exact(end, 0, t)?;
-            if let Some(h) = self.hot.as_ref() {
+            if let Some(h) = self.hot.as_ref().filter(|h| h.asynch.is_none()) {
                 unsafe {
-                    tidelm_cuda::memcpy_async(h.host.raw(), np(&self.act.hot), t * self.cfg.topk * 8,
+                    tidelm_cuda::memcpy_async(h.host.raw(), self.hot_region(end), t * self.cfg.topk * 8,
                                               tidelm_cuda::ffi::MEMCPY_DEVICE_TO_HOST, &self.st)?;
                 }
             }
             return Ok(());
         }
         self.norm(np(&self.act.h), true, &self.w.norm, np(&self.act.hn), t)?;
-        self.head_dev(np(&self.act.hn), t)
+        self.head_dev(np(&self.act.hn), t)?;
+        self.hot_table_copy()
+    }
+
+    /// Async hot reads: every MoE layer's candidates to the host behind the head (inside a
+    /// decode pass's graph), the table the next plan reads.
+    fn hot_table_copy(&self) -> Result<()> {
+        let Some(a) = self.hot.as_ref().and_then(|h| h.asynch.as_ref()) else { return Ok(()) };
+        unsafe {
+            tidelm_cuda::memcpy_async(a.table.raw(), np(&self.act.hot), a.table.len() * 4, tidelm_cuda::ffi::MEMCPY_DEVICE_TO_HOST,
+                                      &self.st)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn moe_layers(&self) -> &[usize] {
+        &self.moe_layers
     }
 
     /// The head over `t` rows of `x` (bf16 [t][H]) and each row's argmax into out_tok.
@@ -1002,8 +1040,8 @@ impl Engine {
         self.exl3(&self.w.head, x, self.cfg.hidden, t, np(&a.head), false)?;
         ck(unsafe { glm_argmax(st, np(&a.head), self.vl as i64, t as i32, self.vl as i32, (self.rank * self.vl) as i32,
                                np(&a.pairs)) }, "argmax")?;
-        self.gather(np(&a.pairs), t * 8, at(&a.pairs, 2 * VERIFY_ROWS * 2), false)?;
-        ck(unsafe { glm_argmax_combine(st, at(&a.pairs, 2 * VERIFY_ROWS * 2), self.world as i32, t as i32, np(&a.out_tok)) },
+        self.gather(np(&a.pairs), t * 8, at(&a.pairs, 2 * HEAD_ROWS * 2), false)?;
+        ck(unsafe { glm_argmax_combine(st, at(&a.pairs, 2 * HEAD_ROWS * 2), self.world as i32, t as i32, np(&a.out_tok)) },
            "argmax combine")?;
         if self.sampled {
             let c = np(&self.cand);
@@ -1101,10 +1139,12 @@ impl Engine {
         let h = cfg.hidden;
         let lw = &self.w.layers[l];
         let mx = lw.mtp.as_ref().ok_or("no MTP layer")?;
+        // past 16 rows (the fill after a long copy) a prefill pass, as before HEAD_ROWS: the MTP
+        // layer's cache is whole, so a prefill pass of it gathers nothing
         let prefill = t > MAX_ROWS;
         self.positions(t, true)?;
         // e = embed(next ids), zero at position 0; x = eh_proj(cat(enorm(e), hnorm(h_prev)))
-        self.embed(t, true, np(&a.xn))?;
+        self.embed(t, true, np(&a.xn), prefill)?;
         ck(unsafe { glm_rmsnorm(st, np(&a.xn), h as i64, std::ptr::null(), 0, np(&mx.enorm), np(&a.ehin), (2 * h) as i64, t as i32,
                                 h as i32, cfg.rms_eps) }, "enorm")?;
         let hp = match hsrc {
@@ -1209,8 +1249,8 @@ fn decode_split(k: usize, heads: usize, t: usize) -> (usize, usize) {
 
 impl Act {
     fn new(cfg: &GlmConfig, opt: &Options, hl: usize, vl: usize, s_loc: usize, slots: usize) -> Result<Self> {
-        let r = opt.chunk.max(MAX_ROWS);
-        let d = MAX_ROWS;
+        let r = opt.chunk.max(HEAD_ROWS);
+        let d = HEAD_ROWS;
         let h = cfg.hidden;
         let il = cfg.moe_inter / (cfg.heads / hl);
         let world = cfg.heads / hl;
@@ -1283,7 +1323,7 @@ impl Act {
             ew: DeviceBuffer::new(mr.max(d) * cfg.topk)?,
             pick: DeviceBuffer::new(mr.max(d) * cfg.topk)?,
             wts: DeviceBuffer::new(mr.max(d) * cfg.topk)?,
-            hot: DeviceBuffer::new(d * cfg.topk * 2)?,
+            hot: DeviceBuffer::new((cfg.dense.iter().filter(|&&x| !x).count() + 1) * MAX_ROWS * cfg.topk * 2)?,
             gu: z(r * 2 * (cfg.inter / world).max(il))?,
             pair: DeviceBuffer::new(pair_bytes)?,
             xdf: z(pd * il * world)?,
@@ -1304,9 +1344,9 @@ impl Act {
             block_slot: DeviceBuffer::new(nb)?,
             block_pair: DeviceBuffer::new(nb * 64)?,
             block_route: DeviceBuffer::new(nb * 64)?,
-            head: DeviceBuffer::new(d * vl)?,
-            pairs: DeviceBuffer::new(2 * VERIFY_ROWS * 2 * (1 + world))?,
-            out_tok: DeviceBuffer::new(d)?,
+            head: DeviceBuffer::new(HEAD_ROWS * vl)?,
+            pairs: DeviceBuffer::new(2 * HEAD_ROWS * 2 * (1 + world))?,
+            out_tok: DeviceBuffer::new(HEAD_ROWS)?,
             hn: z(r * h)?,
             mhn: z(r * h)?,
             hlast: z(h)?,
@@ -1378,8 +1418,9 @@ impl Engine {
         Ok(())
     }
 
-    /// Run `ids` at the sequence's end: <= 16 rows the decode path (each row's argmax back),
-    /// more in prefill chunks (the last row's). With `mtp_fill`, the MTP layer's cache follows
+    /// Run `ids` at the sequence's end: up to MAX_ROWS rows the decode path, more in prefill
+    /// chunks, MAX_ROWS + 1 ..= HEAD_ROWS either (HEAD_ROWS above); up to HEAD_ROWS rows every
+    /// row's argmax comes back, past it the last row's. With `mtp_fill`, the MTP layer's cache follows
     /// every row whose next token is in `ids` (the last row waits for the sampled token).
     pub fn forward(&mut self, ids: &[u32], mtp_fill: bool) -> Result<Vec<u32>> {
         self.mirror(|m| {
@@ -1398,10 +1439,12 @@ impl Engine {
         }
         let h = self.cfg.hidden;
         let mtp = mtp_fill && self.cfg.mtp;
-        if t <= MAX_ROWS {
+        // async hot reads planned after the last decode pass become routable for this one
+        self.hot_install()?;
+        if t <= MAX_ROWS || (t <= HEAD_ROWS && self.pos >= self.wide_from) {
             self.stage(ids, self.pos, false)?;
             if t <= VERIFY_ROWS && self.graphs {
-                if self.hot.is_some() {
+                if self.hot.as_ref().is_some_and(|h| h.asynch.is_none()) {
                     self.hot_begin();
                     let n = self.moe_layers.len();
                     for seg in 0..=n {
@@ -1416,11 +1459,15 @@ impl Engine {
                     self.replay(GraphKey::Target { t, sampled: self.sampled }, |e| (0..nseg).try_for_each(|seg| e.decode_segment(seg, t)))?;
                 }
             } else {
-                self.layers(t)?;
+                self.layers(t, false)?;
                 self.head_dev(np(&self.act.hn), t)?;
+                self.hot_table_copy()?;
             }
             self.last_rows = t;
             let out = self.read_tokens(t)?;
+            if t <= MAX_ROWS {
+                self.hot_plan(t)?; // wider passes leave no candidates (moe_exact)
+            }
             let p0 = self.pos;
             self.tokens.extend_from_slice(ids);
             self.pos += t;
@@ -1435,9 +1482,12 @@ impl Engine {
             let n = self.opt.chunk.min(t - c0);
             let part = &ids[c0..c0 + n];
             self.stage(part, self.pos, false)?;
-            self.layers(n)?;
+            self.layers(n, true)?;
             self.last_rows = n;
-            if c0 + n == t {
+            if c0 + n == t && t <= HEAD_ROWS {
+                self.head_dev(np(&self.act.hn), n)?;
+                out = self.read_tokens(n)?;
+            } else if c0 + n == t {
                 self.head_dev(at(&self.act.hn, (n - 1) * h), 1)?;
                 out = self.read_tokens(1)?;
             }
