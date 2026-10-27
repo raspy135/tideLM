@@ -12,17 +12,21 @@ Two settings control it; the engine derives the rest and logs what it chose at s
 | Setting | Default in `.env.example.fp4` / `.exl3` | Meaning |
 | --- | --- | --- |
 | `DSV41_ADAPT_SENSITIVITY` | `high` | How far one request moves the resident set. See the levels below. |
-| `DSV41_ADAPT_PRIOR` | `4` | Weight of the shipped routing trace, in requests. Lower lets this server's own traffic dominate sooner. |
+| `DSV41_ADAPT_PRIOR` | `4` | Weight of the shipped routing trace, in votes (below). Lower lets this server's own traffic dominate sooner. |
 
-| Sensitivity | Demand half-life | Newest request's share of observed demand | Miss gate (prefill and decode passes) |
+A request votes twice: its prompt's demand at the prefill→decode boundary, its answer's at the
+end (both engines). Each vote ages the history by one step, so a half-life in votes is about half
+as many requests.
+
+| Sensitivity | Demand half-life | Newest vote's share of observed demand | Miss gate (prefill and decode passes) |
 | --- | ---: | ---: | ---: |
 | `off` | never (ranking frozen) | — | — |
-| `low` | 40 requests | 1.7% | 4% |
-| `medium` | 20 requests | 3.4% | 2% |
-| `high` | 10 requests | 6.7% | 1% |
-| `max` | 5 requests | 12.9% | 0.5% |
+| `low` | 40 votes (~20 requests) | 1.7% | 4% |
+| `medium` | 20 votes (~10 requests) | 3.4% | 2% |
+| `high` | 10 votes (~5 requests) | 6.7% | 1% |
+| `max` | 5 votes (~2.5 requests) | 12.9% | 0.5% |
 
-A number in `[0, 0.5)` sets the newest request's share directly. Higher sensitivity swaps
+A number in `[0, 0.5)` sets the newest vote's share directly. Higher sensitivity swaps
 more experts per request (roughly 2x from `medium` to `high`). Judge it by the `routed-miss`
 rate in the request logs, not by swap counts: too high a setting chases each prompt and makes
 misses worse (see [gotchas](gotchas.md)).
