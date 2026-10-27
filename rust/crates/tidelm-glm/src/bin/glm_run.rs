@@ -55,7 +55,10 @@ fn main() -> Result<()> {
     let residents: Vec<(usize, usize)> = if rank == 0 {
         let db = PathBuf::from(arg(&args, "--db").ok_or("--db")?);
         let mass = tidelm_glm::residency::read_mass(&db, cfg.n_layers(), e)?;
-        let r = tidelm_glm::residency::placement(&mass, e, &swap, opt.slots, 2 * cfg.topk);
+        let pk = tidelm_glm::arena::Pack::open(&opt.pack, cfg.hidden, cfg.moe_inter)?;
+        let unit: usize = tidelm_glm::arena::record_sizes([3; 3], world, cfg.hidden, cfg.moe_inter).iter().sum();
+        let cost = |l: usize, x: usize| pk.records.get(&(l, x)).map(|r| r.nbytes).unwrap_or(usize::MAX);
+        let r = tidelm_glm::residency::placement_bytes(&mass, e, &swap, opt.slots * unit, 2 * cfg.topk, &cost);
         if let Some(p) = pair.as_mut() {
             let mut m = tidelm_comm::Msg::default();
             m.u32s(&r.iter().map(|&(l, x)| (l * e + x) as u32).collect::<Vec<_>>());

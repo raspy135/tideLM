@@ -135,26 +135,35 @@ fn prefill(st: &Stream, t1p: &DeviceBuffer<i64>, t3p: &DeviceBuffer<i64>, t2p: &
     let zup = DeviceBuffer::<f32>::new(2 * p * il)?;
     let zd = DeviceBuffer::<f32>::new(p * dn)?;
     println!("prefill expert GEMM, {rows} rows x top-{TOPK} over {POOL} experts (median of 8, ms / GB/s of trellis bytes)");
-    for (name, mats, x0p, x1p, tp0, tp1, z, k, n, wq) in [("gate+up", 2, &x0, &x1, t1p, t3p, &zup, h, il, wgu),
-                                                          ("down", 1, &xd, &xd, t2p, t2p, &zd, kd, dn, wdn)] {
-        let mut ts = vec![];
-        for i in 0..10 {
-            e0.record(st)?;
-            unsafe {
-                exl3m_prefill_smem_mode(x0p.raw(), x1p.raw(), tp0.raw(), tp1.raw(), k2.raw(), k2.raw(), bslot.raw(), ucount.raw(),
-                                        members.raw(), z.raw(), k as i32, n as i32, p as i32, TOPK as i32, nb as i32, mats, 4,
-                                        1, 8, -4, st.raw());
+    // the shipped mul1 2-3-bit tile, then exl3m_prefill_smem_cb (mixed widths, up to 4 bits) on the same
+    // 3-bit experts in both codebooks
+    for kernel in ["smem_mode (3-bit mul1)", "smem_cb mul1", "smem_cb mcg"] {
+        for (name, mats, x0p, x1p, tp0, tp1, z, k, n, wq) in [("gate+up", 2, &x0, &x1, t1p, t3p, &zup, h, il, wgu),
+                                                              ("down", 1, &xd, &xd, t2p, t2p, &zd, kd, dn, wdn)] {
+            let mut ts = vec![];
+            for i in 0..10 {
+                e0.record(st)?;
+                unsafe {
+                    match kernel {
+                        "smem_mode (3-bit mul1)" => exl3m_prefill_smem_mode(x0p.raw(), x1p.raw(), tp0.raw(), tp1.raw(), k2.raw(),
+                            k2.raw(), bslot.raw(), ucount.raw(), members.raw(), z.raw(), k as i32, n as i32, p as i32, TOPK as i32,
+                            nb as i32, mats, 4, 1, 8, -4, st.raw()),
+                        _ => exl3m_prefill_smem_cb(x0p.raw(), x1p.raw(), tp0.raw(), tp1.raw(), k2.raw(), k2.raw(), bslot.raw(),
+                            ucount.raw(), members.raw(), z.raw(), k as i32, n as i32, p as i32, TOPK as i32, nb as i32, mats,
+                            if kernel.ends_with("mcg") { CB_MCG } else { CB_MUL1 }, 8, st.raw()),
+                    }
+                }
+                e1.record(st)?;
+                e1.synchronize()?;
+                if i >= 2 {
+                    ts.push(e1.elapsed_ms(e0)? as f64);
+                }
             }
-            e1.record(st)?;
-            e1.synchronize()?;
-            if i >= 2 {
-                ts.push(e1.elapsed_ms(e0)? as f64);
-            }
+            ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let ms = ts[ts.len() / 2];
+            let bytes = (POOL * mats as usize * wq * 4) as f64;
+            println!("{kernel:>24} {name:>7}: {ms:.2} ms, {:.0} GB/s", bytes / ms / 1e6);
         }
-        ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let ms = ts[ts.len() / 2];
-        let bytes = (POOL * mats as usize * wq * 4) as f64;
-        println!("{name:>7}: {ms:.2} ms, {:.0} GB/s", bytes / ms / 1e6);
     }
     Ok(())
 }

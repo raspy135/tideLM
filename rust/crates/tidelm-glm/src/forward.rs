@@ -317,28 +317,40 @@ impl Engine {
         log(&format!("[glm] dense weights {:.2} GB a rank in {:.0} s", w.bytes as f64 / 1e9, t0.elapsed().as_secs_f64()));
         let nl = cfg.n_layers();
         let e = cfg.experts;
-        // the decoder arena (3-bit records) and the MTP layer's (4-bit, all resident)
-        let bits = pack.record(cfg.dense.iter().position(|d| !d).ok_or("no MoE layer")?, 0)?.bits;
-        let arena = Arena::new(opt.slots + 1, bits, world, cfg.hidden, cfg.moe_inter)?;
+        // the decoder arena: a class of slots for each width triple among the residents and a
+        // transient slot as wide as any (sync hot reads); the MTP layer's, every expert resident
+        let moe_all: Vec<usize> = (0..cfg.layers).filter(|&l| !cfg.dense[l]).collect();
+        let (mut arena, slot_of) = class_arena(&pack, residents, Some(&moe_all), world, cfg.hidden, cfg.moe_inter)?;
+        arena.prefill_tiled = true;
         let mut lut_h = vec![-1i32; nl * e];
-        for (slot, &(l, ex)) in residents.iter().enumerate() {
-            if slot >= opt.slots {
-                return Err("more residents than slots".into());
-            }
+        for (&(l, ex), &slot) in residents.iter().zip(&slot_of) {
             lut_h[l * e + ex] = slot as i32;
         }
         let t1 = std::time::Instant::now();
-        load_slots(&pack, &arena, &residents.iter().enumerate().map(|(s, &(l, ex))| (s, l, ex)).collect::<Vec<_>>())?;
-        log(&format!("[glm] {} routed experts resident ({:.1} GB) in {:.0} s", residents.len(),
-                     (residents.len() * arena.slot_bytes()) as f64 / 1e9, t1.elapsed().as_secs_f64()));
+        let placed: Vec<(usize, usize, usize)> = residents.iter().zip(&slot_of).map(|(&(l, ex), &s)| (s, l, ex)).collect();
+        load_slots(&pack, &arena, &placed)?;
+        let widths: Vec<String> = arena.classes.iter().filter(|c| c.n > 1 || arena.classes.len() == 1)
+            .map(|c| format!("{}/{}/{} x{}", c.bits[0], c.bits[1], c.bits[2], c.n)).collect();
+        log(&format!("[glm] {} routed experts resident ({:.1} GB; {}) in {:.0} s", residents.len(), arena.bytes() as f64 / 1e9,
+                     widths.join(", "), t1.elapsed().as_secs_f64()));
         let mtp_arena = if cfg.mtp {
             let l = cfg.mtp_layer();
-            let a = Arena::new(e, pack.record(l, 0)?.bits, world, cfg.hidden, cfg.moe_inter)?;
-            load_slots(&pack, &a, &(0..e).map(|x| (x, l, x)).collect::<Vec<_>>())?;
-            Some(a)
+            let items: Vec<(usize, usize)> = (0..e).map(|x| (l, x)).collect();
+            let (a, so) = class_arena(&pack, &items, None, world, cfg.hidden, cfg.moe_inter)?;
+            load_slots(&pack, &a, &items.iter().zip(&so).map(|(&(l, x), &s)| (s, l, x)).collect::<Vec<_>>())?;
+            let mut lut = vec![0i32; e];
+            for (x, &s) in so.iter().enumerate() {
+                lut[x] = s as i32;
+            }
+            Some((a, lut))
         } else {
             None
         };
+        let (mtp_arena, mtp_lut) = match mtp_arena {
+            Some((a, lut)) => (Some(a), lut),
+            None => (None, (0..e as i32).collect()),
+        };
+        let n_slots = arena.slots;
         let allowed_h: Vec<u8> = lut_h.iter().map(|&s| (s >= 0) as u8).collect();
         let s_loc = if opt.kv_split && world > 1 { opt.max_seq.div_ceil(world) } else { opt.max_seq };
         let mut kv = Vec::with_capacity(nl);
@@ -360,11 +372,10 @@ impl Engine {
         }
         log(&format!("[glm] KV cache {:.2} GB a rank ({} positions{})", kv_bytes as f64 / 1e9, opt.max_seq,
                      if opt.kv_split { ", split" } else { "" }));
-        let act = Act::new(&cfg, &opt, hl, vl, s_loc, opt.slots + 1)?;
-        let mtp_lut: Vec<i32> = (0..e as i32).collect();
+        let act = Act::new(&cfg, &opt, hl, vl, s_loc, n_slots)?;
         let moe_layers: Vec<usize> = (0..cfg.layers).filter(|&l| !cfg.dense[l]).collect();
         let opt_chunk = opt.chunk;
-        let opt_slots = opt.slots;
+
         let moe_layers_res = moe_layers.clone();
         let engine = Engine {
             lut: DeviceBuffer::from_slice(&lut_h)?,
@@ -406,7 +417,7 @@ impl Engine {
             graphs_map: std::collections::HashMap::new(),
             hot: None,
             wide_from: wide_decode_from(),
-            res: crate::adapt::Res::new(nl, e, opt_slots, moe_layers_res, residents),
+            res: crate::adapt::Res::new(nl, e, n_slots, moe_layers_res, &placed),
             h_ids: tidelm_cuda::PinnedBuffer::zeroed(opt_chunk.max(MAX_ROWS))?,
             h_pos: tidelm_cuda::PinnedBuffer::zeroed(2)?,
             h_tok: tidelm_cuda::PinnedBuffer::zeroed(HEAD_ROWS)?,
@@ -852,18 +863,25 @@ impl Engine {
             (64, nb)
         };
         let uids = if decode { np(&a.uids) } else { np(&a.block_slot) };
-        let up_tiled = !decode && arena.bits <= 3;
+        // prefill: the smem tile for the decoder's arena (the shipped mul1 2-3-bit kernel, or the
+        // mixed-width one), the grouped GEMV for the MTP layer's
+        let up_tiled = !decode && arena.prefill_tiled;
+        let mixed = arena.cb != CB_MUL1 || arena.max_k2 > 6;
         unsafe {
             exl3m_rot_in(x, h as i32, np(&a.pick), arena.pool(3), arena.pool(4), np(&a.xh0), np(&a.xh1), n as i32, h as i32,
                          k as i32, slots, 1, st);
-            if up_tiled {
-                exl3m_prefill_smem_mode(np(&a.xh0), np(&a.xh1), np(&arena.t1p), np(&arena.t3p), np(&arena.k2), np(&arena.k2),
+            if up_tiled && mixed {
+                exl3m_prefill_smem_cb(np(&a.xh0), np(&a.xh1), np(&arena.t1p), np(&arena.t3p), np(&arena.k2g), np(&arena.k2u),
+                                      uids, np(&a.ucount), np(&a.members), np(&a.zup), h as i32, il as i32, p as i32,
+                                      k as i32, nexp, 2, arena.cb, arena.max_k2, st);
+            } else if up_tiled {
+                exl3m_prefill_smem_mode(np(&a.xh0), np(&a.xh1), np(&arena.t1p), np(&arena.t3p), np(&arena.k2g), np(&arena.k2u),
                                         uids, np(&a.ucount), np(&a.members), np(&a.zup), h as i32, il as i32, p as i32,
                                         k as i32, nexp, 2, 4, 1, 8, -4, st);
             } else {
-                exl3m_grouped(np(&a.xh0), np(&a.xh1), np(&arena.t1p), np(&arena.t3p), np(&arena.k2), np(&arena.k2), uids,
+                exl3m_grouped(np(&a.xh0), np(&a.xh1), np(&arena.t1p), np(&arena.t3p), np(&arena.k2g), np(&arena.k2u), uids,
                               np(&a.ucount), np(&a.members), np(&a.zup), h as i32, il as i32, p as i32, 1, maxm, k as i32,
-                              nexp, 2, 8, 4, if decode { 1 } else { 2 }, 2, 10, CB_MUL1, st);
+                              nexp, 2, 8, 4, if decode { 1 } else { 2 }, 2, 10, arena.cb, st);
             }
             let suh2 = (arena.pool(5) as *mut u16).add(self.rank * il) as *const c_void;
             exl3m_gateup(np(&a.zup), np(&a.pick), arena.pool(6), arena.pool(7), suh2, np(&a.pair), n as i32, p as i32, il as i32,
@@ -893,14 +911,18 @@ impl Engine {
         }
         self.exl3_on(sst, x3, sh_down, np(&a.hf), kd, n, np(&a.shout), false)?;
         unsafe {
-            if up_tiled {
-                exl3m_prefill_smem_mode(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2), np(&arena.k2),
+            if up_tiled && mixed {
+                exl3m_prefill_smem_cb(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
+                                      uids, np(&a.ucount), np(&a.members), np(&a.zd), kd as i32, dn as i32, p as i32,
+                                      k as i32, nexp, 1, arena.cb, arena.max_k2, st);
+            } else if up_tiled {
+                exl3m_prefill_smem_mode(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
                                         uids, np(&a.ucount), np(&a.members), np(&a.zd), kd as i32, dn as i32, p as i32,
                                         k as i32, nexp, 1, 4, 1, 8, -4, st);
             } else {
-                exl3m_grouped(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2), np(&arena.k2), uids,
+                exl3m_grouped(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d), uids,
                               np(&a.ucount), np(&a.members), np(&a.zd), kd as i32, dn as i32, p as i32, 1, maxm, k as i32,
-                              nexp, 1, 8, 4, if decode { 1 } else { 2 }, 2, 10, CB_MUL1, st);
+                              nexp, 1, 8, 4, if decode { 1 } else { 2 }, 2, 10, arena.cb, st);
             }
             exl3m_down_combine(np(&a.zd), np(&a.pick), arena.pool(8), np(&a.wts), np(&a.local), n as i32, p as i32, dn as i32, 1,
                                k as i32, slots, st);
@@ -1359,6 +1381,38 @@ impl Act {
     }
 }
 
+/// An arena for `items` (layer, expert): a class for each width triple among them in sorted order,
+/// slots handed out in item order within a class; with `transient` (the decoder's MoE layers), one
+/// more slot as wide as any of those layers' records. Returns each item's slot.
+pub fn class_arena(pack: &Pack, items: &[(usize, usize)], transient: Option<&[usize]>, world: usize, hidden: usize,
+                   inter: usize) -> Result<(Arena, Vec<usize>)> {
+    let bits: Vec<crate::arena::Bits> = items.iter().map(|&(l, x)| pack.record(l, x).map(|r| r.bits)).collect::<Result<_>>()?;
+    let mut counts: std::collections::BTreeMap<crate::arena::Bits, usize> = std::collections::BTreeMap::new();
+    for b in &bits {
+        *counts.entry(*b).or_default() += 1;
+    }
+    let mut classes: Vec<(crate::arena::Bits, usize)> = counts.into_iter().collect();
+    if let Some(layers) = transient {
+        let mut w = [0usize; 3];
+        for (&(l, _), r) in &pack.records {
+            if layers.contains(&l) {
+                for i in 0..3 {
+                    w[i] = w[i].max(r.bits[i]);
+                }
+            }
+        }
+        classes.push((w, 1));
+    }
+    let arena = Arena::new(&classes, pack.cb, world, hidden, inter)?;
+    let mut next: Vec<usize> = arena.classes.iter().map(|c| c.first).collect();
+    let slots = bits.iter().map(|b| {
+        let c = classes.iter().position(|x| x.0 == *b).unwrap();
+        next[c] += 1;
+        next[c] - 1
+    }).collect();
+    Ok((arena, slots))
+}
+
 /// Load records (slot, layer, expert) into an arena on reader threads, each with its own
 /// O_DIRECT buffer and stream.
 pub fn load_slots(pack: &Pack, arena: &Arena, items: &[(usize, usize, usize)]) -> Result<()> {
@@ -1381,8 +1435,8 @@ pub fn load_slots(pack: &Pack, arena: &Arena, items: &[(usize, usize, usize)]) -
                         }
                         let (slot, l, e) = items[i];
                         let r = pack.read(l, e, &mut buf)?;
-                        if r.bits != arena.bits {
-                            return Err(format!("expert ({l}, {e}) is {} bits, the arena {}", r.bits, arena.bits).into());
+                        if r.bits != arena.bits(slot) {
+                            return Err(format!("expert ({l}, {e}) is {:?} bits, its slot {slot} {:?}", r.bits, arena.bits(slot)).into());
                         }
                         arena.load(slot, &buf[..r.nbytes], &st)?;
                         st.synchronize()?;

@@ -34,7 +34,7 @@ pub fn is_glm(model_dir: &std::path::Path) -> bool {
 }
 
 pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
-    const VALUED: [&str; 39] = ["--bench-widths", "--copy", "--hot-async", "--bench-width", "--bench-ctx", "--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
+    const VALUED: [&str; 41] = ["--bench-nll-out", "--bench-nll", "--bench-widths", "--copy", "--hot-async", "--bench-width", "--bench-ctx", "--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
                                 "--max-seq", "--chunk", "--hot", "--hot-keep", "--depth", "--cal", "--dyn", "--lookup",
                                 "--adapt", "--adapt-every", "--adapt-prefill", "--adapt-decode", "--bg-every", "--loop-break",
                                 "--two-pass", "--two-pass-miss", "--host", "--port", "--served-model-name", "--moe-rows",
@@ -96,7 +96,11 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         let db = if state_db.exists() { state_db.clone() } else { PathBuf::from(arg(args, "--db").ok_or("--db HISTORY")?) };
         let m = tidelm_glm::residency::read_mass(&db, cfg.n_layers(), e)?;
         eprintln!("boot: routing history {} ", db.display());
-        let r = tidelm_glm::residency::placement(&m, e, &swap, opt.slots, 2 * cfg.topk);
+        // the expert memory is --slots 3-bit experts' worth: a pack of narrower experts holds more
+        let pack = tidelm_glm::arena::Pack::open(&opt.pack, cfg.hidden, cfg.moe_inter)?;
+        let unit: usize = tidelm_glm::arena::record_sizes([3; 3], world, cfg.hidden, cfg.moe_inter).iter().sum();
+        let cost = |l: usize, x: usize| pack.records.get(&(l, x)).map(|r| r.nbytes).unwrap_or(usize::MAX);
+        let r = tidelm_glm::residency::placement_bytes(&m, e, &swap, opt.slots * unit, 2 * cfg.topk, &cost);
         if let Some(p) = pair.as_mut() {
             let mut msg = tidelm_comm::Msg::default();
             msg.u32s(&r.iter().map(|&(l, x)| (l * e + x) as u32).collect::<Vec<_>>());
@@ -179,6 +183,12 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
     }
     // --bench-width TEXT (rank 0, instead of serving): verify passes of each width timed on the
     // file's own continuation - what a longer copy costs - then rank 1 is released
+    // --bench-nll JSONL (rank 0, instead of serving): teacher-forced NLL of each line's text
+    if let Some(path) = arg(args, "--bench-nll") {
+        let text = Text::load(&model_dir)?;
+        let keep = num("--hot-keep", 32.0)? as usize;
+        return bench_nll(&mut srv.eng, &path, &text, keep, arg(args, "--bench-nll-out"));
+    }
     if let Some(path) = arg(args, "--bench-width") {
         let text = Text::load(&model_dir)?;
         let list = |k: &str, d: &str| -> tidelm_engine::Result<Vec<usize>> {
@@ -259,6 +269,7 @@ fn engine_loop(mut srv: Server, rx: mpsc::Receiver<Cmd>) -> tidelm_engine::Resul
         }
         let id = job.id;
         let (s0, r0) = (srv.stats.clone(), srv.eng.res.stats.clone());
+        let m0 = srv.eng.miss_totals()?;
         let mut poll = || {
             while let Ok(c) = rx.try_recv() {
                 match c {
@@ -277,8 +288,11 @@ fn engine_loop(mut srv: Server, rx: mpsc::Receiver<Cmd>) -> tidelm_engine::Resul
         }
         let (s1, r1) = (&srv.stats, &srv.eng.res.stats);
         let rounds = (s1.rounds - s0.rounds).max(1) as f64;
+        // the routed weight (prompt and answer) that went to substitutes: what more residents lower
+        let m1 = srv.eng.miss_totals()?;
+        let missed = if m1[2] > m0[2] { (m1[3] - m0[3]) / (m1[2] - m0[2]) * 100.0 } else { 0.0 };
         eprintln!("request {id}, GLM: {:.2} drafted / {:.2} accepted a round, copy rounds {} ({} long, {} accepted), \
-                   hot reads {} (kept {}, {:.2} s waited), swaps {}, fallbacks {}",
+                   routed weight missed {missed:.1}%, hot reads {} (kept {}, {:.2} s waited), swaps {}, fallbacks {}",
                   (s1.drafted - s0.drafted) as f64 / rounds, (s1.accepted - s0.accepted) as f64 / rounds,
                   s1.copy_rounds - s0.copy_rounds, s1.long_copies - s0.long_copies, s1.copy_accepted - s0.copy_accepted,
                   r1.hot_reads - r0.hot_reads,
@@ -340,6 +354,77 @@ fn bench_widths(eng: &mut Engine, ids: &[u32], ctx: usize, widths: &[usize]) -> 
     }
     let (m, lo, hi) = median(ts);
     eprintln!("bench-width: MTP draft pass {m:.2} ms (min {lo:.2}, max {hi:.2})");
+    Ok(())
+}
+
+/// Teacher-forced NLL of each JSONL line's "text" (by its "category") through the serving path:
+/// a 32-token prefill and its adaptation, then passes of 8 rows as a verify runs them (graphs, hot
+/// reads, the background period's victims every 2 passes, an adaptation every 200 tokens). A row's
+/// next token's -log p at T = 1 comes from the pair's candidates, or the whole row when it is not
+/// among them; top-1 is the row's argmax. Texts are cut at 4,096 tokens.
+fn bench_nll(eng: &mut Engine, path: &str, text: &Text, keep: usize, out: Option<String>) -> tidelm_engine::Result<()> {
+    eng.set_sampling(Some(1.0))?;
+    // --bench-nll-out: each scored token's "category nll top1" a line, for paired comparisons
+    let mut dump = out.map(std::fs::File::create).transpose()?;
+    let mut acc: std::collections::BTreeMap<String, (f64, f64, f64, usize)> = Default::default();
+    let t0 = Instant::now();
+    for line in std::fs::read_to_string(path)?.lines().filter(|l| !l.trim().is_empty()) {
+        let v: serde_json::Value = serde_json::from_str(line)?;
+        let cat = v["category"].as_str().unwrap_or("all").to_string();
+        let ids = text.encode(v["text"].as_str().unwrap_or("")).map_err(|e| format!("{path}: {e:?}"))?;
+        if ids.len() < 48 {
+            continue;
+        }
+        let ids = &ids[..ids.len().min(4096)];
+        eng.set_pos(0)?;
+        eng.forward(&ids[..32], false)?;
+        eng.adapt(512)?;
+        let (mut i, mut since, mut passes) = (32usize, 0usize, 0usize);
+        let a = acc.entry(cat).or_default();
+        while i + 1 < ids.len() {
+            let n = 8.min(ids.len() - 1 - i);
+            let am = eng.forward(&ids[i..i + n], false)?;
+            for r in 0..n {
+                let t = ids[i + r + 1];
+                let rc = eng.candidates(r);
+                let m = rc.lse.iter().map(|x| x.0).fold(f32::NEG_INFINITY, f32::max);
+                let z: f64 = rc.lse.iter().map(|&(mr, s)| s as f64 * ((mr - m) as f64).exp()).sum();
+                let zt = match rc.ids.iter().position(|&x| x == t) {
+                    Some(j) => rc.vals[j] as f64,
+                    None => eng.full_row(r)?[t as usize] as f64,
+                };
+                let nll = m as f64 + z.ln() - zt;
+                if let Some(f) = dump.as_mut() {
+                    use std::io::Write;
+                    writeln!(f, "{} {nll:.6} {}", v["category"].as_str().unwrap_or("all"), (am[r] == t) as u8)?;
+                }
+                a.0 += nll;
+                a.1 += nll * nll;
+                a.2 += (am[r] == t) as u8 as f64;
+                a.3 += 1;
+            }
+            i += n;
+            since += n;
+            passes += 1;
+            if passes % 2 == 0 && eng.hot.is_some() {
+                eng.bg_step(keep)?;
+            }
+            if since >= 200 {
+                eng.adapt(256)?;
+                since = 0;
+            }
+        }
+    }
+    let (mut tn, mut tsum) = (0usize, 0f64);
+    for (cat, (s, s2, top, n)) in &acc {
+        let mean = s / *n as f64;
+        let sd = (s2 / *n as f64 - mean * mean).max(0.0).sqrt();
+        eprintln!("bench-nll: {cat}: {n} tokens, NLL {mean:.4} (sd {sd:.3}), top-1 {:.2}%", 100.0 * top / *n as f64);
+        tn += n;
+        tsum += s;
+    }
+    eprintln!("bench-nll: all: {tn} tokens, NLL {:.4}, {:.0} s", tsum / tn.max(1) as f64, t0.elapsed().as_secs_f64());
+    eng.stop_follower()?;
     Ok(())
 }
 

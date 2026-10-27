@@ -5,7 +5,8 @@
 //!   0.9 * score + demand; across the swap layers, the non-resident experts with the highest
 //!   score replace the residents with the lowest while the newcomer beats the victim by x1.5,
 //!   never taking a layer below 2 x top-k residents. Rank 0 plans, both ranks load the same
-//!   experts into the same slots.
+//!   experts into the same slots. With mixed widths (arena.rs) a newcomer only replaces a
+//!   resident of its own width class, so every victim, swap or hot read, is chosen in its class.
 //! - bg_step, every 2 rounds: rank 0 queues up to 32 victims for hot reads to keep (residents
 //!   whose recent mass is below 0.01, not installed within 8 periods, lowest score first).
 //! - hot reads, between a decode pass's segments: a MoE layer's heaviest missed pick with a
@@ -148,10 +149,11 @@ impl HotAsync {
 }
 
 impl Res {
-    pub fn new(nl: usize, e: usize, slots: usize, swap_layers: Vec<usize>, residents: &[(usize, usize)]) -> Self {
-        let mut owner = vec![None; slots + 1];
-        for (s, &r) in residents.iter().enumerate() {
-            owner[s] = Some(r);
+    /// `placed`: (slot, layer, expert) of the boot residents; `slots` every slot of the arena.
+    pub fn new(nl: usize, e: usize, slots: usize, swap_layers: Vec<usize>, placed: &[(usize, usize, usize)]) -> Self {
+        let mut owner = vec![None; slots];
+        for &(s, l, x) in placed {
+            owner[s] = Some((l, x));
         }
         Res { owner, swap_layers, score: vec![0.0; nl * e], bg_score: vec![0.0; nl * e], bg_last: vec![0.0; nl * e],
               bg_until: vec![0; nl * e], bg_period: 0, hot_q: vec![], db_mass: None, db_tokens: 0, db_path: None,
@@ -256,27 +258,48 @@ impl Engine {
         let res = |l: usize, x: usize| self.lut_h[l * e + x] >= 0;
         let mut cand: Vec<(usize, usize)> = layers.iter().flat_map(|&l| (0..e).map(move |x| (l, x))).filter(|&(l, x)| !res(l, x)).collect();
         cand.sort_by(|a, b| sc[b.0 * e + b.1].partial_cmp(&sc[a.0 * e + a.1]).unwrap().then(a.cmp(b)));
-        let mut vict: Vec<(usize, usize)> = layers.iter().flat_map(|&l| (0..e).map(move |x| (l, x))).filter(|&(l, x)| res(l, x)).collect();
-        vict.sort_by(|a, b| sc[a.0 * e + a.1].partial_cmp(&sc[b.0 * e + b.1]).unwrap().then(a.cmp(b)));
+        // victims weakest first, a list a width class: a newcomer takes a slot of its own class
+        let class = |l: usize, x: usize| -> usize {
+            let b = self.pack.records.get(&(l, x)).map(|r| r.bits).unwrap_or([0; 3]);
+            self.arena.classes.iter().position(|c| c.bits == b).unwrap_or(usize::MAX)
+        };
+        let mut vict: Vec<Vec<(usize, usize)>> = vec![vec![]; self.arena.classes.len()];
+        for (l, x) in layers.iter().flat_map(|&l| (0..e).map(move |x| (l, x))).filter(|&(l, x)| res(l, x)) {
+            let s = self.lut_h[l * e + x] as usize;
+            vict[self.arena.class_of[s]].push((l, x));
+        }
+        for v in vict.iter_mut() {
+            v.sort_by(|a, b| sc[a.0 * e + a.1].partial_cmp(&sc[b.0 * e + b.1]).unwrap().then(a.cmp(b)));
+        }
         let mut left: std::collections::HashMap<usize, usize> =
             layers.iter().map(|&l| (l, (0..e).filter(|&x| res(l, x)).count())).collect();
-        let (mut plan, mut vi) = (vec![], 0);
+        let (mut plan, mut vi) = (vec![], vec![0usize; vict.len()]);
+        let mut done = vec![false; vict.len()];
         for (cl, ce) in cand {
-            if plan.len() >= max_swaps || sc[cl * e + ce] <= 0.0 {
+            if plan.len() >= max_swaps || sc[cl * e + ce] <= 0.0 || done.iter().all(|&d| d) {
                 break;
             }
+            let c = class(cl, ce);
+            if c >= vict.len() || done[c] {
+                continue; // no slot of its width (or its class is settled)
+            }
             let mut found = None;
-            while vi < vict.len() {
-                let (vl, ve) = vict[vi];
-                vi += 1;
+            while vi[c] < vict[c].len() {
+                let (vl, ve) = vict[c][vi[c]];
+                vi[c] += 1;
                 if left[&vl] > floor {
                     found = Some((vl, ve));
                     break;
                 }
             }
-            let Some((vl, ve)) = found else { break };
+            let Some((vl, ve)) = found else {
+                done[c] = true;
+                continue;
+            };
             if sc[cl * e + ce] <= sc[vl * e + ve] * ADAPT_MARGIN {
-                break;
+                // candidates only weaken from here: this class is settled
+                done[c] = true;
+                continue;
             }
             *left.get_mut(&vl).unwrap() -= 1;
             *left.get_mut(&cl).unwrap() += 1;
@@ -314,14 +337,16 @@ impl Engine {
             })
             .map(|(l, x)| (self.res.score[l * e + x] + demand[l * e + x], l, x)).collect();
         cold.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then((a.1, a.2).cmp(&(b.1, b.2))));
+        // up to `keep` victims a width class (a hot read keeps its expert only in its own class)
         let mut q = vec![];
+        let mut per = vec![0usize; self.arena.classes.len()];
         for (_, l, x) in cold {
-            if q.len() >= keep {
-                break;
-            }
-            if left[&l] > floor {
+            let s = self.lut_h[l * e + x] as usize;
+            let c = self.arena.class_of[s];
+            if per[c] < keep && left[&l] > floor {
                 *left.get_mut(&l).unwrap() -= 1;
-                q.push((l, x, self.lut_h[l * e + x] as usize));
+                per[c] += 1;
+                q.push((l, x, s));
             }
         }
         let flat: Vec<u32> = q.iter().flat_map(|&(a, b, c)| [a as u32, b as u32, c as u32]).collect();
@@ -375,7 +400,18 @@ impl Engine {
         {
             let h = self.hot.as_mut().unwrap();
             let r = self.pack.read(l, x, &mut h.buf)?;
-            self.arena.load(slot, &h.buf[..r.nbytes], &self.st)?;
+            // the transient slot is as wide as any expert: it takes this one's widths
+            self.arena.set_widths(slot, r.bits, &self.st)?;
+            let d = self.arena.slot_dsts(slot);
+            let mut off = 0;
+            let sz = crate::arena::record_sizes(r.bits, self.world, self.cfg.hidden, self.cfg.moe_inter);
+            for t in 0..9 {
+                unsafe {
+                    tidelm_cuda::memcpy_async(d[t].0 as *mut c_void, h.buf[off..].as_ptr() as *const c_void, sz[t],
+                                              tidelm_cuda::ffi::MEMCPY_HOST_TO_DEVICE, &self.st)?;
+                }
+                off += sz[t];
+            }
             h.reads += 1;
             h.live = Some((l, x));
         }
@@ -394,10 +430,8 @@ impl Engine {
         let Some((l, x)) = h.live.take() else { return Ok(()) };
         let src = h.slot;
         let i = l * e + x;
-        while let Some((vl, ve, vs)) = self.res.hot_q.pop() {
-            if self.res.owner[vs] != Some((vl, ve)) {
-                continue;
-            }
+        let bits = self.pack.record(l, x)?.bits;
+        while let Some((vl, ve, vs)) = self.take_victim(bits) {
             self.arena.copy_slot(vs, src, self.stream())?;
             self.lut_h[vl * e + ve] = -1;
             self.allowed_h[vl * e + ve] = 0;
@@ -450,21 +484,11 @@ impl Engine {
         cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap()); // stable: equal shares keep layer order
         cands.truncate(h.per_step);
         for (_, l, x) in cands {
-            let victim = loop {
-                match self.res.hot_q.pop() {
-                    Some((vl, ve, vs)) if self.res.owner[vs] == Some((vl, ve)) => break Some((vl, ve, vs)),
-                    Some(_) => continue,
-                    None => break None,
-                }
-            };
-            let Some((vl, ve, vs)) = victim else {
+            let r = self.pack.record(l, x)?;
+            let Some((vl, ve, vs)) = self.take_victim(r.bits) else {
                 self.res.stats.hot_unkept += 1;
                 continue;
             };
-            let r = self.pack.record(l, x)?;
-            if r.bits != self.arena.bits {
-                return Err(format!("hot read: expert ({l}, {x}) is {} bits, the arena {}", r.bits, self.arena.bits).into());
-            }
             self.lut_h[vl * e + ve] = -1;
             self.allowed_h[vl * e + ve] = 0;
             self.lut_entry(vl * e + ve)?;
@@ -477,6 +501,25 @@ impl Engine {
             self.res.stats.hot_reads += 1;
         }
         Ok(())
+    }
+
+    /// The weakest queued victim of width `bits` that still holds its slot (bg_step queues them
+    /// weakest last); stale entries of that class are dropped on the way.
+    fn take_victim(&mut self, bits: crate::arena::Bits) -> Option<(usize, usize, usize)> {
+        let q = &mut self.res.hot_q;
+        let mut i = q.len();
+        while i > 0 {
+            i -= 1;
+            let (vl, ve, vs) = q[i];
+            if self.arena.bits(vs) != bits {
+                continue;
+            }
+            q.remove(i);
+            if self.res.owner[vs] == Some((vl, ve)) {
+                return Some((vl, ve, vs));
+            }
+        }
+        None
     }
 
     /// Async (both ranks), before a decoder pass or an adaptation: the planned reads waited for
@@ -510,7 +553,8 @@ impl Engine {
     /// background period's victims to keep a read).
     pub fn enable_hot(&mut self, asynch: bool) -> Result<()> {
         let rows = crate::forward::VERIFY_ROWS;
-        let mut h = Hot::new(self.opt.slots, self.pack.max_record, rows, self.cfg.topk)?;
+        // the decoder arena's last slot is the transient one (forward.rs class_arena)
+        let mut h = Hot::new(self.arena.slots - 1, self.pack.max_record, rows, self.cfg.topk)?;
         if asynch {
             let len = self.moe_layers().len() * crate::weights::MAX_ROWS * self.cfg.topk * 2;
             h.asynch = Some(HotAsync::new(&self.pack, h.per_step.min(8), len)?);

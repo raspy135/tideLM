@@ -32,6 +32,19 @@ fn e4m3(b: u8) -> f32 {
     let m = (b & 7) as f32;
     if e == 0 { s * m * 2f32.powi(-9) } else { s * (1.0 + m / 8.0) * 2f32.powi(e - 7) }
 }
+/// f32 -> f16 bits, round to nearest (normal range and zero; test inputs only).
+fn f32_to_f16(f: f32) -> u16 {
+    let b = f.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let e = ((b >> 23) & 0xff) as i32 - 127 + 15;
+    if e <= 0 {
+        return sign;
+    }
+    let m = b & 0x7f_ffff;
+    let r = (((e as u32) << 10) | (m >> 13)) + ((m >> 12) & 1);
+    sign | r.min(0x7bff) as u16
+}
+
 fn f16_to_f32(h: u16) -> f32 {
     let s = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
     let e = ((h >> 10) & 0x1f) as i32;
@@ -216,6 +229,74 @@ fn exl3_unpack_matches_the_oracle_and_both_paths_match_the_reference() {
     let (ed, ep) = (rel_err(&yd, &want), rel_err(&yp, &want));
     eprintln!("exl3 dense: decode rel {ed:.2e}, prefill rel {ep:.2e}");
     assert!(ed < 2e-3 && ep < 2e-3, "decode {ed}, prefill {ep}");
+}
+
+/// The prefill expert GEMM for a pack of mixed widths (exl3m_prefill_smem_cb) against the grouped
+/// GEMV the MTP layer prefills with, over the same routed blocks: gate+up of six experts of widths
+/// 2/2/2 .. 4/4/4 at the rank shapes, random trellis words, both codebooks; and, at one width and
+/// mul1, against the shipped 2-3-bit tile (exl3m_prefill_smem_mode), which it must equal bit for bit.
+#[test]
+fn mixed_width_prefill_matches_the_grouped_gemv() {
+    use tidelm_kernels::ds41::{ds_route_blocks, ds_route_large};
+    let Some(st) = setup() else { return };
+    let (k, n, topk, rows) = (6144usize, 1024usize, 2usize, 160usize);
+    let p_ = rows * topk;
+    let run = |widths: &[[usize; 2]], cb: i32, seed: u64| -> (Vec<f32>, Vec<f32>, Option<Vec<f32>>) {
+        let e = widths.len();
+        let mut rng = Rng(seed);
+        let tr: Vec<[DeviceBuffer<u16>; 2]> = widths.iter().map(|w| {
+            [0, 1].map(|m| dev(&(0..(k / 16) * (n / 16) * 16 * w[m]).map(|_| rng.next() as u16).collect::<Vec<_>>()))
+        }).collect();
+        let ptr = |m: usize| dev(&tr.iter().map(|t| t[m].raw() as i64).collect::<Vec<_>>());
+        let (t1p, t3p) = (ptr(0), ptr(1));
+        let k2 = |m: usize| dev(&widths.iter().map(|w| 2 * w[m] as i32).collect::<Vec<_>>());
+        let (k2g, k2u) = (k2(0), k2(1));
+        // each row's two picks: experts r % e and (r + 1 + r / e) % e, never the same
+        let picks: Vec<i32> = (0..rows).flat_map(|r| [(r % e) as i32, ((r + 1 + r / e % (e - 1)) % e) as i32]).collect();
+        let d_pick = dev(&picks);
+        let nb = unsafe { ds_route_blocks(p_ as i32, e as i32, 64) } as usize;
+        let work = DeviceBuffer::<i32>::new(3 * e + 64).unwrap();
+        let (bs, bp, br) = (DeviceBuffer::<i32>::new(nb).unwrap(), DeviceBuffer::<i32>::new(nb * 64).unwrap(),
+                            DeviceBuffer::<i32>::new(nb * 64).unwrap());
+        let mem = DeviceBuffer::<i32>::new(nb * 64).unwrap();
+        let cnt = DeviceBuffer::<i32>::new(1).unwrap();
+        ok(unsafe { ds_route_large(st.raw(), p(&d_pick), p_ as i32, topk as i32, e as i32, p(&work), p(&bs), p(&bp), p(&br), 64) });
+        ok(unsafe { glm_member_codes(st.raw(), p(&bp), (nb * 64) as i32, topk as i32, p(&mem)) });
+        ok(unsafe { glm_count_live(st.raw(), p(&bs), nb as i32, p(&cnt)) });
+        let x0 = dev(&(0..p_ * k).map(|_| f32_to_f16(rng.normal() * 0.5)).collect::<Vec<_>>());
+        let x1 = dev(&(0..p_ * k).map(|_| f32_to_f16(rng.normal() * 0.5)).collect::<Vec<_>>());
+        let z = || DeviceBuffer::<f32>::zeroed(2 * p_ * n).unwrap();
+        let (zg, zs) = (z(), z());
+        unsafe {
+            exl3m_grouped(p(&x0), p(&x1), p(&t1p), p(&t3p), p(&k2g), p(&k2u), p(&bs), p(&cnt), p(&mem), p(&zg), k as i32,
+                          n as i32, p_ as i32, 1, 64, topk as i32, nb as i32, 2, 8, 4, 2, 2, 10, cb, st.raw());
+            exl3m_prefill_smem_cb(p(&x0), p(&x1), p(&t1p), p(&t3p), p(&k2g), p(&k2u), p(&bs), p(&cnt), p(&mem), p(&zs),
+                                  k as i32, n as i32, p_ as i32, topk as i32, nb as i32, 2, cb, 8, st.raw());
+        }
+        let old = (cb == CB_MUL1 && widths.iter().all(|w| w[0] <= 3 && w[1] <= 3)).then(|| {
+            let zo = z();
+            unsafe {
+                exl3m_prefill_smem_mode(p(&x0), p(&x1), p(&t1p), p(&t3p), p(&k2g), p(&k2u), p(&bs), p(&cnt), p(&mem),
+                                        p(&zo), k as i32, n as i32, p_ as i32, topk as i32, nb as i32, 2, 4, 1, 8, -4, st.raw());
+            }
+            last_ok();
+            zo.download().unwrap()
+        });
+        last_ok();
+        (zg.download().unwrap(), zs.download().unwrap(), old)
+    };
+    let mixed = [[2, 2], [2, 2], [3, 3], [3, 3], [4, 4], [3, 3]];
+    for cb in [CB_MCG, CB_MUL1] {
+        let (g, s, _) = run(&mixed, cb, 11 + cb as u64);
+        let want: Vec<f64> = g.iter().map(|&v| v as f64).collect();
+        let e = rel_err(&s, &want);
+        eprintln!("mixed widths, codebook {cb}: smem vs grouped rel {e:.2e}");
+        assert!(e < 1e-5, "mixed widths, codebook {cb}: smem vs grouped rel {e}");
+    }
+    let (g, s, old) = run(&[[3, 3]; 6], CB_MUL1, 5);
+    assert_eq!(s, old.unwrap(), "3-bit mul1: the mixed-width tile must equal the shipped one");
+    let want: Vec<f64> = g.iter().map(|&v| v as f64).collect();
+    assert!(rel_err(&s, &want) < 1e-5);
 }
 
 // ------------------------------------------------------------------ elementwise

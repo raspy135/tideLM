@@ -12,8 +12,10 @@
 use crate::CudaStream;
 use std::os::raw::{c_int, c_void};
 
-/// The mul1 codebook (`exl3_moe_cuda.py` CB_MUL1): the only one the GLM checkpoint uses.
+/// The mul1 codebook (`exl3_moe_cuda.py` CB_MUL1): bertholomus's GLM-5.3 checkpoint.
 pub const CB_MUL1: c_int = 2;
+/// The mcg codebook: Mia's AI Lab's mixed-width GLM-5.3 checkpoint.
+pub const CB_MCG: c_int = 1;
 /// Decode grouping: at most this many members a slot (`exl3m_group`'s maxm).
 pub const MAX_MEMBERS: c_int = 16;
 
@@ -43,6 +45,12 @@ extern "C" {
                                    ucount: *const c_void, members: *const c_void, z: *mut c_void, k: c_int, n: c_int,
                                    p: c_int, slots: c_int, nblocks: c_int, mats: c_int, warps: c_int, mtw: c_int,
                                    ntb: c_int, mode: c_int, s: CudaStream);
+    /// exl3m_prefill_smem_mode's serving tile (4x1x8, mode -4) for a mixed-width arena: codebook `cb`
+    /// (CB_MUL1 / CB_MCG), widths up to `hi` (2 x bits, at most 8).
+    pub fn exl3m_prefill_smem_cb(x0: *const c_void, x1: *const c_void, tp0: *const c_void, tp1: *const c_void,
+                                 k2_0: *const c_void, k2_1: *const c_void, uids: *const c_void, ucount: *const c_void,
+                                 members: *const c_void, z: *mut c_void, k: c_int, n: c_int, p: c_int, slots: c_int,
+                                 nblocks: c_int, mats: c_int, cb: c_int, hi: c_int, s: CudaStream);
     pub fn exl3m_gateup(z: *const c_void, pick: *const c_void, svh_g: *const c_void, svh_u: *const c_void,
                         suh_d: *const c_void, xd: *mut c_void, rows: c_int, p: c_int, n: c_int, sk: c_int,
                         slots: c_int, e: c_int, suh_d_stride: c_int, limit: f32, act_mode: c_int, s: CudaStream);

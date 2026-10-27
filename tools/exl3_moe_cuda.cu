@@ -941,6 +941,21 @@ void prefill_smem_mode_launch(const void* x0, const void* x1, const int64_t* tp0
 #undef EXL3_MLAUNCH
 }
 
+// smem prefill for an arena of mixed widths (a version-2 pack): codebook CB, trellis widths of 2 to
+// HI / 2 bits per slot (k2_0 / k2_1), the serving tile 4x1x8 with 4 cp.async stages. A separate
+// instantiation, so prefill_smem_mode_launch's mul1 2-3-bit kernel keeps its registers and bits.
+template <int CB, int HI>
+void prefill_smem_cb_launch(const void* x0, const void* x1, const int64_t* tp0, const int64_t* tp1,
+                            const int* k2_0, const int* k2_1, const int* uids, const int* ucount, const int* members,
+                            float* z, int K, int N, int P, int slots, int nblocks, int mats, cudaStream_t stream) {
+    constexpr int W = 4, MTW = 1, NTB = 8, KS = W / NTB > 0 ? W / NTB : 1;
+    EXL3_CHECK((N / 16) % NTB == 0, "N must be a multiple of 16 * NTB");
+    EXL3_CHECK((K / 16) % KS == 0, "K must be a multiple of 16 * KS");
+    dim3 grid((unsigned)((N / 16) / NTB), (unsigned)nblocks, (unsigned)mats);
+    prefill_smem_kernel<CB, W, MTW, NTB, 2, 4, HI, -4><<<grid, W * 32, 0, stream>>>(
+        (const half*)x0, (const half*)x1, tp0, tp1, k2_0, k2_1, uids, ucount, members, z, K, N, P, slots);
+}
+
 // ---------------------------------------------------------------- rotations / epilogues (TensorFold experts.cu)
 
 constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
@@ -1280,6 +1295,20 @@ void exl3m_prefill_smem_mode(const void* X0, const void* X1, const int64_t* tp0,
                              int warps, int mtw, int ntb, int mode, cudaStream_t s) {
     exl3::prefill_smem_mode_launch<2>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots,
                                       nblocks, mats, warps, mtw, ntb, mode, s);
+}
+
+// exl3m_prefill_smem_mode's 4x1x8 tile at cp.async depth 4 for a mixed-width arena: codebook cb (2 mul1,
+// 1 mcg), widths up to hi (K2 = 2 x bits: 6 or 8).
+void exl3m_prefill_smem_cb(const void* X0, const void* X1, const int64_t* tp0, const int64_t* tp1, const int* k2_0,
+                           const int* k2_1, const int* uids, const int* ucount, const int* members, float* Z, int K,
+                           int N, int P, int slots, int nblocks, int mats, int cb, int hi, cudaStream_t s) {
+    if (cb == 1 && hi <= 8)
+        exl3::prefill_smem_cb_launch<1, 8>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots,
+                                           nblocks, mats, s);
+    else if (cb == 2 && hi <= 8)
+        exl3::prefill_smem_cb_launch<2, 8>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots,
+                                           nblocks, mats, s);
+    else EXL3_CHECK(false, "smem prefill (mixed widths): codebook mul1 or mcg, widths up to 4 bits");
 }
 
 void exl3m_gateup(const float* Z, const int* pick, const void* svh_g, const void* svh_u, const void* suh_d,

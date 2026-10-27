@@ -39,6 +39,9 @@ BITS = (1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, 7, 8)
 # a different ("uncensored") checkpoint.  See tools/pack_exl3_experts.py.
 PACK_FORMAT = "exl3-experts"
 PACK_VERSION = 1
+# Version 2: a record's "bits" is [gate, up, down] (a checkpoint with mixed widths per expert and
+# projection); the header's per-layer "bits" is then the layer's average.
+PACK_VERSION_MIXED = 2
 ALIGN = 4096
 # The rank slice of one expert, in the order Exl3Arena.load_slot wants it.  w1/w3 are gate/up
 # [5,120 -> 2,304], w2 is down [2,304 -> 5,120]; a rank keeps half the N tiles of every matrix
@@ -226,9 +229,13 @@ def _n_split(n: int, rank: int, world: int) -> int:
     return n // world
 
 
-def record_shapes(bits: float, rank: int, world: int, words: int | None = None) -> dict[str, tuple[int, ...]]:
-    """Each record tensor's shape for one rank.  A rank holds the N-tile slice [rank*N/world, +N/world)."""
+def record_shapes(bits, rank: int, world: int, words: int | None = None) -> dict[str, tuple[int, ...]]:
+    """Each record tensor's shape for one rank.  A rank holds the N-tile slice [rank*N/world, +N/world).
+    ``bits`` is one width, or [gate, up, down]."""
 
+    if isinstance(bits, (list, tuple)):
+        g, u, d = (record_shapes(float(b), rank, world) for b in bits)
+        return {**g, "t3": u["t3"], "t2": d["t2"]}
     w = words if words is not None else tile_words(bits)
     nt13 = _n_split(NT13, rank, world)       # N tiles a rank of w1/w3 (72)
     nt2 = _n_split(NT2, rank, world)         # N tiles a rank of w2 (160)
@@ -247,7 +254,7 @@ _RECORD_DTYPES = {"t1": np.int16, "t3": np.int16, "t2": np.int16,
                   "svh1": np.float16, "svh3": np.float16, "svh2": np.float16}
 
 
-def record_nbytes(bits: float, rank: int, world: int) -> int:
+def record_nbytes(bits, rank: int, world: int) -> int:
     shapes = record_shapes(bits, rank, world)
     return sum(int(np.prod(shapes[name])) * np.dtype(_RECORD_DTYPES[name]).itemsize
                for name in RECORD_TENSORS)
@@ -258,24 +265,27 @@ def _align_up(n: int, a: int = ALIGN) -> int:
 
 
 def build_header(bits_map: dict[int, float], rank: int, world: int, codebook: str,
-                 source_sha256: str, n_experts: int = 384) -> tuple[bytes, int, dict[tuple[int, int], dict]]:
+                 source_sha256: str, n_experts: int = 384,
+                 expert_bits: dict[tuple[int, int], tuple] | None = None) -> tuple[bytes, int, dict[tuple[int, int], dict]]:
     """(header bytes, data offset, {(layer, expert): {"off", "nbytes", "bits"}}) with every record 4096-aligned.
 
     Records are laid out layer-major then expert, each padded up to ``ALIGN``, so the data offset
     and every record offset are aligned and O_DIRECT can read an expert in one preadv.  ``n_experts``
-    is 384 for a real pack; a smaller value builds a self-consistent test pack.
+    is 384 for a real pack; a smaller value builds a self-consistent test pack. ``expert_bits``
+    gives each record its own [gate, up, down] widths (a version-2 pack).
     """
 
     records: dict[tuple[int, int], dict] = {}
     off = 0
     for layer in sorted(bits_map):
         for expert in range(n_experts):
-            nb = record_nbytes(bits_map[layer], rank, world)
-            records[(layer, expert)] = {"off": off, "nbytes": nb, "bits": bits_map[layer]}
+            b = list(expert_bits[(layer, expert)]) if expert_bits else bits_map[layer]
+            nb = record_nbytes(b, rank, world)
+            records[(layer, expert)] = {"off": off, "nbytes": nb, "bits": b}
             off += _align_up(nb)
     data_nbytes = off
     header = {
-        "format": PACK_FORMAT, "version": PACK_VERSION,
+        "format": PACK_FORMAT, "version": PACK_VERSION_MIXED if expert_bits else PACK_VERSION,
         "rank": rank, "world": world, "codebook": codebook,
         "bits": {str(L): bits_map[L] for L in sorted(bits_map)},
         "record_align": ALIGN, "tensors": list(RECORD_TENSORS),
@@ -287,11 +297,11 @@ def build_header(bits_map: dict[int, float], rank: int, world: int, codebook: st
 
 
 def write_pack(path: str, bits_map: dict[int, float], rank: int, world: int, codebook: str,
-               source_sha256: str, records_iter, n_experts: int = 384):
+               source_sha256: str, records_iter, n_experts: int = 384, expert_bits=None):
     """Stream a pack.  ``records_iter`` yields ``((layer, expert), {tensor_name: ndarray})`` in any order;
     the header offsets are already fixed, so each record is written with ``pwrite`` at its own offset."""
 
-    header, data0, records = build_header(bits_map, rank, world, codebook, source_sha256, n_experts)
+    header, data0, records = build_header(bits_map, rank, world, codebook, source_sha256, n_experts, expert_bits)
     end = data0
     with open(path, "wb") as f:
         f.write(struct.pack("<Q", len(header)) + header)
@@ -347,7 +357,7 @@ class PackReader:
 
     def read_expert(self, layer: int, expert: int) -> dict[str, np.ndarray]:
         meta = self.records[(layer, expert)]
-        bits = float(meta["bits"])
+        bits = meta["bits"] if isinstance(meta["bits"], list) else float(meta["bits"])
         shapes = record_shapes(bits, self.rank, self.world)
         with open(self.path, "rb") as f:
             f.seek(self.data0 + meta["off"])

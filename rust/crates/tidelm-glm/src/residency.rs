@@ -72,13 +72,22 @@ pub fn write_mass(path: &Path, mass: &[f64], layers: usize, experts: usize, toke
 /// tp._db_resident: per swap layer its `floor` heaviest experts by mass, then the remaining
 /// slots by global mass (ties to the lower layer, then expert).
 pub fn placement(mass: &[f64], experts: usize, swap_layers: &[usize], slots: usize, floor: usize) -> Vec<(usize, usize)> {
+    placement_bytes(mass, experts, swap_layers, slots, floor, &|_, _| 1)
+}
+
+/// placement() over a byte budget, each expert costing `cost(layer, expert)` (its record, whose
+/// widths a version-2 pack sets per expert): the floor first, then by global mass while the
+/// budget lasts, an expert too big for what is left skipped for the smaller ones after it.
+pub fn placement_bytes(mass: &[f64], experts: usize, swap_layers: &[usize], budget: usize, floor: usize,
+                       cost: &dyn Fn(usize, usize) -> usize) -> Vec<(usize, usize)> {
     let mut chosen = vec![false; mass.len()];
-    let mut out = vec![];
+    let (mut out, mut left) = (vec![], budget);
     for &l in swap_layers {
         let mut es: Vec<usize> = (0..experts).collect();
         es.sort_by(|&a, &b| mass[l * experts + b].partial_cmp(&mass[l * experts + a]).unwrap().then(a.cmp(&b)));
         for &e in es.iter().take(floor) {
-            if out.len() < slots {
+            if cost(l, e) <= left {
+                left -= cost(l, e);
                 chosen[l * experts + e] = true;
                 out.push((l, e));
             }
@@ -87,11 +96,30 @@ pub fn placement(mass: &[f64], experts: usize, swap_layers: &[usize], slots: usi
     let mut rest: Vec<(usize, usize)> = swap_layers.iter().flat_map(|&l| (0..experts).map(move |e| (l, e)))
         .filter(|&(l, e)| !chosen[l * experts + e]).collect();
     rest.sort_by(|a, b| mass[b.0 * experts + b.1].partial_cmp(&mass[a.0 * experts + a.1]).unwrap().then(a.cmp(b)));
-    for x in rest {
-        if out.len() >= slots {
-            break;
+    for (l, e) in rest {
+        if cost(l, e) <= left {
+            left -= cost(l, e);
+            out.push((l, e));
         }
-        out.push(x);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_byte_budget_fills_with_the_heaviest_that_fit() {
+        // two layers of four experts; mass by expert id within each layer, layer 1 heavier
+        let mass: Vec<f64> = (0..8).map(|i| (i % 4) as f64 + if i >= 4 { 10.0 } else { 0.0 }).collect();
+        // uniform cost: the slot count of placement()
+        assert_eq!(placement(&mass, 4, &[0, 1], 5, 1).len(), 5);
+        // layer 1's expert 2 is three times the others: after each layer's floor (expert 3 of
+        // both), 7 - 2 = 5 units take (1, 2) at 3, then (1, 1) and (1, 0) at 1 each
+        let cost = |l: usize, e: usize| if (l, e) == (1, 2) { 3 } else { 1 };
+        assert_eq!(placement_bytes(&mass, 4, &[0, 1], 7, 1, &cost), vec![(0, 3), (1, 3), (1, 2), (1, 1), (1, 0)]);
+        // with 4 units (1, 2) no longer fits after the floor: the lighter ones after it take its place
+        assert_eq!(placement_bytes(&mass, 4, &[0, 1], 4, 1, &cost), vec![(0, 3), (1, 3), (1, 1), (1, 0)]);
+    }
 }
