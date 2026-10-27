@@ -4588,3 +4588,27 @@ context, sync hot reads:
 Off and on emitted the same greedy text where an off/off pair did (hash `8f0f02b95081`, and
 `bab7872d97f4` in the crossover run): the copies are exact. Two boots of identical code put the
 rewrite's off arm at 34.2-36.9 tok/s; compare within a boot.
+
+## A short match in the context does not help GLM's MTP gate (2026-10-27)
+
+The idea: when MTP's draft agrees with what followed a 3-6-token match earlier in the context, trust
+it more and draft deeper - a confidence bias of 0.2 / 0.3 / 0.4 / 0.5 for a match of 3 / 4 / 5 / 6+
+tokens - instead of waiting for a long copy. Measured with `TIDELM_GLM_ROUND_LOG` from a boot that
+drafts 7 every round (greedy, copies off, async hot reads), so each draft's acceptance is known at
+any depth, on three two-turn conversations whose second turn asks more about the first answer
+(jazz chord progressions -> the 2-5-1; a CSV parser -> error handling and type hints; TCP
+congestion control -> slow start): 6 requests, 1,312 rounds, 2.32 of 7 drafts accepted a round.
+`rust/tools/glm_match_gate_replay.py`, priced with the measured verify by rows:
+
+- Agreement predicts acceptance - agreeing drafts were accepted 85-90%, the rest 32% - but only
+  74-137 of ~9,200 drafts agreed, and their own MTP probability was already ~1 (median 1.00, 96%
+  at 0.9 or more). The gate keeps them anyway.
+- Modelled tok/s, the calibrated gate at 0.36 (tables fitted leave-one-request-out): 18.99; with
+  agreement as a table key 18.95; with the bias 19.02. The flat gate likewise; per request -0.0 to
+  +0.4%.
+- The other way round, the match's token in place of MTP's: at MTP's 1,216 first rejections a
+  3-token match had a token at that position 17 times, the right one 3 times.
+
+Follow-up turns repeat ideas, not text: a long copy (6 matched, 6 to copy) was available in 0-6%
+of rounds. Where text is repeated verbatim, the long copier above takes it past the MTP's depth
+of 7, and that is where the gain was. Greedy only; sampled requests were not measured.

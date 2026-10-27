@@ -278,12 +278,24 @@ pub struct Server {
     pub store: Option<crate::prefix::Store>,
     sampling: Option<f32>,
     pub log: Box<dyn Fn(&str) + Send>,
+    /// TIDELM_GLM_ROUND_LOG: a JSON line a request (its prompt and tokens) and a round (drafts,
+    /// their probabilities, the target's tokens, accepted) for offline gate studies (rank 0)
+    round_log: Option<std::fs::File>,
 }
 
 impl Server {
     pub fn new(eng: Engine, opt: ServeOptions, log: Box<dyn Fn(&str) + Send>) -> Self {
         let cal = opt.cal.map(|t| CalGate::new(t, true));
-        Server { eng, opt, cal, stats: Stats::default(), store: None, sampling: None, log }
+        let round_log = std::env::var("TIDELM_GLM_ROUND_LOG").ok()
+            .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
+        Server { eng, opt, cal, stats: Stats::default(), store: None, sampling: None, log, round_log }
+    }
+
+    fn log_json(&mut self, v: serde_json::Value) {
+        if let Some(f) = self.round_log.as_mut() {
+            use std::io::Write;
+            let _ = writeln!(f, "{v}");
+        }
     }
 
     /// Row `row` of the last pass as a distribution (sampled requests).
@@ -307,7 +319,9 @@ impl Server {
     /// One request, its tokens to `job.sink` as they are decided. `cancelled` is polled every round.
     pub fn run(&mut self, mut job: Job, cancelled: &mut dyn FnMut() -> bool) -> Result<()> {
         let mut g = Generation { admitted: Some(std::time::Instant::now()), ..Default::default() };
+        self.log_json(serde_json::json!({"prompt": job.prompt}));
         let finish = self.generate(&mut job, &mut g, cancelled)?;
+        self.log_json(serde_json::json!({"tokens": g.tokens}));
         let ok = !matches!(finish, Finish::Error(_));
         (job.sink)(Event::Done(finish, g));
         if ok {
@@ -500,6 +514,7 @@ impl Server {
             let mut drafts: Vec<u32> = vec![];
             let mut qs: Vec<Option<Dist>> = vec![];
             let mut pending: Vec<(usize, f64)> = vec![];
+            let mut pks: Vec<f64> = vec![];
             if let Some(c) = copy.as_ref() {
                 drafts = c.clone();
                 qs = vec![None; drafts.len()];
@@ -525,6 +540,7 @@ impl Server {
                         break;
                     }
                     pending.push((k, conf));
+                    pks.push(pk);
                     drafts.push(d);
                     qs.push(q);
                     if k + 1 < dmax {
@@ -536,6 +552,10 @@ impl Server {
             let mut block = vec![anchor];
             block.extend_from_slice(&drafts);
             let am = self.eng.forward(&block, false)?;
+            if self.round_log.is_some() {
+                self.log_json(serde_json::json!({"pos": p, "anchor": anchor, "copy": copy.is_some(), "drafts": drafts,
+                                                 "probs": pks, "target": am}));
+            }
             g.steps += 1;
             let (mut n_acc, mut nxt) = (nd, None);
             for k in 0..nd {

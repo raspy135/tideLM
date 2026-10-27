@@ -234,8 +234,9 @@ fi
 # TIDELM_GRAPH_CACHE: how many step graphs the engine keeps (default 128, ~4-8 MB each);
 # TIDELM_STEP_SPLIT: a line per request splitting its decode step's time;
 # TIDELM_GLM_WIDE_DECODE_FROM: GLM, the position from which a 17-33-row verify runs the decode path
-# instead of a prefill chunk (default 32768, docs/gotchas.md)
-for v in TIDELM_MEM_LOG_MB TIDELM_GRAPH_CACHE TIDELM_STEP_SPLIT TIDELM_GLM_WIDE_DECODE_FROM; do [[ -n "${!v:-}" ]] && envs+=("$v=${!v}"); done
+# instead of a prefill chunk (default 32768, docs/gotchas.md); TIDELM_GLM_ROUND_LOG: GLM, a JSON
+# line a speculative round to this path (in a mounted directory) for offline gate studies
+for v in TIDELM_MEM_LOG_MB TIDELM_GRAPH_CACHE TIDELM_STEP_SPLIT TIDELM_GLM_WIDE_DECODE_FROM TIDELM_GLM_ROUND_LOG; do [[ -n "${!v:-}" ]] && envs+=("$v=${!v}"); done
 for e in "${envs[@]}"; do envf+=(-e "$e"); done
 vols=() seen=" "
 for p in "${rw[@]}"; do [[ $seen == *" $p "* ]] && continue; seen+="$p "; vols+=(-v "$p:$p"); done
