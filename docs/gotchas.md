@@ -4696,3 +4696,33 @@ weight. Quality, teacher-forced on `corpus/heldout_quick.jsonl` through the serv
 
 More residents and, per token, no measurable loss from the narrower experts: the profile ships the
 2.75bpw packs. A 3.0bpw pack still loads (one class).
+
+## DFlash2 drafters on our 2.75bpw target: code up, prose down, parity overall (2026-10-27)
+
+Measured before porting, against the cards' +10-19% over GLM-5.3's MTP: the residual stream after
+the drafters' target layers dumped for six greedy requests of the 2.75bpw serving setup (branch
+`glm-dflash-study`: `tidelm-server --dump-taps`), then `incoai/GLM-5.3-DFlash2` and
+`modal-labs/GLM-5.3-NVFP4-DFlash` run over them exactly as z-lab's `dflash_generate` runs them
+(their model code, GLM-5.3's BF16 embedding and head), set against the MTP rounds of the same
+requests (forced depth 7, round log). Two-turn conversations: jazz -> the 2-5-1, a CSV parser ->
+error handling, TCP -> slow start.
+
+| tokens a step, 7 drafted | MTP | incoai | modal |
+| --- | ---: | ---: | ---: |
+| prose turns (jazz, TCP) | 2.65-3.04 | 2.39-2.81 | 2.54-2.90 |
+| code turns (CSV) | 4.16-4.31 | 4.48-4.52 | 4.52-4.84 |
+| all | 3.22 | 3.05 | 3.10 |
+
+By position (cumulative): MTP 76.4 / 55.1 / 35.9 / 22.5%, the DFlash2 pair 68.5-68.6 / 46.7 /
+31.8-32.9 / 22.2-24.0%, ahead from the fifth draft. Modelled under the calibrated gate with this
+pair's verify by rows (a DFlash2 pass 14 ms in BF16, 2.5 GB a rank; 8 ms if FP8), tok/s:
+
+| | MTP | DFlash2 BF16 | DFlash2 FP8 |
+| --- | ---: | ---: | ---: |
+| prose | 17.13 | 15.7-15.8 | 16.4-16.5 |
+| code | 21.98 | 23.4-23.7 | 24.2-24.6 |
+| all | 18.53 | 17.7-17.9 | 18.5-18.65 |
+
+Neither drafter was trained on these weights' hidden states (BF16 and NVFP4 targets), while the
+MTP layer is part of the model served; the cards also measured long Max-effort reasoning. Two code
+requests, greedy only: the code gain is a small sample. Not ported.
