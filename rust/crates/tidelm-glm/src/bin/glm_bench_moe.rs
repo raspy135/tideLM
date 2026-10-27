@@ -4,7 +4,12 @@
 //! timed call routes to experts no recent call touched, so every read is DRAM-cold as in decode.
 //! Rows R with U distinct experts as TensorFold's kit tabulates them (R 1 / U 8 ... R 8 / U 40).
 //!
-//!   glm_bench_moe
+//!
+//! --prefill: the prefill expert GEMM instead (exl3m_prefill_smem_mode at the engine's tile and
+//! cp.async depth, 4x1x8 mode -4), one MoE sub-chunk of 2,048 rows x top-8 spread uniformly over
+//! the pool, gate+up then down; ms a call and GB/s of trellis bytes (the median of 8).
+//!
+//!   glm_bench_moe [--prefill]
 
 use tidelm_cuda::{DeviceBuffer, Event, Stream};
 use tidelm_glm::Result;
@@ -40,6 +45,9 @@ fn main() -> Result<()> {
     let (uids, ucount, members) = (DeviceBuffer::<i32>::new(pmax)?, DeviceBuffer::<i32>::new(1)?,
                                    DeviceBuffer::<i32>::new(pmax * MAX_MEMBERS as usize)?);
     let (e0, e1) = (Event::timing()?, Event::timing()?);
+    if std::env::args().any(|a| a == "--prefill") {
+        return prefill(&st, &t1p, &t3p, &t2p, &k2, (h, il, kd, dn), (wgu, wdn), &e0, &e1);
+    }
     let mut call = 0usize;
     println!("GB/s of trellis bytes read (median of 12 calls); nt x warps x pf, then split-K");
     for &(r, u) in &[(1usize, 8usize), (2, 12), (4, 21), (8, 40)] {
@@ -84,6 +92,69 @@ fn main() -> Result<()> {
             }
             println!("{line}");
         }
+    }
+    Ok(())
+}
+
+/// The prefill expert GEMM over one MoE sub-chunk (forward.rs moe_rows' prefill branch).
+#[allow(clippy::too_many_arguments)]
+fn prefill(st: &Stream, t1p: &DeviceBuffer<i64>, t3p: &DeviceBuffer<i64>, t2p: &DeviceBuffer<i64>, k2: &DeviceBuffer<i32>,
+           (h, il, kd, dn): (usize, usize, usize, usize), (wgu, wdn): (usize, usize), e0: &Event, e1: &Event) -> Result<()> {
+    use tidelm_kernels::ds41::{ds_route_blocks, ds_route_large};
+    use tidelm_kernels::glm::{glm_count_live, glm_member_codes};
+    let rows = 2048usize;
+    let p = rows * TOPK;
+    let mut seed = 0x2545F4914F6CDD1Du64;
+    let picks: Vec<i32> = (0..rows).flat_map(|_| {
+        let mut row: Vec<i32> = vec![];
+        while row.len() < TOPK {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let e = (seed % POOL as u64) as i32;
+            if !row.contains(&e) {
+                row.push(e);
+            }
+        }
+        row
+    }).collect();
+    let pick = DeviceBuffer::<i32>::from_slice(&picks)?;
+    let nb = unsafe { ds_route_blocks(p as i32, POOL as i32, 64) } as usize;
+    let work = DeviceBuffer::<i32>::new(3 * POOL + 64)?;
+    let (bslot, bpair, broute) = (DeviceBuffer::<i32>::new(nb)?, DeviceBuffer::<i32>::new(nb * 64)?, DeviceBuffer::<i32>::new(nb * 64)?);
+    let members = DeviceBuffer::<i32>::new(nb * 64)?;
+    let ucount = DeviceBuffer::<i32>::new(1)?;
+    let ok = |rc: i32, what: &str| if rc == 0 { Ok(()) } else { Err(format!("{what}: {rc}")) };
+    ok(unsafe { ds_route_large(st.raw(), pick.raw(), p as i32, TOPK as i32, POOL as i32, work.raw(), bslot.raw(), bpair.raw(),
+                               broute.raw(), 64) }, "route")?;
+    ok(unsafe { glm_member_codes(st.raw(), bpair.raw(), (nb * 64) as i32, TOPK as i32, members.raw()) }, "members")?;
+    ok(unsafe { glm_count_live(st.raw(), bslot.raw(), nb as i32, ucount.raw()) }, "live")?;
+    let x0 = DeviceBuffer::<u16>::from_slice(&vec![0x3c00u16; p * h])?;
+    let x1 = DeviceBuffer::<u16>::from_slice(&vec![0x3c00u16; p * h])?;
+    let xd = DeviceBuffer::<u16>::from_slice(&vec![0x3c00u16; p * kd])?;
+    let zup = DeviceBuffer::<f32>::new(2 * p * il)?;
+    let zd = DeviceBuffer::<f32>::new(p * dn)?;
+    println!("prefill expert GEMM, {rows} rows x top-{TOPK} over {POOL} experts (median of 8, ms / GB/s of trellis bytes)");
+    for (name, mats, x0p, x1p, tp0, tp1, z, k, n, wq) in [("gate+up", 2, &x0, &x1, t1p, t3p, &zup, h, il, wgu),
+                                                          ("down", 1, &xd, &xd, t2p, t2p, &zd, kd, dn, wdn)] {
+        let mut ts = vec![];
+        for i in 0..10 {
+            e0.record(st)?;
+            unsafe {
+                exl3m_prefill_smem_mode(x0p.raw(), x1p.raw(), tp0.raw(), tp1.raw(), k2.raw(), k2.raw(), bslot.raw(), ucount.raw(),
+                                        members.raw(), z.raw(), k as i32, n as i32, p as i32, TOPK as i32, nb as i32, mats, 4,
+                                        1, 8, -4, st.raw());
+            }
+            e1.record(st)?;
+            e1.synchronize()?;
+            if i >= 2 {
+                ts.push(e1.elapsed_ms(e0)? as f64);
+            }
+        }
+        ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let ms = ts[ts.len() / 2];
+        let bytes = (POOL * mats as usize * wq * 4) as f64;
+        println!("{name:>7}: {ms:.2} ms, {:.0} GB/s", bytes / ms / 1e6);
     }
     Ok(())
 }

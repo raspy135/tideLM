@@ -4491,3 +4491,29 @@ can rank layouts the engine ranks the other way, and an end-to-end A/B at the fe
 needs more than one boot an arm: residency, hot reads and the step-time-driven depth policy move
 a step by as much. `__ldcs` on the dense FP8 decode GEMV changed nothing (x is staged in shared
 memory, so nothing in L2 needs protecting); a comment at the load records it.
+
+## EXL3 evict-first trellis loads: ~1% of a GLM decode pass; prefill is compute-bound (2026-10-27)
+
+After DS's `__ldcs` result above, `tools/exl3_moe_cuda.cu` got the same switch (`EXL3_STREAM`,
+built with `TIDELM_EXL3_STREAM=1`): decode's trellis words through `__ldcs` instead of `__ldg`.
+Same bits. Microbenchmarks on one Spark, cold weights, two runs an arm, best split per shape:
+
+| `glm_bench_moe` (routed, rows / experts) | gate+up plain -> stream | down |
+| --- | ---: | ---: |
+| 1 / 8 | 176 -> 174 us | 94 -> 94 |
+| 2 / 12 | 263 -> 259 | 135 -> 133 |
+| 4 / 21 | 462 -> 446 | 234 -> 232 |
+| 8 / 40 | 873 -> 846 | 436 -> 431 |
+
+Plain loads already stream 210-216 GB/s. In `glm_bench_exl3` (layer 40's dense matrices) the small,
+latency-bound ones gain 7-12% (shared gate+up 69-70 -> 59-62 us, shared down 37 -> 34, kv_a 28 ->
+26); q_a, o_proj and the head do not move, and q_b swings +-10% between runs either way. Summed
+over a pass that is ~1-2.5 ms of a 120-200 ms round, part of it on the side stream behind the
+routed experts: ~1%, below the 2-3 ms a step two boots of the same build differ by. Left off.
+
+Prefill gains nothing to stream for: the expert GEMM (`glm_bench_moe --prefill`, one 2,048-row
+sub-chunk, top-8 over 128 cold experts, the engine's cp.async tile) runs at 51-57 GB/s of trellis
+bytes - gate+up 10.9-11.8 ms, down 5.3-5.4 - a quarter of what the loads can stream, as the
+probe kernels of 2026-10-23 found (the consume side is the floor). The evict-first L2 policy on
+its 4-byte `cp.async` (`createpolicy` + `.L2::cache_hint`; a 4-byte copy has no `.cg`) raised an
+illegal instruction on GB10 and was dropped.

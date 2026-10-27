@@ -36,6 +36,8 @@ fn main() {
     println!("cargo:rerun-if-changed={}", vision_src.display());
     println!("cargo:rerun-if-changed={}", glm_src.display());
     println!("cargo:rerun-if-changed={}", exl3_src.display());
+    // TIDELM_EXL3_STREAM=1: the EXL3 kernels' trellis loads evict-first (a benchmark switch)
+    println!("cargo:rerun-if-env-changed=TIDELM_EXL3_STREAM");
     println!("cargo:rerun-if-changed={}", fp4_src.display());
     println!("cargo:rerun-if-changed={}", engram_src.display());
     println!("cargo:rerun-if-env-changed=TIDELM_CUDA_ARCH");
@@ -98,9 +100,10 @@ fn main() {
     // GLM-5.3: the engine's own kernels, and the EXL3 trellis kernels exactly as
     // tools/exl3_moe_cuda.py::_library builds them (no tuning defines)
     let mut objs = vec![];
+    let stream = std::env::var("TIDELM_EXL3_STREAM").as_deref() == Ok("1");
     for (src, name) in [(&glm_src, "glm.o"), (&exl3_src, "exl3_moe_cuda.o")] {
         let obj = out.join(name);
-        run(Command::new(&nvcc).args([
+        run(Command::new(&nvcc).args(if stream { &["-DEXL3_STREAM=1"][..] } else { &[][..] }).args([
             "-std=c++17",
             "-O3",
             "-DNDEBUG",

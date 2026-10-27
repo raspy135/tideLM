@@ -22,6 +22,12 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+// EXL3_STREAM=1: decode's trellis words load evict-first (load_word); a benchmark switch, off: the
+// kernels gain 1-3% (routed) to 7-12% (the small dense matrices), ~1% of a decode pass (gotchas)
+#ifndef EXL3_STREAM
+#define EXL3_STREAM 0
+#endif
+
 #define EXL3_CHECK(cond, msg) do { if (!(cond)) { fprintf(stderr, "exl3_moe_cuda: %s\n", msg); exit(2); } } while (0)
 
 namespace exl3 {
@@ -127,15 +133,24 @@ __device__ __forceinline__ void decode_tile(const uint32_t (&w)[Fmt<K2>::LW], co
     b1[1] = cb_pair<CB>(st[6], st[7]);
 }
 
+// EXL3_STREAM: trellis words through __ldcs (evict-first: read once a pass) instead of __ldg
+__device__ __forceinline__ uint32_t load_word(const uint32_t* p) {
+#if EXL3_STREAM
+    return __ldcs(p);
+#else
+    return __ldg(p);
+#endif
+}
+
 template <int K2>
 __device__ __forceinline__ void load_words(uint32_t (&dst)[Fmt<K2>::LW], const uint32_t* p, int lane) {
     constexpr int TW = Fmt<K2>::TW;
 #pragma unroll
     for (int l = 0; l < Fmt<K2>::LW; ++l) {
         if constexpr ((TW % 32) == 0)
-            dst[l] = __ldg(p + l * 32);
+            dst[l] = load_word(p + l * 32);
         else
-            dst[l] = (l * 32 + lane < TW) ? __ldg(p + l * 32) : 0u;
+            dst[l] = (l * 32 + lane < TW) ? load_word(p + l * 32) : 0u;
     }
 }
 
@@ -156,6 +171,9 @@ __device__ __forceinline__ uint32_t load_pair(const half* x, bool ok) {
 // word's own. wait_group<N> blocks until at most N commit groups are still in flight.
 __device__ __forceinline__ void cp_async4(uint32_t* smem_dst, const uint32_t* gmem_src) {
     const unsigned s = (unsigned)__cvta_generic_to_shared(smem_dst);
+    // An evict-first L2 policy here (createpolicy + .L2::cache_hint; a 4-byte cp.async has no .cg)
+    // raised an illegal instruction on GB10, and is moot: this prefill GEMM is compute-bound, at
+    // 51-57 GB/s of trellis bytes (glm_bench_moe --prefill, 2026-10-27).
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(s), "l"(gmem_src));
 }
 
