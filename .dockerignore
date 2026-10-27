@@ -38,6 +38,7 @@ results/oneshots/
 # Local prompts, KV caches and mutable demand histories are never image content.
 results/**
 !results/trace-union/stats/coverage.json
+!results/trace-union-1017/stats/coverage.json
 !results/trace-full-20260910/stats/coverage.json
 results/prefix-cache*/
 results/captured_request*.pt

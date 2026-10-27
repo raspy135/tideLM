@@ -25,7 +25,10 @@
 #                            its own demand history: the first launch copies the Python server's
 #                            (DSV41_PRUNE_DB, written by its container as root), else the bundled
 #                            seed profiles/learned-experts-v1.npz
-#   RUST_TRACE=results/trace-union/stats/coverage.json   the routing trace the history blends with
+#   RUST_TRACE=results/trace-union-1017/stats/coverage.json   the routing trace the history blends
+#                            with, a host path (relative: to the checkout): the trace corpora routed
+#                            by 1017. results/trace-union, routed by the original V4.1-Flash,
+#                            differs by 0.038 a layer (docs/gotchas.md)
 #   RUST_PREFIX_DIR=~/tidelm-rust-state/prefix-cache     the prefix cache's disk tier
 #   RUST_EXPERT_TOPP         unset: off (DSV41_EXPERT_TOPP=0.90 measured slower in Rust, rust/PORT.md)
 #   RUST_COPY_DRAFT=1        the copy drafter (CPU prompt lookup in front of DSpark; 0 off)
@@ -151,13 +154,18 @@ if [[ -n "$ablit" ]]; then
     [[ -f "$ablit" ]] || err "DSV41_ABLIT_WOB=$ablit is not a file on this box (the Rust engine reads the host path)"
     [[ -z "${PEER:-}" ]] || ssh -n "$PEER" "test -f '$ablit'" || err "DSV41_ABLIT_WOB=$ablit is not a file on $PEER"
 fi
+# the routing trace the history blends with, read by rank 0 only: from the checkout, mounted on
+# rank 0 alone, so a pulled trace needs no image rebuild and the worker gets no directory for it
+trace=${RUST_TRACE:-results/trace-union-1017/stats/coverage.json}
+[[ $trace == /* ]] || trace="$ROOT/$trace"
+[[ -f "$trace" ]] || err "RUST_TRACE=$trace is not a file on this box"
 [[ $check == 1 ]] && exit 0
 
 lanes=${RUST_LANES:-1}
 args=(--resident --graphs --model-dir "$MODEL_DIR" --served-model-name "${SERVED_MODEL_NAME:-deepseek}"
       --host "${HOST:-0.0.0.0}" --port "${PORT:-8000}" --max-seq "${MAX_SEQ:-32768}"
       --lanes "$lanes" --vision "${DSV41_VISION:-1}"
-      --adapt-db "$db" --trace "${RUST_TRACE:-/app/results/trace-union/stats/coverage.json}"
+      --adapt-db "$db" --trace "$trace"
       --budget "${RUST_BUDGET:-10000}" --adapt-sensitivity "${DSV41_ADAPT_SENSITIVITY:-high}"
       --adapt-prior "${DSV41_ADAPT_PRIOR:-4}" --adapt-decode-tokens "${DSV41_ADAPT_DECODE_TOKENS:-600}"
       --adapt-probe "${DSV41_PROBE_PREFILL:-1}"
@@ -176,7 +184,6 @@ if [[ "${DSV41_PREFIX_DISK:-1}" == 1 ]]; then
     rw+=("${RUST_PREFIX_DIR:-$STATE/prefix-cache}")
 fi
 ro+=("$MODEL_DIR") rw+=("$(dirname "$db")")
-[[ -n "${RUST_TRACE:-}" ]] && ro+=("$(dirname "$RUST_TRACE")")
 
 # what both ranks must run with (the boot guard compares it): RoCE, hot reads, packed KV
 envs=(NCCL_PROTO=Simple TIDELM_PACKED_KV="${DSV41_PACKED_KV:-1}" TIDELM_HOT_MIN="${DSV41_HOT_MIN:-0.3}"
@@ -229,6 +236,8 @@ vols=() seen=" "
 for p in "${rw[@]}"; do [[ $seen == *" $p "* ]] && continue; seen+="$p "; vols+=(-v "$p:$p"); done
 for p in "${ro[@]}"; do [[ $seen == *" $p "* ]] && continue; seen+="$p "; vols+=(-v "$p:$p:ro"); done
 mkdir -p "${rw[@]}"   # docker would create a missing one as root
+r0vols=()   # rank 0's alone: the DS routing trace (above)
+[[ -n "${trace:-}" && $seen != *" $(dirname "$trace") "* ]] && r0vols=(-v "$(dirname "$trace"):$(dirname "$trace"):ro")
 dflags=(-d --network host --gpus all --device /dev/infiniband --cap-add IPC_LOCK --ipc host
         --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=65536
         --entrypoint /app/scripts/memguard.sh)
@@ -245,7 +254,7 @@ rank0=("${pair[@]}")
 docker rm -f tidelm-rank0 > /dev/null 2>&1 || true
 docker run "${dflags[@]}" --name tidelm-rank0 --user "$(id -u):$(id -g)" -e HOME="$HOME" \
     --health-cmd "curl -fsS http://127.0.0.1:${PORT:-8000}/health || exit 1" --health-interval 30s \
-    --health-start-period 10m "${vols[@]}" "${envf[@]}" "${bin[@]}" \
+    --health-start-period 10m "${vols[@]}" "${r0vols[@]}" "${envf[@]}" "${bin[@]}" \
     "$IMAGE" "$guard" tidelm-server "${args[@]}" "${rank0[@]}" > /dev/null
 if [[ -n "${PEER:-}" ]]; then
     ssh -n "$PEER" "docker rm -f tidelm-rank1 > /dev/null 2>&1; docker run $(printf '%q ' "${dflags[@]}") \
