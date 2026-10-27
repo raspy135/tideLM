@@ -3411,6 +3411,21 @@ code-heavy; serving adaptation (sensitivity high) re-ranks from 1017's own traff
 cover part of the gap in the meantime. Re-measure `exact` after a few days of 1017 traffic before
 blaming the model for prose.
 
+## 1017 routes like V4.1-Flash: a fresh trace changes 279 of 10,000 boot residents (2026-10-26)
+
+The trace prior every ranking blends in (`results/trace-union`, 21% of the score at
+`DSV41_ADAPT_PRIOR=4` against a full history) was routed by the original V4.1-Flash.
+`results/trace-union-1017` is the same 190 sequences and 36,250 tokens routed exactly by 1017
+(`tools/expert_trace.py`; the 152 distinct sequences traced once, the 38 that both corpora hold
+copied, so the makeup matches; teacher-forced top-1 0.816 code, 0.501 general). On the same
+tokens the router barely moved: a layer's routing share differs by 0.038 on average (total
+variation; the most, 0.070, at layer 2), against 0.596 between the corpus's coding and general
+halves on one model. The two 10,000-expert sets share 9,721; the old trace's set covers 94.1% of
+1017's routing of the corpus against 94.3% for 1017's own, and both cover 82.5% of the live
+history's demand. A static prior is far from serving because of the workload (the live window's
+own set covers 97.4% of it), not the checkpoint, so the section above's prose cost is not the old
+model's routing. Re-tracing for a fine-tune of this size is not worth a server stop.
+
 ## bench.py's random prompt was 3.7x too long on GLM, then served from cache (2026-10-18)
 
 `bench/bench.py --workload random --isl 8192` sizes its filler prompt with the server's own
