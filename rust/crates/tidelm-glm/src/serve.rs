@@ -390,9 +390,12 @@ impl Server {
             self.eng.adapt(opt.adapt_prefill)?;
         }
         let last = self.eng.last_rows - 1;
-        let mut anchor = if greedy { first[0] } else { draw(&self.dist(0, temp, top_p)?, &mut rng) };
+        // a decode-path forward returns every row's argmax: the suffix's next token is its last
+        // row's (a prefill chunk's head ran on that row alone: row 0)
+        let arow = first.len() - 1;
+        let mut anchor = if greedy { first[arow] } else { draw(&self.dist(arow, temp, top_p)?, &mut rng) };
         let mut z_anchor: Option<Dist> = None; // the anchor's distribution, for a loop break
-        let mut anchor_row = 0usize; // the anchor's row in the last decoder pass
+        let mut anchor_row = arow; // the anchor's row in the last decoder pass
         self.eng.keep_hidden(last)?;
         let mut lookup = (opt.lookup > 0 && depth > 0).then(|| Lookup::new(&prompt, opt.lookup));
         let mut out: Vec<u32> = vec![];
