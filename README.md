@@ -42,8 +42,9 @@ experts. TideLM decides which share, keeps deciding, and cheaply covers the rest
 3. **Hot reads for the misses that matter.** When a missing expert would have carried a large
    share of a token's routing weight, it is read from NVMe while decoding continues:
    - DeepSeek (`DSV41_HOT_ASYNC`): after each step, the heaviest misses are read into a ring of
-     128 slots of their own while the next step runs, and are routable from the step after until
-     the ring wraps. No measured decode cost (41.21 vs 41.08 tok/s on the generation gate), and
+     slots of their own (`DSV41_HOT_RING`, 64 in the example profile) while the next step runs, and
+     are routable from the step after until the ring wraps. No measured decode cost with 128 slots
+     (41.21 vs 41.08 tok/s on the generation gate), and
      held-out loss improves by 0.007 nats on code and 0.138 on prose
      ([measurements](docs/hot-reads.md)). Both lanes share the ring: every lane's misses feed
      one plan, at no decode cost (41.2 vs 40.6 tok/s for two requests at once).
@@ -181,12 +182,12 @@ with what each setting measured.
 
 | DeepSeek | GLM-5.3 | What it controls |
 | --- | --- | --- |
-| `RUST_BUDGET=9872` | `GLM_SLOTS=12500` | How many experts stay resident (GLM: slots a rank). Fewer, more memory for context. |
+| `RUST_BUDGET=9950` | `GLM_SLOTS=12500` | How many experts stay resident (GLM: slots a rank). Fewer, more memory for context. |
 | `MAX_SEQ=1048576`, `RUST_KV_TOKENS=1572864` | `GLM_MAX_SEQ=262144` | Context, generated tokens included (DeepSeek: the most one lane reaches, out of a pool of `RUST_KV_TOKENS` the lanes share). Less context, more experts. |
 | `DSV41_ADAPT_SENSITIVITY=high` | `GLM_ADAPT=1`, `GLM_ADAPT_EVERY=200` | How fast the resident set follows new traffic. |
 | `RUST_ADAPT_DB` | `RUST_GLM_STATE_DB` | The learned history, under `~/tidelm-rust-state`. With none yet, the first boot starts from the bundled one in `profiles/`. |
-| `DSV41_HOT_READS=1`, `DSV41_HOT_ASYNC=1`, `DSV41_HOT_RING=128` | `GLM_HOT=1`, `GLM_HOT_KEEP=32` | Hot reads (above). |
-| `RUST_LANES=2` | — | Concurrent requests; the lanes share the hot-read ring, whose 128 slots come out of `RUST_BUDGET` (10,000 at one lane). |
+| `DSV41_HOT_READS=1`, `DSV41_HOT_ASYNC=1`, `DSV41_HOT_RING=64` | `GLM_HOT=1`, `GLM_HOT_KEEP=32` | Hot reads (above). The ring's slots are on top of `RUST_BUDGET`, 9.4 MB a rank each (0.56 GiB at 64): a bigger ring needs a smaller budget. |
+| `RUST_LANES=2` | — | Concurrent requests; the lanes share the one hot-read ring. |
 | `SPEC=1`, `RUST_DEPTH=confidence` | `GLM_MTP=1`, `GLM_MTP_DEPTH=7`, `GLM_MTP_CAL=0.36` | Speculative decoding and its depth policy. |
 | `DSV41_PREFIX_CACHE=1`, `DSV41_PREFIX_DISK=1` | `GLM_PREFIX_DISK=1`, `GLM_KV_SPLIT=1` | Prompt caching; GLM's KV cache split across the ranks. |
 | — | `GLM_KV=fp8` | GLM's KV cache format, the one the Rust engine serves. The Python engine's 4-bit latent with the first and last ten layers in FP8 fits 320K in less memory and measured KL +0.004 against FP8 on the long eval, but in use the model's recall of its context was visibly worse ([gotchas](docs/gotchas.md)). |
