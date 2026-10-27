@@ -4635,3 +4635,53 @@ Sparks a verified row costs 15-25 ms (eight new experts a layer), so a drafter p
 acceptance, and this one's is not higher. The three-Spark numbers come from bandwidth and
 residency, not the drafter. Different texts (its datasets, ours), and the card does not give its
 sampling temperature; not downloaded or ported.
+
+## GLM-5.3 with Mia's 2-4-bit experts: 13,320 residents in the same 89 GB, NLL at parity (2026-10-27)
+
+`Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold` quantizes each routed expert's gate / up / down at its
+own width (2, 3 or 4 bits; 2.75 on average, the MTP layer's at 4) with the mcg codebook, and keeps
+every other weight in BF16 (~19 GB a rank on two Sparks; Mia's own recipe serves them as 4-bit
+groups of 64, which its card measures at KL 0.086 -> 0.124 against BF16). The engine takes only its
+routed experts and the non-expert weights of bertholomus's 3.0bpw checkpoint (EXL3, ~5-6 bits,
+7.3 GB a rank): both are the same GLM-5.3 - every tensor stored in the same dtype is
+byte-identical, and the router gate and indexer wk, F16 in the 3.0bpw one, equal Mia's BF16
+rounded to F16 (all 2.36M values). `tools/glm_fetch_dense.py` range-fetches those 15 GB (2,954
+tensors, checked equal to the local checkpoint), so a user downloads one checkpoint, not two.
+FP8 at load was sized and not built: ~9.0 GB a rank against EXL3's ~6.3, ~380 fewer residents and
++2.7 GB read a decode pass (~+12 ms).
+
+The engine side: a version-2 pack (`tools/glm_pack_exl3.py` writes [gate, up, down] widths a
+record; a 3.0bpw pack comes out byte-identical), an arena of width classes (`arena.rs`: per class
+its own trellis pools, per slot its pointers and widths, which the kernels already read), swaps,
+background victims and hot reads matched within a class, the boot placement over a byte budget
+(`GLM_SLOTS` 3-bit experts' worth, `residency::placement_bytes`), and a prefill instantiation of
+the smem tile for mcg and 4 bits (`exl3m_prefill_smem_cb`: equal to the grouped GEMV at 5.9e-6 on
+mixed widths, bit-identical to the shipped tile at 3-bit mul1, `tests/glm_gpu.rs`). On the 3.0bpw
+pack the new binary's greedy answers equal the old binary's.
+
+The budget buys 13,320 residents for 12,500 (69.4% of the decoder layers' experts): not 8% more,
+because the experts with the most routing mass are the ones Mia gave more bits (286 of the 329
+all-4-bit experts are resident; the residents average ~2.8 bits). Offline over the routing
+history: 81.7% of its routed mass resident against 78.4%. Measured, one boot an arm from the same
+history copy, the user's profile (async hot reads, long copies), device memory 101.66 GiB in both:
+
+| | 3.0bpw | 2.75bpw |
+| --- | ---: | ---: |
+| routed weight missed, first requests after boot | 19.2-20.0% | 14.8-16.5% |
+| routed weight missed, README prose / code runs | 3.3-4.3% / 7.7-9.4% | 2.7-3.5% / 6.1-7.8% |
+| README protocol prose / code tok/s | 17.84 / 21.52 | 17.47 / 22.30 |
+| ms a decode step, prose / code | 118-122 / 145-147 | 122-125 / 140-148 |
+
+Speed is at parity (each arm within the 2-3% two boots of one build differ by): fewer bytes an
+expert, but the resident set leans to the wide experts and the trellis decode costs the same a
+weight. Quality, teacher-forced on `corpus/heldout_quick.jsonl` through the serving path
+(`tidelm-server --bench-nll`: 8-row passes, hot reads, adaptation; 10,151 tokens, paired by token):
+
+| | 3.0bpw NLL / top-1 | 2.75bpw | difference, paired SE |
+| --- | ---: | ---: | ---: |
+| coding (6,674) | 1.6037 / 65.73% | 1.5981 / 65.97% | -0.0056 +- 0.0058 |
+| general (3,477) | 2.3181 / 49.44% | 2.3068 / 49.35% | -0.0113 +- 0.0092 |
+| all | 1.8484 | 1.8408 | -0.0076 +- 0.0049 |
+
+More residents and, per token, no measurable loss from the narrower experts: the profile ships the
+2.75bpw packs. A 3.0bpw pack still loads (one class).

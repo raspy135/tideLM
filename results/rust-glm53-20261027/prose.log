@@ -1,0 +1,12 @@
+== rust-glm53-275-prose: workload=prose isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=53 ttft=   1586.3 ms  tpot=  62.64 ms  decode= 15.97 tok/s  out=1024 (length)
+          accept_len=2.096311475409836  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=53 ttft=    838.2 ms  tpot=  58.54 ms  decode= 17.08 tok/s  out=1024 (length)
+          accept_len=2.1536842105263156  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=53 ttft=    560.2 ms  tpot=  58.80 ms  decode= 17.01 tok/s  out=1024 (length)
+          accept_len=2.1136363636363638  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=53 ttft=    548.0 ms  tpot=  56.09 ms  decode= 17.83 tok/s  out=1024 (length)
+          accept_len=2.2582781456953644  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=560.1543 ms  tpot=58.5434 ms  decode=17.0813 tok/s
+  -> ENGINE  accept_len=2.1537  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /home/ryan/git/tidelm/results/rust-glm53-20261027/prose.json

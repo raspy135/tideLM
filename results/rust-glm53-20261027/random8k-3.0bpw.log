@@ -1,0 +1,12 @@
+== old-random8k: workload=random isl=8192 osl=256 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=8219 ttft=  19951.2 ms  tpot=  53.97 ms  decode= 18.53 tok/s  out=256 (length)
+          accept_len=3.072289156626506  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=8211 ttft=  19930.0 ms  tpot=  64.65 ms  decode= 15.47 tok/s  out=256 (length)
+          accept_len=2.6288659793814433  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=8225 ttft=  20112.1 ms  tpot=  66.07 ms  decode= 15.14 tok/s  out=256 (length)
+          accept_len=2.04  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=8205 ttft=  20164.9 ms  tpot=  47.06 ms  decode= 21.25 tok/s  out=256 (length)
+          accept_len=3.493150684931507  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=20112.0761 ms  tpot=64.6522 ms  decode=15.4674 tok/s
+  -> ENGINE  accept_len=2.6289  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /tmp/claude-1000/-home-ryan-git-tidelm/ee5bdf57-c37e-4b07-b12d-be6b933bf449/scratchpad/glm/old-random8k.json

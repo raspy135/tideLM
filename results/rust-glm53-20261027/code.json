@@ -1,0 +1,99 @@
+{
+  "label": "rust-glm53-275-code",
+  "workload": "code",
+  "seed_salt": "glm-perf-20261021-code",
+  "isl": null,
+  "osl": 1024,
+  "runs": 3,
+  "warmup": 1,
+  "thinking": false,
+  "effort": null,
+  "temperature": 0.6,
+  "ignore_eos": true,
+  "base": "http://127.0.0.1:8000",
+  "model": "glm-5.3",
+  "health": {
+    "status": "ok",
+    "engine": "tidelm-rust"
+  },
+  "ttft_ms_median": 639.5255,
+  "tpot_ms_median": 47.4481,
+  "decode_tok_s_median": 21.0757,
+  "engine_median": {
+    "accept_len_mean": 3.2069,
+    "expert_hit_rate": null,
+    "nvme_gb": null,
+    "engram_rows": null
+  },
+  "raw": [
+    {
+      "ttft_ms": 639.5255250390619,
+      "tpot_ms": 48.05119341546133,
+      "decode_tok_s": 20.81113764134383,
+      "completion_tokens": 1024,
+      "reasoning_tokens": null,
+      "finish_reason": "length",
+      "total_s": 49.795896389056,
+      "x_engine_stats": {
+        "prompt_tokens": 68,
+        "reused_prefix": 14,
+        "completion_tokens": 1024,
+        "ttft_s": 0.639,
+        "decode_tok_s": 20.81,
+        "engine": "tidelm-rust",
+        "steps": 327,
+        "accept_len_mean": 3.128440366972477,
+        "copy_steps": 1,
+        "copy_accepted": 3
+      },
+      "prompt_tokens_actual": 68,
+      "completion_chars": 4509
+    },
+    {
+      "ttft_ms": 631.1048970092088,
+      "tpot_ms": 46.42941701368867,
+      "decode_tok_s": 21.538069274166688,
+      "completion_tokens": 1024,
+      "reasoning_tokens": null,
+      "finish_reason": "length",
+      "total_s": 48.128398502012715,
+      "x_engine_stats": {
+        "prompt_tokens": 68,
+        "reused_prefix": 14,
+        "completion_tokens": 1024,
+        "ttft_s": 0.631,
+        "decode_tok_s": 21.54,
+        "engine": "tidelm-rust",
+        "steps": 303,
+        "accept_len_mean": 3.376237623762376,
+        "copy_steps": 2,
+        "copy_accepted": 4
+      },
+      "prompt_tokens_actual": 68,
+      "completion_chars": 4489
+    },
+    {
+      "ttft_ms": 645.1025509741157,
+      "tpot_ms": 47.448096874935636,
+      "decode_tok_s": 21.075660898177098,
+      "completion_tokens": 1024,
+      "reasoning_tokens": null,
+      "finish_reason": "length",
+      "total_s": 49.18450565403327,
+      "x_engine_stats": {
+        "prompt_tokens": 68,
+        "reused_prefix": 14,
+        "completion_tokens": 1024,
+        "ttft_s": 0.645,
+        "decode_tok_s": 21.08,
+        "engine": "tidelm-rust",
+        "steps": 319,
+        "accept_len_mean": 3.206896551724138,
+        "copy_steps": 0,
+        "copy_accepted": 0
+      },
+      "prompt_tokens_actual": 68,
+      "completion_chars": 4423
+    }
+  ]
+}

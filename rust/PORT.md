@@ -495,6 +495,11 @@ What is ported, by the DS port's feature list:
   two-pass prefill, bg_step's victims, hot reads kept over victims, synchronous or read during the
   next round (`GLM_HOT_ASYNC`, opt-in: 5-7% faster a round, at the quality cost Python measured);
   the history in its own .npz (read at first boot from the Python server's db.pt).
+- **Mixed-width experts** (2026-10-27): a version-2 pack gives each expert its own gate / up /
+  down widths and the mcg codebook (Mia's AI Lab's 2.75bpw checkpoint); the arena holds a class
+  of slots a width triple, every swap and hot read stays in its class, the boot placement fills
+  a byte budget (`GLM_SLOTS` 3-bit experts' worth), and prefill runs a mixed-width instantiation
+  of the smem tile. 13,320 residents for 12,500 in the same 89 GB (docs/gotchas.md).
 - **Prefix cache**: the live sequence's prefix in RAM, and the disk store (`prefix.rs`).
 - **Server**: the OpenAI routes, the Anthropic Messages route, tool calls (GLM's XML), the GLM
   template and parser (`tidelm-text/src/glm.rs`, fixture-tested against glm_app.py).

@@ -1,0 +1,12 @@
+== rust-glm53-275-random8k: workload=random isl=8192 osl=256 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=8219 ttft=  20490.4 ms  tpot=  68.90 ms  decode= 14.51 tok/s  out=256 (length)
+          accept_len=1.8214285714285714  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=8211 ttft=  20835.8 ms  tpot=  69.53 ms  decode= 14.38 tok/s  out=256 (length)
+          accept_len=1.8345323741007193  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=8225 ttft=  20374.3 ms  tpot=  64.46 ms  decode= 15.51 tok/s  out=256 (length)
+          accept_len=1.9921875  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=8205 ttft=  20168.4 ms  tpot=  67.45 ms  decode= 14.83 tok/s  out=256 (length)
+          accept_len=2.04  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=20374.281 ms  tpot=67.4479 ms  decode=14.8263 tok/s
+  -> ENGINE  accept_len=1.9922  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /home/ryan/git/tidelm/results/rust-glm53-20261027/random8k.json

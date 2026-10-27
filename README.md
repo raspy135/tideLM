@@ -10,10 +10,10 @@ tide — so the engine gets better the more you use it.
 | Profile | Model | Routed experts | Resident | Context | Prose | Code | 8K-token prompt, first token |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,000 / 15,360 (65.1%) | 1M (2 lanes, 1.5M shared) | **31.8 tok/s** | **49.0 tok/s** | 4.8 s |
-| `glm53-exl3` | GLM-5.3 | EXL3 3.0 bpw | 12,500 / 19,200 (65.1%) | 256K | **17.2 tok/s** | **20.8 tok/s** | 19.5 s |
+| `glm53-exl3` | GLM-5.3 | EXL3 2.75 bpw (2-4 bits an expert) | 13,326 / 19,200 (69.4%) | 256K | **17.1 tok/s** | **21.1 tok/s** | 20.4 s |
 
 *Medians of three `bench/bench.py` runs after a warmup, 1,024 tokens at temperature 0.6 (raw runs:
-[DeepSeek](results/rust-ds41-20261024/README.md), [GLM-5.3](results/rust-glm53-20261025/README.md)).
+[DeepSeek](results/rust-ds41-20261024/README.md), [GLM-5.3](results/rust-glm53-20261027/README.md)).
 The DeepSeek row was measured with two 512K lanes; 1M measured within noise of it
 ([runs](results/rust-ds41-20261026-1m/README.md)).*
 
@@ -80,13 +80,19 @@ cp configs/glm53-exl3.env.example  .env.glm53-exl3     # GLM-5.3, EXL3 (needs th
 | Profile | Checkpoint | Size |
 | --- | --- | ---: |
 | `ds41-mxfp4` | [`deepseek-ai/DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) (or the original `DeepSeek-V4.1-Flash`) | 510 GB |
-| `glm53-exl3` | [`bertholomus/GLM-5.3-EXL3-3.0bpw`](https://huggingface.co/bertholomus/GLM-5.3-EXL3-3.0bpw), repacked into one file per node (below) | 293 GB checkpoint; 139 GB pack a node |
+| `glm53-exl3` | [`Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold`](https://huggingface.co/Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold)'s routed experts, repacked into one file per node, and the non-expert weights of [`bertholomus/GLM-5.3-EXL3-3.0bpw`](https://huggingface.co/bertholomus/GLM-5.3-EXL3-3.0bpw) (below) | 293 GB checkpoint, needed only to pack; 128 GB pack and 15 GB of weights a node |
 
 `MODEL_REPO=deepseek-ai/DeepSeek-V4.1-Flash-1017 MODEL_DIR=<dir> bash scripts/download-model.sh`
 fetches the DeepSeek checkpoint and resumes if interrupted (`HF_TOKEN` is optional; it only
-raises rate limits). The GLM checkpoint downloads with `hf download <repo> --local-dir <dir>`.
-For the EXL3 profile, pack each node's half once, after building the image (step 3); the EXL3
-checkpoint supplies the dense and fixed weights too, so keep it on both nodes:
+raises rate limits). For GLM, download Mia's AI Lab's checkpoint with
+`hf download Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold --local-dir <exl3 dir>`. It keeps its
+non-expert weights in BF16, ~19 GB a rank, so the profile takes those from bertholomus's EXL3
+checkpoint of the same GLM-5.3 instead (~5-6 bits, 7.3 GB a rank): on each node,
+`python3 tools/glm_fetch_dense.py --out <dense dir>` fetches just those 15 GB by range requests
+(stdlib Python; re-run to resume) — `GLM_MODEL_DIR`. Then pack each node's half of the experts
+once, after building the image (step 3). The packer reads the checkpoint, so run it where the
+checkpoint is (copy the checkpoint to the worker, or pack both ranks on the head and copy rank 1's
+128 GB pack across); once packed, the 293 GB checkpoint is no longer read:
 
 ```bash
 # on node 0 (and on node 1 with r1of2 / --rank 1)
@@ -94,6 +100,9 @@ docker run --rm --gpus all -v <exl3 dir>:/models-exl3:ro -v <packs dir>:/packs -
   --entrypoint python tidelm:local tools/glm_pack_exl3.py \
   --source /models-exl3 --out /packs/glm-exl3-experts-r0of2.bin --rank 0
 ```
+
+bertholomus's whole 3.0bpw checkpoint works the same way (its experts at 3 bits for 12,500
+residents in the same memory, its own weights as `GLM_MODEL_DIR`).
 
 **3. Build the image** on the head; it is copied to the worker, and both models run from it:
 
@@ -182,7 +191,7 @@ with what each setting measured.
 
 | DeepSeek | GLM-5.3 | What it controls |
 | --- | --- | --- |
-| `RUST_BUDGET=9950` | `GLM_SLOTS=12500` | How many experts stay resident (GLM: slots a rank). Fewer, more memory for context. |
+| `RUST_BUDGET=9950` | `GLM_SLOTS=12500` | How many experts stay resident (GLM: expert memory a rank, in 3-bit experts' worth: ~13,300 of the 2.75bpw pack's). Fewer, more memory for context. |
 | `MAX_SEQ=1048576`, `RUST_KV_TOKENS=1572864` | `GLM_MAX_SEQ=262144` | Context, generated tokens included (DeepSeek: the most one lane reaches, out of a pool of `RUST_KV_TOKENS` the lanes share). Less context, more experts. |
 | `DSV41_ADAPT_SENSITIVITY=high` | `GLM_ADAPT=1`, `GLM_ADAPT_EVERY=200` | How fast the resident set follows new traffic. |
 | `RUST_ADAPT_DB` | `RUST_GLM_STATE_DB` | The learned history, under `~/tidelm-rust-state`. With none yet, the first boot starts from the bundled one in `profiles/`. |

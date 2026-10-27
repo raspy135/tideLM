@@ -1,0 +1,12 @@
+== rust-glm53-275-code: workload=code isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=68 ttft=   1375.0 ms  tpot=  47.95 ms  decode= 20.86 tok/s  out=1024 (length)
+          accept_len=3.2169811320754715  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=68 ttft=    639.5 ms  tpot=  48.05 ms  decode= 20.81 tok/s  out=1024 (length)
+          accept_len=3.128440366972477  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=68 ttft=    631.1 ms  tpot=  46.43 ms  decode= 21.54 tok/s  out=1024 (length)
+          accept_len=3.376237623762376  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=68 ttft=    645.1 ms  tpot=  47.45 ms  decode= 21.08 tok/s  out=1024 (length)
+          accept_len=3.206896551724138  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=639.5255 ms  tpot=47.4481 ms  decode=21.0757 tok/s
+  -> ENGINE  accept_len=3.2069  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /home/ryan/git/tidelm/results/rust-glm53-20261027/code.json
