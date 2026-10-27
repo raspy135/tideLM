@@ -1,154 +1,134 @@
 # Install
 
-Target: one DGX Spark class box — NVIDIA GB10, `sm_121a`, 128 GB unified memory
-(≈121 GiB visible), 20 cores, local NVMe — on DGX OS / Ubuntu 24.04 with a CUDA 13
-driver. Nothing here is multi-GPU and nothing here is x86.
+The README's quick start in full: two DGX Sparks serving DeepSeek-V4.1-Flash-1017 or GLM-5.3
+with the Rust engine, in Docker. One profile serves at a time, using both boxes.
 
-## Host prerequisites
+## What you need
 
 | what | why |
 |---|---|
-| GB10 / `sm_121a`, CUDA 13 driver (580.x or newer) | the Triton MoE kernel emits `cvt.rn.f16x2.e2m1x2` and is compiled for `sm_121a`; nothing older names that target |
-| ≥ 600 GB free on **local NVMe** | the checkpoint is 510 GB and the engine reads experts out of it with `O_DIRECT` on every miss. A network filesystem turns each miss into a network round trip; overlayfs will not do `O_DIRECT` at all |
-| the box essentially to itself | GPU and host draw on one pool. The resident expert arena is sized from what is free at load time, so a neighbour does not cause an OOM — it causes a small arena and a permanently NVMe-bound server |
-| Python 3.11 or 3.12 (native path) or docker + nvidia-container-toolkit (container path) | both are described below |
+| two DGX Sparks (GB10, 128 GB unified memory each), DGX OS / Ubuntu 24.04, CUDA 13 driver | the pair splits every layer between the two GPUs (tensor parallel) |
+| a working RoCE link between them (the 200G cable) | every decode step gathers across it; the profiles name its interfaces (`NCCL_SOCKET_IFNAME`, `NCCL_IB_HCA`) |
+| passwordless SSH from the head (rank 0, which serves HTTP) to the worker (rank 1) | the launcher starts the worker's container and ships it the image |
+| Docker with the NVIDIA container toolkit on both | the engine is built and run inside the image; the boxes need nothing else |
+| this repository at the same absolute path on both | the launcher mounts the same host paths on both nodes |
+| local NVMe, enough free on both (below) | experts not resident in memory are read from disk with `O_DIRECT` during decode; a network filesystem makes every such read a network round trip |
+| the boxes to themselves | GPU and host share one memory pool. The server is sized to leave `KEEP_FREE_GB` (4) free, and `scripts/memguard.sh` stops it rather than let the box run out: another heavy process, a large download included, can get it stopped |
 
-Check the two that are easy to get wrong:
+Disk, per node:
+
+| profile | both nodes | head only, while setting up |
+|---|---|---|
+| `ds41-mxfp4` | 510 GB checkpoint | |
+| `glm53-exl3` | 15 GB of non-expert weights + a 128 GB expert pack | the 293 GB checkpoint, read only to pack, then deletable (+128 GB for the worker's pack if you pack both on the head) |
+
+## 1. Profile
 
 ```bash
-nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv
-df -h /path/to/where/the/weights/will/live
-awk '/MemAvailable/ {printf "%.1f GiB available\n", $2/1048576}' /proc/meminfo
+cp configs/ds41-mxfp4.env.example  .env.ds41-mxfp4     # DeepSeek-V4.1-Flash-1017
+cp configs/glm53-exl3.env.example  .env.glm53-exl3     # GLM-5.3
 ```
 
-## The checkpoint
+Set the paths (`/home/you/...`), `PEER` (the worker's `user@address`) and, in the DeepSeek
+profile, the RoCE interfaces. Both files are private: keep them out of Git (`.env*` is ignored).
+Each key is explained where it is set.
 
-510 GB in 48 safetensors shards: 288.8 GB of FP4 routed experts (one 7.39 GB shard per
-layer), 203 GB of Engram n-gram tables (shards 47 and 48, 101.5 GB each), ~19 GB of
-everything else. Serving needs all of it — the Engram tables are read row by row at run
-time, so unlike the routing tracer the server cannot skip them.
+## 2. Weights
+
+### DeepSeek-V4.1-Flash-1017
 
 ```bash
-# container path
-./run.sh setup                     # pulls the image, then downloads into ./models
-
-# native path
-MODEL_DIR=./models/DeepSeek-V4.1-Flash ./scripts/download-model.sh
+MODEL_REPO=deepseek-ai/DeepSeek-V4.1-Flash-1017 MODEL_DIR=<dir> bash scripts/download-model.sh
 ```
 
-Both call [`scripts/download-model.sh`](../scripts/download-model.sh), which is a
-`snapshot_download` of `deepseek-ai/DeepSeek-V4.1-Flash`: resumable, safe to re-run,
-skips complete shards. `HF_TOKEN` is optional (the repo is public; a token only raises
-rate limits). Expect hours, and re-run it until it says `checkpoint complete`.
+on both nodes, or on the head and copy it across (below). Resumable; `HF_TOKEN` is optional. Set
+`MODEL_DIR=<dir>` in the profile.
 
-## Two ways to run it
+### GLM-5.3
 
-They are the same server. The container exists so the box does not have to host a
-torch/CUDA 13 environment; the native path exists because on a machine with one memory
-pool, one fewer layer between the engine and the NVMe is worth something.
+The profile combines two published quantizations of the same GLM-5.3: the routed experts of
+[`Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold`](https://huggingface.co/Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold)
+(each expert at 2-4 bits, 2.75 on average) and the non-expert weights of
+[`bertholomus/GLM-5.3-EXL3-3.0bpw`](https://huggingface.co/bertholomus/GLM-5.3-EXL3-3.0bpw)
+(EXL3, ~5-6 bits; Mia's checkpoint has them in BF16, twice the memory). Why, and what it
+measured: [gotchas](gotchas.md), "GLM-5.3 with Mia's 2-4-bit experts".
 
-### Native (venv)
-
-There is no `setup.sh` here: the engine is plain PyTorch, so any interpreter with the
-right wheels will run it. On aarch64 that means the cu130 index:
+On the head, the checkpoint (`pip install -U huggingface_hub` gives `hf`):
 
 ```bash
-python3.12 -m venv .venv && . .venv/bin/activate
-pip install torch==2.13.0+cu130 --index-url https://download.pytorch.org/whl/cu130
-pip install "transformers>=4.57" "tokenizers>=0.21" "safetensors>=0.5" numpy sympy
+hf download Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold --local-dir <ckpt dir>
 ```
 
-`triton` arrives as a dependency of `torch` and must not be replaced with a PyPI build —
-the kernel in `tools/fp4_moe.py` is JIT-compiled against whichever Triton is installed,
-and the one on the cu130 index is the one this torch was tested with.
+On both nodes, the non-expert weights: 15 GB of the 3.0bpw checkpoint, fetched by HTTP range
+requests (stdlib Python, re-run to resume). This directory is `GLM_MODEL_DIR`:
 
 ```bash
-cp env.example .env      # then set MODEL_DIR and PYTHON
-./start.sh               # nohup server/app.py --engine v41; waits for /health
-./stop.sh
+python3 tools/glm_fetch_dense.py --out <dense dir>
 ```
 
-`PYTHON` in [`env.example`](../env.example) points at that interpreter. `start.sh`
-refuses to start if the port is taken or if less than `MIN_FREE_GIB` (90) is available,
-and names the processes holding the pool.
+The expert packs are built in step 3, from the image.
 
-### Container
+### Copying between the nodes
+
+One `rsync` is limited by its SSH cipher (~470 MB/s on these boxes); eight in parallel moved
+~2.6 GB/s:
 
 ```bash
-cp env.example .env      # PORT, MAX_SEQ, ARENA_GB, SPEC, thinking defaults
-./run.sh setup           # pull + download
-./run.sh serve           # detached, waits for /health
-./run.sh logs
-./run.sh stop
+cd <dir> && ls | split -n r/8 - /tmp/files. && \
+  for f in /tmp/files.*; do rsync -a --files-from=$f . <peer>:<dir>/ & done; wait
 ```
 
-[`compose.yaml`](../compose.yaml) publishes the API on `127.0.0.1:8000` only, mounts
-`./models` at `/models` and `./results` at `/app/results`, and reads `./.env`. Note that
-`MODEL_DIR` in `.env` is a **host** path: inside the container the checkpoint is always
-under the `/models` mount, and `./run.sh` derives the bind mount and the directory name
-from it (override with `MODELS_DIR` / `MODEL_NAME` if you want to be explicit).
-
-The equivalent by hand, if you would rather not use compose:
+## 3. Image, then the GLM packs
 
 ```bash
-docker run -d --name deepseek-v41-flash \
-  --gpus all --ipc=host --ulimit memlock=-1 \
-  -p 127.0.0.1:8000:8000 \
-  -v /path/to/models:/models -v "$PWD/results:/app/results" \
-  -e MAX_SEQ=32768 -e SPEC=1 \
-  ghcr.io/<owner>/deepseek-v41-flash-spark:<version>
+scripts/tide.sh build .env.glm53-exl3    # either profile: builds the image here and ships it to PEER
 ```
 
-Three flags are not optional and one is a trap:
+The Rust engine is compiled inside the build. After every `git pull` run it again: the launcher
+refuses an image built from other sources than the checkout.
 
-* `--gpus all` — the container needs the GB10 and the driver's `libcuda`.
-* `--ipc=host` — the engine keeps pinned staging buffers for the `O_DIRECT` reads; the
-  default 64 MB `/dev/shm` and the default IPC namespace get in the way of that.
-* `--ulimit memlock=-1` — pinned memory is what makes the NVMe path fast; without it the
-  staging buffers fall back to pageable memory.
-* **Do not set `--memory`.** On unified memory that is a limit on GPU allocations too,
-  and the arena auto-sizer will quietly shrink to fit it. There is no cgroup number that
-  means "host RAM but not GPU" on this hardware.
-
-The image is built by [GitHub Actions on an arm64 runner](../.github/workflows/image.yml)
-and published to GHCR on `v*` tags. Building it on the box works (`BUILD=1 ./run.sh
-setup`) and takes minutes, not the twenty of an engine compile — there is no C++
-extension in this recipe.
-
-## First start
-
-The socket is bound only *after* the warm start has filled the resident FP4 expert arena
-from NVMe, ranked by the measured routing trace. That is tens of GB of reads: on the
-measured run, 3,891 experts / 73.2 GB in 16 s at 4.6 GB/s once the non-expert weights
-(~19 GB, ~63 s) were up. A server that is not answering at minute 5 is normal; the health
-waits are 20 minutes native and 45 in the container for that reason.
+GLM only: pack each node's half of the routed experts once, as your own user (the packer reads
+the checkpoint and writes one file per rank; ~10 minutes each):
 
 ```bash
-curl -s localhost:8000/health | python3 -m json.tool
+docker run --rm --user "$(id -u):$(id -g)" -v <ckpt dir>:/src:ro -v <packs dir>:/packs \
+  -v "$PWD":/w -w /w --entrypoint python tidelm:local tools/glm_pack_exl3.py \
+  --source /src --out /packs/glm-exl3-experts-r0of2.bin --rank 0
+# the same with r1of2 / --rank 1 for the worker: here, then copy the 128 GB file to the
+# worker's <packs dir>; or copy the checkpoint across and run it there
+```
+
+Set `GLM_EXL3_DIR=<packs dir>` in the profile; the pack must sit at the same path on both nodes.
+Once both packs are in place the checkpoint is no longer read. bertholomus's whole 3.0bpw
+checkpoint also works with the same packer: its experts at 3 bits (12,500 resident in the same
+memory, against 13,300), its own directory as `GLM_MODEL_DIR`.
+
+## 4. Start
+
+```bash
+scripts/tide.sh start .env.glm53-exl3    # stops whatever is serving, starts this profile
+scripts/tide.sh logs -f                  # one line a request: prefill and decode speeds (--rank 1: the worker)
+scripts/tide.sh stop
+```
+
+The engine is up 15 s (DeepSeek) to 40 s (GLM-5.3) after the previous pair has stopped. A
+first boot starts the routing history from the bundled one in `profiles/` and keeps its own
+under `~/tidelm-rust-state`; the first requests are slower while it adapts to your traffic.
+
+```bash
+curl -s localhost:8000/health
 curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' \
   -d '{"messages":[{"role":"user","content":"What is 2+2?"}],"max_tokens":64}'
 ```
 
-`/health` carries `engine_config` — arena GB, arena slots, resident expert percentage,
-kernel, spec on/off — so you never have to remember what the server was started with.
+The API is OpenAI-compatible (tool calls; images with DeepSeek) with an Anthropic Messages
+route for Claude Code ([OpenAI API](openai-api.md)). It binds `HOST` (0.0.0.0) with no
+authentication: keep it on a trusted network.
 
-Next: [architecture](architecture.md) · [OpenAI API](openai-api.md) ·
-[benchmarking](benchmarking.md) · [gotchas](gotchas.md)
+Next: [architecture](architecture.md) · [benchmarking](benchmarking.md) · [gotchas](gotchas.md)
 
-### Routed-expert arena format (`EXPERT_FORMAT`)
+## The single-box Python engine
 
-`EXPERT_FORMAT` (empty or `fp4`, or `cb3`) chooses what the resident expert arena holds.
-
-| | bytes per expert | slots in 90.5 GB | share of the 15,360 routed experts |
-|---|---|---|---|
-| `fp4` (default) | 18,800,640 | 4,813 | 31.3 % |
-| `cb3` | 14,454,784 | 6,260 | 40.8 % |
-
-`cb3` is the 3-bit per-row codebook format (`tools/cb3.py`): per matrix row the 8 FP4 grid levels
-that best represent that row, one 3-bit index per weight, and the checkpoint's UE8M0 scales
-unchanged. It is packed on the GPU at warm start from the same FP4 shards, so nothing on disk
-changes; the price is a slower warm start. Because it is 0.769x the bytes, `PRUNE_KEEP=0.40`
-(6,160 experts, 89.0 GB) is all-resident in `cb3` where it would not fit in `fp4`.
-
-`--sim-bits` is a different thing and stays FP4-only: it simulates the same codebook inside an FP4
-arena to measure quality without a kernel, and the engine refuses to combine the two.
+The original recipe (one Spark, the Python engine, `run.sh` / `compose.yaml`) is described in
+this file as of commit `21b7718`; the profiles' Python settings are in `configs/` as of
+`a6ec917`. `TIDE_ENGINE=python` in a profile still starts the Python containers on the pair.

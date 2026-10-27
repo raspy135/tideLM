@@ -65,8 +65,10 @@ thinking and reasoning-effort control through an OpenAI-compatible API.
 ## Quick start
 
 You need two DGX Sparks connected by a working RoCE link, Docker with NVIDIA GPU support,
-passwordless SSH from the head (rank 0) to the worker, and the checkpoint on local NVMe at the
-same path on both nodes. Clone this repository to the same absolute path on both nodes.
+passwordless SSH from the head (rank 0) to the worker, and the weights on local NVMe at the same
+path on both nodes. Clone this repository to the same absolute path on both nodes. The
+[install guide](docs/install.md) has each step in full: disk per profile, copying between the
+nodes, the GLM packs.
 
 **1. Pick a profile** and fill in your paths, the worker's address and network interfaces:
 
@@ -75,7 +77,7 @@ cp configs/ds41-mxfp4.env.example  .env.ds41-mxfp4     # DeepSeek-V4.1-Flash(-10
 cp configs/glm53-exl3.env.example  .env.glm53-exl3     # GLM-5.3, EXL3 (needs the packs below)
 ```
 
-**2. Get the checkpoint** onto both nodes:
+**2. Get the weights** onto both nodes:
 
 | Profile | Checkpoint | Size |
 | --- | --- | ---: |
@@ -84,25 +86,13 @@ cp configs/glm53-exl3.env.example  .env.glm53-exl3     # GLM-5.3, EXL3 (needs th
 
 `MODEL_REPO=deepseek-ai/DeepSeek-V4.1-Flash-1017 MODEL_DIR=<dir> bash scripts/download-model.sh`
 fetches the DeepSeek checkpoint and resumes if interrupted (`HF_TOKEN` is optional; it only
-raises rate limits). For GLM, download Mia's AI Lab's checkpoint with
-`hf download Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold --local-dir <exl3 dir>`. It keeps its
+raises rate limits). For GLM, download Mia's AI Lab's checkpoint on the head with
+`hf download Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold --local-dir <ckpt dir>`. It keeps its
 non-expert weights in BF16, ~19 GB a rank, so the profile takes those from bertholomus's EXL3
 checkpoint of the same GLM-5.3 instead (~5-6 bits, 7.3 GB a rank): on each node,
 `python3 tools/glm_fetch_dense.py --out <dense dir>` fetches just those 15 GB by range requests
-(stdlib Python; re-run to resume) — `GLM_MODEL_DIR`. Then pack each node's half of the experts
-once, after building the image (step 3). The packer reads the checkpoint, so run it where the
-checkpoint is (copy the checkpoint to the worker, or pack both ranks on the head and copy rank 1's
-128 GB pack across); once packed, the 293 GB checkpoint is no longer read:
-
-```bash
-# on node 0 (and on node 1 with r1of2 / --rank 1)
-docker run --rm --gpus all -v <exl3 dir>:/models-exl3:ro -v <packs dir>:/packs -v "$PWD":/w -w /w \
-  --entrypoint python tidelm:local tools/glm_pack_exl3.py \
-  --source /models-exl3 --out /packs/glm-exl3-experts-r0of2.bin --rank 0
-```
-
-bertholomus's whole 3.0bpw checkpoint works the same way (its experts at 3 bits for 12,500
-residents in the same memory, its own weights as `GLM_MODEL_DIR`).
+(stdlib Python; re-run to resume). That directory is `GLM_MODEL_DIR`; the experts are packed
+after step 3.
 
 **3. Build the image** on the head; it is copied to the worker, and both models run from it:
 
@@ -112,9 +102,23 @@ scripts/tide.sh build .env.ds41-mxfp4    # any of your profiles: the image, ship
 
 It compiles the Rust engine inside the build, so the boxes need nothing but Docker. The engine
 refuses to start from an image built from other sources than the checkout: after `git pull`,
-run the same command again. The EXL3 pack tool (step 2) runs from this image too. The Rust
-engine serves DeepSeek's native scales; the lossless scale pack
-([details](docs/lossless-scales.md)) is the Python engine's.
+run the same command again. The Rust engine serves DeepSeek's native scales; the lossless scale
+pack ([details](docs/lossless-scales.md)) is the Python engine's.
+
+For GLM, pack each node's half of the routed experts once, from this image and as your own user
+(~10 minutes a rank). The packer reads the checkpoint, so run both ranks on the head and copy
+rank 1's 128 GB file to the worker (or copy the checkpoint across and pack there); once both packs
+are in place, at the same path, the checkpoint is no longer read:
+
+```bash
+# rank 0, and the same with r1of2 / --rank 1; then GLM_EXL3_DIR=<packs dir> in the profile
+docker run --rm --user "$(id -u):$(id -g)" -v <ckpt dir>:/src:ro -v <packs dir>:/packs \
+  -v "$PWD":/w -w /w --entrypoint python tidelm:local tools/glm_pack_exl3.py \
+  --source /src --out /packs/glm-exl3-experts-r0of2.bin --rank 0
+```
+
+bertholomus's whole 3.0bpw checkpoint works the same way (its experts at 3 bits for 12,500
+residents in the same memory, its own directory as `GLM_MODEL_DIR`).
 
 **4. Start and stop:**
 
@@ -204,6 +208,7 @@ with what each setting measured.
 
 ## Documentation
 
+- [Install guide](docs/install.md): each setup step in full
 - [Hot reads: design and measurements](docs/hot-reads.md)
 - [Adaptive expert loading](docs/adaptive-experts.md), [GLM-5.3 engine plan](docs/glm53-plan.md)
 - [Known issues and rejected experiments](docs/gotchas.md) — kept on purpose: several plausible

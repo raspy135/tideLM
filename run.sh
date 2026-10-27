@@ -10,8 +10,8 @@
 #   ./run.sh bench ..  run bench/bench.py against it (arguments pass straight through)
 #   ./run.sh config    show the resolved compose configuration
 #
-# For the native path -- a venv on the box, no container -- use ./start.sh and ./stop.sh
-# instead; both read the same .env. docs/install.md compares the two.
+# The original single-box recipe (the Python engine). The two-node Rust setup the README
+# describes is scripts/tide.sh; docs/install.md as of 21b7718 described this one.
 #
 # Reads ./.env (see env.example). Environment beats .env, as everywhere in this recipe:
 #   PORT           published port on 127.0.0.1                    (8000)
