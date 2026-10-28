@@ -1,0 +1,13 @@
+note: server serves 'deepseek', using that
+== pdl-on-random8k: workload=random isl=8192 osl=256 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=8178 ttft=   5289.2 ms  tpot=  17.52 ms  decode= 57.07 tok/s  out=256 (length)
+          accept_len=5.1  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=8170 ttft=   4307.6 ms  tpot=  26.50 ms  decode= 37.73 tok/s  out=256 (length)
+          accept_len=2.4757281553398056  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=8171 ttft=   4252.4 ms  tpot=  23.68 ms  decode= 42.23 tok/s  out=256 (length)
+          accept_len=2.9310344827586206  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=8178 ttft=   4363.7 ms  tpot=  28.84 ms  decode= 34.67 tok/s  out=256 (length)
+          accept_len=2.1982758620689653  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=4307.5814 ms  tpot=26.5025 ms  decode=37.7322 tok/s
+  -> ENGINE  accept_len=2.4757  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /tmp/claude-1000/-home-ryan-git-tidelm/ee5bdf57-c37e-4b07-b12d-be6b933bf449/scratchpad/pdl/srv/on-random8k.json

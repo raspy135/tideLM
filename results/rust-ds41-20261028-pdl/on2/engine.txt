@@ -1,0 +1,90 @@
+boot: tokenizer 0.4 s
+adapt: AdaptConfig { halflife: 10.0, prior: 4.0, gate: 0.010173269452189129, min_new: 32, decode_tokens: 600, swap_max: 512, min_gain: 0.005, floor: 6 }
+adapt: demand history /home/ryan/tidelm-rust-state/bench-pdl-20261028/on2/seed.npz loaded
+boot: demand, residency, pair 0.6 s
+ablit: layers 10-35 attn.wo_b from /home/ryan/models/dsv41-1017-wo-b-ablit/wo_b_l10_35_1017.safetensors (sha256 88324ceaa2c0754a2bdb4ef6bb388a088438e352358343e6c2c882009cdde864)
+kv: 1044 chunks of 2 MB (2.19 GB) for 1572864 tokens over 2 lanes of 1048576
+engine: 3.6 s before the resident load
+resident load: layers 5.7 s, embed + head by 6.4 s, drafter experts by 7.5 s; 10064 experts by 13.3 s (in parallel)
+boot: engine 17.7 s
+engine up in 17.9s; serving deepseek on 0.0.0.0:8000 (2 lanes, depth Confidence)
+memory at boot: device 103.51 GiB (+0.00 since up), pinned 0.37 GiB (+0.00), graphs 0 (0 made since up; 0.00 GiB, heap 0.00), host anon 1.11 GiB (heap in use 1.02, held free 0.00), file-backed 0.21 GiB
+adapt (probe, two-pass 45 of 45 tokens, predicted miss 0.1164): moved 205 experts (202 across layers; residents a layer 199-293, generation 1) in 0.19 s
+adapt (prompt of 45 tokens, miss rate 0.0506): moved 30 experts (29 across layers; residents a layer 199-293, generation 2) in 0.04 s
+adapt (output token 601, miss rate 0.0996 over the last 600 tokens): moved 172 experts (168 across layers; residents a layer 205-294, generation 3) in 0.16 s
+request 1: prompt 45, prefill 45 in 1.85 s (24 tok/s), decode 1024 in 30.63 s (33.39 tok/s, 1.80 a step), length
+memory: device 103.51 GiB (+0.00 since up), pinned 0.37 GiB (+0.00), graphs 50 (50 made since up; 0.22 GiB, heap 0.18), host anon 1.32 GiB (heap in use 1.24, held free 0.00), file-backed 1.10 GiB
+hot reads: 397 reads over 568 decode steps since boot (159 capped, 0.43 s waited)
+adapt (end of request): moved 17 experts (17 across layers; residents a layer 202-294, generation 4) in 0.02 s
+adapt (probe, two-pass 45 of 45 tokens, predicted miss 0.0452): moved 86 experts (84 across layers; residents a layer 204-292, generation 5) in 0.09 s
+adapt (prompt of 45 tokens, miss rate 0.0322): moved 7 experts (6 across layers; residents a layer 203-292, generation 6) in 0.02 s
+adapt (output token 603, miss rate 0.0508 over the last 602 tokens): moved 104 experts (101 across layers; residents a layer 207-292, generation 7) in 0.10 s
+request 2: prompt 45, prefill 45 in 0.52 s (87 tok/s), decode 1024 in 30.22 s (33.85 tok/s, 1.82 a step), length
+memory: device 103.51 GiB (+0.00 since up), pinned 0.37 GiB (+0.00), graphs 65 (65 made since up; 0.33 GiB, heap 0.24), host anon 1.38 GiB (heap in use 1.30, held free 0.00), file-backed 1.59 GiB
+hot reads: 571 reads over 1129 decode steps since boot (199 capped, 0.65 s waited)
+adapt (end of request): moved 16 experts (16 across layers; residents a layer 207-292, generation 8) in 0.02 s
+adapt (probe, two-pass 45 of 45 tokens, predicted miss 0.0337): moved 64 experts (62 across layers; residents a layer 207-290, generation 9) in 0.07 s
+adapt (prompt of 45 tokens, miss rate 0.0255): moved 10 experts (10 across layers; residents a layer 207-290, generation 10) in 0.02 s
+adapt (output token 604, miss rate 0.0442 over the last 603 tokens): moved 83 experts (80 across layers; residents a layer 208-290, generation 11) in 0.08 s
+request 3: prompt 45, prefill 45 in 0.50 s (89 tok/s), decode 1024 in 29.51 s (34.66 tok/s, 1.88 a step), length
+memory: device 103.51 GiB (+0.00 since up), pinned 0.37 GiB (+0.00), graphs 68 (68 made since up; 0.35 GiB, heap 0.25), host anon 1.39 GiB (heap in use 1.31, held free 0.00), file-backed 2.05 GiB
+hot reads: 722 reads over 1674 decode steps since boot (228 capped, 0.84 s waited)
+adapt (end of request): moved 9 experts (9 across layers; residents a layer 208-290, generation 12) in 0.01 s
+adapt (probe, two-pass 45 of 45 tokens, predicted miss 0.0278): moved 57 experts (56 across layers; residents a layer 207-291, generation 13) in 0.06 s
+adapt (prompt of 45 tokens, miss rate 0.0214): moved 5 experts (5 across layers; residents a layer 207-291, generation 14) in 0.02 s
+adapt (output token 601, miss rate 0.0355 over the last 600 tokens): moved 53 experts (52 across layers; residents a layer 205-288, generation 15) in 0.05 s
+request 4: prompt 45, prefill 45 in 0.59 s (77 tok/s), decode 1024 in 30.69 s (33.34 tok/s, 1.82 a step), length
+memory: device 103.51 GiB (+0.00 since up), pinned 0.37 GiB (+0.00), graphs 74 (74 made since up; 0.39 GiB, heap 0.27), host anon 1.42 GiB (heap in use 1.34, held free 0.00), file-backed 2.31 GiB
+hot reads: 851 reads over 2235 decode steps since boot (252 capped, 1.01 s waited)
+adapt (end of request): moved 14 experts (14 across layers; residents a layer 206-287, generation 16) in 0.01 s
+adapt (probe, two-pass 62 of 62 tokens, predicted miss 0.0787): moved 133 experts (125 across layers; residents a layer 209-288, generation 17) in 0.13 s
+adapt (prompt of 62 tokens, miss rate 0.0348): moved 18 experts (17 across layers; residents a layer 209-287, generation 18) in 0.03 s
+adapt (output token 601, miss rate 0.0734 over the last 600 tokens): moved 153 experts (148 across layers; residents a layer 207-287, generation 19) in 0.14 s
+request 5: prompt 62, prefill 62 in 0.65 s (95 tok/s), decode 1024 in 19.37 s (52.80 tok/s, 3.83 a step), length
+memory: device 103.51 GiB (+0.00 since up), pinned 0.37 GiB (+0.00), graphs 90 (90 made since up; 0.48 GiB, heap 0.33), host anon 1.49 GiB (heap in use 1.40, held free 0.00), file-backed 2.45 GiB
+hot reads: 1192 reads over 2502 decode steps since boot (590 capped, 1.36 s waited)
+adapt (end of request): moved 31 experts (30 across layers; residents a layer 208-287, generation 20) in 0.04 s
+adapt (probe, two-pass 62 of 62 tokens, predicted miss 0.0312): moved 55 experts (53 across layers; residents a layer 210-291, generation 21) in 0.06 s
+adapt (prompt of 62 tokens, miss rate 0.0266): moved 3 experts (2 across layers; residents a layer 210-291, generation 22) in 0.01 s
+adapt (output token 604, miss rate 0.0442 over the last 603 tokens): moved 92 experts (90 across layers; residents a layer 207-290, generation 23) in 0.09 s
+request 6: prompt 62, prefill 62 in 0.97 s (64 tok/s), decode 1024 in 18.87 s (54.22 tok/s, 3.77 a step), length
+memory: device 103.51 GiB (+0.00 since up), pinned 0.37 GiB (+0.00), graphs 90 (90 made since up; 0.48 GiB, heap 0.33), host anon 1.49 GiB (heap in use 1.40, held free 0.00), file-backed 2.67 GiB
+hot reads: 1406 reads over 2773 decode steps since boot (644 capped, 1.64 s waited)
+adapt (end of request): moved 40 experts (40 across layers; residents a layer 207-290, generation 24) in 0.04 s
+adapt (probe, two-pass 62 of 62 tokens, predicted miss 0.0257): moved 47 experts (46 across layers; residents a layer 211-290, generation 25) in 0.05 s
+adapt (prompt of 62 tokens, miss rate 0.0224): moved 8 experts (7 across layers; residents a layer 209-290, generation 26) in 0.02 s
+adapt (output token 601, miss rate 0.0384 over the last 600 tokens): moved 74 experts (72 across layers; residents a layer 211-290, generation 27) in 0.07 s
+request 7: prompt 62, prefill 62 in 0.52 s (118 tok/s), decode 1024 in 18.63 s (54.91 tok/s, 3.93 a step), length
+memory: device 103.51 GiB (+0.00 since up), pinned 0.37 GiB (+0.00), graphs 90 (90 made since up; 0.48 GiB, heap 0.33), host anon 1.49 GiB (heap in use 1.40, held free 0.00), file-backed 2.66 GiB
+hot reads: 1552 reads over 3033 decode steps since boot (677 capped, 1.82 s waited)
+adapt (end of request): moved 29 experts (29 across layers; residents a layer 211-291, generation 28) in 0.03 s
+adapt (probe, two-pass 62 of 62 tokens, predicted miss 0.0235): moved 45 experts (43 across layers; residents a layer 212-290, generation 29) in 0.05 s
+adapt (prompt of 62 tokens, miss rate 0.0202): moved 4 experts (4 across layers; residents a layer 212-290, generation 30) in 0.02 s
+adapt (output token 601, miss rate 0.0348 over the last 600 tokens): moved 56 experts (56 across layers; residents a layer 213-287, generation 31) in 0.05 s
+request 8: prompt 62, prefill 62 in 0.52 s (119 tok/s), decode 1024 in 19.36 s (52.85 tok/s, 3.59 a step), length
+memory: device 103.51 GiB (+0.00 since up), pinned 0.37 GiB (+0.00), graphs 93 (93 made since up; 0.50 GiB, heap 0.34), host anon 1.50 GiB (heap in use 1.42, held free 0.00), file-backed 2.79 GiB
+hot reads: 1681 reads over 3318 decode steps since boot (711 capped, 2.03 s waited)
+adapt (end of request): moved 19 experts (18 across layers; residents a layer 211-288, generation 32) in 0.03 s
+adapt (probe, excerpt 64 of 8178 tokens, predicted miss 0.1861): moved 221 experts (216 across layers; residents a layer 213-288, generation 33) in 0.21 s
+adapt (prompt of 8178 tokens, miss rate 0.1380): moved 196 experts (190 across layers; residents a layer 217-287, generation 34) in 0.19 s
+request 9: prompt 8178, prefill 8178 in 4.75 s (1723 tok/s), decode 256 in 6.93 s (36.78 tok/s, 2.58 a step), length
+memory: device 103.51 GiB (+0.00 since up), pinned 0.37 GiB (+0.00), graphs 105 (105 made since up; 0.57 GiB, heap 0.39), host anon 1.62 GiB (heap in use 1.64, held free 0.01), file-backed 2.71 GiB
+hot reads: 1751 reads over 3417 decode steps since boot (755 capped, 2.10 s waited)
+adapt (end of request): moved 87 experts (83 across layers; residents a layer 216-287, generation 35) in 0.08 s
+adapt (probe, excerpt 64 of 8170 tokens, predicted miss 0.0945): moved 148 experts (146 across layers; residents a layer 216-288, generation 36) in 0.14 s
+adapt (prompt of 8170 tokens, miss rate 0.0584): moved 133 experts (130 across layers; residents a layer 220-288, generation 37) in 0.13 s
+request 10: prompt 8170, prefill 8170 in 5.16 s (1582 tok/s), decode 256 in 6.85 s (37.22 tok/s, 2.71 a step), length
+memory: device 103.51 GiB (+0.00 since up), pinned 0.37 GiB (+0.00), graphs 117 (117 made since up; 0.65 GiB, heap 0.43), host anon 1.67 GiB (heap in use 1.69, held free 0.01), file-backed 2.64 GiB
+hot reads: 1830 reads over 3511 decode steps since boot (800 capped, 2.21 s waited)
+adapt (end of request): moved 113 experts (111 across layers; residents a layer 218-288, generation 38) in 0.11 s
+adapt (probe, excerpt 64 of 8171 tokens, predicted miss 0.0626): moved 99 experts (99 across layers; residents a layer 216-289, generation 39) in 0.10 s
+adapt (prompt of 8171 tokens, miss rate 0.0388): moved 84 experts (82 across layers; residents a layer 218-288, generation 40) in 0.09 s
+request 11: prompt 8171, prefill 8171 in 4.24 s (1928 tok/s), decode 256 in 6.33 s (40.26 tok/s, 2.71 a step), length
+memory: device 103.51 GiB (+0.00 since up), pinned 0.37 GiB (+0.00), graphs 117 (117 made since up; 0.65 GiB, heap 0.43), host anon 1.67 GiB (heap in use 1.69, held free 0.01), file-backed 2.72 GiB
+hot reads: 1885 reads over 3605 decode steps since boot (813 capped, 2.28 s waited)
+adapt (end of request): moved 102 experts (101 across layers; residents a layer 218-290, generation 41) in 0.09 s
+adapt (probe, excerpt 64 of 8178 tokens, predicted miss 0.0626): moved 84 experts (83 across layers; residents a layer 219-291, generation 42) in 0.09 s
+adapt (prompt of 8178 tokens, miss rate 0.0319): moved 81 experts (76 across layers; residents a layer 221-289, generation 43) in 0.08 s
+request 12: prompt 8178, prefill 8178 in 4.26 s (1920 tok/s), decode 256 in 6.89 s (37.03 tok/s, 2.60 a step), length
+memory: device 103.51 GiB (+0.00 since up), pinned 0.37 GiB (+0.00), graphs 120 (120 made since up; 0.66 GiB, heap 0.45), host anon 1.69 GiB (heap in use 1.70, held free 0.01), file-backed 2.66 GiB
+hot reads: 1921 reads over 3703 decode steps since boot (821 capped, 2.32 s waited)

@@ -4873,5 +4873,12 @@ before it, only x does, so its first tiles can be requested before `griddepcontr
 microbenchmark: 160 streaming kernels 2.80 -> 2.58 ms). On the pair it measured nothing: 62.8 vs
 62.9-63.2 ms at depth 3, code's confidence policy 63.5 vs 63.9, prose within 0.5 ms either way.
 
+Serving (`results/rust-ds41-20261028-pdl/`, the README protocol, one boot an arm, two rounds in
+opposite orders): prose steps 53.5-54.7 ms with PDL against 55.2-56.3 without, prose 33.49 / 33.85
+tok/s against 33.32, code 51.77 / 54.22 against 50.09. The round's first boot, right after the 10 GB
+image load, emitted far fewer tokens a step (code 2.05-2.64 against 3.20-3.93 in every other boot)
+at an ordinary step time, and measured 29.72 / 39.02 tok/s; its cause is not found, so a benchmark
+does not take the first boot after an image load.
+
 Left: the 11 host waits (1.66 ms a step); merging kernels now saves only their remaining ~0.3 us a
 boundary on top of this.

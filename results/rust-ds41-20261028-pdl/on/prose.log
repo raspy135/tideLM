@@ -1,0 +1,13 @@
+note: server serves 'deepseek', using that
+== pdl-on-prose: workload=prose isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=45 ttft=    806.2 ms  tpot=  29.08 ms  decode= 34.39 tok/s  out=1024 (length)
+          accept_len=1.8736263736263736  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=45 ttft=    532.8 ms  tpot=  29.56 ms  decode= 33.83 tok/s  out=1024 (length)
+          accept_len=1.8202846975088969  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=45 ttft=    516.4 ms  tpot=  29.86 ms  decode= 33.49 tok/s  out=1024 (length)
+          accept_len=1.8106194690265487  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=45 ttft=    506.8 ms  tpot=  30.69 ms  decode= 32.58 tok/s  out=1024 (length)
+          accept_len=1.7427597955706984  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=516.4075 ms  tpot=29.8597 ms  decode=33.49 tok/s
+  -> ENGINE  accept_len=1.8106  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /tmp/claude-1000/-home-ryan-git-tidelm/ee5bdf57-c37e-4b07-b12d-be6b933bf449/scratchpad/pdl/srv/on-prose.json
