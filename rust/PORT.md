@@ -504,9 +504,14 @@ What is ported, by the DS port's feature list:
 - **Server**: the OpenAI routes, the Anthropic Messages route, tool calls (GLM's XML), the GLM
   template and parser (`tidelm-text/src/glm.rs`, fixture-tested against glm_app.py).
 
-Not ported, and why: concurrency (the Python GLM server serves one request at a time too; two
-lanes would halve the 12,500 residents' share of memory per request), vision (GLM-5.3 has
-none), the bounded replay (GLM has no sliding window), GLM_MISS=stream, MXFP4 experts, FP4 KV.
+- **Lanes** (`GLM_LANES`, 2026-10-27): requests at once over one paged KV pool (the DS engine's
+  `tidelm_engine::kv`); a pass's lane table gives each row its lane's positions and cache rows
+  (glm.cu positions / index scores / MLA); `serve.rs` runs a round per decoding lane's phases
+  together (batched MTP drafts, one verify, one MTP fill), prefills a prompt beside them in parts.
+  One request at a time is byte for byte the single-lane engine (docs/gotchas.md).
+
+Not ported, and why: vision (GLM-5.3 has none), the bounded replay (GLM has no sliding window),
+GLM_MISS=stream, MXFP4 experts, FP4 KV (a WIP port is on branch glm-kv-fp4, not built or tested).
 
 Kernels (`tidelm-kernels/cuda/glm.cu`, `tests/glm_gpu.rs` against CPU transcriptions): the EXL3
 unpack equals the numpy oracle's golden values on the real checkpoint; both EXL3 paths match

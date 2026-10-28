@@ -4726,3 +4726,47 @@ pair's verify by rows (a DFlash2 pass 14 ms in BF16, 2.5 GB a rank; 8 ms if FP8)
 Neither drafter was trained on these weights' hidden states (BF16 and NVFP4 targets), while the
 MTP layer is part of the model served; the cards also measured long Max-effort reasoning. Two code
 requests, greedy only: the code gain is a small sample. Not ported.
+
+## GLM two lanes: one request byte for byte, two at once 13-33% more in all (2026-10-27)
+
+GLM_LANES=2 serves two requests together (Rust engine, `rust/crates/tidelm-glm`). The KV moved
+from cudaMalloc to the DS engine's VMM pool: each lane's part of every cache is a reserved range
+paged in as it grows, and the pool is what one lane at GLM_MAX_SEQ fills, so lanes share the
+positions and one alone still reaches the maximum. A decode pass names its rows' lanes in a device
+table; positions, the indexer's scores and MLA read each row's lane's rows (one grid layer a lane
+for the scores, so a block's rows, which share key tiles, are one lane's). Prefill runs one lane.
+
+Measured on the pair, 2.75bpw packs, 12,500 slots, 256K, the user's routing state copied for each
+boot and the disk prefix store off, five prompts of 256 tokens (prose, code, Japanese, a file
+rewrite of copy rounds, one sampled at a fixed seed):
+- main's binary against the branch with GLM_LANES unset: 5 of 5 answers identical byte for byte;
+  the branch with GLM_LANES=2, the same prompts one at a time: 5 of 5 identical again.
+- two at once (three pairs): the rewrite identical, the others coherent and on topic but parting
+  from their one-at-a-time answers within the first heading ("B-Tree Insertion and Balance" /
+  "B-tree Insertion: How It Stays Balanced"). The second request's prefill now follows the first's
+  prefill and adaptation instead of its whole answer (other residents), and a 16-row pass routes
+  its experts as a prefill does (p > 64 picks), not by the decode grouping: other sums.
+- recall beside a decoding lane: prompts of 220 / 600 numbered records (6.8K / 19.2K tokens),
+  prefilled in 1,024-row parts while an essay decoded in the other lane, then three lockers' codes
+  asked: 3 of 3 runs answered all three. The essay meanwhile took a round every ~3 s (the parts).
+- throughput, the pairs against the same two one after the other: prose + code 512 tokens in
+  20.9 s against 26.9 (+29%), Japanese + rewrite 24.4 against 27.5 (+13%), poem + prose 403 tokens
+  in 18.3 against 24.5 (+33%); each request ran at 11.5-14.5 tok/s while sharing.
+- memory: +0.5 GB at boot on rank 0 (twice the graphs).
+
+Beside another lane a block keeps to HEAD_ROWS / lanes rows (a long copy 15 tokens, not 32), and a
+pass of more than 16 rows takes the wide decode path, eager, without hot-read candidates. A second
+request is admitted only while its prompt + 4,096 positions fit the free pool (an idle lane's
+chunks given back first); a lane the pool cannot grow ends at its length.
+
+Found on the way: DeviceBuffer::zeroed returned before its cudaMemset ran. cudaMemset on device
+memory is asynchronous on the legacy stream, which the engine's non-blocking streams do not wait
+for, so a kernel launched next could write first and have its output wiped: glm_gpu's split-KV MLA
+test failed on main that way (rel error 0.76-0.83, a different value each run). zeroed now waits.
+Also noted, not changed: a prefill chunk's MTP fill re-stages the pinned id buffer the chunk's own
+host-to-device copy read, with no sync between; it works because the driver takes small pinned
+copies at enqueue, which CUDA does not promise.
+
+tools/bench_concurrency_http.py asserts a non-empty `content`: on GLM its reasoning_effort "none"
+is the template's Max, and 128-384 tokens of reasoning leave the answer empty, so it fails there.
+
