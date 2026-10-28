@@ -4832,3 +4832,46 @@ What is left in the step is not bandwidth: the experts and GEMVs read at ~250 GB
 ~11 ms around them is gathers, attention, small kernels and launches. FP8 activations
 (DeepSeek's reference quantizes every fp8 / fp4 GEMM's input) would not move decode: a step's
 activations are kilobytes against gigabytes of weights; they would change the numerics.
+
+## DS decode launches: programmatic dependent launch, 1.2-2.1 ms off a step (2026-10-28)
+
+A 4-row DS step on the pair issues ~2,013 kernels (nsys, rank 0). The gaps between them are short
+(median 0.51 us, 1.11 ms a step in all, plus 11 host waits of 3 us or more, 1.66 ms), but 703 of
+the kernels last under 2 us and do almost no work: what a third of the launches costs is mostly
+their own ramp and drain, ~1 ms a step, not the gaps. Merging kernels removes that one site at a
+time (the mHC chain's six kernels, unshard into the gather's copy-out, norm with rope, the router
+chain); programmatic dependent launch (PDL) takes it at every boundary at once.
+
+A microbenchmark first (a CUDA graph captured from a stream, as the engine captures its step):
+2,000 dependent tiny kernels 6.80 -> 3.26 ms with PDL and `griddepcontrol.launch_dependents` after
+the wait (6.77 with the wait alone: the gain is the next grid launching early); 160 weight-streaming
+kernels and 800 tiny ones 4.35 -> 4.09 ms.
+
+Every kernel of `ds41.cu` and `tools/fp4_moe_cuda.cu` now begins with `griddepcontrol.wait` and then
+`launch_dependents`, and their launches carry `cudaLaunchAttributeProgrammaticStreamSerialization`
+once the DS engine sets it (`ds_set_pdl`, `fp4_moe_cuda_set_pdl`; `TIDELM_PDL=0` keeps it off). The
+wait comes before any global access in every block, so each grid still sees its predecessor's writes
+and cannot complete before it: the stream's order holds transitively. The RoCE gather and the L2
+prefetch branch launch plain. GLM and the Python engine never set the switch, so their launches are
+unchanged (both instructions are no-ops without the attribute).
+
+The pair, `tidelm-generate --sweep-depth`, 256 greedy tokens, fixed residents, ms a step, the mean of
+three runs off and five on (code / prose):
+
+| depth | 0 | 1 | 2 | 3 | 4 | 5 | confidence | tok/s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| code off | 38.6 | 50.6 | 58.9 | 64.3 | 74.2 | 79.4 | 65.6 | 46.4 |
+| code on | 37.4 | 49.4 | 57.4 | 63.2 | 72.8 | 78.2 | 64.0 | 47.3 |
+| prose off | 38.1 | 50.8 | 59.5 | 64.7 | 75.1 | 80.0 | 53.2 | 32.4 |
+| prose on | 37.5 | 49.3 | 57.6 | 63.4 | 73.0 | 78.4 | 51.7 | 33.1 |
+
+The confidence policy's ranges do not overlap (code off 65.1-66.3, on 63.9-64.2; prose 53.1-53.3
+against 51.6-51.8). Logits digest unchanged with it on and off (`d0c8b090c1d68ed2`).
+
+**Rejected: the GEMVs' weights before the wait.** A skinny GEMV's weights do not depend on the kernel
+before it, only x does, so its first tiles can be requested before `griddepcontrol.wait` (the
+microbenchmark: 160 streaming kernels 2.80 -> 2.58 ms). On the pair it measured nothing: 62.8 vs
+62.9-63.2 ms at depth 3, code's confidence policy 63.5 vs 63.9, prose within 0.5 ms either way.
+
+Left: the 11 host waits (1.66 ms a step); merging kernels now saves only their remaining ~0.3 us a
+boundary on top of this.

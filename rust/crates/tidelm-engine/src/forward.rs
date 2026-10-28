@@ -1956,6 +1956,14 @@ impl Engine {
         } else {
             (None, None)
         };
+        // programmatic dependent launch for the engine's kernels (ds41.cu, fp4_moe_cuda.cu): each
+        // kernel's blocks launch while the one before finishes. 1.3-1.8 ms off a decode step on the
+        // pair, bit-identical (docs/gotchas.md); TIDELM_PDL=0 turns it off. GLM never sets it.
+        let pdl = std::env::var("TIDELM_PDL").as_deref() != Ok("0");
+        unsafe {
+            ds_set_pdl(pdl as i32);
+            fp4::fp4_moe_cuda_set_pdl(pdl as i32);
+        }
         Ok(Engine {
             arena: Arena::new(ARENA_SLOTS + 1, None)?,
             expert_stage: PinnedBuffer::uninit(STAGE_BYTES)?,

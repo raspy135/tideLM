@@ -20,6 +20,34 @@
 #include <cuda_fp8.h>
 #include <stdint.h>
 #include <algorithm>
+#include <utility>
+
+// Programmatic dependent launch (PDL). Every kernel here starts with pdl_enter(); once the DS engine
+// switches it on (ds_set_pdl / fp4_moe_cuda_set_pdl; TIDELM_PDL=0 keeps it off) every launch carries the
+// programmatic-serialization attribute, so the next kernel's blocks launch while this one finishes and
+// wait on the GPU instead of behind the launch path. griddepcontrol.wait returns once the previous grid
+// has completed and its writes are visible; it comes before any global access, in every block, so reads
+// and writes keep the plain stream's order (transitively too: no grid completes before the one it waited
+// on). Without the attribute both instructions do nothing: other callers (GLM, the Python engine) launch
+// as before. The same kernels and arithmetic either way, bit-identical. The pair, 2026-10-28: 1.3-1.8 ms
+// off a decode step (docs/gotchas.md).
+__device__ __forceinline__ void pdl_enter() {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+}
+static int g_pdl = 0;
+template <typename... P, typename... A>
+static inline void pdl_launch(void (*kernel)(P...), dim3 grid, dim3 block, size_t smem, cudaStream_t st, A&&... args) {
+    cudaLaunchConfig_t c = {};
+    c.gridDim = grid; c.blockDim = block; c.dynamicSmemBytes = smem; c.stream = st;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = 1;
+    c.attrs = at; c.numAttrs = g_pdl ? 1 : 0;
+    cudaLaunchKernelEx(&c, kernel, std::forward<A>(args)...);
+}
+// the DS engine's switch for this file's launches (graph captures made after it carry it)
+extern "C" int ds_set_pdl(int on) { g_pdl = on; return 0; }
 
 namespace {
 
@@ -106,6 +134,10 @@ __device__ float block_max(float v, float* scratch) {
 // UNR: a lane loads its next UNR 16-byte tiles of each row before computing on them, in the
 // order the loop would have, so neither UNR nor ROWS changes a row's FMA chain either: they
 // only set how many weight bytes are in flight and how many blocks a small N gets.
+// Under PDL the weights could be requested before pdl_enter (they do not depend on the kernel
+// before; only x does): the first UNR tiles loaded ahead of the wait measured nothing on the pair,
+// 62.8 vs 62.9-63.2 ms at depth 3 and 63.5 vs 63.9 on code's confidence policy, prose the same
+// within 0.5 ms either way (2026-10-28), so the kernel waits first like every other.
 
 template <int KIND> struct Lane;
 template <> struct Lane<0> { static constexpr int V = 16, ESZ = 1; };
@@ -145,6 +177,7 @@ __global__ void __launch_bounds__(kThreads) skinny_kernel(
     const uint8_t* __restrict__ w, const uint8_t* __restrict__ s, int64_t lds,
     int M, int N, int K, int ksplit,
     __nv_bfloat16* __restrict__ ybf, float* __restrict__ yf, int64_t ldy, float* __restrict__ partial) {
+    pdl_enter();
     constexpr int V = Lane<KIND>::V, ESZ = Lane<KIND>::ESZ, VW = V * 32;
     __shared__ __align__(16) __nv_bfloat16 xs[MT][kChunk];
 
@@ -268,7 +301,7 @@ int launch_skinny(cudaStream_t st, const void* x, int64_t ldx, int64_t gstride, 
     // past 16 rows, 16-row tiles over gridDim.z (the slices a caller used to launch one by one)
     dim3 grid((N + kWarps * rows - 1) / (kWarps * rows), splits, (M + mt - 1) / mt);
 #define DS_SKINNY(R, MT, U) \
-    skinny_kernel<KIND, R, MT, U><<<grid, kThreads, 0, st>>>(xb, ldx, gstride, rpg, wb, sb, lds, M, N, K, ksplit, yb, yff, ldy, pp)
+    pdl_launch(skinny_kernel<KIND, R, MT, U>, grid, kThreads, 0, st, xb, ldx, gstride, rpg, wb, sb, lds, M, N, K, ksplit, yb, yff, ldy, pp)
     if (wide) {
         if (mt == 12) DS_SKINNY(2, 12, 2);
         else DS_SKINNY(2, 16, 2);
@@ -291,6 +324,7 @@ int launch_skinny(cudaStream_t st, const void* x, int64_t ldx, int64_t gstride, 
 
 __global__ void splits_reduce_kernel(const float* __restrict__ partial, int splits, int M, int N,
                                      __nv_bfloat16* __restrict__ ybf, float* __restrict__ yf, int64_t ldy) {
+    pdl_enter();
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (int64_t)M * N) return;
     const int m = (int)(i / N), n = (int)(i % N);
@@ -360,6 +394,7 @@ __global__ void __launch_bounds__(256) mma_skinny_kernel(
     const uint8_t* __restrict__ w, const uint8_t* __restrict__ s, int64_t lds,
     int M, int N, int K, int ksplit,
     __nv_bfloat16* __restrict__ ybf, float* __restrict__ yf, int64_t ldy, float* __restrict__ partial) {
+    pdl_enter();
     constexpr int MTILES = MT / 16;
     constexpr int XS = KC + 2;  // row stride in bf16: an odd number of words, so the 8 rows x 4
                                 // lanes of a fragment read hit 32 distinct banks
@@ -465,7 +500,7 @@ int launch_mma(cudaStream_t st, const void* x, int64_t ldx, int64_t gstride, int
     {                                                                                                      \
         if (rpg > 0 && rpg % (kWarps * 8 * NG)) return cudaErrorInvalidValue;                             \
         dim3 grid((N + kWarps * 8 * NG - 1) / (kWarps * 8 * NG), splits, (M + MT - 1) / MT);              \
-        mma_skinny_kernel<KIND, MT, KC, NG, DEPTH><<<grid, kThreads, 0, st>>>(xb, ldx, gstride, rpg, wb, sb, lds, M, N, \
+        pdl_launch(mma_skinny_kernel<KIND, MT, KC, NG, DEPTH>, grid, kThreads, 0, st, xb, ldx, gstride, rpg, wb, sb, lds, M, N, \
                                                                               K, ksplit, yb, yff, ldy, pp); \
     }
     // (NG, DEPTH) per tile, from examples/tune_mma.rs on the decode shapes (2026-10-24, GB/s
@@ -498,7 +533,7 @@ extern "C" int ds_mma_fp8_big(void* stream, const void* x, int64_t ldx, const vo
 #define DS_BIG(I, MT, KC, NG, DEPTH)                                                                                   \
     if (cfg == I) {                                                                                                  \
         dim3 grid((N + kWarps * 8 * NG - 1) / (kWarps * 8 * NG), 1, (M + MT - 1) / MT);                                \
-        mma_skinny_kernel<0, MT, KC, NG, DEPTH><<<grid, kThreads, 0, st>>>(xb, ldx, 0, 0, wb, sb, lds, M, N, K, K, yb,  \
+        pdl_launch(mma_skinny_kernel<0, MT, KC, NG, DEPTH>, grid, kThreads, 0, st, xb, ldx, 0, 0, wb, sb, lds, M, N, K, K, yb,  \
                                                                            nullptr, N, nullptr);                       \
         return static_cast<int>(cudaGetLastError());                                                                  \
     }
@@ -525,7 +560,7 @@ extern "C" int ds_mma_fp8_cfg(void* stream, const void* x, int64_t ldx, const vo
 #define DS_CFG(MT, KC, NG, DEPTH)                                                                                    \
     if (ng == NG && depth == DEPTH && (M <= MT) && (MT == 16 || M > MT / 2)) {                                        \
         dim3 grid((N + kWarps * 8 * NG - 1) / (kWarps * 8 * NG), splits);                                            \
-        mma_skinny_kernel<0, MT, KC, NG, DEPTH><<<grid, kThreads, 0, st>>>(xb, ldx, 0, 0, wb, sb, lds, M, N, K, ksplit, \
+        pdl_launch(mma_skinny_kernel<0, MT, KC, NG, DEPTH>, grid, kThreads, 0, st, xb, ldx, 0, 0, wb, sb, lds, M, N, K, ksplit, \
                                                                            yb, nullptr, N, pp);                       \
         return static_cast<int>(cudaGetLastError());                                                                  \
     }
@@ -728,6 +763,7 @@ __global__ void __launch_bounds__(256) moe_up_mma_kernel(
     const uint8_t* __restrict__ w3, const uint8_t* __restrict__ s3, __nv_bfloat16* __restrict__ h, int64_t ldh,
     const float* __restrict__ route_weight, const int* __restrict__ block_slot, const int* __restrict__ block_route,
     int N, int K, float limit, int null_slot) {
+    pdl_enter();
     constexpr int BM = 16 * MT;
     __shared__ __align__(16) __half xs[BM * (KC + 8)];
     __shared__ int tok_s[BM], pair_s[BM];
@@ -784,6 +820,7 @@ __global__ void __launch_bounds__(256) moe_down_mma_kernel(
     const __nv_bfloat16* __restrict__ h, int64_t ldh, const uint8_t* __restrict__ w2, const uint8_t* __restrict__ s2,
     float* __restrict__ y, int64_t ldy, const int* __restrict__ block_slot, const int* __restrict__ block_pair,
     int N, int K, int topk, int ntok, int null_slot, int partial, int parts_world) {
+    pdl_enter();
     constexpr int BM = 16 * MT;
     __shared__ __align__(16) __half xs[BM * (KC + 8)];
     __shared__ int pair_s[BM];
@@ -884,6 +921,7 @@ __global__ void __launch_bounds__(256, 2) moe_prefill_kernel(
     const uint8_t* __restrict__ wb, const uint8_t* __restrict__ sb, void* __restrict__ out, int64_t ldo,
     const float* __restrict__ route_weight, const int* __restrict__ block_slot, const int* __restrict__ block_route,
     int N, int K, float limit, int null_slot, int topk, int ntok, int partial, int parts_world) {
+    pdl_enter();
     __shared__ __align__(16) __nv_bfloat16 xs[kPmBM * kPmLD];
     __shared__ __align__(16) __nv_bfloat16 ws[NW][kPmBN * kPmLD];
     __shared__ int row_s[kPmBM], pair_s[kPmBM];
@@ -1051,6 +1089,7 @@ __global__ void __launch_bounds__(256, 2) moe_prefill_kernel(
 __global__ void rmsnorm_kernel(const __nv_bfloat16* __restrict__ x, int64_t ldx,
                                const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ y,
                                int64_t ldy, int D, float eps) {
+    pdl_enter();
     __shared__ float scratch[32];
     const __nv_bfloat16* xr = x + (int64_t)blockIdx.x * ldx;
     float ss = 0.f;
@@ -1070,6 +1109,7 @@ __global__ void rmsnorm_kernel(const __nv_bfloat16* __restrict__ x, int64_t ldx,
 __global__ void hc_pre_norm_kernel(const __nv_bfloat16* __restrict__ h, const float* __restrict__ pre,
                                    const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ y,
                                    int D, int hc, float eps) {
+    pdl_enter();
     extern __shared__ __align__(16) unsigned char smem_raw[];
     __nv_bfloat16* v = reinterpret_cast<__nv_bfloat16*>(smem_raw);
     __shared__ float scratch[32];
@@ -1099,6 +1139,7 @@ __global__ void hc_pre_norm_kernel(const __nv_bfloat16* __restrict__ h, const fl
 // rsqrt(mean(x^2) + eps) per row of bf16 x (v41_ref.rms_rsqrt on x.float()).
 __global__ void row_rsqrt_kernel(const __nv_bfloat16* __restrict__ x, int64_t ldx, int D, float eps,
                                  float* __restrict__ out) {
+    pdl_enter();
     __shared__ float scratch[32];
     const __nv_bfloat16* xr = x + (int64_t)blockIdx.x * ldx;
     float ss = 0.f;
@@ -1119,6 +1160,7 @@ __global__ void row_rsqrt_kernel(const __nv_bfloat16* __restrict__ x, int64_t ld
 // (the hc mix, the norm) is unchanged. D % 8 == 0.
 __global__ void row_rsqrt_v8_kernel(const __nv_bfloat16* __restrict__ x, int64_t ldx, int D, float eps,
                                     float* __restrict__ out) {
+    pdl_enter();
     __shared__ float scratch[32];
     const uint4* xr = reinterpret_cast<const uint4*>(x + (int64_t)blockIdx.x * ldx);
     float ss = 0.f;
@@ -1135,6 +1177,7 @@ __global__ void row_rsqrt_v8_kernel(const __nv_bfloat16* __restrict__ x, int64_t
 __global__ void hc_pre_norm_v8_kernel(const __nv_bfloat16* __restrict__ h, const float* __restrict__ pre,
                                       const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ y, int D,
                                       int hc, float eps) {
+    pdl_enter();
     __shared__ float scratch[32];
     const int m = blockIdx.x;
     const __nv_bfloat16* hr = h + (int64_t)m * hc * D;
@@ -1181,6 +1224,7 @@ __global__ void hc_sinkhorn_kernel(const float* __restrict__ mixes, const float*
                                    const float* __restrict__ scale, const float* __restrict__ base,
                                    int M, int iters, float eps, float* __restrict__ pre,
                                    float* __restrict__ post, float* __restrict__ comb) {
+    pdl_enter();
     constexpr int HC = 4;
     const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     const int lane = threadIdx.x & 31;
@@ -1229,6 +1273,7 @@ __global__ void hc_sinkhorn_kernel(const float* __restrict__ mixes, const float*
 __global__ void hc_post_kernel(const __nv_bfloat16* __restrict__ y, const __nv_bfloat16* residual,
                                const float* __restrict__ post, const float* __restrict__ comb,
                                __nv_bfloat16* out, int D) {
+    pdl_enter();
     constexpr int HC = 4;
     const int m = blockIdx.y;
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1252,6 +1297,7 @@ __global__ void hc_post_kernel(const __nv_bfloat16* __restrict__ y, const __nv_b
 __global__ void rope_kernel(__nv_bfloat16* x, int64_t ld_row, int heads, int64_t ld_head, int offset,
                             int rd, const int* __restrict__ pos, const float2* __restrict__ table,
                             int inverse) {
+    pdl_enter();
     const int row = blockIdx.x;
     const int pairs = rd / 2;
     const float2* f = table + (int64_t)pos[row] * pairs;
@@ -1294,6 +1340,7 @@ struct RouterRec {
 __global__ void router_kernel(const float* __restrict__ z, const float* __restrict__ bias,
                               const uint8_t* __restrict__ keep, int E, int K, float route_scale,
                               int* __restrict__ idx_out, float* __restrict__ w_out, RouterRec rec) {
+    pdl_enter();
     extern __shared__ float sh[];
     float* score = sh;      // [E]
     float* sel = sh + E;    // [E]
@@ -1413,6 +1460,7 @@ __global__ void router_kernel(const float* __restrict__ z, const float* __restri
 // the expert to its ring slot; undo puts the saved values back.
 __global__ void hot_marks_kernel(int* __restrict__ lut, uint8_t* __restrict__ keep, const int* __restrict__ marks,
                                  int* __restrict__ saved, int n, int apply) {
+    pdl_enter();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const int li = marks[3 * i], ki = marks[3 * i + 1];
@@ -1432,6 +1480,7 @@ __global__ void hot_marks_kernel(int* __restrict__ lut, uint8_t* __restrict__ ke
 // out[0..n) shares and out[W..W+n) ids (as f32), zeros past n. One block.
 __global__ void __launch_bounds__(256) hot_candidates_kernel(const float* __restrict__ hot, int n, int W,
                                                              float* __restrict__ out) {
+    pdl_enter();
     __shared__ float bv[8];
     __shared__ int bi[8];
     __shared__ int taken[32];
@@ -1472,6 +1521,7 @@ __global__ void __launch_bounds__(256) hot_candidates_kernel(const float* __rest
 __global__ void swiglu_kernel(const __nv_bfloat16* __restrict__ gate, int64_t ldg,
                               const __nv_bfloat16* __restrict__ up, int64_t ldu,
                               __nv_bfloat16* __restrict__ h, int64_t ldh, int N, float limit) {
+    pdl_enter();
     const int m = blockIdx.y;
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
     if (n >= N) return;
@@ -1490,6 +1540,7 @@ __global__ void swiglu_kernel(const __nv_bfloat16* __restrict__ gate, int64_t ld
 __global__ void moe_combine_kernel(const float* __restrict__ parts, int K, int M,
                                    const __nv_bfloat16* __restrict__ shared, __nv_bfloat16* __restrict__ out,
                                    int D) {
+    pdl_enter();
     const int m = blockIdx.y;
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= D) return;
@@ -1503,6 +1554,7 @@ __global__ void moe_combine_kernel(const float* __restrict__ parts, int K, int M
 // once more if that would still clip, then the round-to-nearest e4m3 conversion. One block a tile.
 __global__ void quant_fp8_block32_kernel(const __nv_bfloat16* __restrict__ w, int N, int K, uint8_t* __restrict__ codes,
                                          uint8_t* __restrict__ scales, int nbk) {
+    pdl_enter();
     __shared__ float red[256];
     const int r0 = blockIdx.y * 32, c0 = blockIdx.x * 32;
     float amax = 0.f;
@@ -1533,6 +1585,7 @@ __global__ void quant_fp8_block32_kernel(const __nv_bfloat16* __restrict__ w, in
 // for the peer's experts) in k order into fp32, the pair sums those (one a + b, the same
 // bits on both ranks), and the shared expert joins at the single-box rounding point.
 __global__ void moe_partial_kernel(const float* __restrict__ parts, int K, int M, float* __restrict__ out, int D) {
+    pdl_enter();
     const int m = blockIdx.y;
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= D) return;
@@ -1543,6 +1596,7 @@ __global__ void moe_partial_kernel(const float* __restrict__ parts, int K, int M
 
 __global__ void moe_finish_kernel(const float* __restrict__ routed, const __nv_bfloat16* __restrict__ shared,
                                   __nv_bfloat16* __restrict__ out, int D) {
+    pdl_enter();
     const int m = blockIdx.y;
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= D) return;
@@ -1625,6 +1679,7 @@ __global__ void __launch_bounds__(256) attn_fd_kernel(
     const int* __restrict__ cidx, int C, float scale, int H, const int* __restrict__ row_lane,
     int64_t ring_lstride, int64_t ckv_lstride, int tiles_per_split, int S, float* __restrict__ part_o,
     float* __restrict__ part_ml, const int* __restrict__ decode_rows, int ckv_fp4) {
+    pdl_enter();
     // a prompt row of a mixed step is attn_prefill_kernel's
     if (decode_rows && !decode_rows[blockIdx.z]) return;
     extern __shared__ __align__(16) unsigned char fd_smem[];
@@ -1820,6 +1875,7 @@ __global__ void __launch_bounds__(256) attn_prefill_kernel(
     const int* __restrict__ cidx, int C, float scale, int H, const int* __restrict__ row_lane,
     int64_t ring_lstride, int64_t ckv_lstride, const float* __restrict__ sink, const int* __restrict__ rows,
     __nv_bfloat16* __restrict__ out, int ckv_fp4) {
+    pdl_enter();
     constexpr int HB = 16 * MT, PS = NT + 4;
     static_assert(NT == 32 || NT == 64, "a softmax lane takes one or two keys");
     extern __shared__ __align__(16) unsigned char fp_smem[];
@@ -2033,6 +2089,7 @@ __global__ void __launch_bounds__(256) attn_prefill_kernel(
 __global__ void attn_fd_combine_kernel(const float* __restrict__ part_o, const float* __restrict__ part_ml, int S, int H,
                                        const float* __restrict__ sink, __nv_bfloat16* __restrict__ out,
                                        const int* __restrict__ decode_rows) {
+    pdl_enter();
     const int h = blockIdx.x, m = blockIdx.y;
     if (decode_rows && !decode_rows[m]) return;
     float mx = sink[h];
@@ -2073,6 +2130,7 @@ __global__ void __launch_bounds__(256) attn_decode_kernel(
     const int* __restrict__ cidx, int C, const float* __restrict__ sink, float scale,
     __nv_bfloat16* __restrict__ out, int H, const int* __restrict__ row_lane, int64_t ring_lstride,
     int64_t ckv_lstride) {
+    pdl_enter();
     constexpr int D = 512;
     extern __shared__ __align__(16) float smem[];
     float* qs = smem;                    // [HG][D]
@@ -2186,6 +2244,7 @@ __global__ void __launch_bounds__(256) attn_decode_kernel(
 __global__ void compress_pair_kernel(const float* __restrict__ kv_a, const float* __restrict__ sc_a,
                                      const float* __restrict__ kv_b, const float* __restrict__ sc_b,
                                      __nv_bfloat16* __restrict__ out, int D) {
+    pdl_enter();
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= D) return;
     const float a = sc_a[d], b = sc_b[d];
@@ -2198,6 +2257,7 @@ __global__ void compress_pair_kernel(const float* __restrict__ kv_a, const float
 // v41_ref.fp4_qdq(x, 16, "e4m3"): FP4 values with an E4M3 group scale, dequantized back,
 // in place on bf16 rows. One thread per 16-value group.
 __global__ void fp4_qdq_e4m3_kernel(__nv_bfloat16* x, int64_t n_groups) {
+    pdl_enter();
     const int64_t g = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (g >= n_groups) return;
     __nv_bfloat16* p = x + g * 16;
@@ -2219,6 +2279,7 @@ __global__ void fp4_qdq_e4m3_kernel(__nv_bfloat16* x, int64_t n_groups) {
 __global__ void scatter_compressed_fp4_kernel(const __nv_bfloat16* __restrict__ src, int64_t ld_src, uint8_t* __restrict__ dst,
                                               const int* __restrict__ pos, int r, int D, const int* __restrict__ lane,
                                               int64_t lstride) {
+    pdl_enter();
     const int t = blockIdx.x, g = threadIdx.x;
     if (g >= D / 16 || (pos[t] + 1) % r != 0) return;
     float v[16];
@@ -2234,6 +2295,7 @@ __global__ void scatter_compressed_fp4_kernel(const __nv_bfloat16* __restrict__ 
 
 // Packed rows back to bf16 rows (tests, dumps): rows x D values.
 __global__ void unpack_fp4_rows_kernel(const uint8_t* __restrict__ src, __nv_bfloat16* __restrict__ dst, int rows) {
+    pdl_enter();
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (int64_t)rows * 64) return;
     const int64_t r = i / 64;
@@ -2247,6 +2309,7 @@ __global__ void unpack_fp4_rows_kernel(const uint8_t* __restrict__ src, __nv_bfl
 // inv maps (token, col) to a unique row of `raw`.
 __global__ void engram_dequant_kernel(const uint8_t* __restrict__ raw, const int* __restrict__ inv,
                                       int cols, __nv_bfloat16* __restrict__ out) {
+    pdl_enter();
     const int tc = blockIdx.x;  // token * cols + col
     const uint8_t* row = raw + (int64_t)inv[tc] * 264;
     const int v = threadIdx.x;  // 256 threads
@@ -2263,6 +2326,7 @@ __global__ void engram_dequant_kernel(const uint8_t* __restrict__ raw, const int
 __global__ void engram_gate_kernel(__nv_bfloat16* h, const __nv_bfloat16* __restrict__ kv,
                                    const float* __restrict__ weight, int D, int hc, float eps, float dim_scale,
                                    const int* __restrict__ skip) {
+    pdl_enter();
     __shared__ float scratch[32];
     const int m = blockIdx.x / hc, i = blockIdx.x % hc;
     // an image row: engram_combine's gate is zero where engram_mask is False
@@ -2292,6 +2356,7 @@ __global__ void engram_gate_kernel(__nv_bfloat16* h, const __nv_bfloat16* __rest
 // ------------------------------------------------------------------ embedding / sampling
 __global__ void embed_hc_kernel(const int* __restrict__ ids, const __nv_bfloat16* __restrict__ table,
                                 __nv_bfloat16* __restrict__ h, int D, int hc) {
+    pdl_enter();
     const int m = blockIdx.y;
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= D) return;
@@ -2326,6 +2391,7 @@ __device__ __forceinline__ void nuc_scan(const __nv_bfloat16* ar, const __nv_bfl
 // 16-byte loads when `vec` (26 -> 7 us a 129,280-wide row, bench_nucleus).
 __global__ void __launch_bounds__(kRowThreads) argmax_bf16_kernel(const __nv_bfloat16* __restrict__ x, int64_t ldx, int N,
                                                                    bool vec, int* __restrict__ out, int pair, int offset) {
+    pdl_enter();
     __shared__ float bv[32];
     __shared__ int bi[32];
     const __nv_bfloat16* xr = x + (int64_t)blockIdx.x * ldx;
@@ -2360,6 +2426,7 @@ __global__ void __launch_bounds__(kRowThreads) argmax_bf16_kernel(const __nv_bfl
 // [world][M][2], the earlier rank on a tie - its indices are the lower ones, so this is the
 // one-box first-index argmax.
 __global__ void argmax_combine_kernel(const int* __restrict__ pairs, int world, int M, int* __restrict__ out) {
+    pdl_enter();
     const int m = blockIdx.x * blockDim.x + threadIdx.x;
     if (m >= M) return;
     int best = pairs[2 * m];
@@ -2373,6 +2440,7 @@ __global__ void argmax_combine_kernel(const int* __restrict__ pairs, int world, 
 
 // A tensor-parallel gather's rank-major result [world][M][n] as full rows [M][world * n].
 __global__ void unshard_u16_kernel(const uint16_t* __restrict__ src, uint16_t* __restrict__ dst, int M, int n, int world) {
+    pdl_enter();
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t total = (int64_t)world * M * n;
     if (i >= total) return;
@@ -2393,6 +2461,7 @@ __global__ void __launch_bounds__(256) index_scores_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_base, const float* __restrict__ w,
     const int* __restrict__ clen, const uint8_t* __restrict__ cand, int64_t ld_cand, int n,
     __nv_bfloat16* __restrict__ out, int64_t ld_out, const int* __restrict__ lane, int64_t k_lstride) {
+    pdl_enter();
     __shared__ float qs[kIdxH][kIdxD + 1];
     __shared__ __align__(16) __nv_bfloat16 ks[kIdxTile][kIdxD];
     const int t = blockIdx.y;
@@ -2441,6 +2510,7 @@ __global__ void __launch_bounds__(256) index_scores_mma_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_base, const float* __restrict__ w,
     const int* __restrict__ clen, const uint8_t* __restrict__ cand, int64_t ld_cand, int n,
     __nv_bfloat16* __restrict__ out, int64_t ld_out, const int* __restrict__ lane, int64_t k_lstride, int T, int chunk) {
+    pdl_enter();
     __shared__ __align__(16) __nv_bfloat16 ks[kIdxTile * kIsLD];
     __shared__ int lane_s[kIsRows], lim_s[kIsRows];
     const int warp = threadIdx.x >> 5, l = threadIdx.x & 31, g = l >> 2, c = l & 3;
@@ -2552,6 +2622,7 @@ __global__ void __launch_bounds__(kIcWarps * 32) index_cand_scores_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_base, const float* __restrict__ w,
     const int* __restrict__ clen, const int* __restrict__ blocks, int kb, int n,
     __nv_bfloat16* __restrict__ out, int64_t ld_out, const int* __restrict__ lane, int64_t k_lstride, int per_cta) {
+    pdl_enter();
     __shared__ __align__(16) __nv_bfloat16 ks[kIcWarps][8 * kIsLD];
     const int warp = threadIdx.x >> 5, l = threadIdx.x & 31, g = l >> 2, c = l & 3;
     const int t = blockIdx.x;
@@ -2624,6 +2695,7 @@ __global__ void __launch_bounds__(kIcWarps * 32) index_cand_scores_kernel(
 // A list's selected columns (topk_select's, ascending, -1 padded) back to positions in place:
 // column i is block list[i / 8]'s key i % 8, so an ascending list keeps them ascending.
 __global__ void cand_positions_kernel(const int* __restrict__ blocks, int kb, int* __restrict__ sel, int width) {
+    pdl_enter();
     const int t = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= width) return;
     int* s = sel + (int64_t)t * width;
@@ -2651,6 +2723,7 @@ constexpr int kSelThreads = 1024;
 __global__ void __launch_bounds__(kSelThreads) topk_select_kernel(
     const __nv_bfloat16* __restrict__ s, int64_t ld_s, int n, int K, int* __restrict__ out, int width,
     const int* __restrict__ lim) {
+    pdl_enter();
     // a row's values past lim[row] are -inf (the indexer's past clen): not read at all
     if (lim) n = max(0, min(n, lim[blockIdx.x]));
     __shared__ int hist[256];
@@ -2766,6 +2839,7 @@ __global__ void __launch_bounds__(kSelThreads) topk_select_kernel(
 __global__ void candidate_blocks_kernel(const __nv_bfloat16* __restrict__ s, int64_t ld_s, int n, int block,
                                         const int* __restrict__ clen, __nv_bfloat16* __restrict__ bmax,
                                         int64_t ld_b) {
+    pdl_enter();
     const int t = blockIdx.y;
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     const int nb = (n + block - 1) / block;
@@ -2780,6 +2854,7 @@ __global__ void candidate_blocks_kernel(const __nv_bfloat16* __restrict__ s, int
 // -1 padded). The caller zeroes `cand` first; this kernel only sets.
 __global__ void candidate_set_kernel(const int* __restrict__ blocks, int kb, int block, int n,
                                      uint8_t* __restrict__ cand, int64_t ld_cand) {
+    pdl_enter();
     const int t = blockIdx.y;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;  // over kb * block
     if (i >= kb * block) return;
@@ -2792,6 +2867,7 @@ __global__ void candidate_set_kernel(const int* __restrict__ blocks, int kb, int
 // bf16 -> f32 times a scale (model.py::_indexer's `mm(x, weights_proj).float() * c`).
 __global__ void bf16_to_f32_scale_kernel(const __nv_bfloat16* __restrict__ x, int64_t n, float scale,
                                          float* __restrict__ out) {
+    pdl_enter();
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = bf(x[i]) * scale;
 }
@@ -2800,6 +2876,7 @@ __global__ void bf16_to_f32_scale_kernel(const __nv_bfloat16* __restrict__ x, in
 // layer), rounded to bf16 where the seed hands it to main_proj.
 __global__ void hc_mean_kernel(const __nv_bfloat16* __restrict__ h, __nv_bfloat16* __restrict__ out,
                                int64_t ld_out, int D, int hc) {
+    pdl_enter();
     const int m = blockIdx.y;
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= D) return;
@@ -2813,6 +2890,7 @@ __global__ void hc_mean_kernel(const __nv_bfloat16* __restrict__ h, __nv_bfloat1
 __global__ void __launch_bounds__(kRowThreads) argmax_sum_bf16_kernel(const __nv_bfloat16* __restrict__ a, int64_t lda,
                                                                        const __nv_bfloat16* __restrict__ b, int64_t ldb,
                                                                        int N, bool vec, int* __restrict__ out) {
+    pdl_enter();
     __shared__ float bv[32];
     __shared__ int bi[32];
     const __nv_bfloat16* ar = a + (int64_t)blockIdx.x * lda;
@@ -2877,6 +2955,7 @@ __global__ void __launch_bounds__(kNucThreads) nucleus_kernel(
     const __nv_bfloat16* __restrict__ a, int64_t lda, const __nv_bfloat16* __restrict__ b, int64_t ldb, int N, bool vec,
     const float* __restrict__ temp, const float* __restrict__ top_p, const float* __restrict__ u, int K,
     int* __restrict__ ids, float* __restrict__ probs, int64_t ldo, int* __restrict__ cnt, int* __restrict__ tok) {
+    pdl_enter();
     __shared__ union {
         struct { unsigned c[32][kNucBins]; unsigned m[32][kNucBins]; } h;
         struct { unsigned long long e[kNucCap]; float incl[kNucCap]; } s;
@@ -3147,6 +3226,7 @@ __global__ void __launch_bounds__(kNucThreads) nucleus_kernel(
 // blocks: ds_route_blocks(P, S, bm), entries blocks * bm
 __global__ void route_init_kernel(int blocks, int bm, int S, int* block_slot, int* block_pair, int* block_route,
                                   int* counts, int* cursor) {
+    pdl_enter();
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < (int64_t)blocks * bm) { block_pair[i] = -1; block_route[i] = -1; }
     if (i < blocks) block_slot[i] = -1;
@@ -3154,6 +3234,7 @@ __global__ void route_init_kernel(int blocks, int bm, int S, int* block_slot, in
 }
 
 __global__ void route_count_kernel(const int* __restrict__ slots, int P, int* counts) {
+    pdl_enter();
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p < P && slots[p] >= 0) atomicAdd(&counts[slots[p]], 1);
 }
@@ -3161,6 +3242,7 @@ __global__ void route_count_kernel(const int* __restrict__ slots, int P, int* co
 // one 1024-thread block: thread t owns slots [t * per, (t + 1) * per)
 __global__ void __launch_bounds__(1024) route_scan_kernel(const int* __restrict__ counts, int S, int bm, int* block_base,
                                                           int* block_slot) {
+    pdl_enter();
     __shared__ int warp_tot[32];
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int per = (S + 1023) / 1024, s0 = min(S, t * per), s1 = min(S, s0 + per);
@@ -3193,6 +3275,7 @@ __global__ void __launch_bounds__(1024) route_scan_kernel(const int* __restrict_
 
 __global__ void route_place_kernel(const int* __restrict__ slots, int P, int topk, int bm, const int* __restrict__ block_base,
                                    int* cursor, int* block_pair, int* block_route) {
+    pdl_enter();
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= P) return;
     const int s = slots[p];
@@ -3205,6 +3288,7 @@ __global__ void route_place_kernel(const int* __restrict__ slots, int P, int top
 
 // x[i] = table[x[i]]: a listed draft vocabulary's columns to token ids (graph-safe).
 __global__ void map_i32_kernel(const int* __restrict__ table, int* __restrict__ x, int n) {
+    pdl_enter();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = table[x[i]];
 }
@@ -3212,6 +3296,7 @@ __global__ void map_i32_kernel(const int* __restrict__ table, int* __restrict__ 
 // out[m] = table[idx[m]] for 16-bit rows of D values; idx lives on the device (graph-safe).
 __global__ void gather_rows_u16_kernel(const uint16_t* __restrict__ table, const int* __restrict__ idx,
                                        uint16_t* __restrict__ out, int D) {
+    pdl_enter();
     const int m = blockIdx.y;
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d < D) out[(int64_t)m * D + d] = table[(int64_t)idx[m] * D + d];
@@ -3226,6 +3311,7 @@ __global__ void gather_rows_u16_kernel(const uint16_t* __restrict__ table, const
 // dst[pos[t] % ring_size] = src[t]  (the window ring write, model.py: ring[pos % RING] = kv)
 __global__ void scatter_ring_kernel(const uint16_t* __restrict__ src, uint16_t* __restrict__ ring, int ring_size,
                                     const int* __restrict__ pos, int D, const int* __restrict__ lane, int64_t lstride) {
+    pdl_enter();
     const int t = blockIdx.y;
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t base = (int64_t)(lane ? lane[t] : 0) * lstride;
@@ -3235,6 +3321,7 @@ __global__ void scatter_ring_kernel(const uint16_t* __restrict__ src, uint16_t* 
 // out[t, j] = j for j < (pos[t] + 1) / r, else -1; clen[t] = (pos[t] + 1) / r.
 __global__ void visible_kernel(const int* __restrict__ pos, int r, int C, int* __restrict__ cidx,
                                int* __restrict__ clen) {
+    pdl_enter();
     const int t = blockIdx.y;
     const int vis = (pos[t] + 1) / r;
     for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < C; j += gridDim.x * blockDim.x)
@@ -3250,6 +3337,7 @@ __global__ void compress_rows_kernel(const float* __restrict__ kv, const float* 
                                      const float* __restrict__ pkv, const float* __restrict__ psc,
                                      const int* __restrict__ pos, __nv_bfloat16* __restrict__ out, int D,
                                      const int* __restrict__ lane) {
+    pdl_enter();
     const int t = blockIdx.y;
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= D || (pos[t] + 1) % 2 != 0) return;
@@ -3270,6 +3358,7 @@ __global__ void compress_rows_kernel(const float* __restrict__ kv, const float* 
 __global__ void scatter_compressed_kernel(const uint16_t* __restrict__ src, int64_t ld_src, uint16_t* __restrict__ dst,
                                           const int* __restrict__ pos, int r, int D, const int* __restrict__ lane,
                                           int64_t lstride) {
+    pdl_enter();
     const int t = blockIdx.y;
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= D || (pos[t] + 1) % r != 0) return;
@@ -3286,6 +3375,7 @@ __global__ void pending_update_kernel(const float* __restrict__ kv, const float*
                                       const int* __restrict__ seg_lane, float* pkv, float* psc, int* flag, float* mem_kv,
                                       float* mem_sc, float* before_kv, float* before_sc, int* before_flag, int* mem_start,
                                       int D, int mem_rows) {
+    pdl_enter();
     const int f = seg_first[blockIdx.x], T = seg_count[blockIdx.x], L = seg_lane[blockIdx.x];
     // the step graph launches one block per lane slot; a lane absent from this step has T == 0
     if (T == 0) return;
@@ -3349,6 +3439,7 @@ __global__ void rollback_pending_kernel(const int* __restrict__ n_dev, const int
                                         const int* __restrict__ mem_start, const float* __restrict__ before_kv,
                                         const float* __restrict__ before_sc, const int* __restrict__ before_flag,
                                         float* pkv, float* psc, int* flag, int D, int mem_rows) {
+    pdl_enter();
     const int L = lanes ? lanes[blockIdx.x] : 0;
     pending_at(n_dev[blockIdx.x], L, mem_kv, mem_sc, mem_start, before_kv, before_sc, before_flag, pkv + (int64_t)L * D,
                psc + (int64_t)L * D, flag + L, D, mem_rows);
@@ -3360,6 +3451,7 @@ __global__ void pending_snapshot_kernel(int n, int L, const float* __restrict__ 
                                         const int* __restrict__ mem_start, const float* __restrict__ before_kv,
                                         const float* __restrict__ before_sc, const int* __restrict__ before_flag,
                                         float* out, int* out_flag, int D, int mem_rows) {
+    pdl_enter();
     pending_at(n, L, mem_kv, mem_sc, mem_start, before_kv, before_sc, before_flag, out, out + D, out_flag, D, mem_rows);
 }
 
@@ -3367,6 +3459,7 @@ __global__ void pending_snapshot_kernel(int n, int L, const float* __restrict__ 
 // their slots).
 __global__ void scatter_rows_u16_kernel(const uint16_t* __restrict__ src, const int* __restrict__ idx, uint16_t* __restrict__ out,
                                         int D) {
+    pdl_enter();
     const int m = blockIdx.y;
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     // a row whose index is negative stays where it is
@@ -3378,6 +3471,7 @@ __global__ void scatter_rows_u16_kernel(const uint16_t* __restrict__ src, const 
 // which the MoE kernels skip: filler rows must not pull experts through the bandwidth.
 __global__ void lut_slots_kernel(const int* __restrict__ idx, const int* __restrict__ lut, int P,
                                  int* __restrict__ slots, const int* __restrict__ live) {
+    pdl_enter();
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p < P) slots[p] = (live && p >= *live) ? -1 : lut[idx[p]];
 }
@@ -3390,6 +3484,7 @@ __global__ void lut_slots_kernel(const int* __restrict__ idx, const int* __restr
 // running share a sequential inclusive sum, tested as (running - share) < topp.
 __global__ void expert_topp_kernel(int* __restrict__ idx, float* __restrict__ rw, int T, int K, float topp, int min_k,
                                    int sentinel, const int* __restrict__ rows) {
+    pdl_enter();
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= T || !rows[t]) return;
     float f[8];
@@ -3422,6 +3517,7 @@ __global__ void expert_topp_kernel(int* __restrict__ idx, float* __restrict__ rw
 // Stop tokens are the host's business (it truncates on the copy it reads).
 __global__ void greedy_accept_kernel(const int* __restrict__ am, const int* __restrict__ block, int T,
                                      const int* __restrict__ pos, int* __restrict__ out) {
+    pdl_enter();
     if (threadIdx.x != 0) return;
     int a = 0;
     while (a + 1 < T && am[a] == block[a + 1]) ++a;
@@ -3447,6 +3543,7 @@ struct L2Pf {
 };
 
 __global__ void __launch_bounds__(128) l2_prefetch_kernel(L2Pf a) {
+    pdl_enter();
     constexpr uint64_t CH = 32u << 10;
     const uint32_t w = blockIdx.x * blockDim.x + threadIdx.x, workers = gridDim.x * blockDim.x;
     uint64_t j = 0;
@@ -3461,6 +3558,7 @@ __global__ void __launch_bounds__(128) l2_prefetch_kernel(L2Pf a) {
 }
 
 __global__ void wait_flag_kernel(const volatile int* flag, int expect, long long timeout_ns, int* err) {
+    pdl_enter();
     if (threadIdx.x != 0) return;
     const unsigned long long t0 = clock64();
     long long spins = 0;
@@ -3506,7 +3604,7 @@ int ds_linear_f32w(void* stream, const void* x, int64_t ldx, const void* w, int 
 int ds_splits_reduce(void* stream, const void* partial, int splits, int M, int N, void* y_bf16, void* y_f32,
                      int64_t ldy) {
     const int64_t total = (int64_t)M * N;
-    splits_reduce_kernel<<<(unsigned)((total + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(splits_reduce_kernel, (unsigned)((total + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const float*>(partial), splits, M, N, static_cast<__nv_bfloat16*>(y_bf16),
         static_cast<float*>(y_f32), ldy);
     return static_cast<int>(cudaGetLastError());
@@ -3514,7 +3612,7 @@ int ds_splits_reduce(void* stream, const void* partial, int splits, int M, int N
 
 int ds_rmsnorm(void* stream, const void* x, int64_t ldx, const void* w, void* y, int64_t ldy, int M, int D,
                float eps) {
-    rmsnorm_kernel<<<M, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(rmsnorm_kernel, M, 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const __nv_bfloat16*>(x), ldx, static_cast<const __nv_bfloat16*>(w),
         static_cast<__nv_bfloat16*>(y), ldy, D, eps);
     return static_cast<int>(cudaGetLastError());
@@ -3524,12 +3622,12 @@ int ds_hc_pre_norm(void* stream, const void* h, const void* pre, const void* w, 
                    float eps) {
     const int threads = ((D / 8 + 31) / 32) * 32;
     if (D % 8 == 0 && threads <= 1024) {
-        hc_pre_norm_v8_kernel<<<M, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        pdl_launch(hc_pre_norm_v8_kernel, M, threads, 0, static_cast<cudaStream_t>(stream),
             static_cast<const __nv_bfloat16*>(h), static_cast<const float*>(pre),
             static_cast<const __nv_bfloat16*>(w), static_cast<__nv_bfloat16*>(y), D, hc, eps);
         return static_cast<int>(cudaGetLastError());
     }
-    hc_pre_norm_kernel<<<M, 256, D * sizeof(__nv_bfloat16), static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(hc_pre_norm_kernel, M, 256, D * sizeof(__nv_bfloat16), static_cast<cudaStream_t>(stream),
         static_cast<const __nv_bfloat16*>(h), static_cast<const float*>(pre),
         static_cast<const __nv_bfloat16*>(w), static_cast<__nv_bfloat16*>(y), D, hc, eps);
     return static_cast<int>(cudaGetLastError());
@@ -3537,18 +3635,18 @@ int ds_hc_pre_norm(void* stream, const void* h, const void* pre, const void* w, 
 
 int ds_row_rsqrt(void* stream, const void* x, int64_t ldx, int M, int D, float eps, void* out) {
     if (D % 8 == 0 && ldx % 8 == 0) {
-        row_rsqrt_v8_kernel<<<M, 1024, 0, static_cast<cudaStream_t>(stream)>>>(
+        pdl_launch(row_rsqrt_v8_kernel, M, 1024, 0, static_cast<cudaStream_t>(stream),
             static_cast<const __nv_bfloat16*>(x), ldx, D, eps, static_cast<float*>(out));
         return static_cast<int>(cudaGetLastError());
     }
-    row_rsqrt_kernel<<<M, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(row_rsqrt_kernel, M, 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const __nv_bfloat16*>(x), ldx, D, eps, static_cast<float*>(out));
     return static_cast<int>(cudaGetLastError());
 }
 
 int ds_hc_sinkhorn(void* stream, const void* mixes, const void* rsq, const void* scale, const void* base,
                    int M, int iters, float eps, void* pre, void* post, void* comb) {
-    hc_sinkhorn_kernel<<<(M + 3) / 4, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(hc_sinkhorn_kernel, (M + 3) / 4, 128, 0, static_cast<cudaStream_t>(stream),
         static_cast<const float*>(mixes), static_cast<const float*>(rsq), static_cast<const float*>(scale),
         static_cast<const float*>(base), M, iters, eps, static_cast<float*>(pre), static_cast<float*>(post),
         static_cast<float*>(comb));
@@ -3558,7 +3656,7 @@ int ds_hc_sinkhorn(void* stream, const void* mixes, const void* rsq, const void*
 int ds_hc_post(void* stream, const void* y, const void* residual, const void* post, const void* comb, void* out,
                int M, int D) {
     dim3 grid((D + 255) / 256, M);
-    hc_post_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(hc_post_kernel, grid, 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const __nv_bfloat16*>(y), static_cast<const __nv_bfloat16*>(residual),
         static_cast<const float*>(post), static_cast<const float*>(comb), static_cast<__nv_bfloat16*>(out), D);
     return static_cast<int>(cudaGetLastError());
@@ -3566,7 +3664,7 @@ int ds_hc_post(void* stream, const void* y, const void* residual, const void* po
 
 int ds_rope(void* stream, void* x, int64_t ld_row, int rows, int heads, int64_t ld_head, int offset, int rd,
             const void* pos, const void* table, int inverse) {
-    rope_kernel<<<rows, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(rope_kernel, rows, 128, 0, static_cast<cudaStream_t>(stream),
         static_cast<__nv_bfloat16*>(x), ld_row, heads, ld_head, offset, rd, static_cast<const int*>(pos),
         static_cast<const float2*>(table), inverse);
     return static_cast<int>(cudaGetLastError());
@@ -3578,7 +3676,7 @@ int ds_router(void* stream, const void* z, const void* bias, const void* keep, i
     RouterRec rec{};
     rec.img = static_cast<const int*>(img);
     rec.bias_vl = static_cast<const float*>(bias_vl);
-    router_kernel<<<M, 128, 2 * E * sizeof(float), static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(router_kernel, M, 128, 2 * E * sizeof(float), static_cast<cudaStream_t>(stream),
         static_cast<const float*>(z), static_cast<const float*>(bias), static_cast<const uint8_t*>(keep), E, K,
         route_scale, static_cast<int*>(idx), static_cast<float*>(weights), rec);
     return static_cast<int>(cudaGetLastError());
@@ -3593,7 +3691,7 @@ int ds_router_rec(void* stream, const void* z, const void* bias, const void* kee
                   static_cast<const int*>(lane), lanes, static_cast<const int*>(phase), static_cast<float*>(hot),
                   static_cast<const int*>(live), static_cast<const int*>(img), static_cast<const float*>(bias_vl)};
     if (rec.counts && (!rec.mass || !rec.miss)) return cudaErrorInvalidValue;
-    router_kernel<<<M, 128, 2 * E * sizeof(float), static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(router_kernel, M, 128, 2 * E * sizeof(float), static_cast<cudaStream_t>(stream),
         static_cast<const float*>(z), static_cast<const float*>(bias), static_cast<const uint8_t*>(keep), E, K,
         route_scale, static_cast<int*>(idx), static_cast<float*>(weights), rec);
     return static_cast<int>(cudaGetLastError());
@@ -3601,14 +3699,14 @@ int ds_router_rec(void* stream, const void* z, const void* bias, const void* kee
 
 int ds_hot_marks(void* stream, void* lut, void* keep, const void* marks, void* saved, int n, int apply) {
     if (n <= 0) return cudaSuccess;
-    hot_marks_kernel<<<(n + 127) / 128, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(hot_marks_kernel, (n + 127) / 128, 128, 0, static_cast<cudaStream_t>(stream),
         static_cast<int*>(lut), static_cast<uint8_t*>(keep), static_cast<const int*>(marks), static_cast<int*>(saved), n, apply);
     return static_cast<int>(cudaGetLastError());
 }
 
 int ds_hot_candidates(void* stream, const void* hot, int n, int W, void* out) {
     if (W < 1 || W > 32 || n < 0) return cudaErrorInvalidValue;
-    hot_candidates_kernel<<<1, 256, 0, static_cast<cudaStream_t>(stream)>>>(static_cast<const float*>(hot), n, W,
+    pdl_launch(hot_candidates_kernel, 1, 256, 0, static_cast<cudaStream_t>(stream), static_cast<const float*>(hot), n, W,
                                                                            static_cast<float*>(out));
     return static_cast<int>(cudaGetLastError());
 }
@@ -3616,7 +3714,7 @@ int ds_hot_candidates(void* stream, const void* hot, int n, int W, void* out) {
 int ds_swiglu(void* stream, const void* gate, int64_t ldg, const void* up, int64_t ldu, void* h, int64_t ldh,
               int M, int N, float limit) {
     dim3 grid((N + 255) / 256, M);
-    swiglu_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(swiglu_kernel, grid, 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const __nv_bfloat16*>(gate), ldg, static_cast<const __nv_bfloat16*>(up), ldu,
         static_cast<__nv_bfloat16*>(h), ldh, N, limit);
     return static_cast<int>(cudaGetLastError());
@@ -3624,7 +3722,7 @@ int ds_swiglu(void* stream, const void* gate, int64_t ldg, const void* up, int64
 
 int ds_moe_combine(void* stream, const void* parts, int K, int M, const void* shared, void* out, int D) {
     dim3 grid((D + 255) / 256, M);
-    moe_combine_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(moe_combine_kernel, grid, 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const float*>(parts), K, M, static_cast<const __nv_bfloat16*>(shared),
         static_cast<__nv_bfloat16*>(out), D);
     return static_cast<int>(cudaGetLastError());
@@ -3644,7 +3742,7 @@ static int launch_attn(cudaStream_t st, const void* q, const void* ring, int rin
         configured = smem;
     }
     dim3 grid(H / HG, M);
-    attn_decode_kernel<HG><<<grid, 256, smem, st>>>(
+    pdl_launch(attn_decode_kernel<HG>, grid, 256, smem, st,
         static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(ring), ring_size,
         static_cast<const int*>(pos), W, static_cast<const int*>(win_lo), static_cast<const __nv_bfloat16*>(ckv),
         static_cast<const int*>(cidx), C, static_cast<const float*>(sink), scale,
@@ -3680,11 +3778,11 @@ int ds_attn_decode(void* stream, const void* q, const void* ring, int ring_size,
             if (e != cudaSuccess) return static_cast<int>(e);
             configured = true;
         }
-        attn_fd_kernel<<<dim3(hb, S, M), 256, smem, static_cast<cudaStream_t>(stream)>>>(
+        pdl_launch(attn_fd_kernel, dim3(hb, S, M), 256, smem, static_cast<cudaStream_t>(stream),
             static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(ring), ring_size,
             static_cast<const int*>(pos), W, static_cast<const int*>(win_lo), static_cast<const __nv_bfloat16*>(ckv), static_cast<const int*>(cidx),
             C, scale, H, static_cast<const int*>(lane), ring_lstride, ckv_lstride, tps, S, po, pml, dr, ckv_fp4);
-        attn_fd_combine_kernel<<<dim3(H, M), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        pdl_launch(attn_fd_combine_kernel, dim3(H, M), 256, 0, static_cast<cudaStream_t>(stream),
             po, pml, S, H, static_cast<const float*>(sink), static_cast<__nv_bfloat16*>(out), dr);
         return static_cast<int>(cudaGetLastError());
     }
@@ -3709,7 +3807,7 @@ int ds_attn_prefill(void* stream, const void* q, const void* ring, int ring_size
                             (size_t)C * 4;
         const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
         if (e != cudaSuccess) return static_cast<int>(e);
-        kern<<<dim3((H + hb_heads - 1) / hb_heads, M), 256, smem, static_cast<cudaStream_t>(stream)>>>(
+        pdl_launch(kern, dim3((H + hb_heads - 1) / hb_heads, M), 256, smem, static_cast<cudaStream_t>(stream),
             static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(ring), ring_size,
             static_cast<const int*>(pos), W, static_cast<const int*>(win_lo), static_cast<const __nv_bfloat16*>(ckv), static_cast<const int*>(cidx),
             C, scale, H, static_cast<const int*>(lane), ring_lstride, ckv_lstride, static_cast<const float*>(sink),
@@ -3723,7 +3821,7 @@ int ds_attn_prefill(void* stream, const void* q, const void* ring, int ring_size
 
 int ds_compress_pair(void* stream, const void* kv_a, const void* sc_a, const void* kv_b, const void* sc_b,
                      void* out, int D) {
-    compress_pair_kernel<<<(D + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(compress_pair_kernel, (D + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const float*>(kv_a), static_cast<const float*>(sc_a), static_cast<const float*>(kv_b),
         static_cast<const float*>(sc_b), static_cast<__nv_bfloat16*>(out), D);
     return static_cast<int>(cudaGetLastError());
@@ -3733,7 +3831,7 @@ int ds_scatter_compressed_fp4(void* stream, const void* src, int64_t ld_src, voi
                               int D, const void* lane, int64_t lstride_bytes) {
     if (D % 128 || D / 16 > 1024) return cudaErrorInvalidValue;
     if (T < 1) return cudaSuccess;
-    scatter_compressed_fp4_kernel<<<T, D / 16, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(scatter_compressed_fp4_kernel, T, D / 16, 0, static_cast<cudaStream_t>(stream),
         static_cast<const __nv_bfloat16*>(src), ld_src, static_cast<uint8_t*>(dst), static_cast<const int*>(pos), r, D,
         static_cast<const int*>(lane), lstride_bytes);
     return static_cast<int>(cudaGetLastError());
@@ -3742,7 +3840,7 @@ int ds_scatter_compressed_fp4(void* stream, const void* src, int64_t ld_src, voi
 int ds_unpack_fp4_rows(void* stream, const void* src, void* dst, int rows) {
     if (rows < 1) return cudaSuccess;
     const int64_t n = (int64_t)rows * 64;
-    unpack_fp4_rows_kernel<<<(unsigned)((n + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(unpack_fp4_rows_kernel, (unsigned)((n + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const uint8_t*>(src), static_cast<__nv_bfloat16*>(dst), rows);
     return static_cast<int>(cudaGetLastError());
 }
@@ -3750,7 +3848,7 @@ int ds_unpack_fp4_rows(void* stream, const void* src, void* dst, int rows) {
 int ds_pending_snapshot(void* stream, int n, int lane, const void* mem_kv, const void* mem_sc, const void* mem_start,
                         const void* before_kv, const void* before_sc, const void* before_flag, void* out, void* out_flag, int D,
                         int mem_rows) {
-    pending_snapshot_kernel<<<1, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(pending_snapshot_kernel, 1, 256, 0, static_cast<cudaStream_t>(stream),
         n, lane, static_cast<const float*>(mem_kv), static_cast<const float*>(mem_sc), static_cast<const int*>(mem_start),
         static_cast<const float*>(before_kv), static_cast<const float*>(before_sc), static_cast<const int*>(before_flag),
         static_cast<float*>(out), static_cast<int*>(out_flag), D, mem_rows);
@@ -3759,7 +3857,7 @@ int ds_pending_snapshot(void* stream, int n, int lane, const void* mem_kv, const
 
 int ds_scatter_rows_u16(void* stream, const void* src, const void* idx, void* out, int M, int D) {
     if (M < 1) return cudaSuccess;
-    scatter_rows_u16_kernel<<<dim3((D + 255) / 256, M), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(scatter_rows_u16_kernel, dim3((D + 255) / 256, M), 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const uint16_t*>(src), static_cast<const int*>(idx), static_cast<uint16_t*>(out), D);
     return static_cast<int>(cudaGetLastError());
 }
@@ -3767,20 +3865,20 @@ int ds_scatter_rows_u16(void* stream, const void* src, const void* idx, void* ou
 int ds_fp4_qdq_e4m3(void* stream, void* x, int64_t n_values) {
     if (n_values % 16) return cudaErrorInvalidValue;
     const int64_t groups = n_values / 16;
-    fp4_qdq_e4m3_kernel<<<(unsigned)((groups + 127) / 128), 128, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(fp4_qdq_e4m3_kernel, (unsigned)((groups + 127) / 128), 128, 0, static_cast<cudaStream_t>(stream),
         static_cast<__nv_bfloat16*>(x), groups);
     return static_cast<int>(cudaGetLastError());
 }
 
 int ds_engram_dequant(void* stream, const void* raw, const void* inv, int tokens, int cols, void* out) {
-    engram_dequant_kernel<<<tokens * cols, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(engram_dequant_kernel, tokens * cols, 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const uint8_t*>(raw), static_cast<const int*>(inv), cols, static_cast<__nv_bfloat16*>(out));
     return static_cast<int>(cudaGetLastError());
 }
 
 int ds_engram_gate(void* stream, void* h, const void* kv, const void* weight, int M, int D, int hc, float eps,
                    float dim_scale, const void* skip) {
-    engram_gate_kernel<<<M * hc, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(engram_gate_kernel, M * hc, 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<__nv_bfloat16*>(h), static_cast<const __nv_bfloat16*>(kv), static_cast<const float*>(weight),
         D, hc, eps, dim_scale, static_cast<const int*>(skip));
     return static_cast<int>(cudaGetLastError());
@@ -3790,6 +3888,7 @@ int ds_engram_gate(void* stream, void* h, const void* kv, const void* weight, in
 // table row idx[m] - an aligner row or a learned delimiter - in every hc copy.
 __global__ void splice_rows_kernel(__nv_bfloat16* __restrict__ h, const __nv_bfloat16* __restrict__ table,
                                    const int* __restrict__ idx, int D, int hc) {
+    pdl_enter();
     const int m = blockIdx.y, src = idx[m];
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (src < 0 || d >= D) return;
@@ -3799,14 +3898,14 @@ __global__ void splice_rows_kernel(__nv_bfloat16* __restrict__ h, const __nv_bfl
 
 int ds_splice_rows(void* stream, void* h, const void* table, const void* idx, int M, int D, int hc) {
     dim3 grid((D + 255) / 256, M);
-    splice_rows_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(splice_rows_kernel, grid, 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<__nv_bfloat16*>(h), static_cast<const __nv_bfloat16*>(table), static_cast<const int*>(idx), D, hc);
     return static_cast<int>(cudaGetLastError());
 }
 
 int ds_embed_hc(void* stream, const void* ids, const void* table, void* h, int M, int D, int hc) {
     dim3 grid((D + 255) / 256, M);
-    embed_hc_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(embed_hc_kernel, grid, 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const int*>(ids), static_cast<const __nv_bfloat16*>(table), static_cast<__nv_bfloat16*>(h),
         D, hc);
     return static_cast<int>(cudaGetLastError());
@@ -3819,7 +3918,7 @@ static bool row_vec(const void* a, int64_t lda, const void* b, int64_t ldb, int 
 }
 
 int ds_argmax_bf16(void* stream, const void* x, int64_t ldx, int M, int N, void* out) {
-    argmax_bf16_kernel<<<M, kRowThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(argmax_bf16_kernel, M, kRowThreads, 0, static_cast<cudaStream_t>(stream),
         static_cast<const __nv_bfloat16*>(x), ldx, N, row_vec(x, ldx, nullptr, 0, N), static_cast<int*>(out), 0, 0);
     return static_cast<int>(cudaGetLastError());
 }
@@ -3828,7 +3927,7 @@ int ds_index_scores(void* stream, const void* q, const void* k, const void* w, c
                     int64_t ld_cand, int n, void* out, int64_t ld_out, int T, const void* lane, int64_t k_lstride) {
     if (n < 1) return cudaErrorInvalidValue;
     dim3 grid((n + kIdxTile - 1) / kIdxTile, T);
-    index_scores_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(index_scores_kernel, grid, 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(k), static_cast<const float*>(w),
         static_cast<const int*>(clen), static_cast<const uint8_t*>(cand), ld_cand, n,
         static_cast<__nv_bfloat16*>(out), ld_out, static_cast<const int*>(lane), k_lstride);
@@ -3840,7 +3939,7 @@ int ds_index_scores_mma_chunked(void* stream, const void* q, const void* k, cons
                                 const void* lane, int64_t k_lstride, int chunk) {
     if (n < 1 || T < 1 || chunk < kIdxTile || chunk % kIdxTile) return cudaErrorInvalidValue;
     dim3 grid((T + kIsRows - 1) / kIsRows, (n + chunk - 1) / chunk);
-    index_scores_mma_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(index_scores_mma_kernel, grid, 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(k), static_cast<const float*>(w),
         static_cast<const int*>(clen), static_cast<const uint8_t*>(cand), ld_cand, n,
         static_cast<__nv_bfloat16*>(out), ld_out, static_cast<const int*>(lane), k_lstride, T, chunk);
@@ -3857,7 +3956,7 @@ int ds_index_scores_mma(void* stream, const void* q, const void* k, const void* 
 int ds_topk_select_lim(void* stream, const void* s, int64_t ld_s, int n, int K, void* out, int width, int T,
                        const void* lim) {
     if (K > width || n < 1) return cudaErrorInvalidValue;
-    topk_select_kernel<<<T, kSelThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(topk_select_kernel, T, kSelThreads, 0, static_cast<cudaStream_t>(stream),
         static_cast<const __nv_bfloat16*>(s), ld_s, n, K, static_cast<int*>(out), width, static_cast<const int*>(lim));
     return static_cast<int>(cudaGetLastError());
 }
@@ -3870,7 +3969,7 @@ int ds_index_cand_scores(void* stream, const void* q, const void* k, const void*
                          int kb, int n, void* out, int64_t ld_out, int T, const void* lane, int64_t k_lstride, int per_cta) {
     if (n < 1 || T < 1 || kb < 1 || per_cta < 1 || ld_out < (int64_t)kb * 8) return cudaErrorInvalidValue;
     dim3 grid(T, (kb + per_cta - 1) / per_cta);
-    index_cand_scores_kernel<<<grid, kIcWarps * 32, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(index_cand_scores_kernel, grid, kIcWarps * 32, 0, static_cast<cudaStream_t>(stream),
         static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(k), static_cast<const float*>(w),
         static_cast<const int*>(clen), static_cast<const int*>(blocks), kb, n, static_cast<__nv_bfloat16*>(out), ld_out,
         static_cast<const int*>(lane), k_lstride, per_cta);
@@ -3879,7 +3978,7 @@ int ds_index_cand_scores(void* stream, const void* q, const void* k, const void*
 
 int ds_cand_positions(void* stream, const void* blocks, int kb, void* sel, int width, int T) {
     dim3 grid((width + 255) / 256, T);
-    cand_positions_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(cand_positions_kernel, grid, 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const int*>(blocks), kb, static_cast<int*>(sel), width);
     return static_cast<int>(cudaGetLastError());
 }
@@ -3888,7 +3987,7 @@ int ds_candidate_blocks(void* stream, const void* s, int64_t ld_s, int n, int bl
                         int64_t ld_b, int T) {
     const int nb = (n + block - 1) / block;
     dim3 grid((nb + 255) / 256, T);
-    candidate_blocks_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(candidate_blocks_kernel, grid, 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const __nv_bfloat16*>(s), ld_s, n, block, static_cast<const int*>(clen),
         static_cast<__nv_bfloat16*>(bmax), ld_b);
     return static_cast<int>(cudaGetLastError());
@@ -3896,26 +3995,26 @@ int ds_candidate_blocks(void* stream, const void* s, int64_t ld_s, int n, int bl
 
 int ds_candidate_set(void* stream, const void* blocks, int kb, int block, int n, void* cand, int64_t ld_cand, int T) {
     dim3 grid((kb * block + 255) / 256, T);
-    candidate_set_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(candidate_set_kernel, grid, 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const int*>(blocks), kb, block, n, static_cast<uint8_t*>(cand), ld_cand);
     return static_cast<int>(cudaGetLastError());
 }
 
 int ds_bf16_to_f32_scale(void* stream, const void* x, int64_t n, float scale, void* out) {
-    bf16_to_f32_scale_kernel<<<(unsigned)((n + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(bf16_to_f32_scale_kernel, (unsigned)((n + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const __nv_bfloat16*>(x), n, scale, static_cast<float*>(out));
     return static_cast<int>(cudaGetLastError());
 }
 
 int ds_hc_mean(void* stream, const void* h, void* out, int64_t ld_out, int M, int D, int hc) {
     dim3 grid((D + 255) / 256, M);
-    hc_mean_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(hc_mean_kernel, grid, 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const __nv_bfloat16*>(h), static_cast<__nv_bfloat16*>(out), ld_out, D, hc);
     return static_cast<int>(cudaGetLastError());
 }
 
 int ds_argmax_sum_bf16(void* stream, const void* a, int64_t lda, const void* b, int64_t ldb, int M, int N, void* out) {
-    argmax_sum_bf16_kernel<<<M, kRowThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(argmax_sum_bf16_kernel, M, kRowThreads, 0, static_cast<cudaStream_t>(stream),
         static_cast<const __nv_bfloat16*>(a), lda, static_cast<const __nv_bfloat16*>(b), ldb, N, row_vec(a, lda, b, ldb, N),
         static_cast<int*>(out));
     return static_cast<int>(cudaGetLastError());
@@ -3923,7 +4022,7 @@ int ds_argmax_sum_bf16(void* stream, const void* a, int64_t lda, const void* b, 
 
 int ds_gather_rows_u16(void* stream, const void* table, const void* idx, void* out, int M, int D) {
     dim3 grid((D + 255) / 256, M);
-    gather_rows_u16_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(gather_rows_u16_kernel, grid, 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const uint16_t*>(table), static_cast<const int*>(idx), static_cast<uint16_t*>(out), D);
     return static_cast<int>(cudaGetLastError());
 }
@@ -3933,20 +4032,20 @@ int ds_gather_rows_u16(void* stream, const void* table, const void* idx, void* o
 
 int ds_scatter_ring(void* stream, const void* src, void* ring, int ring_size, const void* pos, int T, int D,
                     const void* lane, int64_t lstride) {
-    scatter_ring_kernel<<<dim3((D + 255) / 256, T), 256, 0, DS_ST>>>(static_cast<const uint16_t*>(src),
+    pdl_launch(scatter_ring_kernel, dim3((D + 255) / 256, T), 256, 0, DS_ST, static_cast<const uint16_t*>(src),
         static_cast<uint16_t*>(ring), ring_size, static_cast<const int*>(pos), D, static_cast<const int*>(lane), lstride);
     DS_RET;
 }
 
 int ds_visible(void* stream, const void* pos, int T, int r, int C, void* cidx, void* clen) {
-    visible_kernel<<<dim3((C + 255) / 256 > 0 ? (C + 255) / 256 : 1, T), 256, 0, DS_ST>>>(static_cast<const int*>(pos), r,
+    pdl_launch(visible_kernel, dim3((C + 255) / 256 > 0 ? (C + 255) / 256 : 1, T), 256, 0, DS_ST, static_cast<const int*>(pos), r,
         C, static_cast<int*>(cidx), static_cast<int*>(clen));
     DS_RET;
 }
 
 int ds_compress_rows(void* stream, const void* kv, const void* sc, const void* pkv, const void* psc, const void* pos,
                      void* out, int T, int D, const void* lane) {
-    compress_rows_kernel<<<dim3((D + 255) / 256, T), 256, 0, DS_ST>>>(static_cast<const float*>(kv),
+    pdl_launch(compress_rows_kernel, dim3((D + 255) / 256, T), 256, 0, DS_ST, static_cast<const float*>(kv),
         static_cast<const float*>(sc), static_cast<const float*>(pkv), static_cast<const float*>(psc),
         static_cast<const int*>(pos), static_cast<__nv_bfloat16*>(out), D, static_cast<const int*>(lane));
     DS_RET;
@@ -3954,7 +4053,7 @@ int ds_compress_rows(void* stream, const void* kv, const void* sc, const void* p
 
 int ds_scatter_compressed(void* stream, const void* src, int64_t ld_src, void* dst, const void* pos, int r, int T, int D,
                           const void* lane, int64_t lstride) {
-    scatter_compressed_kernel<<<dim3((D + 255) / 256, T), 256, 0, DS_ST>>>(static_cast<const uint16_t*>(src), ld_src,
+    pdl_launch(scatter_compressed_kernel, dim3((D + 255) / 256, T), 256, 0, DS_ST, static_cast<const uint16_t*>(src), ld_src,
         static_cast<uint16_t*>(dst), static_cast<const int*>(pos), r, D, static_cast<const int*>(lane), lstride);
     DS_RET;
 }
@@ -3963,7 +4062,7 @@ int ds_pending_update(void* stream, const void* kv, const void* sc, const void* 
                       const void* seg_count, const void* seg_lane, int segments, void* pkv, void* psc, void* flag,
                       void* mem_kv, void* mem_sc, void* before_kv, void* before_sc, void* before_flag, void* mem_start,
                       int D, int mem_rows) {
-    pending_update_kernel<<<segments, 256, 0, DS_ST>>>(static_cast<const float*>(kv), static_cast<const float*>(sc),
+    pdl_launch(pending_update_kernel, segments, 256, 0, DS_ST, static_cast<const float*>(kv), static_cast<const float*>(sc),
         static_cast<const int*>(pos), static_cast<const int*>(seg_first), static_cast<const int*>(seg_count),
         static_cast<const int*>(seg_lane), static_cast<float*>(pkv), static_cast<float*>(psc), static_cast<int*>(flag),
         static_cast<float*>(mem_kv), static_cast<float*>(mem_sc), static_cast<float*>(before_kv),
@@ -3974,7 +4073,7 @@ int ds_pending_update(void* stream, const void* kv, const void* sc, const void* 
 int ds_rollback_pending(void* stream, const void* n_dev, const void* lanes, int entries, const void* mem_kv,
                         const void* mem_sc, const void* mem_start, const void* before_kv, const void* before_sc,
                         const void* before_flag, void* pkv, void* psc, void* flag, int D, int mem_rows) {
-    rollback_pending_kernel<<<entries, 256, 0, DS_ST>>>(static_cast<const int*>(n_dev), static_cast<const int*>(lanes),
+    pdl_launch(rollback_pending_kernel, entries, 256, 0, DS_ST, static_cast<const int*>(n_dev), static_cast<const int*>(lanes),
         static_cast<const float*>(mem_kv), static_cast<const float*>(mem_sc), static_cast<const int*>(mem_start),
         static_cast<const float*>(before_kv), static_cast<const float*>(before_sc), static_cast<const int*>(before_flag),
         static_cast<float*>(pkv), static_cast<float*>(psc), static_cast<int*>(flag), D, mem_rows);
@@ -3982,37 +4081,37 @@ int ds_rollback_pending(void* stream, const void* n_dev, const void* lanes, int 
 }
 
 int ds_lut_slots(void* stream, const void* idx, const void* lut, int P, void* slots, const void* live) {
-    lut_slots_kernel<<<(P + 127) / 128, 128, 0, DS_ST>>>(static_cast<const int*>(idx), static_cast<const int*>(lut), P,
+    pdl_launch(lut_slots_kernel, (P + 127) / 128, 128, 0, DS_ST, static_cast<const int*>(idx), static_cast<const int*>(lut), P,
         static_cast<int*>(slots), static_cast<const int*>(live));
     DS_RET;
 }
 
 int ds_expert_topp(void* stream, void* idx, void* rw, int T, int K, float topp, int min_k, int sentinel, const void* rows) {
     if (K > 8 || min_k < 1 || min_k > K) return cudaErrorInvalidValue;
-    expert_topp_kernel<<<(T + 127) / 128, 128, 0, DS_ST>>>(static_cast<int*>(idx), static_cast<float*>(rw), T, K, topp,
+    pdl_launch(expert_topp_kernel, (T + 127) / 128, 128, 0, DS_ST, static_cast<int*>(idx), static_cast<float*>(rw), T, K, topp,
                                                            min_k, sentinel, static_cast<const int*>(rows));
     DS_RET;
 }
 
 int ds_greedy_accept(void* stream, const void* am, const void* block, int T, const void* pos, void* out) {
-    greedy_accept_kernel<<<1, 32, 0, DS_ST>>>(static_cast<const int*>(am), static_cast<const int*>(block), T,
+    pdl_launch(greedy_accept_kernel, 1, 32, 0, DS_ST, static_cast<const int*>(am), static_cast<const int*>(block), T,
         static_cast<const int*>(pos), static_cast<int*>(out));
     DS_RET;
 }
 
 int ds_wait_flag(void* stream, const void* flag, int expect, long long timeout_ns, void* err) {
-    wait_flag_kernel<<<1, 32, 0, DS_ST>>>(static_cast<const volatile int*>(flag), expect, timeout_ns, static_cast<int*>(err));
+    pdl_launch(wait_flag_kernel, 1, 32, 0, DS_ST, static_cast<const volatile int*>(flag), expect, timeout_ns, static_cast<int*>(err));
     DS_RET;
 }
 
 int ds_l2_prefetch(void* stream, const void* pf, int grid) {
     if (grid < 1) return cudaErrorInvalidValue;
-    l2_prefetch_kernel<<<grid, 128, 0, DS_ST>>>(*static_cast<const L2Pf*>(pf));
+    pdl_launch(l2_prefetch_kernel, grid, 128, 0, DS_ST, *static_cast<const L2Pf*>(pf));
     DS_RET;
 }
 
 int ds_argmax_bf16_pairs(void* stream, const void* x, int64_t ldx, int M, int N, int offset, void* out) {
-    argmax_bf16_kernel<<<M, kRowThreads, 0, DS_ST>>>(static_cast<const __nv_bfloat16*>(x), ldx, N,
+    pdl_launch(argmax_bf16_kernel, M, kRowThreads, 0, DS_ST, static_cast<const __nv_bfloat16*>(x), ldx, N,
                                                     row_vec(x, ldx, nullptr, 0, N), static_cast<int*>(out), 1, offset);
     DS_RET;
 }
@@ -4020,7 +4119,7 @@ int ds_argmax_bf16_pairs(void* stream, const void* x, int64_t ldx, int M, int N,
 int ds_nucleus(void* stream, const void* a, int64_t lda, const void* b, int64_t ldb, int M, int N, const void* temp,
                const void* top_p, const void* u, int K, void* ids, void* probs, int64_t ldo, void* cnt, void* tok) {
     if (K < 1 || K > kNucCap || ldo < K || M < 1) return cudaErrorInvalidValue;
-    nucleus_kernel<<<M, kNucThreads, 0, DS_ST>>>(
+    pdl_launch(nucleus_kernel, M, kNucThreads, 0, DS_ST,
         static_cast<const __nv_bfloat16*>(a), lda, static_cast<const __nv_bfloat16*>(b), ldb, N, row_vec(a, lda, b, ldb, N),
         static_cast<const float*>(temp), static_cast<const float*>(top_p), static_cast<const float*>(u), K,
         static_cast<int*>(ids), static_cast<float*>(probs), ldo, static_cast<int*>(cnt), static_cast<int*>(tok));
@@ -4045,48 +4144,48 @@ int ds_route_large(void* stream, const void* slots, int P, int topk, int S, void
     int *counts = w, *cursor = w + S, *base = w + 2 * S;
     const int blocks = ds_route_blocks(P, S, bm);
     const int64_t init = std::max<int64_t>((int64_t)blocks * bm, S);
-    route_init_kernel<<<(unsigned)((init + 255) / 256), 256, 0, DS_ST>>>(blocks, bm, S, static_cast<int*>(block_slot),
+    pdl_launch(route_init_kernel, (unsigned)((init + 255) / 256), 256, 0, DS_ST, blocks, bm, S, static_cast<int*>(block_slot),
         static_cast<int*>(block_pair), static_cast<int*>(block_route), counts, cursor);
-    route_count_kernel<<<(P + 255) / 256, 256, 0, DS_ST>>>(static_cast<const int*>(slots), P, counts);
-    route_scan_kernel<<<1, 1024, 0, DS_ST>>>(counts, S, bm, base, static_cast<int*>(block_slot));
-    route_place_kernel<<<(P + 255) / 256, 256, 0, DS_ST>>>(static_cast<const int*>(slots), P, topk, bm, base, cursor,
+    pdl_launch(route_count_kernel, (P + 255) / 256, 256, 0, DS_ST, static_cast<const int*>(slots), P, counts);
+    pdl_launch(route_scan_kernel, 1, 1024, 0, DS_ST, counts, S, bm, base, static_cast<int*>(block_slot));
+    pdl_launch(route_place_kernel, (P + 255) / 256, 256, 0, DS_ST, static_cast<const int*>(slots), P, topk, bm, base, cursor,
         static_cast<int*>(block_pair), static_cast<int*>(block_route));
     DS_RET;
 }
 
 int ds_map_i32(void* stream, const void* table, void* x, int n) {
-    map_i32_kernel<<<(n + 127) / 128, 128, 0, DS_ST>>>(static_cast<const int*>(table), static_cast<int*>(x), n);
+    pdl_launch(map_i32_kernel, (n + 127) / 128, 128, 0, DS_ST, static_cast<const int*>(table), static_cast<int*>(x), n);
     DS_RET;
 }
 
 int ds_argmax_combine(void* stream, const void* pairs, int world, int M, void* out) {
-    argmax_combine_kernel<<<(M + 127) / 128, 128, 0, DS_ST>>>(static_cast<const int*>(pairs), world, M,
+    pdl_launch(argmax_combine_kernel, (M + 127) / 128, 128, 0, DS_ST, static_cast<const int*>(pairs), world, M,
                                                               static_cast<int*>(out));
     DS_RET;
 }
 
 int ds_unshard_u16(void* stream, const void* src, void* dst, int M, int n, int world) {
     const int64_t total = (int64_t)world * M * n;
-    unshard_u16_kernel<<<(unsigned)((total + 255) / 256), 256, 0, DS_ST>>>(static_cast<const uint16_t*>(src),
+    pdl_launch(unshard_u16_kernel, (unsigned)((total + 255) / 256), 256, 0, DS_ST, static_cast<const uint16_t*>(src),
         static_cast<uint16_t*>(dst), M, n, world);
     DS_RET;
 }
 
 int ds_quant_fp8_block32(void* stream, const void* w, int N, int K, void* codes, void* scales) {
     const int nbk = (K + 31) / 32;
-    quant_fp8_block32_kernel<<<dim3(nbk, (N + 31) / 32), 256, 0, DS_ST>>>(static_cast<const __nv_bfloat16*>(w), N, K,
+    pdl_launch(quant_fp8_block32_kernel, dim3(nbk, (N + 31) / 32), 256, 0, DS_ST, static_cast<const __nv_bfloat16*>(w), N, K,
         static_cast<uint8_t*>(codes), static_cast<uint8_t*>(scales), nbk);
     DS_RET;
 }
 
 int ds_moe_partial(void* stream, const void* parts, int K, int M, void* out, int D) {
-    moe_partial_kernel<<<dim3((D + 255) / 256, M), 256, 0, DS_ST>>>(static_cast<const float*>(parts), K, M,
+    pdl_launch(moe_partial_kernel, dim3((D + 255) / 256, M), 256, 0, DS_ST, static_cast<const float*>(parts), K, M,
                                                                     static_cast<float*>(out), D);
     DS_RET;
 }
 
 int ds_moe_finish(void* stream, const void* routed, const void* shared, void* out, int M, int D) {
-    moe_finish_kernel<<<dim3((D + 255) / 256, M), 256, 0, DS_ST>>>(static_cast<const float*>(routed),
+    pdl_launch(moe_finish_kernel, dim3((D + 255) / 256, M), 256, 0, DS_ST, static_cast<const float*>(routed),
         static_cast<const __nv_bfloat16*>(shared), static_cast<__nv_bfloat16*>(out), D);
     DS_RET;
 }
@@ -4098,7 +4197,7 @@ int ds_moe_up_mma(void* stream, const void* x, int64_t ldx, const void* w1, cons
     if (K % 128 || nb < 1 || (bm != 16 && bm != 32 && bm != 64)) return cudaErrorInvalidValue;
     dim3 grid(nb, (N + kWarps * 8 * NG - 1) / (kWarps * 8 * NG));
 #define DS_UP(...)                                                                                                     \
-    __VA_ARGS__<<<grid, kThreads, 0, DS_ST>>>(                                                                        \
+    pdl_launch(__VA_ARGS__, grid, kThreads, 0, DS_ST,                                                                         \
         static_cast<const __nv_bfloat16*>(x), ldx, static_cast<const uint8_t*>(w1), static_cast<const uint8_t*>(s1),     \
         static_cast<const uint8_t*>(w3), static_cast<const uint8_t*>(s3), static_cast<__nv_bfloat16*>(h), ldh,          \
         static_cast<const float*>(route_weight), static_cast<const int*>(block_slot), static_cast<const int*>(block_route), \
@@ -4114,7 +4213,7 @@ int ds_moe_prefill_up(void* stream, const void* x, int64_t ldx, const void* w1, 
                       const void* s3, void* h, int64_t ldh, const void* route_weight, const void* block_slot,
                       const void* block_route, int nb, int N, int K, float limit, int null_slot) {
     if (K % kPmBK || nb < 1) return cudaErrorInvalidValue;
-    moe_prefill_kernel<2><<<dim3((N + kPmBN - 1) / kPmBN, nb), 256, 0, DS_ST>>>(
+    pdl_launch(moe_prefill_kernel<2>, dim3((N + kPmBN - 1) / kPmBN, nb), 256, 0, DS_ST,
         static_cast<const __nv_bfloat16*>(x), ldx, static_cast<const uint8_t*>(w1), static_cast<const uint8_t*>(s1),
         static_cast<const uint8_t*>(w3), static_cast<const uint8_t*>(s3), h, ldh, static_cast<const float*>(route_weight),
         static_cast<const int*>(block_slot), static_cast<const int*>(block_route), N, K, limit, null_slot, 1, 1, 0, 1);
@@ -4125,7 +4224,7 @@ int ds_moe_prefill_down(void* stream, const void* h, int64_t ldh, const void* w2
                         const void* block_slot, const void* block_route, int nb, int N, int K, int topk, int ntok,
                         int null_slot, int partial, int parts_world) {
     if (K % kPmBK || nb < 1 || parts_world < 1 || N % parts_world) return cudaErrorInvalidValue;
-    moe_prefill_kernel<1><<<dim3((N + kPmBN - 1) / kPmBN, nb), 256, 0, DS_ST>>>(
+    pdl_launch(moe_prefill_kernel<1>, dim3((N + kPmBN - 1) / kPmBN, nb), 256, 0, DS_ST,
         static_cast<const __nv_bfloat16*>(h), ldh, static_cast<const uint8_t*>(w2), static_cast<const uint8_t*>(s2), nullptr,
         nullptr, y, ldy, nullptr, static_cast<const int*>(block_slot), static_cast<const int*>(block_route), N, K, 0.f,
         null_slot, topk, ntok, partial, parts_world);
@@ -4139,7 +4238,7 @@ int ds_moe_down_mma(void* stream, const void* h, int64_t ldh, const void* w2, co
     if (K % 128 || nb < 1 || parts_world < 1 || N % parts_world || (bm != 16 && bm != 32 && bm != 64)) return cudaErrorInvalidValue;
     dim3 grid(nb, (N + kWarps * 8 * NG - 1) / (kWarps * 8 * NG));
 #define DS_DOWN(...)                                                                                                   \
-    __VA_ARGS__<<<grid, kThreads, 0, DS_ST>>>(                                                                        \
+    pdl_launch(__VA_ARGS__, grid, kThreads, 0, DS_ST,                                                                         \
         static_cast<const __nv_bfloat16*>(h), ldh, static_cast<const uint8_t*>(w2), static_cast<const uint8_t*>(s2),     \
         static_cast<float*>(y), ldy, static_cast<const int*>(block_slot), static_cast<const int*>(block_pair), N, K,      \
         topk, ntok, null_slot, partial, parts_world)

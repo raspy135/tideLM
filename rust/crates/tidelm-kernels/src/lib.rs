@@ -33,6 +33,9 @@ pub mod fp4 {
     use super::*;
 
     extern "C" {
+        /// Programmatic dependent launch on every launch of fp4_moe_cuda.cu (pdl_launch): off until set.
+        pub fn fp4_moe_cuda_set_pdl(on: c_int) -> c_int;
+
         /// v1 up-projection (gate+up, SwiGLU input `h`): BM=16 grouped-by-block pairs.
         pub fn fp4_moe_cuda_up(
             stream: CudaStream,

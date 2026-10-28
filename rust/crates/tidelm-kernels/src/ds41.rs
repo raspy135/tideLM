@@ -281,6 +281,8 @@ extern "C" {
     pub fn ds_wait_flag(stream: CudaStream, flag: *const c_void, expect: c_int, timeout_ns: i64, err: *mut c_void) -> c_int;
     /// L2 prefetch of `pf` (an L2Prefetch) by `grid` blocks of TMA bulk prefetches.
     pub fn ds_l2_prefetch(stream: CudaStream, pf: *const c_void, grid: c_int) -> c_int;
+    /// Programmatic dependent launch on every launch of ds41.cu (pdl_launch): off until set.
+    pub fn ds_set_pdl(on: c_int) -> c_int;
 
     /// Tensor-core skinny GEMM over fp8 block-scaled weights, M <= 64 (rows_per_group > 0
     /// for the grouped wo_a form, as ds_linear_fp8_grouped). K % 64 == 0.

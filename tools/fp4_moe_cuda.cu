@@ -14,6 +14,34 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <utility>
+
+// Programmatic dependent launch (PDL). Every kernel here starts with pdl_enter(); once the DS engine
+// switches it on (ds_set_pdl / fp4_moe_cuda_set_pdl; TIDELM_PDL=0 keeps it off) every launch carries the
+// programmatic-serialization attribute, so the next kernel's blocks launch while this one finishes and
+// wait on the GPU instead of behind the launch path. griddepcontrol.wait returns once the previous grid
+// has completed and its writes are visible; it comes before any global access, in every block, so reads
+// and writes keep the plain stream's order (transitively too: no grid completes before the one it waited
+// on). Without the attribute both instructions do nothing: other callers (GLM, the Python engine) launch
+// as before. The same kernels and arithmetic either way, bit-identical. The pair, 2026-10-28: 1.3-1.8 ms
+// off a decode step (docs/gotchas.md).
+__device__ __forceinline__ void pdl_enter() {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+}
+static int g_pdl = 0;
+template <typename... P, typename... A>
+static inline void pdl_launch(void (*kernel)(P...), dim3 grid, dim3 block, size_t smem, cudaStream_t st, A&&... args) {
+    cudaLaunchConfig_t c = {};
+    c.gridDim = grid; c.blockDim = block; c.dynamicSmemBytes = smem; c.stream = st;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = 1;
+    c.attrs = at; c.numAttrs = g_pdl ? 1 : 0;
+    cudaLaunchKernelEx(&c, kernel, std::forward<A>(args)...);
+}
+// the DS engine's switch for this file's launches (graph captures made after it carry it)
+extern "C" int fp4_moe_cuda_set_pdl(int on) { g_pdl = on; return 0; }
 
 namespace {
 
@@ -132,6 +160,7 @@ __global__ void moe_up_bm16(
     const int32_t *__restrict__ block_slot, const int32_t *__restrict__ block_pair,
     int64_t stride_x, int64_t stride_h, float limit,
     int topk, int n, int k, int null_slot) {
+    pdl_enter();
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int slot_i = block_slot[blockIdx.x];
@@ -227,6 +256,7 @@ __global__ void moe_down_bm16(
     float *__restrict__ y, const int32_t *__restrict__ block_slot,
     const int32_t *__restrict__ block_pair, int64_t stride_h, int64_t stride_y,
     int topk, int n, int k, int ntok, int null_slot, int partial, int parts_world) {
+    pdl_enter();
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int slot_i = block_slot[blockIdx.x];
@@ -412,6 +442,7 @@ __global__ void moe_up_bm16_v2(
     const int32_t *__restrict__ block_slot, const int32_t *__restrict__ block_pair,
     int64_t stride_x, int64_t stride_h, float limit,
     int topk, int n, int k, int null_slot, int scale_stride = 0) {
+    pdl_enter();
     constexpr int kPerLane = kV2MaxGroups / 32;
     __shared__ float part_s[kWarps][2][kV2MaxGroups];
     __shared__ float scale_s[kWarps][2][kV2MaxGroups];
@@ -481,6 +512,7 @@ __global__ void moe_down_bm16_v2(
     float *__restrict__ y, const int32_t *__restrict__ block_slot,
     const int32_t *__restrict__ block_pair, int64_t stride_h, int64_t stride_y,
     int topk, int n, int k, int ntok, int null_slot, int partial, int parts_world, int scale_stride = 0) {
+    pdl_enter();
     constexpr int kPerLane = kV2MaxGroups / 32;
     __shared__ float part_s[kWarps][kV2MaxGroups];
     __shared__ float scale_s[kWarps][kV2MaxGroups];
@@ -565,6 +597,7 @@ __global__ void moe_down_bm16_v3(
     float *__restrict__ y, const int32_t *__restrict__ block_slot,
     const int32_t *__restrict__ block_pair, int64_t stride_h, int64_t stride_y,
     int topk, int n, int k, int ntok, int null_slot, int partial, int parts_world, int scale_stride = 0) {
+    pdl_enter();
     constexpr int kPerLane = kDownMaxGroups / 32;
     __shared__ float part_s[kWarps][R][kDownMaxGroups];
     __shared__ float scale_s[kWarps][R][kDownMaxGroups];
@@ -656,6 +689,7 @@ __global__ void moe_up_bm16_v2_pairbatch(
     const int32_t *__restrict__ block_slot, const int32_t *__restrict__ block_pair,
     int64_t stride_x, int64_t stride_h, float limit,
     int topk, int n, int k, int null_slot) {
+    pdl_enter();
     constexpr int PB = 2, kPerLane = kV2MaxGroups / 32;
     __shared__ float part_s[kWarps][PB][2][kV2MaxGroups];
     __shared__ float scale_s[kWarps][2][kV2MaxGroups];
@@ -729,6 +763,7 @@ __global__ void moe_down_bm16_v2_pairbatch(
     float *__restrict__ y, const int32_t *__restrict__ block_slot,
     const int32_t *__restrict__ block_pair, int64_t stride_h, int64_t stride_y,
     int topk, int n, int k, int ntok, int null_slot, int partial, int parts_world) {
+    pdl_enter();
     constexpr int PB = 2, kPerLane = kV2MaxGroups / 32;
     __shared__ float part_s[kWarps][PB][kV2MaxGroups];
     __shared__ float scale_s[kWarps][kV2MaxGroups];
@@ -804,6 +839,7 @@ __global__ void moe_down_bm16_v2_pairbatch(
 __global__ void route_small_bm16(const int32_t *slots, int32_t *block_slot,
                                  int32_t *block_pair, int32_t *block_route,
                                  int pairs, int topk) {
+    pdl_enter();
     const int p = threadIdx.x;
     for (int i = p; i < pairs; i += blockDim.x) block_slot[i] = -1;
     for (int i = p; i < (pairs << 4); i += blockDim.x) {
@@ -863,6 +899,7 @@ constexpr int kRouteWideMax = 512;
 __global__ void route_wide_bm16(const int32_t *slots, int32_t *block_slot,
                                 int32_t *block_pair, int32_t *block_route,
                                 int pairs, int topk) {
+    pdl_enter();
     const int p = threadIdx.x;
     for (int i = p; i < pairs; i += blockDim.x) block_slot[i] = -1;
     for (int i = p; i < (pairs << 4); i += blockDim.x) {
@@ -901,6 +938,7 @@ __global__ void route_wide_bm16(const int32_t *slots, int32_t *block_slot,
 }
 
 __global__ void round_reduce(const float *parts, void *out, int td, int topk, int out_bf16) {
+    pdl_enter();
     // This internal kernel is always launched with 256 threads below.
     const int i = (static_cast<int>(blockIdx.x) << 8) + threadIdx.x;
     if (i >= td) return;
@@ -962,6 +1000,7 @@ __global__ void dream_fp8_up(
     const int32_t *__restrict__ map, int n_experts, const uint8_t *__restrict__ w13,
     const uint8_t *__restrict__ s13, __nv_bfloat16 *__restrict__ h, int64_t stride_h,
     const float *__restrict__ route_weight, float limit, int topk, int n, int k) {
+    pdl_enter();
     const int pair = blockIdx.x;
     const int64_t e = idx[pair];
     if (e < 0 || e >= n_experts) return;
@@ -991,6 +1030,7 @@ __global__ void dream_fp8_down(
     const int32_t *__restrict__ map, int n_experts, const uint8_t *__restrict__ w2,
     const uint8_t *__restrict__ s2, float *__restrict__ y, int64_t stride_y,
     int topk, int n, int k, int ntok, int partial) {
+    pdl_enter();
     const int pair = blockIdx.x;
     const int64_t e = idx[pair];
     if (e < 0 || e >= n_experts) return;
@@ -1018,7 +1058,7 @@ extern "C" int fp4_moe_cuda_up(
     int64_t stride_x, int64_t stride_h, float limit, int topk, int n, int k, int nb,
     int null_slot) {
     dim3 grid(nb, (n + kRowsPerBlock - 1) >> kRowsPerBlockShift);
-    moe_up_bm16<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(moe_up_bm16, grid, kThreads, 0, static_cast<cudaStream_t>(stream),
         static_cast<const __nv_bfloat16 *>(x), static_cast<const uint8_t *>(w1),
         static_cast<const uint8_t *>(s1), static_cast<const uint8_t *>(w3),
         static_cast<const uint8_t *>(s3), static_cast<__nv_bfloat16 *>(h),
@@ -1033,7 +1073,7 @@ extern "C" int fp4_moe_cuda_down(
     const void *block_slot, const void *block_pair, int64_t stride_h, int64_t stride_y,
     int topk, int n, int k, int ntok, int nb, int null_slot, int partial, int parts_world) {
     dim3 grid(nb, (n + kRowsPerBlock - 1) >> kRowsPerBlockShift);
-    moe_down_bm16<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(moe_down_bm16, grid, kThreads, 0, static_cast<cudaStream_t>(stream),
         static_cast<const __nv_bfloat16 *>(h), static_cast<const uint8_t *>(w2),
         static_cast<const uint8_t *>(s2), static_cast<float *>(y),
         static_cast<const int32_t *>(block_slot), static_cast<const int32_t *>(block_pair),
@@ -1048,19 +1088,22 @@ extern "C" int fp4_moe_cuda_up_v2(
     int null_slot) {
     if (k > (kV2MaxGroups << 5) || (k & 31)) return static_cast<int>(cudaErrorInvalidValue);
 #if FP4_V2_PAIR_BATCH == 2
+#define FP4_V2_TAIL
     dim3 grid(nb, (n + kWarps - 1) >> kWarpsShift);
-    moe_up_bm16_v2_pairbatch<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(moe_up_bm16_v2_pairbatch, grid, kThreads, 0, static_cast<cudaStream_t>(stream),
 #else
     // __ldcs weights (load_w): v2's bits, ~2 ms a 4-row decode step on the pair
+#define FP4_V2_TAIL , 0
     dim3 grid(nb, (n + kWarps - 1) >> kWarpsShift);
-    moe_up_bm16_v2<false, true, false><<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(moe_up_bm16_v2<false, true, false>, grid, kThreads, 0, static_cast<cudaStream_t>(stream),
 #endif
         static_cast<const __nv_bfloat16 *>(x), static_cast<const uint8_t *>(w1),
         static_cast<const uint8_t *>(s1), static_cast<const uint8_t *>(w3),
         static_cast<const uint8_t *>(s3), static_cast<__nv_bfloat16 *>(h),
         static_cast<const float *>(route_weight), static_cast<const int32_t *>(block_slot),
         static_cast<const int32_t *>(block_pair), stride_x, stride_h, limit, topk, n, k,
-        null_slot);
+        null_slot FP4_V2_TAIL);
+#undef FP4_V2_TAIL
     return static_cast<int>(cudaGetLastError());
 }
 
@@ -1070,16 +1113,19 @@ extern "C" int fp4_moe_cuda_down_v2(
     int topk, int n, int k, int ntok, int nb, int null_slot, int partial, int parts_world) {
     if (k > (kV2MaxGroups << 5) || (k & 31)) return static_cast<int>(cudaErrorInvalidValue);
 #if FP4_V2_PAIR_BATCH == 2
+#define FP4_V2_TAIL
     dim3 grid(nb, (n + kWarps - 1) >> kWarpsShift);
-    moe_down_bm16_v2_pairbatch<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(moe_down_bm16_v2_pairbatch, grid, kThreads, 0, static_cast<cudaStream_t>(stream),
 #else
+#define FP4_V2_TAIL , 0
     dim3 grid(nb, (n + kWarps - 1) >> kWarpsShift);
-    moe_down_bm16_v2<false, true, false><<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(moe_down_bm16_v2<false, true, false>, grid, kThreads, 0, static_cast<cudaStream_t>(stream),
 #endif
         static_cast<const __nv_bfloat16 *>(h), static_cast<const uint8_t *>(w2),
         static_cast<const uint8_t *>(s2), static_cast<float *>(y),
         static_cast<const int32_t *>(block_slot), static_cast<const int32_t *>(block_pair),
-        stride_h, stride_y, topk, n, k, ntok, null_slot, partial, parts_world);
+        stride_h, stride_y, topk, n, k, ntok, null_slot, partial, parts_world FP4_V2_TAIL);
+#undef FP4_V2_TAIL
     return static_cast<int>(cudaGetLastError());
 }
 
@@ -1094,12 +1140,12 @@ extern "C" int fp4_moe_cuda_up_v2x(
     const int rows = (n + kWarps - 1) >> kWarpsShift;
     const dim3 grid = variant & 2 ? dim3(rows, nb) : dim3(nb, rows);
 #define FP4_UP_V2X(S, R)                                                                         \
-    moe_up_bm16_v2<false, S, R><<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(       \
+    pdl_launch(moe_up_bm16_v2<false, S, R>, grid, kThreads, 0, static_cast<cudaStream_t>(stream),        \
         static_cast<const __nv_bfloat16 *>(x), static_cast<const uint8_t *>(w1),                 \
         static_cast<const uint8_t *>(s1), static_cast<const uint8_t *>(w3),                      \
         static_cast<const uint8_t *>(s3), static_cast<__nv_bfloat16 *>(h),                       \
         static_cast<const float *>(route_weight), static_cast<const int32_t *>(block_slot),     \
-        static_cast<const int32_t *>(block_pair), stride_x, stride_h, limit, topk, n, k, null_slot)
+        static_cast<const int32_t *>(block_pair), stride_x, stride_h, limit, topk, n, k, null_slot, 0)
     switch (variant) {
     case 0: FP4_UP_V2X(false, false); break;
     case 1: FP4_UP_V2X(true, false); break;
@@ -1118,11 +1164,11 @@ extern "C" int fp4_moe_cuda_down_v2x(
     const int rows = (n + kWarps - 1) >> kWarpsShift;
     const dim3 grid = variant & 2 ? dim3(rows, nb) : dim3(nb, rows);
 #define FP4_DOWN_V2X(S, R)                                                                       \
-    moe_down_bm16_v2<false, S, R><<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(     \
+    pdl_launch(moe_down_bm16_v2<false, S, R>, grid, kThreads, 0, static_cast<cudaStream_t>(stream),      \
         static_cast<const __nv_bfloat16 *>(h), static_cast<const uint8_t *>(w2),                 \
         static_cast<const uint8_t *>(s2), static_cast<float *>(y),                               \
         static_cast<const int32_t *>(block_slot), static_cast<const int32_t *>(block_pair),      \
-        stride_h, stride_y, topk, n, k, ntok, null_slot, partial, parts_world)
+        stride_h, stride_y, topk, n, k, ntok, null_slot, partial, parts_world, 0)
     switch (variant) {
     case 0: FP4_DOWN_V2X(false, false); break;
     case 1: FP4_DOWN_V2X(true, false); break;
@@ -1140,12 +1186,12 @@ extern "C" int fp4_moe_cuda_down_v3(
     int rows_per_warp) {
     if (k > (kDownMaxGroups << 5) || (k & 31)) return static_cast<int>(cudaErrorInvalidValue);
 #define FP4_DOWN_V3(R)                                                                          \
-    moe_down_bm16_v3<R><<<dim3(nb, (n + (kWarps * R) - 1) / (kWarps * R)), kThreads, 0,          \
-                          static_cast<cudaStream_t>(stream)>>>(                                 \
+    pdl_launch(moe_down_bm16_v3<R>, dim3(nb, (n + (kWarps * R) - 1) / (kWarps * R)), kThreads, 0,          \
+                          static_cast<cudaStream_t>(stream),                                  \
         static_cast<const __nv_bfloat16 *>(h), static_cast<const uint8_t *>(w2),                 \
         static_cast<const uint8_t *>(s2), static_cast<float *>(y),                               \
         static_cast<const int32_t *>(block_slot), static_cast<const int32_t *>(block_pair),      \
-        stride_h, stride_y, topk, n, k, ntok, null_slot, partial, parts_world)
+        stride_h, stride_y, topk, n, k, ntok, null_slot, partial, parts_world, 0)
     switch (rows_per_warp) {
     case 2: FP4_DOWN_V3(2); break;
     case 4: FP4_DOWN_V3(4); break;
@@ -1160,12 +1206,12 @@ extern "C" int fp4_moe_cuda_route_small(void *stream, const void *slots, void *b
                                           int pairs, int topk) {
     if (pairs > 64) {
         if (pairs > kRouteWideMax) return static_cast<int>(cudaErrorInvalidValue);
-        route_wide_bm16<<<1, kRouteWideMax, 0, static_cast<cudaStream_t>(stream)>>>(
+        pdl_launch(route_wide_bm16, 1, kRouteWideMax, 0, static_cast<cudaStream_t>(stream),
             static_cast<const int32_t *>(slots), static_cast<int32_t *>(block_slot),
             static_cast<int32_t *>(block_pair), static_cast<int32_t *>(block_route), pairs, topk);
         return static_cast<int>(cudaGetLastError());
     }
-    route_small_bm16<<<1, 64, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(route_small_bm16, 1, 64, 0, static_cast<cudaStream_t>(stream),
         static_cast<const int32_t *>(slots), static_cast<int32_t *>(block_slot),
         static_cast<int32_t *>(block_pair), static_cast<int32_t *>(block_route), pairs, topk);
     return static_cast<int>(cudaGetLastError());
@@ -1173,7 +1219,7 @@ extern "C" int fp4_moe_cuda_route_small(void *stream, const void *slots, void *b
 
 extern "C" int fp4_moe_cuda_round_reduce(void *stream, const void *parts, void *out,
                                            int td, int topk, int out_bf16) {
-    round_reduce<<<(td + 255) >> 8, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(round_reduce, (td + 255) >> 8, 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const float *>(parts), out, td, topk, out_bf16);
     return static_cast<int>(cudaGetLastError());
 }
@@ -1183,7 +1229,7 @@ extern "C" int dream_fp8_cuda_up(
     const void *w13, const void *s13, void *h, int64_t stride_h, const void *route_weight,
     float limit, int topk, int pairs, int n, int k) {
     if (k & 31) return static_cast<int>(cudaErrorInvalidValue);
-    dream_fp8_up<<<dim3(pairs, (n + kWarps - 1) / kWarps), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(dream_fp8_up, dim3(pairs, (n + kWarps - 1) / kWarps), kThreads, 0, static_cast<cudaStream_t>(stream),
         static_cast<const __nv_bfloat16 *>(x), stride_x, static_cast<const int64_t *>(idx),
         static_cast<const int32_t *>(map), n_experts, static_cast<const uint8_t *>(w13),
         static_cast<const uint8_t *>(s13), static_cast<__nv_bfloat16 *>(h), stride_h,
@@ -1196,7 +1242,7 @@ extern "C" int dream_fp8_cuda_down(
     const void *w2, const void *s2, void *y, int64_t stride_y, int topk, int pairs, int n, int k,
     int ntok, int partial) {
     if (k & 31) return static_cast<int>(cudaErrorInvalidValue);
-    dream_fp8_down<<<dim3(pairs, (n + kWarps - 1) / kWarps), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(dream_fp8_down, dim3(pairs, (n + kWarps - 1) / kWarps), kThreads, 0, static_cast<cudaStream_t>(stream),
         static_cast<const __nv_bfloat16 *>(h), stride_h, static_cast<const int64_t *>(idx),
         static_cast<const int32_t *>(map), n_experts, static_cast<const uint8_t *>(w2),
         static_cast<const uint8_t *>(s2), static_cast<float *>(y), stride_y, topk, n, k, ntok, partial);
@@ -1209,8 +1255,8 @@ extern "C" int fp4_moe_cuda_up_scales(
     int64_t stride_x, int64_t stride_h, float limit, int topk, int n, int k, int nb,
     int null_slot, int scale_stride) {
     if (k > (kV2MaxGroups << 5) || (k & 31)) return static_cast<int>(cudaErrorInvalidValue);
-    moe_up_bm16_v2<true><<<dim3(nb, (n + kWarps - 1) >> kWarpsShift), kThreads, 0,
-                             static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(moe_up_bm16_v2<true>, dim3(nb, (n + kWarps - 1) >> kWarpsShift), kThreads, 0,
+                             static_cast<cudaStream_t>(stream),
         static_cast<const __nv_bfloat16 *>(x), static_cast<const uint8_t *>(w1),
         static_cast<const uint8_t *>(s1), static_cast<const uint8_t *>(w3),
         static_cast<const uint8_t *>(s3), static_cast<__nv_bfloat16 *>(h),
@@ -1231,26 +1277,27 @@ extern "C" int fp4_moe_cuda_down_scales(
     stride_h, stride_y, topk, n, k, ntok, null_slot, partial, parts_world, scale_stride
     if (k > (kV2MaxGroups << 5) || (k & 31)) return static_cast<int>(cudaErrorInvalidValue);
     if (rows_per_warp == 2 && k <= 3072)
-        moe_down_bm16_v3<2, true><<<dim3(nb, (n + kWarps * 2 - 1) / (kWarps * 2)), kThreads, 0,
-                                   static_cast<cudaStream_t>(stream)>>>(SCALE_DOWN_ARGS);
+        pdl_launch(moe_down_bm16_v3<2, true>, dim3(nb, (n + kWarps * 2 - 1) / (kWarps * 2)), kThreads, 0,
+                                   static_cast<cudaStream_t>(stream), SCALE_DOWN_ARGS);
     else if (rows_per_warp == 4 && k <= 3072)
-        moe_down_bm16_v3<4, true><<<dim3(nb, (n + kWarps * 4 - 1) / (kWarps * 4)), kThreads, 0,
-                                   static_cast<cudaStream_t>(stream)>>>(SCALE_DOWN_ARGS);
+        pdl_launch(moe_down_bm16_v3<4, true>, dim3(nb, (n + kWarps * 4 - 1) / (kWarps * 4)), kThreads, 0,
+                                   static_cast<cudaStream_t>(stream), SCALE_DOWN_ARGS);
     else
-        moe_down_bm16_v2<true><<<dim3(nb, (n + kWarps - 1) >> kWarpsShift), kThreads, 0,
-                                static_cast<cudaStream_t>(stream)>>>(SCALE_DOWN_ARGS);
+        pdl_launch(moe_down_bm16_v2<true>, dim3(nb, (n + kWarps - 1) >> kWarpsShift), kThreads, 0,
+                                static_cast<cudaStream_t>(stream), SCALE_DOWN_ARGS);
 #undef SCALE_DOWN_ARGS
     return static_cast<int>(cudaGetLastError());
 }
 
 __global__ void scale_bytes_kernel(const uint8_t *packed, uint8_t *out, int size, int stride, int slots) {
+    pdl_enter();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int slot = blockIdx.y;
     if (i < size && slot < slots) out[static_cast<int64_t>(slot) * size + i] = scale_byte<true>(packed, slot, i, size, stride);
 }
 extern "C" int fp4_moe_cuda_scale_expand(void *stream, const void *packed, void *out,
                                           int size, int stride, int slots) {
-    scale_bytes_kernel<<<dim3((size + 255) / 256, slots), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    pdl_launch(scale_bytes_kernel, dim3((size + 255) / 256, slots), 256, 0, static_cast<cudaStream_t>(stream),
         static_cast<const uint8_t *>(packed), static_cast<uint8_t *>(out), size, stride, slots);
     return static_cast<int>(cudaGetLastError());
 }
