@@ -1,5 +1,6 @@
 //! tidelm-server for a GLM-5.3 checkpoint (crates/tidelm-glm): the same HTTP front, the GLM
-//! engine behind it, one request at a time (server/muse_app.py's queue). main() comes here when
+//! engine behind it, --lanes requests at a time (serve.rs's scheduler; 1: server/muse_app.py's
+//! queue). main() comes here when
 //! --model-dir's config.json has model_type glm_moe_dsa.
 //!
 //!   tidelm-server --model-dir DIR --pack PACK_r{rank}of2.bin --db HISTORY [--world 2 --rank R
@@ -7,20 +8,19 @@
 //!                 [--hot 1] [--hot-async 0] [--hot-keep 32] [--depth 7] [--cal 0.36 | --dyn 0.9] [--lookup 8] [--copy 1]
 //!                 [--adapt 1] [--adapt-every 200] [--adapt-prefill 512] [--adapt-decode 256]
 //!                 [--bg-every 2] [--loop-break 12] [--two-pass 512] [--two-pass-miss 0.15]
+//!                 [--lanes 1] [--lane-chunk 1024]
 //!                 [--state-db FILE] [--host 0.0.0.0] [--port 8000] [--served-model-name glm-5.3]
 //!
 //! The routing history: --db is read at boot (the Python engine's torch.save .pt or this
 //! engine's .npz); adaptation writes its own .npz at --state-db (default ~/tidelm-rust-state/
 //! glm-stats-rust.npz), never the Python server's file.
 
-use std::collections::VecDeque;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
-use tidelm_engine::decode::{Event, Finish, Generation};
 use tidelm_glm::forward::{Engine, Options, Pair, ROCE_BYTES};
 use tidelm_glm::serve::{ServeOptions, Server};
 use tidelm_text::Text;
@@ -34,7 +34,7 @@ pub fn is_glm(model_dir: &std::path::Path) -> bool {
 }
 
 pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
-    const VALUED: [&str; 41] = ["--bench-nll-out", "--bench-nll", "--bench-widths", "--copy", "--hot-async", "--bench-width", "--bench-ctx", "--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
+    const VALUED: [&str; 43] = ["--lanes", "--lane-chunk", "--bench-nll-out", "--bench-nll", "--bench-widths", "--copy", "--hot-async", "--bench-width", "--bench-ctx", "--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
                                 "--max-seq", "--chunk", "--hot", "--hot-keep", "--depth", "--cal", "--dyn", "--lookup",
                                 "--adapt", "--adapt-every", "--adapt-prefill", "--adapt-decode", "--bg-every", "--loop-break",
                                 "--two-pass", "--two-pass-miss", "--host", "--port", "--served-model-name", "--moe-rows",
@@ -67,6 +67,7 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         prefill_reduce_bf16: arg(args, "--reduce").as_deref() != Some("fp32"),
         moe_rows: num("--moe-rows", 2048.0)? as usize,
         pack: PathBuf::from(&pack),
+        lanes: num("--lanes", 1.0)? as usize,
         guard_extra: format!("graphs {} hot {} async {} prefix {} gb {}", args.iter().any(|a| a == "--graphs"),
                              arg(args, "--hot").unwrap_or_else(|| "1".into()), arg(args, "--hot-async").unwrap_or_default(),
                              arg(args, "--prefix-disk").is_some(), arg(args, "--prefix-disk-gb").unwrap_or_default()),
@@ -151,6 +152,7 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         loop_break: num("--loop-break", 12.0)? as usize,
         two_pass: num("--two-pass", 512.0)? as usize,
         two_pass_miss: num("--two-pass-miss", 0.15)?,
+        lane_chunk: num("--lane-chunk", 1024.0)? as usize,
     };
     // the disk prefix store: its namespace is everything that changes what a cached row means
     let mut store = None;
@@ -239,64 +241,36 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
     engine_loop(srv, rx)
 }
 
-/// The engine thread: one request at a time in arrival order; cancels and new requests are
-/// taken between rounds. An engine error is fatal: a pair that failed one call cannot go on.
+/// The engine thread: the scheduler's turns (serve.rs: requests into lanes in arrival order, a
+/// round of every decoding lane a turn), cancels and new requests taken between turns. An engine
+/// error is fatal: a pair that failed one call cannot go on.
 fn engine_loop(mut srv: Server, rx: mpsc::Receiver<Cmd>) -> tidelm_engine::Result<()> {
-    let mut queue = VecDeque::new();
-    let mut cancelled = std::collections::HashSet::new();
     loop {
-        if queue.is_empty() {
+        if !srv.busy() {
             match rx.recv() {
-                Ok(Cmd::Submit(j)) => queue.push_back(j),
-                Ok(Cmd::Cancel(id)) => {
-                    cancelled.insert(id);
-                }
+                Ok(Cmd::Submit(j)) => srv.submit(j),
+                Ok(Cmd::Cancel(id)) => srv.cancel(id),
                 Err(_) => break,
             }
         }
         while let Ok(c) = rx.try_recv() {
             match c {
-                Cmd::Submit(j) => queue.push_back(j),
-                Cmd::Cancel(id) => {
-                    cancelled.insert(id);
-                }
+                Cmd::Submit(j) => srv.submit(j),
+                Cmd::Cancel(id) => srv.cancel(id),
             }
         }
-        let Some(mut job) = queue.pop_front() else { continue };
-        if cancelled.remove(&job.id) {
-            (job.sink)(Event::Done(Finish::Cancelled, Generation::default()));
-            continue;
-        }
-        let id = job.id;
-        let (s0, r0) = (srv.stats.clone(), srv.eng.res.stats.clone());
-        let m0 = srv.eng.miss_totals()?;
-        let mut poll = || {
-            while let Ok(c) = rx.try_recv() {
-                match c {
-                    Cmd::Submit(j) => queue.push_back(j),
-                    Cmd::Cancel(c) => {
-                        cancelled.insert(c);
-                    }
+        match srv.step() {
+            Ok(done) => {
+                for f in done {
+                    eprintln!("{}", f.line);
                 }
             }
-            cancelled.remove(&id)
-        };
-        if let Err(e) = srv.run(std::mem::replace(&mut job, dummy_job()), &mut poll) {
-            eprintln!("engine failed: {e}");
-            let _ = srv.eng.stop_follower();
-            std::process::exit(1);
+            Err(e) => {
+                eprintln!("engine failed: {e}");
+                let _ = srv.eng.stop_follower();
+                std::process::exit(1);
+            }
         }
-        let (s1, r1) = (&srv.stats, &srv.eng.res.stats);
-        let rounds = (s1.rounds - s0.rounds).max(1) as f64;
-        // the routed weight (prompt and answer) that went to substitutes: what more residents lower
-        let m1 = srv.eng.miss_totals()?;
-        let missed = if m1[2] > m0[2] { (m1[3] - m0[3]) / (m1[2] - m0[2]) * 100.0 } else { 0.0 };
-        eprintln!("request {id}, GLM: {:.2} drafted / {:.2} accepted a round, copy rounds {} ({} long, {} accepted), \
-                   routed weight missed {missed:.1}%, hot reads {} (kept {}, {:.2} s waited), swaps {}, fallbacks {}",
-                  (s1.drafted - s0.drafted) as f64 / rounds, (s1.accepted - s0.accepted) as f64 / rounds,
-                  s1.copy_rounds - s0.copy_rounds, s1.long_copies - s0.long_copies, s1.copy_accepted - s0.copy_accepted,
-                  r1.hot_reads - r0.hot_reads,
-                  r1.hot_kept - r0.hot_kept, r1.hot_wait_s - r0.hot_wait_s, r1.swaps - r0.swaps, s1.fallbacks - s0.fallbacks);
     }
     srv.eng.stop_follower()?;
     Ok(())
@@ -426,9 +400,4 @@ fn bench_nll(eng: &mut Engine, path: &str, text: &Text, keep: usize, out: Option
     eprintln!("bench-nll: all: {tn} tokens, NLL {:.4}, {:.0} s", tsum / tn.max(1) as f64, t0.elapsed().as_secs_f64());
     eng.stop_follower()?;
     Ok(())
-}
-
-fn dummy_job() -> tidelm_engine::decode::Job {
-    tidelm_engine::decode::Job { id: 0, prompt: vec![], max_tokens: 0, sampling: tidelm_engine::forward::Sampling::GREEDY, seed: 0,
-                                 stop: vec![], sink: Box::new(|_| {}), images: vec![], key: None, copy_draft: false }
 }

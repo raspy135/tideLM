@@ -1322,8 +1322,10 @@ __global__ void dup_rows_kernel(const __nv_bfloat16* __restrict__ x, int64_t ldx
 // Per row of this rank's logits [M][n]: (max, sum exp((x - max) / temp)) into out[r * ldo],
 // out[r * ldo + 1] -- with the rows' candidates (topk_kernel) the host's nucleus over the
 // pair's whole vocabulary. temp a device scalar (a captured graph replays at any temperature).
+// temp: row r's temperature at temp[r * temp_ld] (0: one for every row)
 __global__ void __launch_bounds__(1024) row_lse_kernel(const float* __restrict__ x, int64_t ldx, int n,
-                                                       const float* __restrict__ temp, float* __restrict__ out, int64_t ldo) {
+                                                       const float* __restrict__ temp, int temp_ld, float* __restrict__ out,
+                                                       int64_t ldo) {
     __shared__ float red[32];
     const float* row = x + (int64_t)blockIdx.x * ldx;
     float m = -INFINITY;
@@ -1339,7 +1341,7 @@ __global__ void __launch_bounds__(1024) row_lse_kernel(const float* __restrict__
     __syncthreads();
     m = red[0];
     __syncthreads();
-    const float inv = 1.f / fmaxf(temp[0], 1e-6f);
+    const float inv = 1.f / fmaxf(temp[(int64_t)blockIdx.x * temp_ld], 1e-6f);
     float s = 0.f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) s += expf((row[i] - m) * inv);
     s = block_sum(s, red);
@@ -1624,8 +1626,9 @@ int glm_dup_rows(void* stream, const void* x, int64_t ldx, void* out, int T, int
     GRET;
 }
 
-int glm_row_lse(void* stream, const void* x, int64_t ldx, int M, int n, const void* temp, void* out, int64_t ldo) {
-    row_lse_kernel<<<M, 1024, 0, GST>>>(static_cast<const float*>(x), ldx, n, static_cast<const float*>(temp),
+int glm_row_lse(void* stream, const void* x, int64_t ldx, int M, int n, const void* temp, int temp_ld, void* out,
+                int64_t ldo) {
+    row_lse_kernel<<<M, 1024, 0, GST>>>(static_cast<const float*>(x), ldx, n, static_cast<const float*>(temp), temp_ld,
                                         static_cast<float*>(out), ldo);
     GRET;
 }

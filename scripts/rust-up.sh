@@ -117,6 +117,8 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
     [[ "${GLM_GRAPHS:-1}" == 1 ]] && args+=(--graphs)
     # the long prompt copier, on unless GLM_COPY=0 (the server's default)
     [[ -n "${GLM_COPY:-}" ]] && args+=(--copy "$GLM_COPY")
+    # lanes: requests served at once, sharing the KV pool (1 unless set)
+    [[ -n "${GLM_LANES:-}" ]] && args+=(--lanes "$GLM_LANES" --lane-chunk "${GLM_LANE_CHUNK:-1024}")
     if [[ "${GLM_PREFIX_DISK:-0}" == 1 ]]; then
         args+=(--prefix-disk "${RUST_GLM_PREFIX_DIR:-$STATE/glm-prefix}"
                --prefix-disk-gb "${GLM_PREFIX_DISK_GB:-20}" --prefix-min "${GLM_PREFIX_DISK_MIN:-256}")

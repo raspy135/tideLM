@@ -221,6 +221,16 @@ impl PagedKv {
         Ok(n)
     }
 
+    /// Give back `lane`'s chunks past those its rows below position `end` need (`release` with
+    /// the floor at `end`, for this call: 0 gives back every one); its rows there read as the
+    /// dummy's. Returns the chunks freed.
+    pub fn shrink(&mut self, lane: usize, end: usize) -> Result<usize> {
+        let floor = std::mem::replace(&mut self.floor[lane], end);
+        let r = self.release(lane);
+        self.floor[lane] = floor;
+        r
+    }
+
     /// Keep `lane`'s rows below `tokens` mapped for good (`release` stops there).
     pub fn set_floor(&mut self, lane: usize, tokens: usize) -> Result<()> {
         self.ensure(lane, tokens)?;
@@ -316,6 +326,13 @@ mod tests {
         assert!(kv.release(2).unwrap() > 0);
         assert_eq!(kv.held(2), 2);
         assert!(before > 2);
+        // shrink keeps what a shorter sequence needs, and leaves the floor as it was
+        kv.ensure(1, 20_000).unwrap();
+        assert_eq!(kv.held(1), 5); // 20,001 rows of 288 bytes: 3 chunks; 10,001 of 256: 2
+        assert_eq!(kv.shrink(1, 7_000).unwrap(), 3);
+        assert_eq!(kv.held(1), 2);
+        assert_eq!(kv.shrink(1, 0).unwrap(), 2); // to 0: all of them
+        assert_eq!(kv.release(1).unwrap(), 0);
         assert_eq!(kv.release(0).unwrap(), 3);
         assert_eq!(kv.free_chunks(), 12 - 2);
         // a released range reads (the dummy) without faulting

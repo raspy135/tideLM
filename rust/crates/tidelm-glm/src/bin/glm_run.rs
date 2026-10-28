@@ -30,6 +30,7 @@ fn main() -> Result<()> {
         prefill_reduce_bf16: arg(&args, "--reduce").as_deref() != Some("fp32"),
         moe_rows: arg(&args, "--moe-rows").map(|s| s.parse()).transpose()?.unwrap_or(2048),
         pack: PathBuf::from(&pack),
+        lanes: 1,
         guard_extra: format!("graphs {} hot {}", args.iter().any(|a| a == "--graphs"), args.iter().any(|a| a == "--hot")),
     };
     let log = move |s: &str| {
@@ -119,7 +120,7 @@ fn main() -> Result<()> {
             let ta = Instant::now();
             let mut drafts = vec![eng.mtp(&[anchor], Hidden::Last, p - 1, true)?.unwrap()[0]];
             for k in 1..depth {
-                let d = eng.mtp(&[drafts[k - 1]], Hidden::Mtp, p - 1 + k, true)?.unwrap()[0];
+                let d = eng.mtp(&[drafts[k - 1]], Hidden::Mtp(0), p - 1 + k, true)?.unwrap()[0];
                 drafts.push(d);
             }
             let mut block = vec![anchor];

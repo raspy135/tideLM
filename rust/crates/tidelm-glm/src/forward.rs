@@ -12,11 +12,20 @@
 //! Rows <= 16 take the decode kernels (EXL3 GEMVs, FP8 absorb, flash-decoding splits), more the
 //! prefill ones (unpacked EXL3 through cuBLAS, bf16 absorb, one attention pass) in chunks.
 //! Rank 0 sends every engine call to rank 1 before it runs it (`mirror`); rank 1 decides nothing.
+//!
+//! Lanes (GLM_LANES): sequences that share the engine, each with its own rows of every cache
+//! (lane L's part from L * a lane's rows, paged in from one pool as it grows: tidelm_engine::kv)
+//! and its own position, tokens and kept hidden. A pass names its rows' lanes in a device table
+//! (glm.cu positions_kernel: first row, rows, first position, cache-row offset each), so a decode
+//! pass may carry several lanes' rows, each attending its own cache; prefill runs one lane. Every
+//! call names its lane; the single-sequence calls (forward, mtp, set_pos, keep_hidden) act on the
+//! selected one (`select`, rank 0's choice, sent with each call).
 
 use std::os::raw::c_void;
 use std::path::Path;
 
 use tidelm_cuda::{DeviceBuffer, Stream};
+use tidelm_engine::kv::{KvBuf, PagedKv, Spec};
 use tidelm_kernels::blas::{Blas, Mat, R_16BF};
 use tidelm_kernels::ds41::{ds_linear_bf16, ds_linear_f32w, ds_route_blocks, ds_route_large, ds_splits_reduce};
 use tidelm_kernels::exl3::*;
@@ -60,6 +69,11 @@ const OP_KEEP_HIDDEN: u32 = 4;
 const OP_SAMPLING: u32 = 5;
 const OP_ZERO_DEMAND: u32 = 7;
 const OP_FULL_ROW: u32 = 6;
+const OP_FORWARD_LANES: u32 = 8;
+const OP_KV_SHRINK: u32 = 10;
+const OP_FORWARD_PART: u32 = 11;
+/// Lanes a pass may carry (glm.cu kMaxLanes).
+pub const MAX_LANES: usize = 4;
 const OP_EXIT: u32 = 99;
 /// Candidates a rank sends a sampled row: its top logits, with its (max, sum of exp) the
 /// host's nucleus over the pair's vocabulary (falls back to the whole row when they do not
@@ -82,6 +96,8 @@ pub struct Options {
     /// MoE prefill in sub-chunks of this many rows (bounds the per-pair scratch)
     pub moe_rows: usize,
     pub pack: std::path::PathBuf,
+    /// sequences served at once (GLM_LANES), sharing the KV pool max_seq positions fill
+    pub lanes: usize,
     /// the serving flags both ranks act on (hot reads split the pass on both, graphs, the disk
     /// store's mirrored calls): compared at boot with the rest
     pub guard_extra: String,
@@ -95,9 +111,9 @@ impl Options {
         let exe = std::fs::read(std::env::current_exe()?)?;
         let s = format!(
             "glm-boot v1\nconfig {:x}\nexe {:x}\nmax_seq {}\nchunk {}\nslots {}\nkv_split {}\nreduce_bf16 {}\nmoe_rows {}\n\
-             pack_source {}\nenv {}\nflags {}\n",
+             lanes {}\npack_source {}\nenv {}\nflags {}\n",
             sha2::Sha256::digest(&cfg), sha2::Sha256::digest(&exe), self.max_seq, self.chunk, self.slots, self.kv_split,
-            self.prefill_reduce_bf16, self.moe_rows, pack.source_sha256,
+            self.prefill_reduce_bf16, self.moe_rows, self.lanes, pack.source_sha256,
             ["TIDELM_GLM_HOT", "TIDELM_GLM_WIDE_DECODE_FROM", "NCCL_PROTO"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
                 .collect::<Vec<_>>().join(" "), self.guard_extra);
         Ok(s.into_bytes())
@@ -112,28 +128,58 @@ pub struct Pair {
     pub roce: tidelm_comm::roce::Roce,
 }
 
+/// A layer's caches, each `[lanes][lane_rows][row]` (paged: Engine::paged).
 pub(crate) struct LayerKv {
     /// latent FP8 [rows][512] + fp32 [rows][4]
-    pub(crate) cq: DeviceBuffer<u8>,
-    pub(crate) cs: DeviceBuffer<f32>,
+    pub(crate) cq: KvBuf,
+    pub(crate) cs: KvBuf,
     /// RoPE key BF16 [rows][64]
-    pub(crate) cr: DeviceBuffer<u16>,
+    pub(crate) cr: KvBuf,
     /// indexer key FP8 [rows][128] + fp32 [rows] (full layers)
-    pub(crate) iq: Option<DeviceBuffer<u8>>,
-    pub(crate) is: Option<DeviceBuffer<f32>>,
+    pub(crate) iq: Option<KvBuf>,
+    pub(crate) is: Option<KvBuf>,
     /// split by position across the pair (decoder layers under kv_split)
     pub(crate) split: bool,
+    /// a lane's rows: the stride between lanes' parts
+    pub(crate) lane_rows: usize,
+}
+
+/// A layer cache's row bytes in LayerKv order (cq, cs, cr, iq, is).
+pub(crate) const KV_ROW_BYTES: [usize; 5] = [512, 16, 128, 128, 4];
+
+impl LayerKv {
+    /// The caches' bases for `lane` (bytes into each: lane * lane_rows rows), in KV_ROW_BYTES order.
+    pub(crate) fn lane_bases(&self, lane: usize) -> Vec<*mut c_void> {
+        let mut v = vec![self.cq.raw(), self.cs.raw(), self.cr.raw()];
+        if let (Some(iq), Some(is)) = (&self.iq, &self.is) {
+            v.push(iq.raw());
+            v.push(is.raw());
+        }
+        v.iter().zip(KV_ROW_BYTES).map(|(&b, rb)| unsafe { (b as *mut u8).add(lane * self.lane_rows * rb) } as *mut c_void).collect()
+    }
+}
+
+/// A lane's sequence while another is selected.
+#[derive(Default)]
+struct Seq {
+    pos: usize,
+    tokens: Vec<u32>,
 }
 
 /// Activations and scratch, sized for a prefill chunk.
 struct Act {
     tok: DeviceBuffer<i32>,
-    pos0: DeviceBuffer<i32>,
-    mpos0: DeviceBuffer<i32>,
+    /// the pass's lane tables: [0][MAX_LANES][4] the decoder's, [1][MAX_LANES][4] the MTP layer's
+    lanes: DeviceBuffer<i32>,
     pos: DeviceBuffer<i32>,
     rows: DeviceBuffer<i32>,
     bound: DeviceBuffer<i32>,
+    /// each row's cache-row offset (its lane's part)
+    koff: DeviceBuffer<i32>,
     mpos: DeviceBuffer<i32>,
+    mrows: DeviceBuffer<i32>,
+    mbound: DeviceBuffer<i32>,
+    mkoff: DeviceBuffer<i32>,
     h: DeviceBuffer<u16>,
     xn: DeviceBuffer<u16>,
     a: DeviceBuffer<u16>,
@@ -201,7 +247,10 @@ struct Act {
     out_tok: DeviceBuffer<i32>,
     hn: DeviceBuffer<u16>,
     mhn: DeviceBuffer<u16>,
+    /// a lane's kept target hidden each: [lanes][H]
     hlast: DeviceBuffer<u16>,
+    /// an MTP pass's previous hidden, gathered when its rows' come from more than one place
+    hprev: DeviceBuffer<u16>,
     ehin: DeviceBuffer<u16>,
     ehout: DeviceBuffer<u16>,
     x3s: Exl3Scratch,
@@ -213,12 +262,20 @@ struct Act {
 /// Where the MTP layer's previous hidden comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hidden {
-    /// the kept target hidden (keep_hidden)
+    /// the lane's kept target hidden (keep_hidden)
     Last,
-    /// the MTP layer's own output row 0 (a draft chain)
-    Mtp,
+    /// rows [from, from + n) of the MTP layer's own last output (a draft chain)
+    Mtp(usize),
     /// rows [from, from + n) of the last decoder forward's post-norm hidden
     Target(usize),
+}
+
+/// One lane's rows of a batched MTP pass: its ids, their previous hidden and first position.
+pub struct MtpRows<'a> {
+    pub lane: usize,
+    pub ids: &'a [u32],
+    pub hidden: Hidden,
+    pub pos0: usize,
 }
 
 pub struct Engine {
@@ -253,6 +310,16 @@ pub struct Engine {
     pub demand: DeviceBuffer<f32>,
     pub miss: DeviceBuffer<f64>,
     pub(crate) kv: Vec<LayerKv>,
+    /// every layer cache's chunks (KV_ROW_BYTES order a layer, layers in order)
+    pub(crate) paged: PagedKv,
+    /// the selected lane (pos, tokens are its) and the others' sequences
+    pub lane: usize,
+    seqs: Vec<Seq>,
+    /// each lane's sampling temperature (the candidates' sums), staged per row
+    lane_temp: Vec<f32>,
+    /// lanes in the decoder / MTP tables the last stage wrote
+    pass_nl: usize,
+    mtp_nl: usize,
     act: Act,
     pub pair: Option<Pair>,
     pub pack: Pack,
@@ -277,13 +344,16 @@ pub struct Engine {
     wide_from: usize,
     pub res: crate::adapt::Res,
     h_ids: tidelm_cuda::PinnedBuffer<i32>,
-    h_pos: tidelm_cuda::PinnedBuffer<i32>,
+    /// the lane tables' staging ([2][MAX_LANES][4], Act::lanes)
+    h_lanes: tidelm_cuda::PinnedBuffer<i32>,
     h_tok: tidelm_cuda::PinnedBuffer<i32>,
     /// the disk prefix store's directory for this rank (None: off) and its pinned staging
     pub prefix_dir: Option<std::path::PathBuf>,
     pub(crate) stage: Option<tidelm_cuda::PinnedBuffer<u8>>,
     /// passes also return each row's sampling candidates (set_sampling)
     pub sampled: bool,
+    /// the rows' temperatures for the candidates' sums: [0][HEAD_ROWS] a decoder pass's,
+    /// [1][HEAD_ROWS] an MTP pass's (staged from lane_temp)
     temp: DeviceBuffer<f32>,
     h_temp: tidelm_cuda::PinnedBuffer<f32>,
     cand: DeviceBuffer<f32>,
@@ -353,26 +423,49 @@ impl Engine {
         let n_slots = arena.slots;
         let allowed_h: Vec<u8> = lut_h.iter().map(|&s| (s >= 0) as u8).collect();
         let s_loc = if opt.kv_split && world > 1 { opt.max_seq.div_ceil(world) } else { opt.max_seq };
-        let mut kv = Vec::with_capacity(nl);
-        let mut kv_bytes = 0usize;
+        // every cache paged from one pool (tidelm_engine::kv): a lane's part is a reserved range
+        // of lane_rows rows (s_loc + the spare row, padded so each part is whole chunks in every
+        // width, one stride for every decoder layer: a row's koff serves all of them), backed by
+        // chunks as far as its positions reach. The pool is what one lane at max_seq fills (the
+        // memory the unpaged caches took, to within a chunk a cache): lanes share it.
+        let lanes = opt.lanes.clamp(1, MAX_LANES);
+        let gran = PagedKv::gran()?;
+        let dec_rows = PagedKv::padded_rows(gran, s_loc + 1, &KV_ROW_BYTES);
+        let mtp_rows = PagedKv::padded_rows(gran, opt.max_seq, &KV_ROW_BYTES);
+        let mut specs = vec![];
+        let mut pool = 0usize;
         for l in 0..nl {
             let split = opt.kv_split && world > 1 && l < cfg.layers;
-            let rows = if split { s_loc + 1 } else { opt.max_seq };
+            let rows = if split { dec_rows } else { mtp_rows };
+            let n = if cfg.index_full[l] { 5 } else { 3 };
+            for &rb in &KV_ROW_BYTES[..n] {
+                let spec = Spec { ratio: if split { world } else { 1 }, row_bytes: rb };
+                pool += PagedKv::chunks_for(gran, spec, rows, opt.max_seq - 1);
+                specs.push((spec, rows));
+            }
+        }
+        let paged = PagedKv::new(lanes, &specs, pool)?;
+        let mut kv = Vec::with_capacity(nl);
+        let mut i = 0;
+        for l in 0..nl {
+            let split = opt.kv_split && world > 1 && l < cfg.layers;
             let full = cfg.index_full[l];
             let lk = LayerKv {
-                cq: DeviceBuffer::zeroed(rows * 512)?,
-                cs: DeviceBuffer::zeroed(rows * 4)?,
-                cr: DeviceBuffer::zeroed(rows * 64)?,
-                iq: if full { Some(DeviceBuffer::zeroed(rows * 128)?) } else { None },
-                is: if full { Some(DeviceBuffer::zeroed(rows)?) } else { None },
+                cq: paged.buf(i),
+                cs: paged.buf(i + 1),
+                cr: paged.buf(i + 2),
+                iq: full.then(|| paged.buf(i + 3)),
+                is: full.then(|| paged.buf(i + 4)),
                 split,
+                lane_rows: if split { dec_rows } else { mtp_rows },
             };
-            kv_bytes += rows * (512 + 16 + 128) + if full { rows * 132 } else { 0 };
+            i += if full { 5 } else { 3 };
             kv.push(lk);
         }
-        log(&format!("[glm] KV cache {:.2} GB a rank ({} positions{})", kv_bytes as f64 / 1e9, opt.max_seq,
-                     if opt.kv_split { ", split" } else { "" }));
-        let act = Act::new(&cfg, &opt, hl, vl, s_loc, n_slots)?;
+        log(&format!("[glm] KV cache {:.2} GB a rank ({} positions{}, {lanes} lane{} sharing them)",
+                     (pool * gran) as f64 / 1e9, opt.max_seq, if opt.kv_split { ", split" } else { "" },
+                     if lanes > 1 { "s" } else { "" }));
+        let act = Act::new(&cfg, &opt, hl, vl, s_loc, n_slots, lanes)?;
         let moe_layers: Vec<usize> = (0..cfg.layers).filter(|&l| !cfg.dense[l]).collect();
         let opt_chunk = opt.chunk;
 
@@ -403,6 +496,12 @@ impl Engine {
             arena,
             mtp_arena,
             kv,
+            paged,
+            lane: 0,
+            seqs: (0..lanes).map(|_| Seq::default()).collect(),
+            lane_temp: vec![1.0; lanes],
+            pass_nl: 1,
+            mtp_nl: 1,
             act,
             pair,
             pack,
@@ -418,14 +517,14 @@ impl Engine {
             hot: None,
             wide_from: wide_decode_from(),
             res: crate::adapt::Res::new(nl, e, n_slots, moe_layers_res, &placed),
-            h_ids: tidelm_cuda::PinnedBuffer::zeroed(opt_chunk.max(MAX_ROWS))?,
-            h_pos: tidelm_cuda::PinnedBuffer::zeroed(2)?,
+            h_ids: tidelm_cuda::PinnedBuffer::zeroed(opt_chunk.max(HEAD_ROWS))?,
+            h_lanes: tidelm_cuda::PinnedBuffer::zeroed(2 * MAX_LANES * 4)?,
             h_tok: tidelm_cuda::PinnedBuffer::zeroed(HEAD_ROWS)?,
             prefix_dir: None,
             stage: None,
             sampled: false,
-            temp: DeviceBuffer::from_slice(&[1.0f32])?,
-            h_temp: tidelm_cuda::PinnedBuffer::zeroed(1)?,
+            temp: DeviceBuffer::from_slice(&[1.0f32; 2 * HEAD_ROWS])?,
+            h_temp: tidelm_cuda::PinnedBuffer::zeroed(2 * HEAD_ROWS)?,
             cand: DeviceBuffer::new(HEAD_ROWS * CROW)?,
             h_cand: tidelm_cuda::PinnedBuffer::zeroed(world * HEAD_ROWS * CROW)?,
             cand_rows: 0,
@@ -577,9 +676,12 @@ impl Engine {
         let mtp = cfg.mtp && l == cfg.mtp_layer();
         let kv = &self.kv[l];
         let split = kv.split;
-        // positions, the cache rows they take (a split layer's own, or the spare row), the last
-        // row each may attend (the local bound on a split layer, else the position itself)
-        let (posb, rowsb, bound) = if mtp { (np(&a.mpos), np(&a.mpos), np(&a.mpos)) } else { (np(&a.pos), np(&a.rows), np(&a.bound)) };
+        // positions, the cache rows they take (a split layer's own, or the spare row, in the row's
+        // lane's part), the last row each may attend (the local bound on a split layer, else the
+        // position itself), each row's lane offset, and the pass's lane table (positions)
+        let (posb, rowsb, bound, koff) = if mtp { (np(&a.mpos), np(&a.mrows), np(&a.mbound), np(&a.mkoff)) }
+                                         else { (np(&a.pos), np(&a.rows), np(&a.bound), np(&a.koff)) };
+        let (lanes, nl) = if mtp { (at(&a.lanes, MAX_LANES * 4), self.mtp_nl as i32) } else { (np(&a.lanes), self.pass_nl as i32) };
         let p0 = if mtp { self.mtp_pos } else { self.pos };
         let full = cfg.index_full[l];
         let decode = !prefill;
@@ -595,10 +697,10 @@ impl Engine {
         let ldk = lw.kv_a.n;
         ck(unsafe { glm_rmsnorm(s2, np(&a.ckv), ldk as i64, std::ptr::null(), 0, np(&lw.kv_norm), np(&a.c), 512, t as i32, 512,
                                 1e-6) }, "kv norm")?;
-        ck(unsafe { glm_kv_fp8(s2, np(&a.c), 512, rowsb, np(&kv.cq), np(&kv.cs), t as i32, 512) }, "latent cache")?;
+        ck(unsafe { glm_kv_fp8(s2, np(&a.c), 512, rowsb, kv.cq.raw(), kv.cs.raw(), t as i32, 512) }, "latent cache")?;
         ck(unsafe { glm_rope(s2, at(&a.ckv, 512), ldk as i64, 64, np(&a.kr), 64, 64, t as i32, 1, np(&self.w.cos), np(&self.w.sin),
                              posb) }, "rope key")?;
-        ck(unsafe { glm_rows_copy(s2, np(&a.kr), 64, rowsb, np(&kv.cr), t as i32, 64) }, "rope cache")?;
+        ck(unsafe { glm_rows_copy(s2, np(&a.kr), 64, rowsb, kv.cr.raw(), t as i32, 64) }, "rope cache")?;
         if full {
             let ix = lw.index.as_ref().unwrap();
             if prefill {
@@ -611,7 +713,7 @@ impl Engine {
                 ck(unsafe { ds_splits_reduce(s2, part2, 12, t as i32, 128, np(&a.ki), std::ptr::null_mut(), 128) }, "wk reduce")?;
             }
             ck(unsafe { glm_index_key(s2, np(&a.ki), 128, np(&ix.kn_w), np(&ix.kn_b), np(&self.w.cos), np(&self.w.sin), posb,
-                                      rowsb, np(kv.iq.as_ref().unwrap()), np(kv.is.as_ref().unwrap()), t as i32) }, "index key")?;
+                                      rowsb, kv.iq.unwrap().raw(), kv.is.unwrap().raw(), t as i32) }, "index key")?;
             self.linear_f32w_on(sst, part2, np(&a.xn), h, &ix.wp, t, 32, h, np(&a.iw), if prefill { 1 } else { 24 })?;
         }
         // q_a, its norm, q_b (this rank's heads), RoPE on its last 64 dims, the absorbed query
@@ -652,11 +754,10 @@ impl Engine {
             // each rank scores and attends its own positions for every head
             let lim = self.s_loc.min(self.opt.max_seq.div_ceil(self.world));
             if full {
-                let ix_q = np(kv.iq.as_ref().unwrap());
-                let ix_s = np(kv.is.as_ref().unwrap());
+                let (ix_q, ix_s) = (kv.iq.unwrap().raw(), kv.is.unwrap().raw());
                 ck(unsafe { glm_index_scores(st, np(&a.qi), np(&a.iw), wscale, ix_q, ix_s, posb, t as i32, lim as i32,
                                              self.world as i32, self.rank as i32, 0, inv_d, np(&a.scores), lim as i64,
-                                             std::ptr::null(), 0) },
+                                             lanes, nl) },
                    "index scores")?;
                 let vals = at(&a.qsend, hl * 576 * 2);
                 ck(unsafe { glm_topk(st, np(&a.scores), lim as i64, posb, self.world as i32, self.rank as i32, lim as i32,
@@ -670,10 +771,10 @@ impl Engine {
             }
             let hh = cfg.heads;
             let (ns, chunk) = decode_split(TOPK, hh, t);
-            ck(unsafe { glm_mla(st, 2, np(&a.gs), (nbytes / 2) as i64, (self.qrow / 2) as i64, 576, hl as i32, np(&kv.cq), np(&kv.cs),
-                                np(&kv.cr), 0, np(&a.idx), TOPK as i64, TOPK as i32, 0, bound, t as i32, hh as i32, scale,
+            ck(unsafe { glm_mla(st, 2, np(&a.gs), (nbytes / 2) as i64, (self.qrow / 2) as i64, 576, hl as i32, kv.cq.raw(), kv.cs.raw(),
+                                kv.cr.raw(), 0, np(&a.idx), TOPK as i64, TOPK as i32, 0, bound, t as i32, hh as i32, scale,
                                 ns as i32, chunk as i32, np(&a.pm), np(&a.pl), np(&a.pacc), std::ptr::null_mut(), 0, 0,
-                                std::ptr::null()) },
+                                koff) },
                "mla (split)")?;
             ck(unsafe { glm_mla_combine(st, np(&a.pm), np(&a.pl), np(&a.pacc), t as i32, hh as i32, ns as i32,
                                         std::ptr::null_mut(), 0, 0, np(&a.own_o), np(&a.own_l), np(&a.send2), self.row2 as i64,
@@ -686,37 +787,38 @@ impl Engine {
         } else if decode {
             // the MTP layer (or an unsplit cache): this rank's heads over the whole cache
             if full {
-                let ix_q = np(kv.iq.as_ref().unwrap());
-                let ix_s = np(kv.is.as_ref().unwrap());
+                let (ix_q, ix_s) = (kv.iq.unwrap().raw(), kv.is.unwrap().raw());
                 let lim = self.opt.max_seq;
                 ck(unsafe { glm_index_scores(st, np(&a.qi), np(&a.iw), wscale, ix_q, ix_s, posb, t as i32, lim as i32, 1, 0, 0,
-                                             inv_d, np(&a.scores), lim as i64, std::ptr::null(), 0) }, "index scores")?;
+                                             inv_d, np(&a.scores), lim as i64, lanes, nl) }, "index scores")?;
                 ck(unsafe { glm_topk(st, np(&a.scores), lim as i64, posb, 1, 0, lim as i32, TOPK as i32, t as i32, np(&a.idx),
                                      TOPK as i64, std::ptr::null_mut(), 0) }, "topk")?;
             }
             let (ns, chunk) = decode_split(TOPK, hl, t);
-            ck(unsafe { glm_mla(st, 2, qbase, 0, qrow as i64, 576, hl as i32, np(&kv.cq), np(&kv.cs), np(&kv.cr), 0,
+            ck(unsafe { glm_mla(st, 2, qbase, 0, qrow as i64, 576, hl as i32, kv.cq.raw(), kv.cs.raw(), kv.cr.raw(), 0,
                                 np(&a.idx), TOPK as i64, TOPK as i32, 1, bound, t as i32, hl as i32, scale, ns as i32, chunk as i32,
-                                np(&a.pm), np(&a.pl), np(&a.pacc), std::ptr::null_mut(), 0, 0, std::ptr::null()) }, "mla")?;
+                                np(&a.pm), np(&a.pl), np(&a.pacc), std::ptr::null_mut(), 0, 0, koff) }, "mla")?;
             ck(unsafe { glm_mla_combine(st, np(&a.pm), np(&a.pl), np(&a.pacc), t as i32, hl as i32, ns as i32, np(&a.olat),
                                         (hl * 512) as i64, 512, std::ptr::null_mut(), std::ptr::null_mut(),
                                         std::ptr::null_mut(), 0, 0, 0) }, "mla combine")?;
         } else {
-            // prefill: a split layer's caches for [0, S) gathered into position order first
+            // prefill (one lane, the selected one): a split layer's caches for [0, S) gathered into
+            // position order first
+            let b = kv.lane_bases(self.lane);
             let (cq, cs, cr, iq, is, split_n) = if split {
                 let n = s_all.div_ceil(self.world);
                 let big = true;
-                self.gather(np(&kv.cq), n * 512, np(&a.gcq), big)?;
-                self.gather(np(&kv.cs), n * 16, np(&a.gcs), big)?;
-                self.gather(np(&kv.cr), n * 128, np(&a.gcr), big)?;
+                self.gather(b[0], n * 512, np(&a.gcq), big)?;
+                self.gather(b[1], n * 16, np(&a.gcs), big)?;
+                self.gather(b[2], n * 128, np(&a.gcr), big)?;
                 if full {
-                    self.gather(np(kv.iq.as_ref().unwrap()), n * 128, np(&a.giq), big)?;
-                    self.gather(np(kv.is.as_ref().unwrap()), n * 4, np(&a.gis), big)?;
+                    self.gather(b[3], n * 128, np(&a.giq), big)?;
+                    self.gather(b[4], n * 4, np(&a.gis), big)?;
                 }
                 (np(&a.gcq), np(&a.gcs), np(&a.gcr), np(&a.giq), np(&a.gis), n)
             } else {
-                let (iq, is) = if full { (np(kv.iq.as_ref().unwrap()), np(kv.is.as_ref().unwrap())) } else { (std::ptr::null_mut(), std::ptr::null_mut()) };
-                (np(&kv.cq), np(&kv.cs), np(&kv.cr), iq, is, 0)
+                let (iq, is) = if full { (b[3], b[4]) } else { (std::ptr::null_mut(), std::ptr::null_mut()) };
+                (b[0], b[1], b[2], iq, is, 0)
             };
             if full && !dense_causal {
                 // rows in blocks that bound the [rows, S] scores
@@ -939,33 +1041,57 @@ impl Engine {
     }
 
     // ------------------------------------------------------------------ model
-    /// Host -> device of a pass's token ids and first position (pinned staging, before any graph).
-    fn stage(&mut self, ids: &[u32], pos0: usize, mtp: bool) -> Result<()> {
+    /// Host -> device of a pass's token ids, its lane table (`groups`: each lane's (lane, rows,
+    /// first position), its rows in order) and its rows' temperatures (pinned staging, before any
+    /// graph). The decoder's and the MTP layer's tables and temperatures have slots of their own.
+    fn stage(&mut self, ids: &[u32], groups: &[(usize, usize, usize)], mtp: bool) -> Result<()> {
         let t = ids.len();
+        if groups.is_empty() || groups.len() > MAX_LANES || groups.iter().map(|g| g.1).sum::<usize>() != t {
+            return Err(format!("stage: {t} rows in lanes {groups:?}").into());
+        }
         for (d, &x) in self.h_ids.iter_mut().zip(ids) {
             *d = x as i32;
         }
-        let pslot = if mtp { 1 } else { 0 };
-        self.h_pos[pslot] = pos0 as i32;
+        let slot = if mtp { 1 } else { 0 };
+        let (mut row0, base) = (0usize, slot * MAX_LANES * 4);
+        for (z, &(lane, n, pos0)) in groups.iter().enumerate() {
+            let stride = if mtp { self.kv[self.cfg.mtp_layer()].lane_rows } else { self.kv[0].lane_rows };
+            self.h_lanes[base + 4 * z..base + 4 * z + 4].copy_from_slice(&[row0 as i32, n as i32, pos0 as i32, (lane * stride) as i32]);
+            if row0 < HEAD_ROWS {
+                let tt = self.lane_temp[lane];
+                for r in row0..(row0 + n).min(HEAD_ROWS) {
+                    self.h_temp[slot * HEAD_ROWS + r] = tt;
+                }
+            }
+            row0 += n;
+        }
+        if mtp {
+            self.mtp_nl = groups.len();
+        } else {
+            self.pass_nl = groups.len();
+        }
         unsafe {
             tidelm_cuda::memcpy_async(np(&self.act.tok), self.h_ids.raw(), t * 4, tidelm_cuda::ffi::MEMCPY_HOST_TO_DEVICE, &self.st)?;
-            let dst = if mtp { np(&self.act.mpos0) } else { np(&self.act.pos0) };
-            tidelm_cuda::memcpy_async(dst, (self.h_pos.raw() as *mut i32).add(pslot) as *const c_void, 4,
-                                      tidelm_cuda::ffi::MEMCPY_HOST_TO_DEVICE, &self.st)?;
+            tidelm_cuda::memcpy_async(at(&self.act.lanes, base), (self.h_lanes.raw() as *mut i32).add(base) as *const c_void,
+                                      MAX_LANES * 16, tidelm_cuda::ffi::MEMCPY_HOST_TO_DEVICE, &self.st)?;
+            tidelm_cuda::memcpy_async(at(&self.temp, slot * HEAD_ROWS), (self.h_temp.raw() as *mut f32).add(slot * HEAD_ROWS)
+                                      as *const c_void, t.min(HEAD_ROWS) * 4, tidelm_cuda::ffi::MEMCPY_HOST_TO_DEVICE, &self.st)?;
         }
         Ok(())
     }
 
-    /// The pass's positions from its staged first one (and a split cache's rows and bounds).
+    /// The pass's positions from its staged lane table: each row's position, its cache rows in
+    /// its lane's part (a split cache's own, or the lane's spare row), its bound and lane offset.
     fn positions(&self, t: usize, mtp: bool) -> Result<()> {
         let a = &self.act;
         if mtp {
-            ck(unsafe { glm_positions(self.st.raw(), np(&a.mpos0), t as i32, 0, 1, 0, np(&a.mpos), std::ptr::null_mut(),
-                                      std::ptr::null_mut(), std::ptr::null(), 0, std::ptr::null_mut()) }, "mtp positions")
+            ck(unsafe { glm_positions(self.st.raw(), std::ptr::null(), t as i32, 0, 1, 0, np(&a.mpos), np(&a.mrows),
+                                      np(&a.mbound), at(&a.lanes, MAX_LANES * 4), self.mtp_nl as i32, np(&a.mkoff)) },
+               "mtp positions")
         } else {
-            ck(unsafe { glm_positions(self.st.raw(), np(&a.pos0), t as i32, self.rank as i32,
+            ck(unsafe { glm_positions(self.st.raw(), std::ptr::null(), t as i32, self.rank as i32,
                                       if self.opt.kv_split { self.world as i32 } else { 1 }, self.s_loc as i32, np(&a.pos),
-                                      np(&a.rows), np(&a.bound), std::ptr::null(), 0, std::ptr::null_mut()) }, "positions")
+                                      np(&a.rows), np(&a.bound), np(&a.lanes), self.pass_nl as i32, np(&a.koff)) }, "positions")
         }
     }
 
@@ -1039,7 +1165,7 @@ impl Engine {
             return Ok(());
         }
         self.norm(np(&self.act.h), true, &self.w.norm, np(&self.act.hn), t)?;
-        self.head_dev(np(&self.act.hn), t)?;
+        self.head_dev(np(&self.act.hn), t, false)?;
         self.hot_table_copy()
     }
 
@@ -1058,8 +1184,9 @@ impl Engine {
         &self.moe_layers
     }
 
-    /// The head over `t` rows of `x` (bf16 [t][H]) and each row's argmax into out_tok.
-    fn head_dev(&self, x: *const c_void, t: usize) -> Result<()> {
+    /// The head over `t` rows of `x` (bf16 [t][H]) and each row's argmax into out_tok (the
+    /// candidates' sums at the decoder's or, `mtp`, the MTP pass's row temperatures).
+    fn head_dev(&self, x: *const c_void, t: usize, mtp: bool) -> Result<()> {
         let a = &self.act;
         let st = self.st.raw();
         self.exl3(&self.w.head, x, self.cfg.hidden, t, np(&a.head), false)?;
@@ -1070,7 +1197,8 @@ impl Engine {
            "argmax combine")?;
         if self.sampled {
             let c = np(&self.cand);
-            ck(unsafe { glm_row_lse(st, np(&a.head), self.vl as i64, t as i32, self.vl as i32, np(&self.temp), c, CROW as i64) },
+            ck(unsafe { glm_row_lse(st, np(&a.head), self.vl as i64, t as i32, self.vl as i32,
+                                    at(&self.temp, if mtp { HEAD_ROWS } else { 0 }), 1, c, CROW as i64) },
                "row lse")?;
             ck(unsafe { glm_topk(st, np(&a.head), self.vl as i64, std::ptr::null(), 1, 0, self.vl as i32, CAND as i32, t as i32,
                                  at(&self.cand, 2 + CAND), CROW as i64, at(&self.cand, 2), CROW as i64) }, "candidates")?;
@@ -1104,25 +1232,22 @@ impl Engine {
         rc
     }
 
-    /// Sampling on or off for the passes that follow, at this temperature (both ranks: the
-    /// candidates are a gather).
+    /// Sampling on or off for the passes that follow (every row's candidates, both ranks: they
+    /// are a gather), the selected lane's rows' sums at this temperature.
     pub fn set_sampling(&mut self, temp: Option<f32>) -> Result<()> {
+        let lane = self.lane;
         self.mirror(|m| {
-            m.u32(OP_SAMPLING).u32(temp.map(|t| t.to_bits()).unwrap_or(0)).u32(temp.is_some() as u32);
+            m.u32(OP_SAMPLING).u32(lane as u32).u32(temp.map(|t| t.to_bits()).unwrap_or(0)).u32(temp.is_some() as u32);
         })?;
-        self.sampling_local(temp)
+        self.sampling_local(lane, temp);
+        Ok(())
     }
 
-    fn sampling_local(&mut self, temp: Option<f32>) -> Result<()> {
+    fn sampling_local(&mut self, lane: usize, temp: Option<f32>) {
         self.sampled = temp.is_some();
         if let Some(t) = temp {
-            self.h_temp[0] = t;
-            unsafe {
-                tidelm_cuda::memcpy_async(np(&self.temp), self.h_temp.raw(), 4, tidelm_cuda::ffi::MEMCPY_HOST_TO_DEVICE, &self.st)?;
-            }
-            self.st.synchronize()?;
+            self.lane_temp[lane] = t;
         }
-        Ok(())
     }
 
     /// Row `row` of the last pass's logits over the whole vocabulary (the nucleus fallback).
@@ -1154,10 +1279,10 @@ impl Engine {
         Ok(self.h_tok[..t].iter().map(|&x| x as u32).collect())
     }
 
-    /// The MTP layer over `t` staged rows (token i + 1 at position pos0 + i) and the previous
-    /// hidden `hsrc` -> its post-norm hidden in mhn and, with `logits`, each row's argmax in
-    /// out_tok (device only).
-    fn mtp_dev(&self, t: usize, hsrc: Hidden, logits: bool) -> Result<()> {
+    /// The MTP layer over `t` staged rows (token i + 1 at position pos0 + i of its lane) and
+    /// their previous hidden at `hp` (bf16 [t][H]) -> its post-norm hidden in mhn and, with
+    /// `logits`, each row's argmax in out_tok (device only).
+    fn mtp_dev(&self, t: usize, hp: *mut c_void, logits: bool) -> Result<()> {
         let l = self.cfg.mtp_layer();
         let (cfg, a) = (&self.cfg, &self.act);
         let st = self.st.raw();
@@ -1172,11 +1297,6 @@ impl Engine {
         self.embed(t, true, np(&a.xn), prefill)?;
         ck(unsafe { glm_rmsnorm(st, np(&a.xn), h as i64, std::ptr::null(), 0, np(&mx.enorm), np(&a.ehin), (2 * h) as i64, t as i32,
                                 h as i32, cfg.rms_eps) }, "enorm")?;
-        let hp = match hsrc {
-            Hidden::Last => np(&a.hlast),
-            Hidden::Mtp => np(&a.mhn),
-            Hidden::Target(from) => at(&a.hn, from * h),
-        };
         ck(unsafe { glm_rmsnorm(st, hp, h as i64, std::ptr::null(), 0, np(&mx.hnorm), at(&a.ehin, h), (2 * h) as i64, t as i32,
                                 h as i32, cfg.rms_eps) }, "hnorm")?;
         self.exl3(&mx.eh, np(&a.ehin), 2 * h, t, np(&a.ehout), true)?;
@@ -1187,20 +1307,56 @@ impl Engine {
         self.mlp(l, t, prefill)?;
         self.norm(np(&a.h), true, &mx.sh_norm, np(&a.mhn), t)?;
         if logits {
-            self.head_dev(np(&a.mhn), t)?;
+            self.head_dev(np(&a.mhn), t, true)?;
         }
         Ok(())
     }
 
-    fn mtp_core(&mut self, ids: &[u32], hsrc: Hidden, pos0: usize, logits: bool) -> Result<Option<Vec<u32>>> {
-        let t = ids.len();
-        self.mtp_pos = pos0;
-        self.stage(ids, pos0, true)?;
-        if t <= VERIFY_ROWS && self.graphs {
-            let key = GraphKey::Mtp { t, logits, hidden: hidden_code(hsrc), sampled: self.sampled };
-            self.replay(key, |e| e.mtp_dev(t, hsrc, logits))?;
+    /// Where an MTP row group's previous hidden is: `lane`'s kept one, or rows of mhn / hn.
+    fn hidden_ptr(&self, lane: usize, h: Hidden) -> *mut c_void {
+        let hd = self.cfg.hidden;
+        match h {
+            Hidden::Last => at(&self.act.hlast, lane * hd),
+            Hidden::Mtp(f) => at(&self.act.mhn, f * hd),
+            Hidden::Target(f) => at(&self.act.hn, f * hd),
+        }
+    }
+
+    /// The MTP layer over every group's rows in one pass (each its lane's cache rows): one
+    /// group's hidden is read where it is, several are first gathered into hprev.
+    fn mtp_core(&mut self, groups: &[MtpRows], logits: bool) -> Result<Option<Vec<u32>>> {
+        let t: usize = groups.iter().map(|g| g.ids.len()).sum();
+        // past MAX_ROWS the MTP layer's prefill pass: one lane's
+        if groups.is_empty() || (groups.len() > 1 && t > MAX_ROWS) {
+            return Err(format!("an MTP pass of {} lanes and {t} rows", groups.len()).into());
+        }
+        for g in groups {
+            self.kv_ensure(g.lane, g.pos0 + g.ids.len())?;
+        }
+        let ids: Vec<u32> = groups.iter().flat_map(|g| g.ids.iter().copied()).collect();
+        let tab: Vec<(usize, usize, usize)> = groups.iter().map(|g| (g.lane, g.ids.len(), g.pos0)).collect();
+        self.mtp_pos = groups[0].pos0;
+        self.stage(&ids, &tab, true)?;
+        let (hp, code) = if groups.len() == 1 {
+            (self.hidden_ptr(groups[0].lane, groups[0].hidden), hidden_code(groups[0].lane, groups[0].hidden))
         } else {
-            self.mtp_dev(t, hsrc, logits)?;
+            let h = self.cfg.hidden;
+            let mut r0 = 0;
+            for g in groups {
+                let n = g.ids.len();
+                unsafe {
+                    tidelm_cuda::memcpy_async(at(&self.act.hprev, r0 * h), self.hidden_ptr(g.lane, g.hidden), n * h * 2,
+                                              tidelm_cuda::ffi::MEMCPY_DEVICE_TO_DEVICE, &self.st)?;
+                }
+                r0 += n;
+            }
+            (np(&self.act.hprev), u16::MAX)
+        };
+        if t <= MAX_ROWS && self.graphs {
+            let key = GraphKey::Mtp { t, nl: groups.len(), logits, hidden: code, sampled: self.sampled };
+            self.replay(key, |e| e.mtp_dev(t, hp, logits))?;
+        } else {
+            self.mtp_dev(t, hp, logits)?;
         }
         if !logits {
             return Ok(None);
@@ -1234,20 +1390,23 @@ pub struct RowCands {
     pub min: Vec<f32>,
 }
 
+/// A captured pass: its rows and lanes (the lane table is read on the device, so one graph
+/// serves any split of t rows into nl lanes), and an MTP pass's hidden source.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum GraphKey {
     /// decoder rows t, the whole pass
-    Target { t: usize, sampled: bool },
+    Target { t: usize, nl: usize, sampled: bool },
     /// decoder rows t, one segment between hot-read points
-    Segment { t: usize, seg: usize, sampled: bool },
-    Mtp { t: usize, logits: bool, hidden: u8, sampled: bool },
+    Segment { t: usize, nl: usize, seg: usize, sampled: bool },
+    Mtp { t: usize, nl: usize, logits: bool, hidden: u16, sampled: bool },
 }
 
-fn hidden_code(h: Hidden) -> u8 {
+/// An MTP pass's hidden source in its graph key (u16::MAX: gathered into hprev).
+fn hidden_code(lane: usize, h: Hidden) -> u16 {
     match h {
-        Hidden::Last => 0,
-        Hidden::Mtp => 1,
-        Hidden::Target(f) => 2 + f as u8,
+        Hidden::Last => 0x8000 | lane as u16,
+        Hidden::Mtp(f) => 0x4000 | f as u16,
+        Hidden::Target(f) => f as u16,
     }
 }
 
@@ -1273,7 +1432,7 @@ fn decode_split(k: usize, heads: usize, t: usize) -> (usize, usize) {
 }
 
 impl Act {
-    fn new(cfg: &GlmConfig, opt: &Options, hl: usize, vl: usize, s_loc: usize, slots: usize) -> Result<Self> {
+    fn new(cfg: &GlmConfig, opt: &Options, hl: usize, vl: usize, s_loc: usize, slots: usize, lanes: usize) -> Result<Self> {
         let r = opt.chunk.max(HEAD_ROWS);
         let d = HEAD_ROWS;
         let h = cfg.hidden;
@@ -1304,12 +1463,15 @@ impl Act {
         let max_zn = (r * (hl * 256).max(4096).max(h)).max(8 * d * 2 * 6144);
         Ok(Act {
             tok: DeviceBuffer::zeroed(r)?,
-            pos0: DeviceBuffer::zeroed(1)?,
-            mpos0: DeviceBuffer::zeroed(1)?,
+            lanes: DeviceBuffer::zeroed(2 * MAX_LANES * 4)?,
             pos: DeviceBuffer::zeroed(r)?,
             rows: DeviceBuffer::zeroed(r)?,
             bound: DeviceBuffer::zeroed(r)?,
+            koff: DeviceBuffer::zeroed(r)?,
             mpos: DeviceBuffer::zeroed(r)?,
+            mrows: DeviceBuffer::zeroed(r)?,
+            mbound: DeviceBuffer::zeroed(r)?,
+            mkoff: DeviceBuffer::zeroed(r)?,
             h: z(r * h)?,
             xn: z(r * h)?,
             a: z(r * h)?,
@@ -1374,7 +1536,8 @@ impl Act {
             out_tok: DeviceBuffer::new(HEAD_ROWS)?,
             hn: z(r * h)?,
             mhn: z(r * h)?,
-            hlast: z(h)?,
+            hlast: z(lanes * h)?,
+            hprev: z(HEAD_ROWS * h)?,
             ehin: z(r * 2 * h)?,
             ehout: z(r * h / world)?,
             x3s: Exl3Scratch::new(r, max_k, max_kn, max_zn)?,
@@ -1475,18 +1638,108 @@ impl Engine {
         Ok(())
     }
 
-    /// Run `ids` at the sequence's end: up to MAX_ROWS rows the decode path, more in prefill
+    /// Select the lane the single-sequence calls act on: its position and tokens become
+    /// self.pos / self.tokens. Rank 0's choice, host only: each call carries its lane to rank 1.
+    pub fn select(&mut self, lane: usize) -> Result<()> {
+        if lane >= self.seqs.len() {
+            return Err(format!("lane {lane} of {}", self.seqs.len()).into());
+        }
+        if lane != self.lane {
+            let next = std::mem::take(&mut self.seqs[lane]);
+            self.seqs[self.lane] = Seq { pos: self.pos, tokens: std::mem::take(&mut self.tokens) };
+            self.pos = next.pos;
+            self.tokens = next.tokens;
+            self.lane = lane;
+        }
+        Ok(())
+    }
+
+    /// The lanes the engine serves (GLM_LANES).
+    pub fn lanes(&self) -> usize {
+        self.seqs.len()
+    }
+
+    /// A lane's position and tokens (the selected lane's are self.pos / self.tokens).
+    pub fn lane_pos(&self, lane: usize) -> usize {
+        if lane == self.lane { self.pos } else { self.seqs[lane].pos }
+    }
+
+    pub fn lane_tokens(&self, lane: usize) -> &[u32] {
+        if lane == self.lane { &self.tokens } else { &self.seqs[lane].tokens }
+    }
+
+    /// Map `lane`'s cache chunks for every position below `end` (both ranks run the same calls,
+    /// so their pools stay alike).
+    pub(crate) fn kv_ensure(&mut self, lane: usize, end: usize) -> Result<()> {
+        if end > 0 {
+            self.paged.ensure(lane, end - 1)?;
+        }
+        Ok(())
+    }
+
+    /// Whether `lane` can grow to `end` positions from the pool's free chunks (host only: the
+    /// caller decides before the pass, which fails the pair if the pool cannot back it).
+    pub fn kv_room(&self, lane: usize, end: usize) -> bool {
+        end == 0 || self.paged.need(lane, end - 1) <= self.paged.free_chunks()
+    }
+
+    /// The pool's free and total chunks, and the chunks a lane holds.
+    pub fn kv_chunks(&self) -> (usize, usize) {
+        (self.paged.free_chunks(), self.paged.total_chunks())
+    }
+
+    pub fn kv_held(&self, lane: usize) -> usize {
+        self.paged.held(lane)
+    }
+
+    /// Truncate `lane` to its first `n` positions and give the pool back the chunks past them (an
+    /// idle lane's rows for another's growth, or a lane taking a prompt that keeps less of it).
+    pub fn kv_shrink(&mut self, lane: usize, n: usize) -> Result<usize> {
+        self.mirror(|m| {
+            m.u32(OP_KV_SHRINK).u32(lane as u32).u32(n as u32);
+        })?;
+        self.kv_shrink_local(lane, n)
+    }
+
+    fn kv_shrink_local(&mut self, lane: usize, n: usize) -> Result<usize> {
+        let sel = self.lane;
+        self.select(lane)?;
+        self.pos = self.pos.min(n);
+        self.tokens.truncate(self.pos);
+        self.select(sel)?;
+        // chunks_for(n) covers the rows below n (PagedKv's floor keeps a row past it); 0 gives back all
+        Ok(self.paged.shrink(lane, n)?)
+    }
+
+    /// Run `ids` at the selected lane's end: up to MAX_ROWS rows the decode path, more in prefill
     /// chunks, MAX_ROWS + 1 ..= HEAD_ROWS either (HEAD_ROWS above); up to HEAD_ROWS rows every
     /// row's argmax comes back, past it the last row's. With `mtp_fill`, the MTP layer's cache follows
     /// every row whose next token is in `ids` (the last row waits for the sampled token).
     pub fn forward(&mut self, ids: &[u32], mtp_fill: bool) -> Result<Vec<u32>> {
+        let lane = self.lane;
         self.mirror(|m| {
-            m.u32(OP_FORWARD).u32(mtp_fill as u32).u32s(ids);
+            m.u32(OP_FORWARD).u32(lane as u32).u32(mtp_fill as u32).u32s(ids);
         })?;
-        self.forward_local(ids, mtp_fill)
+        self.forward_local(ids, mtp_fill, None)
     }
 
-    fn forward_local(&mut self, ids: &[u32], mtp_fill: bool) -> Result<Vec<u32>> {
+    /// A part of a prompt (more than HEAD_ROWS rows) at the selected lane's end, `next` the
+    /// prompt's token after it: the prefill chunks of `forward(prompt, mtp_fill)` that cover
+    /// these rows, the part's last row's MTP fill from `next`, no head (a prompt prefilled in
+    /// parts beside decoding lanes; its last part goes through `forward`).
+    pub fn forward_part(&mut self, ids: &[u32], mtp_fill: bool, next: u32) -> Result<()> {
+        if ids.len() <= HEAD_ROWS {
+            return Err(format!("forward_part of {} rows", ids.len()).into());
+        }
+        let lane = self.lane;
+        self.mirror(|m| {
+            m.u32(OP_FORWARD_PART).u32(lane as u32).u32(mtp_fill as u32).u32(next).u32s(ids);
+        })?;
+        self.forward_local(ids, mtp_fill, Some(next))?;
+        Ok(())
+    }
+
+    fn forward_local(&mut self, ids: &[u32], mtp_fill: bool, next: Option<u32>) -> Result<Vec<u32>> {
         let t = ids.len();
         if t == 0 {
             return Err("forward of no rows".into());
@@ -1496,40 +1749,17 @@ impl Engine {
         }
         let h = self.cfg.hidden;
         let mtp = mtp_fill && self.cfg.mtp;
+        let lane = self.lane;
+        self.kv_ensure(lane, self.pos + t)?;
         // async hot reads planned after the last decode pass become routable for this one
         self.hot_install()?;
-        if t <= MAX_ROWS || (t <= HEAD_ROWS && self.pos >= self.wide_from) {
-            self.stage(ids, self.pos, false)?;
-            if t <= VERIFY_ROWS && self.graphs {
-                if self.hot.as_ref().is_some_and(|h| h.asynch.is_none()) {
-                    self.hot_begin();
-                    let n = self.moe_layers.len();
-                    for seg in 0..=n {
-                        self.replay(GraphKey::Segment { t, seg, sampled: self.sampled }, |e| e.decode_segment(seg, t))?;
-                        if seg < n {
-                            self.hot_point(self.moe_layers[seg], t, seg, n)?;
-                        }
-                    }
-                    self.hot_release()?;
-                } else {
-                    let nseg = self.moe_layers.len() + 1;
-                    self.replay(GraphKey::Target { t, sampled: self.sampled }, |e| (0..nseg).try_for_each(|seg| e.decode_segment(seg, t)))?;
-                }
-            } else {
-                self.layers(t, false)?;
-                self.head_dev(np(&self.act.hn), t)?;
-                self.hot_table_copy()?;
-            }
-            self.last_rows = t;
-            let out = self.read_tokens(t)?;
-            if t <= MAX_ROWS {
-                self.hot_plan(t)?; // wider passes leave no candidates (moe_exact)
-            }
+        if next.is_none() && (t <= MAX_ROWS || (t <= HEAD_ROWS && self.pos >= self.wide_from)) {
             let p0 = self.pos;
+            let out = self.decode_pass(ids, &[(lane, t, p0)])?;
             self.tokens.extend_from_slice(ids);
             self.pos += t;
             if mtp && t > 1 {
-                self.mtp_core(&ids[1..], Hidden::Target(0), p0, false)?;
+                self.mtp_core(&[MtpRows { lane, ids: &ids[1..], hidden: Hidden::Target(0), pos0: p0 }], false)?;
             }
             return Ok(out);
         }
@@ -1538,23 +1768,28 @@ impl Engine {
         while c0 < t {
             let n = self.opt.chunk.min(t - c0);
             let part = &ids[c0..c0 + n];
-            self.stage(part, self.pos, false)?;
+            self.stage(part, &[(lane, n, self.pos)], false)?;
             self.layers(n, true)?;
             self.last_rows = n;
-            if c0 + n == t && t <= HEAD_ROWS {
-                self.head_dev(np(&self.act.hn), n)?;
+            if next.is_some() {
+                // a part: its rows' cache only
+            } else if c0 + n == t && t <= HEAD_ROWS {
+                self.head_dev(np(&self.act.hn), n, false)?;
                 out = self.read_tokens(n)?;
             } else if c0 + n == t {
-                self.head_dev(at(&self.act.hn, (n - 1) * h), 1)?;
+                self.head_dev(at(&self.act.hn, (n - 1) * h), 1, false)?;
                 out = self.read_tokens(1)?;
             }
             let p0 = self.pos;
             self.tokens.extend_from_slice(part);
             self.pos += n;
             if mtp {
-                let next = &ids[c0 + 1..(c0 + n + 1).min(t)];
-                if !next.is_empty() {
-                    self.mtp_core(next, Hidden::Target(0), p0, false)?;
+                let mut fill = ids[c0 + 1..(c0 + n + 1).min(t)].to_vec();
+                if c0 + n == t {
+                    fill.extend(next);
+                }
+                if !fill.is_empty() {
+                    self.mtp_core(&[MtpRows { lane, ids: &fill, hidden: Hidden::Target(0), pos0: p0 }], false)?;
                 }
             }
             c0 += n;
@@ -1563,41 +1798,142 @@ impl Engine {
         Ok(out)
     }
 
-    /// The MTP layer over `ids` at positions pos0.. with the previous hidden from `h`: each
-    /// row's argmax with `logits`, else only its cache rows.
-    pub fn mtp(&mut self, ids: &[u32], h: Hidden, pos0: usize, logits: bool) -> Result<Option<Vec<u32>>> {
+    /// One decode-path pass over `ids`, the groups' rows in order (each (lane, rows, first
+    /// position)): every row's argmax, the next hot reads planned. Lanes are not advanced.
+    fn decode_pass(&mut self, ids: &[u32], groups: &[(usize, usize, usize)]) -> Result<Vec<u32>> {
+        let t = ids.len();
+        let nl = groups.len();
+        self.stage(ids, groups, false)?;
+        if t <= MAX_ROWS && self.graphs {
+            if self.hot.as_ref().is_some_and(|h| h.asynch.is_none()) {
+                self.hot_begin();
+                let n = self.moe_layers.len();
+                for seg in 0..=n {
+                    self.replay(GraphKey::Segment { t, nl, seg, sampled: self.sampled }, |e| e.decode_segment(seg, t))?;
+                    if seg < n {
+                        self.hot_point(self.moe_layers[seg], t, seg, n)?;
+                    }
+                }
+                self.hot_release()?;
+            } else {
+                let nseg = self.moe_layers.len() + 1;
+                self.replay(GraphKey::Target { t, nl, sampled: self.sampled },
+                            |e| (0..nseg).try_for_each(|seg| e.decode_segment(seg, t)))?;
+            }
+        } else {
+            self.layers(t, false)?;
+            self.head_dev(np(&self.act.hn), t, false)?;
+            self.hot_table_copy()?;
+        }
+        self.last_rows = t;
+        let out = self.read_tokens(t)?;
+        if t <= MAX_ROWS {
+            self.hot_plan(t)?; // wider passes leave no candidates (moe_exact)
+        }
+        Ok(out)
+    }
+
+    /// One decode pass over several lanes' rows (`blocks`: each lane's ids at its end, distinct
+    /// lanes, at most HEAD_ROWS rows in all): each block's rows' argmaxes, in order (candidates and
+    /// hidden rows as the blocks lie in the pass). The lanes advance by their rows.
+    pub fn forward_lanes(&mut self, blocks: &[(usize, &[u32])]) -> Result<Vec<Vec<u32>>> {
         self.mirror(|m| {
-            let (kind, from) = match h {
-                Hidden::Last => (0, 0),
-                Hidden::Mtp => (1, 0),
-                Hidden::Target(f) => (2, f as u32),
-            };
-            m.u32(OP_MTP).u32(kind).u32(from).u32(pos0 as u32).u32(logits as u32).u32s(ids);
+            m.u32(OP_FORWARD_LANES).u32(blocks.len() as u32);
+            for (l, ids) in blocks {
+                m.u32(*l as u32).u32s(ids);
+            }
         })?;
-        let r = self.mtp_core(ids, h, pos0, logits)?;
+        self.forward_lanes_local(blocks)
+    }
+
+    fn forward_lanes_local(&mut self, blocks: &[(usize, &[u32])]) -> Result<Vec<Vec<u32>>> {
+        let t: usize = blocks.iter().map(|b| b.1.len()).sum();
+        let mut seen = [false; MAX_LANES];
+        for &(l, ids) in blocks {
+            if l >= self.seqs.len() || seen[l] || ids.is_empty() {
+                return Err(format!("forward_lanes: lane {l} (of {}) twice, out of range or empty", self.seqs.len()).into());
+            }
+            seen[l] = true;
+        }
+        if blocks.is_empty() || t > HEAD_ROWS {
+            return Err(format!("forward_lanes: {} lanes, {t} rows", blocks.len()).into());
+        }
+        let mut groups = vec![];
+        for &(l, ids) in blocks {
+            let p = self.lane_pos(l);
+            if p + ids.len() > self.opt.max_seq {
+                return Err(format!("lane {l}: context {} exceeds max_seq {}", p + ids.len(), self.opt.max_seq).into());
+            }
+            self.kv_ensure(l, p + ids.len())?;
+            groups.push((l, ids.len(), p));
+        }
+        self.hot_install()?;
+        let ids: Vec<u32> = blocks.iter().flat_map(|b| b.1.iter().copied()).collect();
+        let out = self.decode_pass(&ids, &groups)?;
+        let sel = self.lane;
+        let (mut res, mut r0) = (vec![], 0);
+        for &(l, ids) in blocks {
+            self.select(l)?;
+            self.tokens.extend_from_slice(ids);
+            self.pos += ids.len();
+            res.push(out[r0..r0 + ids.len()].to_vec());
+            r0 += ids.len();
+        }
+        self.select(sel)?;
+        Ok(res)
+    }
+
+    /// The MTP layer over `ids` at the selected lane's positions pos0.. with the previous hidden
+    /// from `h`: each row's argmax with `logits`, else only its cache rows.
+    pub fn mtp(&mut self, ids: &[u32], h: Hidden, pos0: usize, logits: bool) -> Result<Option<Vec<u32>>> {
+        let lane = self.lane;
+        self.mtp_lanes(&[MtpRows { lane, ids, hidden: h, pos0 }], logits)
+    }
+
+    /// The MTP layer over several lanes' rows in one pass (`groups` in order, distinct lanes):
+    /// every row's argmax with `logits` (candidates as the rows lie), else only their cache rows.
+    pub fn mtp_lanes(&mut self, groups: &[MtpRows], logits: bool) -> Result<Option<Vec<u32>>> {
+        self.mirror(|m| {
+            m.u32(OP_MTP).u32(logits as u32).u32(groups.len() as u32);
+            for g in groups {
+                let (kind, from) = match g.hidden {
+                    Hidden::Last => (0, 0),
+                    Hidden::Mtp(f) => (1, f as u32),
+                    Hidden::Target(f) => (2, f as u32),
+                };
+                m.u32(g.lane as u32).u32(kind).u32(from).u32(g.pos0 as u32).u32s(g.ids);
+            }
+        })?;
+        let r = self.mtp_core(groups, logits)?;
         if !logits {
             self.st.synchronize()?;
         }
         Ok(r)
     }
 
-    /// Keep row `row` of the last forward's post-norm hidden as the next MTP call's input.
+    /// Keep row `row` of the last forward's post-norm hidden as the selected lane's next MTP input.
     pub fn keep_hidden(&mut self, row: usize) -> Result<()> {
+        let lane = self.lane;
         self.mirror(|m| {
-            m.u32(OP_KEEP_HIDDEN).u32(row as u32);
+            m.u32(OP_KEEP_HIDDEN).u32(lane as u32).u32(row as u32);
         })?;
+        self.keep_hidden_local(lane, row)
+    }
+
+    fn keep_hidden_local(&mut self, lane: usize, row: usize) -> Result<()> {
         let h = self.cfg.hidden;
-        self.act.hlast.copy_from(0, &self.act.hn, row * h, h, &self.st)?;
+        self.act.hlast.copy_from(lane * h, &self.act.hn, row * h, h, &self.st)?;
         Ok(())
     }
 
-    /// Truncate the sequence to `n` positions (rejected drafts; a new prompt's reuse).
+    /// Truncate the selected lane's sequence to `n` positions (rejected drafts; a new prompt's reuse).
     pub fn set_pos(&mut self, n: usize) -> Result<()> {
+        let lane = self.lane;
         self.mirror(|m| {
-            m.u32(OP_SET_POS).u32(n as u32);
+            m.u32(OP_SET_POS).u32(lane as u32).u32(n as u32);
         })?;
         if n > self.pos {
-            return Err(format!("set_pos {n} past the sequence's {}", self.pos).into());
+            return Err(format!("set_pos {n} past lane {lane}'s {}", self.pos).into());
         }
         self.pos = n;
         self.tokens.truncate(n);
@@ -1628,34 +1964,61 @@ impl Engine {
             let mut r = tidelm_comm::Reader::new(&msg);
             match r.u32()? {
                 OP_FORWARD => {
+                    self.select(r.u32()? as usize)?;
                     let fill = r.u32()? != 0;
                     let ids = r.u32s()?;
-                    self.forward_local(&ids, fill)?;
+                    self.forward_local(&ids, fill, None)?;
+                }
+                OP_FORWARD_PART => {
+                    self.select(r.u32()? as usize)?;
+                    let (fill, next) = (r.u32()? != 0, r.u32()?);
+                    let ids = r.u32s()?;
+                    self.forward_local(&ids, fill, Some(next))?;
+                }
+                OP_FORWARD_LANES => {
+                    let n = r.u32()? as usize;
+                    let mut blocks = vec![];
+                    for _ in 0..n {
+                        let l = r.u32()? as usize;
+                        blocks.push((l, r.u32s()?));
+                    }
+                    let b: Vec<(usize, &[u32])> = blocks.iter().map(|(l, v)| (*l, v.as_slice())).collect();
+                    self.forward_lanes_local(&b)?;
                 }
                 OP_MTP => {
-                    let (kind, from, pos0, logits) = (r.u32()?, r.u32()? as usize, r.u32()? as usize, r.u32()? != 0);
-                    let ids = r.u32s()?;
-                    let h = match kind {
-                        0 => Hidden::Last,
-                        1 => Hidden::Mtp,
-                        _ => Hidden::Target(from),
-                    };
-                    self.mtp_core(&ids, h, pos0, logits)?;
+                    let (logits, n) = (r.u32()? != 0, r.u32()? as usize);
+                    let mut raw = vec![];
+                    for _ in 0..n {
+                        let (lane, kind, from, pos0) = (r.u32()? as usize, r.u32()?, r.u32()? as usize, r.u32()? as usize);
+                        let h = match kind {
+                            0 => Hidden::Last,
+                            1 => Hidden::Mtp(from),
+                            _ => Hidden::Target(from),
+                        };
+                        raw.push((lane, h, pos0, r.u32s()?));
+                    }
+                    let groups: Vec<MtpRows> = raw.iter().map(|(lane, h, pos0, ids)| MtpRows { lane: *lane, ids, hidden: *h, pos0: *pos0 })
+                        .collect();
+                    self.mtp_core(&groups, logits)?;
                     self.st.synchronize()?;
                 }
                 OP_KEEP_HIDDEN => {
-                    let row = r.u32()? as usize;
-                    let h = self.cfg.hidden;
-                    self.act.hlast.copy_from(0, &self.act.hn, row * h, h, &self.st)?;
+                    let (lane, row) = (r.u32()? as usize, r.u32()? as usize);
+                    self.keep_hidden_local(lane, row)?;
                 }
                 OP_SET_POS => {
+                    self.select(r.u32()? as usize)?;
                     let n = r.u32()? as usize;
                     self.pos = n.min(self.pos);
                     self.tokens.truncate(self.pos);
                 }
+                OP_KV_SHRINK => {
+                    let (lane, n) = (r.u32()? as usize, r.u32()? as usize);
+                    self.kv_shrink_local(lane, n)?;
+                }
                 OP_SAMPLING => {
-                    let (bits, on) = (r.u32()?, r.u32()? != 0);
-                    self.sampling_local(if on { Some(f32::from_bits(bits)) } else { None })?;
+                    let (lane, bits, on) = (r.u32()? as usize, r.u32()?, r.u32()? != 0);
+                    self.sampling_local(lane, if on { Some(f32::from_bits(bits)) } else { None });
                 }
                 OP_FULL_ROW => {
                     let row = r.u32()? as usize;

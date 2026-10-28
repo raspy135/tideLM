@@ -350,8 +350,8 @@ pub(crate) const OP_DISK_SAVE: u32 = 30;
 pub(crate) const OP_DISK_LOAD: u32 = 31;
 
 impl Engine {
-    /// This rank's device row ranges holding positions [start, end): (address, bytes) per
-    /// cache tensor of every layer.
+    /// This rank's device row ranges holding the selected lane's positions [start, end):
+    /// (address, bytes) per cache tensor of every layer.
     pub(crate) fn seg_ranges(&self, start: usize, end: usize) -> Vec<(*mut u8, usize)> {
         let (rank, world) = (self.rank, self.world);
         let mut out = vec![];
@@ -368,15 +368,8 @@ impl Engine {
             if r1 <= r0 {
                 continue;
             }
-            let mut push = |base: *mut c_void, row: usize| {
+            for (base, row) in kv.lane_bases(self.lane).into_iter().zip(crate::forward::KV_ROW_BYTES) {
                 out.push((unsafe { (base as *mut u8).add(r0 * row) }, (r1 - r0) * row));
-            };
-            push(kv.cq.raw(), 512);
-            push(kv.cs.raw(), 16);
-            push(kv.cr.raw(), 128);
-            if let (Some(iq), Some(is)) = (&kv.iq, &kv.is) {
-                push(iq.raw(), 128);
-                push(is.raw(), 4);
             }
         }
         out
@@ -506,13 +499,14 @@ impl Engine {
         Ok(ok && r.first() == Some(&1))
     }
 
-    /// Save positions [start, end) as segment `id` on both ranks (after dropping `evict`'s
-    /// files): true when both wrote it.
+    /// Save the selected lane's positions [start, end) as segment `id` on both ranks (after
+    /// dropping `evict`'s files): true when both wrote it.
     pub fn disk_save(&mut self, dir_id: u64, start: usize, end: usize, hash: &str, evict: &[u64]) -> Result<bool> {
         let ev: Vec<u32> = evict.iter().map(|&x| x as u32).collect();
         let h = hash.to_string();
+        let lane = self.lane;
         self.mirror_msg(|m| {
-            m.u32(OP_DISK_SAVE).u64(dir_id).u32(start as u32).u32(end as u32).u32s(&ev);
+            m.u32(OP_DISK_SAVE).u32(lane as u32).u64(dir_id).u32(start as u32).u32(end as u32).u32s(&ev);
             m.u32s(&h.bytes().map(|b| b as u32).collect::<Vec<_>>());
         })?;
         self.disk_save_local(dir_id, start, end, hash, evict)
@@ -535,13 +529,15 @@ impl Engine {
         self.pair_status(ok)
     }
 
-    /// Restore a chain of segments [(id, start, end, hash)] on both ranks: true when both read
-    /// every row (the sequence then holds `tokens` up to the chain's end).
+    /// Restore a chain of segments [(id, start, end, hash)] into the selected lane on both
+    /// ranks: true when both read every row (the lane then holds `tokens` up to the chain's end).
+    /// The caller checks the pool can back n positions (kv_room).
     pub fn disk_load(&mut self, chain: &[(u64, usize, usize, String)], tokens: &[u32], n: usize) -> Result<bool> {
         let flat: Vec<u32> = chain.iter().flat_map(|(id, s, e, _)| [*id as u32, (*id >> 32) as u32, *s as u32, *e as u32]).collect();
         let hashes: String = chain.iter().map(|c| c.3.clone()).collect::<Vec<_>>().join(",");
+        let lane = self.lane;
         self.mirror_msg(|m| {
-            m.u32(OP_DISK_LOAD).u32(n as u32).u32s(&flat).u32s(&hashes.bytes().map(|b| b as u32).collect::<Vec<_>>());
+            m.u32(OP_DISK_LOAD).u32(lane as u32).u32(n as u32).u32s(&flat).u32s(&hashes.bytes().map(|b| b as u32).collect::<Vec<_>>());
         })?;
         let ok = self.disk_load_local(chain, n)?;
         if ok {
@@ -552,6 +548,7 @@ impl Engine {
 
     fn disk_load_local(&mut self, chain: &[(u64, usize, usize, String)], n: usize) -> Result<bool> {
         let store_dir = self.prefix_dir.clone().ok_or("no prefix store")?;
+        self.kv_ensure(self.lane, n)?;
         let mut ok = true;
         for (id, s, e, h) in chain {
             match self.seg_read(&store_dir.join(format!("{id}.seg")), *s, *e, h) {
@@ -575,6 +572,7 @@ impl Engine {
     }
 
     pub(crate) fn follow_disk(&mut self, op: u32, r: &mut tidelm_comm::Reader) -> Result<()> {
+        self.select(r.u32()? as usize)?;
         if op == OP_DISK_SAVE {
             let id = r.u64()?;
             let (s, e) = (r.u32()? as usize, r.u32()? as usize);
