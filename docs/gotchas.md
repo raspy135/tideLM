@@ -4836,7 +4836,8 @@ activations are kilobytes against gigabytes of weights; they would change the nu
 ## DS decode launches: programmatic dependent launch, 1.2-2.1 ms off a step (2026-10-28)
 
 A 4-row DS step on the pair issues ~2,013 kernels (nsys, rank 0). The gaps between them are short
-(median 0.51 us, 1.11 ms a step in all, plus 11 host waits of 3 us or more, 1.66 ms), but 703 of
+(median 0.51 us, 1.11 ms a step in all, plus 11 waits of 3 us or more on the host, 1.66 ms, most of
+them the generate tool's own: see below), but 703 of
 the kernels last under 2 us and do almost no work: what a third of the launches costs is mostly
 their own ramp and drain, ~1 ms a step, not the gaps. Merging kernels removes that one site at a
 time (the mHC chain's six kernels, unshard into the gather's copy-out, norm with rope, the router
@@ -4880,5 +4881,16 @@ image load, emitted far fewer tokens a step (code 2.05-2.64 against 3.20-3.93 in
 at an ordinary step time, and measured 29.72 / 39.02 tok/s; its cause is not found, so a benchmark
 does not take the first boot after an image load.
 
-Left: the 11 host waits (1.66 ms a step); merging kernels now saves only their remaining ~0.3 us a
-boundary on top of this.
+Merging kernels now saves only their remaining ~0.3 us a boundary on top of this.
+
+**The host waits are not worth chasing in serving (measured, not pursued).** The 1.66 ms above came
+from `tidelm-generate`, which reads every row's full logits back (1 MB a step) and hashes them on the
+host. The server samples on the GPU. Profiled in the server itself (nsys inside the rank-0 container,
+a 12 s window of a 2,048-token prose request at temperature 0.6; traced per graph, since per-node
+tracing makes a launch ~0.8 us a node slower and inflates every boundary): the GPU waits 0.75 ms of a
+61.6 ms step, 1.2%. The verify's second segment waits on the Engram row gather (48 rows, ~1.9 ms on
+the host against the first segment's 1.65 ms) and its launch, 0.35 ms; the verify and draft graph
+launches 0.13 ms; ~25 small input uploads a step, each its own copy, 0.08 ms; read-back
+turnarounds 0.10 ms. Recovering the Engram wait (segment 2 queued behind a `wait_flag_kernel` gate
+the host releases) would change both ranks' step structure for ~0.3 ms, ~0.5%: inside boot noise in
+tok/s, not built.
