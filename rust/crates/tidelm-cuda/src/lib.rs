@@ -240,10 +240,15 @@ impl<T: Copy> DeviceBuffer<T> {
         Ok(DeviceBuffer { ptr, len, _marker: PhantomData })
     }
 
+    /// Zeroed when it returns: cudaMemset on device memory is asynchronous, queued on the legacy
+    /// stream, which the engine's non-blocking streams do not wait for - a kernel launched
+    /// next could write before the memset and have it wiped (the GLM split-KV MLA test failed
+    /// so, at a different error each run).
     #[track_caller]
     pub fn zeroed(len: usize) -> Result<Self> {
         let buf = Self::new(len)?;
         check(unsafe { ffi::cudaMemset(buf.ptr, 0, len * size_of::<T>()) }, "cudaMemset")?;
+        check(unsafe { ffi::cudaStreamSynchronize(std::ptr::null_mut()) }, "cudaMemset sync")?;
         Ok(buf)
     }
 

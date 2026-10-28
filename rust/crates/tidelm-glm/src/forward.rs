@@ -655,7 +655,8 @@ impl Engine {
                 let ix_q = np(kv.iq.as_ref().unwrap());
                 let ix_s = np(kv.is.as_ref().unwrap());
                 ck(unsafe { glm_index_scores(st, np(&a.qi), np(&a.iw), wscale, ix_q, ix_s, posb, t as i32, lim as i32,
-                                             self.world as i32, self.rank as i32, 0, inv_d, np(&a.scores), lim as i64) },
+                                             self.world as i32, self.rank as i32, 0, inv_d, np(&a.scores), lim as i64,
+                                             std::ptr::null(), 0) },
                    "index scores")?;
                 let vals = at(&a.qsend, hl * 576 * 2);
                 ck(unsafe { glm_topk(st, np(&a.scores), lim as i64, posb, self.world as i32, self.rank as i32, lim as i32,
@@ -671,7 +672,8 @@ impl Engine {
             let (ns, chunk) = decode_split(TOPK, hh, t);
             ck(unsafe { glm_mla(st, 2, np(&a.gs), (nbytes / 2) as i64, (self.qrow / 2) as i64, 576, hl as i32, np(&kv.cq), np(&kv.cs),
                                 np(&kv.cr), 0, np(&a.idx), TOPK as i64, TOPK as i32, 0, bound, t as i32, hh as i32, scale,
-                                ns as i32, chunk as i32, np(&a.pm), np(&a.pl), np(&a.pacc), std::ptr::null_mut(), 0, 0) },
+                                ns as i32, chunk as i32, np(&a.pm), np(&a.pl), np(&a.pacc), std::ptr::null_mut(), 0, 0,
+                                std::ptr::null()) },
                "mla (split)")?;
             ck(unsafe { glm_mla_combine(st, np(&a.pm), np(&a.pl), np(&a.pacc), t as i32, hh as i32, ns as i32,
                                         std::ptr::null_mut(), 0, 0, np(&a.own_o), np(&a.own_l), np(&a.send2), self.row2 as i64,
@@ -688,14 +690,14 @@ impl Engine {
                 let ix_s = np(kv.is.as_ref().unwrap());
                 let lim = self.opt.max_seq;
                 ck(unsafe { glm_index_scores(st, np(&a.qi), np(&a.iw), wscale, ix_q, ix_s, posb, t as i32, lim as i32, 1, 0, 0,
-                                             inv_d, np(&a.scores), lim as i64) }, "index scores")?;
+                                             inv_d, np(&a.scores), lim as i64, std::ptr::null(), 0) }, "index scores")?;
                 ck(unsafe { glm_topk(st, np(&a.scores), lim as i64, posb, 1, 0, lim as i32, TOPK as i32, t as i32, np(&a.idx),
                                      TOPK as i64, std::ptr::null_mut(), 0) }, "topk")?;
             }
             let (ns, chunk) = decode_split(TOPK, hl, t);
             ck(unsafe { glm_mla(st, 2, qbase, 0, qrow as i64, 576, hl as i32, np(&kv.cq), np(&kv.cs), np(&kv.cr), 0,
                                 np(&a.idx), TOPK as i64, TOPK as i32, 1, bound, t as i32, hl as i32, scale, ns as i32, chunk as i32,
-                                np(&a.pm), np(&a.pl), np(&a.pacc), std::ptr::null_mut(), 0, 0) }, "mla")?;
+                                np(&a.pm), np(&a.pl), np(&a.pacc), std::ptr::null_mut(), 0, 0, std::ptr::null()) }, "mla")?;
             ck(unsafe { glm_mla_combine(st, np(&a.pm), np(&a.pl), np(&a.pacc), t as i32, hl as i32, ns as i32, np(&a.olat),
                                         (hl * 512) as i64, 512, std::ptr::null_mut(), std::ptr::null_mut(),
                                         std::ptr::null_mut(), 0, 0, 0) }, "mla combine")?;
@@ -725,7 +727,7 @@ impl Engine {
                     let pr = unsafe { (posb as *mut i32).add(r0) } as *mut c_void;
                     ck(unsafe { glm_index_scores(st, at(&a.qi, r0 * 4096), at(&a.iw, r0 * 32), wscale, iq, is, pr,
                                                  n as i32, s_all as i32, 1, 0, split_n as i32, inv_d, np(&a.scores),
-                                                 s_all as i64) }, "index scores (prefill)")?;
+                                                 s_all as i64, std::ptr::null(), 0) }, "index scores (prefill)")?;
                     ck(unsafe { glm_topk(st, np(&a.scores), s_all as i64, pr, 1, 0, s_all as i32, TOPK as i32,
                                          n as i32, at(&a.idx, r0 * TOPK), TOPK as i64, std::ptr::null_mut(), 0) }, "topk (prefill)")?;
                     r0 += n;
@@ -736,7 +738,8 @@ impl Engine {
             let chunk = k.div_ceil(32) * 32;
             ck(unsafe { glm_mla(st, 2, qbase, 0, qrow as i64, 576, hl as i32, cq, cs, cr, split_n as i32, idx, TOPK as i64,
                                 k as i32, 1, posp, t as i32, hl as i32, scale, 1, chunk as i32, std::ptr::null_mut(),
-                                std::ptr::null_mut(), std::ptr::null_mut(), np(&a.olat), (hl * 512) as i64, 512) }, "mla (prefill)")?;
+                                std::ptr::null_mut(), std::ptr::null_mut(), np(&a.olat), (hl * 512) as i64, 512,
+                                std::ptr::null()) }, "mla (prefill)")?;
         }
         // the latent output through kv_b's value half, o_proj (this rank's head columns), summed
         if decode {
@@ -958,11 +961,11 @@ impl Engine {
         let a = &self.act;
         if mtp {
             ck(unsafe { glm_positions(self.st.raw(), np(&a.mpos0), t as i32, 0, 1, 0, np(&a.mpos), std::ptr::null_mut(),
-                                      std::ptr::null_mut()) }, "mtp positions")
+                                      std::ptr::null_mut(), std::ptr::null(), 0, std::ptr::null_mut()) }, "mtp positions")
         } else {
             ck(unsafe { glm_positions(self.st.raw(), np(&a.pos0), t as i32, self.rank as i32,
                                       if self.opt.kv_split { self.world as i32 } else { 1 }, self.s_loc as i32, np(&a.pos),
-                                      np(&a.rows), np(&a.bound)) }, "positions")
+                                      np(&a.rows), np(&a.bound), std::ptr::null(), 0, std::ptr::null_mut()) }, "positions")
         }
     }
 

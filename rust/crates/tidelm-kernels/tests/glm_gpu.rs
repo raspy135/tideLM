@@ -445,7 +445,7 @@ fn index_scores_and_topk_match_the_reference() {
     let d_out = DeviceBuffer::<f32>::zeroed(t * ld).unwrap();
     let wscale = 32f32.powf(-0.5);
     let inv_d = 128f32.powf(-0.5);
-    ok(unsafe { glm_index_scores(st.raw(), p(&d_q), p(&d_w), wscale, p(&d_kq), p(&d_ks), p(&d_pos), t as i32, rows as i32, stride, off, 0, inv_d, p(&d_out), ld as i64) });
+    ok(unsafe { glm_index_scores(st.raw(), p(&d_q), p(&d_w), wscale, p(&d_kq), p(&d_ks), p(&d_pos), t as i32, rows as i32, stride, off, 0, inv_d, p(&d_out), ld as i64, null(), 0) });
     let got = d_out.download().unwrap();
     let mut want = vec![vec![]; t];
     for r in 0..t {
@@ -595,7 +595,7 @@ fn mla_attention_direct_split_and_cross_rank_merge() {
         ok(unsafe {
             glm_mla(st.raw(), mt, p(&d_q), 0, (hh * 576) as i64, 576, hh as i32, p(&d_cq), p(&d_cs), p(&d_cr), 0, p(&d_idx),
                     kk as i64, kk as i32, 0, p(&d_b), t as i32, hh as i32, scale as f32, 1, 320, null(), null(), null(), p(&d_o),
-                    (hh * 512) as i64, 512)
+                    (hh * 512) as i64, 512, null())
         });
         last_ok();
         let o: Vec<f32> = d_o.download().unwrap().iter().map(|&v| f32_from_bf16(v)).collect();
@@ -611,7 +611,8 @@ fn mla_attention_direct_split_and_cross_rank_merge() {
     let d_pa = DeviceBuffer::<f32>::zeroed(t * hh * ns * 512).unwrap();
     ok(unsafe {
         glm_mla(st.raw(), 2, p(&d_q), 0, (hh * 576) as i64, 576, hh as i32, p(&d_cq), p(&d_cs), p(&d_cr), 0, p(&d_idx), kk as i64,
-                kk as i32, 0, p(&d_b), t as i32, hh as i32, scale as f32, ns as i32, chunk, p(&d_pm), p(&d_pl), p(&d_pa), null(), 0, 0)
+                kk as i32, 0, p(&d_b), t as i32, hh as i32, scale as f32, ns as i32, chunk, p(&d_pm), p(&d_pl), p(&d_pa), null(), 0, 0,
+                null())
     });
     let d_o = DeviceBuffer::<u16>::zeroed(t * hh * 512).unwrap();
     ok(unsafe { glm_mla_combine(st.raw(), p(&d_pm), p(&d_pl), p(&d_pa), t as i32, hh as i32, ns as i32, p(&d_o), (hh * 512) as i64, 512, null(), null(), null(), 0, 0, 0) });
@@ -633,7 +634,7 @@ fn mla_attention_direct_split_and_cross_rank_merge() {
         ok(unsafe {
             glm_mla(st.raw(), 2, p(&d_q), 0, (hh * 576) as i64, 576, hh as i32, p(&d_cq), p(&d_cs), p(&d_cr), 0, p(&d_i),
                     kk as i64, kk as i32, 0, p(&d_b), t as i32, hh as i32, scale as f32, ns as i32, chunk, p(&d_pm), p(&d_pl),
-                    p(&d_pa), null(), 0, 0)
+                    p(&d_pa), null(), 0, 0, null())
         });
         let d_oo = DeviceBuffer::<f32>::zeroed(t * hl * 512).unwrap();
         let d_ol = DeviceBuffer::<f32>::zeroed(t * hl).unwrap();
@@ -663,7 +664,8 @@ fn mla_attention_direct_split_and_cross_rank_merge() {
     let d_b2 = dev(&bound2);
     ok(unsafe {
         glm_mla(st.raw(), 2, p(&d_q), 0, (hh * 576) as i64, 576, hh as i32, p(&d_cq), p(&d_cs), p(&d_cr), 0, null(), 0, 4096, 1,
-                p(&d_b2), t as i32, hh as i32, scale as f32, 1, 4096, null(), null(), null(), p(&d_o), (hh * 512) as i64, 512)
+                p(&d_b2), t as i32, hh as i32, scale as f32, 1, 4096, null(), null(), null(), p(&d_o), (hh * 512) as i64, 512,
+                null())
     });
     last_ok();
     let o: Vec<f32> = d_o.download().unwrap().iter().map(|&v| f32_from_bf16(v)).collect();
@@ -674,6 +676,147 @@ fn mla_attention_direct_split_and_cross_rank_merge() {
     let e = rel_err(&o, &w);
     eprintln!("mla dense causal: rel {e:.2e}");
     assert!(e < 1e-2, "dense causal {e}");
+}
+
+// ------------------------------------------------------------------ lanes
+fn off_by<T: Copy>(b: &DeviceBuffer<T>, n: usize) -> *mut c_void {
+    unsafe { (p(b) as *mut T).add(n) as *mut c_void }
+}
+
+// Two sequences in one pass, each in its own rows of one cache buffer (lane 1's koff rows on):
+// positions, index scores and MLA give each lane's rows bit for bit what a pass of that lane
+// alone gives over its own rows (the single-lane path, lanes null).
+#[test]
+fn two_lanes_in_one_pass_match_each_lane_alone() {
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(11);
+    let (world, rank) = (2i32, 1i32);
+    let slot = 1100usize; // a lane's cache rows: s_loc of its own and the spare
+    let s_loc = slot - 1;
+    let rows = 2 * slot;
+    // lane 0: 3 rows from position 1500, lane 1: 2 rows from 731
+    let (n0, n1, p0, p1) = (3usize, 2usize, 1500i32, 731i32);
+    let t = n0 + n1;
+    let lanes = [0i32, n0 as i32, p0, 0, n0 as i32, n1 as i32, p1, slot as i32];
+    let d_lanes = dev(&lanes);
+    let d_pos = DeviceBuffer::<i32>::zeroed(t).unwrap();
+    let d_rows = DeviceBuffer::<i32>::zeroed(t).unwrap();
+    let d_bound = DeviceBuffer::<i32>::zeroed(t).unwrap();
+    let d_koff = DeviceBuffer::<i32>::zeroed(t).unwrap();
+    ok(unsafe {
+        glm_positions(st.raw(), null(), t as i32, rank, world, s_loc as i32, p(&d_pos), p(&d_rows), p(&d_bound), p(&d_lanes), 2,
+                      p(&d_koff))
+    });
+    let (pos, rws, bound, koff) =
+        (d_pos.download().unwrap(), d_rows.download().unwrap(), d_bound.download().unwrap(), d_koff.download().unwrap());
+    for r in 0..t {
+        let (p, o) = if r < n0 { (p0 + r as i32, 0) } else { (p1 + (r - n0) as i32, slot as i32) };
+        assert_eq!(pos[r], p, "pos {r}");
+        assert_eq!(koff[r], o, "koff {r}");
+        assert_eq!(rws[r], o + if p % world == rank { p / world } else { s_loc as i32 }, "rows {r}");
+        assert_eq!(bound[r], (p - rank) / world, "bound {r}");
+    }
+    // ... and one lane alone, from its device pos0, as today
+    let d_p0 = dev(&[p1]);
+    let d_pos1 = DeviceBuffer::<i32>::zeroed(n1).unwrap();
+    let d_rows1 = DeviceBuffer::<i32>::zeroed(n1).unwrap();
+    let d_bound1 = DeviceBuffer::<i32>::zeroed(n1).unwrap();
+    ok(unsafe {
+        glm_positions(st.raw(), p(&d_p0), n1 as i32, rank, world, s_loc as i32, p(&d_pos1), p(&d_rows1), p(&d_bound1), null(), 0,
+                      null())
+    });
+    assert_eq!(d_pos1.download().unwrap(), &pos[n0..]);
+    assert_eq!(d_bound1.download().unwrap(), &bound[n0..]);
+    assert_eq!(d_rows1.download().unwrap().iter().map(|&r| r + slot as i32).collect::<Vec<_>>(), &rws[n0..]);
+
+    // index scores over the lane's own keys
+    let q = rng.bf16_vec(t * 32 * 128, 0.5);
+    let w: Vec<f32> = (0..t * 32).map(|_| rng.normal()).collect();
+    let mut kq = vec![0u8; rows * 128];
+    let mut ks = vec![0f32; rows];
+    for r in 0..rows {
+        let (row, s) = fp8_row(&mut rng, 128);
+        kq[r * 128..(r + 1) * 128].copy_from_slice(&row);
+        ks[r] = s;
+    }
+    let (d_q, d_w, d_kq, d_ks) = (dev(&q), dev(&w), dev(&kq), dev(&ks));
+    let (wscale, inv_d) = (32f32.powf(-0.5), 128f32.powf(-0.5));
+    let ld = s_loc;
+    let both = DeviceBuffer::<f32>::zeroed(t * ld).unwrap();
+    ok(unsafe {
+        glm_index_scores(st.raw(), p(&d_q), p(&d_w), wscale, p(&d_kq), p(&d_ks), p(&d_pos), t as i32, s_loc as i32, world, rank,
+                         0, inv_d, p(&both), ld as i64, p(&d_lanes), 2)
+    });
+    let both = both.download().unwrap();
+    for (r0, n, o) in [(0, n0, 0), (n0, n1, slot)] {
+        let one = DeviceBuffer::<f32>::zeroed(n * ld).unwrap();
+        ok(unsafe {
+            glm_index_scores(st.raw(), off_by(&d_q, r0 * 32 * 128), off_by(&d_w, r0 * 32), wscale, off_by(&d_kq, o * 128),
+                             off_by(&d_ks, o), off_by(&d_pos, r0), n as i32, s_loc as i32, world, rank, 0, inv_d, p(&one),
+                             ld as i64, null(), 0)
+        });
+        let one = one.download().unwrap();
+        assert!(one == both[r0 * ld..(r0 + n) * ld], "index scores, the lane from row {r0}");
+        assert!(one[..ld].iter().any(|&v| v > 0.0), "index scores: a row scored");
+    }
+
+    // MLA over each row's picks in its lane's rows, direct and split + combine
+    let mut cq = vec![0u8; rows * 512];
+    let mut cs = vec![0f32; rows * 4];
+    for r in 0..rows {
+        for b in 0..4 {
+            let (qq, sc) = fp8_row(&mut rng, 128);
+            cq[r * 512 + b * 128..r * 512 + (b + 1) * 128].copy_from_slice(&qq);
+            cs[r * 4 + b] = sc * 20.0;
+        }
+    }
+    let cr = rng.bf16_vec(rows * 64, 1.0);
+    let (hh, kk) = (64usize, 300usize);
+    let qa = rng.bf16_vec(t * hh * 576, 0.3);
+    let mut idx = vec![0i32; t * kk];
+    for (i, v) in idx.iter_mut().enumerate() {
+        let b = bound[i / kk] as u64 + 1;
+        *v = if i % 37 == 0 { -1 } else { (rng.next() % b) as i32 };
+    }
+    let (d_qa, d_cq, d_cs, d_cr, d_idx) = (dev(&qa), dev(&cq), dev(&cs), dev(&cr), dev(&idx));
+    let scale = 1.0f32 / 16.0;
+    let ns = 4usize;
+    let run = |r0: usize, n: usize, o: usize, lanes: bool, split: bool| -> Vec<u16> {
+        let d_o = DeviceBuffer::<u16>::zeroed(n * hh * 512).unwrap();
+        let (kc, kv) = if lanes { (p(&d_koff), 0) } else { (null(), o) };
+        let (cq, cs, cr) = (off_by(&d_cq, kv * 512), off_by(&d_cs, kv * 4), off_by(&d_cr, kv * 64));
+        let (qp, ip, bp) = (off_by(&d_qa, r0 * hh * 576), off_by(&d_idx, r0 * kk), off_by(&d_bound, r0));
+        if split {
+            let d_pm = DeviceBuffer::<f32>::zeroed(n * hh * ns).unwrap();
+            let d_pl = DeviceBuffer::<f32>::zeroed(n * hh * ns).unwrap();
+            let d_pa = DeviceBuffer::<f32>::zeroed(n * hh * ns * 512).unwrap();
+            ok(unsafe {
+                glm_mla(st.raw(), 2, qp, 0, (hh * 576) as i64, 576, hh as i32, cq, cs, cr, 0, ip, kk as i64, kk as i32, 0, bp,
+                        n as i32, hh as i32, scale, ns as i32, 96, p(&d_pm), p(&d_pl), p(&d_pa), null(), 0, 0, kc)
+            });
+            ok(unsafe {
+                glm_mla_combine(st.raw(), p(&d_pm), p(&d_pl), p(&d_pa), n as i32, hh as i32, ns as i32, p(&d_o),
+                                (hh * 512) as i64, 512, null(), null(), null(), 0, 0, 0)
+            });
+        } else {
+            ok(unsafe {
+                glm_mla(st.raw(), 2, qp, 0, (hh * 576) as i64, 576, hh as i32, cq, cs, cr, 0, ip, kk as i64, kk as i32, 0, bp,
+                        n as i32, hh as i32, scale, 1, 320, null(), null(), null(), p(&d_o), (hh * 512) as i64, 512, kc)
+            });
+        }
+        last_ok();
+        d_o.download().unwrap()
+    };
+    for split in [false, true] {
+        let both = run(0, t, 0, true, split);
+        for (r0, n, o) in [(0, n0, 0), (n0, n1, slot)] {
+            let one = run(r0, n, o, false, split);
+            assert!(one == both[r0 * hh * 512..(r0 + n) * hh * 512], "mla (split {split}), the lane from row {r0}");
+        }
+        // lane 1's rows read its own cache rows, not lane 0's
+        let wrong = run(n0, n1, 0, false, split);
+        assert!(wrong != both[n0 * hh * 512..], "mla (split {split}): lane 1 read lane 0's rows");
+    }
 }
 
 // ------------------------------------------------------------------ absorb, router

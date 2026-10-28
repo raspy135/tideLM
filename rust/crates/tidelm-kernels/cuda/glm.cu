@@ -261,13 +261,35 @@ __global__ void rows_copy_kernel(const __nv_bfloat16* __restrict__ x, int64_t ld
 // scalar: a captured graph replays at any position), rows[t] the row position pos[t] takes in
 // this rank's cache (kv_split.owner_rows: p / world for its own positions, `spare` for the
 // other's), bound[t] the last row it may attend (kv_split.local_bound, floor division).
+// lanes (null: one sequence from pos0[0]): [L][4] (first row, rows, first position, cache-row
+// offset) - row t of lane z is its position pos0_z + t - row0_z, and its cache rows are the
+// lane's, koff_z on (rows[t] includes it, koff[t] reports it; bound[t] stays lane-local).
+constexpr int kMaxLanes = 4;
+
+__device__ __forceinline__ int lane_of(const int* lanes, int nl, int t) {
+    for (int z = 0; z < nl; ++z)
+        if (t >= lanes[4 * z] && t < lanes[4 * z] + lanes[4 * z + 1]) return z;
+    return -1;
+}
+
 __global__ void positions_kernel(const int* __restrict__ pos0, int T, int rank, int world, int spare,
-                                 int* __restrict__ pos, int* __restrict__ rows, int* __restrict__ bound) {
+                                 int* __restrict__ pos, int* __restrict__ rows, int* __restrict__ bound,
+                                 const int* __restrict__ lanes, int nl, int* __restrict__ koff) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= T) return;
-    const int p = pos0[0] + t;
+    int p = pos0 ? pos0[0] + t : 0, off = 0;
+    if (lanes) {
+        const int z = lane_of(lanes, nl, t);
+        if (z >= 0) {
+            p = lanes[4 * z + 2] + t - lanes[4 * z];
+            off = lanes[4 * z + 3];
+        } else {
+            p = 0;  // a row of no lane (padding): position 0 of lane 0's rows, never read
+        }
+    }
     pos[t] = p;
-    if (rows) rows[t] = world > 1 ? (p % world == rank ? p / world : spare) : p;
+    if (koff) koff[t] = off;
+    if (rows) rows[t] = off + (world > 1 ? (p % world == rank ? p / world : spare) : p);
     if (bound) {
         const int d = p - rank;
         bound[t] = world > 1 ? (d >= 0 ? d / world : -1) : p;
@@ -334,22 +356,30 @@ __global__ void index_key_kernel(const __nv_bfloat16* __restrict__ k, int64_t ld
 // FP8 to BF16 (exact). The C layout gives a thread heads g, g + 8, g + 16, g + 24 for two keys;
 // the head sum finishes over lanes 4, 8, 16 apart. split_n: the keys are a gather of both ranks'
 // first split_n rows (prefill on a split layer), key j at row (j % 2) * split_n + j / 2.
+// lanes (null: rows 0..T, one cache): the [L][4] table of positions_kernel, a grid layer a lane
+// (gridDim.z = L), so a block's rows, which share its key tiles, are one lane's: lane z's rows
+// row0_z.. score that lane's keys, its cache rows koff_z on.
 constexpr int kIH = 32, kID = 128, kIT = 64, kILD = kID + 8, kIRows = 8, kIKeys = 512;
 
 __global__ void __launch_bounds__(256) index_scores_kernel(
     const __nv_bfloat16* __restrict__ q, const float* __restrict__ w, float wscale, const uint8_t* __restrict__ kq,
     const float* __restrict__ ks, const int* __restrict__ pos, int T, int nmax, int stride, int off, int split_n,
-    float inv_d, float* __restrict__ out, int64_t ldo) {
+    float inv_d, float* __restrict__ out, int64_t ldo, const int* __restrict__ lanes) {
     __shared__ __align__(16) __nv_bfloat16 kt[kIT * kILD];
     __shared__ float kss[kIT];
     __shared__ int lim_s[kIRows];
     const int warp = threadIdx.x >> 5, l = threadIdx.x & 31, g = l >> 2, c = l & 3;
-    const int t0 = blockIdx.y * kIRows, t = t0 + warp;
+    const int z = blockIdx.z;
+    const int row0 = lanes ? lanes[4 * z] : 0, tend = lanes ? row0 + lanes[4 * z + 1] : T;
+    const int64_t koff = lanes ? lanes[4 * z + 3] : 0;
+    kq += koff * kID;
+    ks += koff;
+    const int t0 = row0 + blockIdx.y * kIRows, t = t0 + warp;
     const int jb = blockIdx.x * kIKeys;
     if (threadIdx.x < kIRows) {
         const int tt = t0 + threadIdx.x;
         int n = 0;
-        if (tt < T) {
+        if (tt < tend) {
             const int p = pos[tt];
             n = p >= off ? min(nmax, (p - off) / stride + 1) : 0;
         }
@@ -360,7 +390,7 @@ __global__ void __launch_bounds__(256) index_scores_kernel(
 #pragma unroll
     for (int r = 0; r < kIRows; ++r) max_lim = max(max_lim, lim_s[r]);
     if (jb >= max_lim) return;
-    const bool row = t < T;
+    const bool row = t < tend;
     const int lim = row ? lim_s[warp] : 0;
     uint32_t af[2][kID / 16][4];
     float wv[4] = {0.f, 0.f, 0.f, 0.f};
@@ -697,7 +727,8 @@ __global__ void kvb_dequant_kernel(const uint8_t* __restrict__ w, const float* _
 //   online softmax (m clamped to >= -1e30), l over fp32 p, acc += bf16(p) . c (fp32).
 // Out: bf16 acc / max(l, 1e-30) (out non-null, one split) or the split's raw (m, l, acc) partials
 // [T][H][NS] for mla_combine_kernel. q head h is at q + (h / hg) * q_ldg + t * q_ldt + (h % hg) * q_ldh
-// (a gathered [rank][row][head] query in place); split_n: a gathered pair's keys (key_row).
+// (a gathered [rank][row][head] query in place); split_n: a gathered pair's keys (key_row);
+// koff (null: 0): row t's keys are its lane's cache rows, koff[t] on (positions_kernel).
 constexpr int kMD = 576, kMLD = kMD + 8, kMNT = 32, kMPS = kMNT + 4;
 
 template <int MT>
@@ -711,7 +742,7 @@ __global__ void __launch_bounds__(256) mla_kernel(
     const uint8_t* __restrict__ cq, const float* __restrict__ cs, const __nv_bfloat16* __restrict__ cr, int split_n,
     const int* __restrict__ idx, int64_t ld_idx, int K, int ascending, const int* __restrict__ bound, int H, float scale,
     int chunk, float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,
-    __nv_bfloat16* __restrict__ out, int64_t o_ldt, int64_t o_ldh) {
+    __nv_bfloat16* __restrict__ out, int64_t o_ldt, int64_t o_ldh, const int* __restrict__ koff) {
     constexpr int HB = 16 * MT;
     extern __shared__ __align__(16) unsigned char mla_smem_raw[];
     __nv_bfloat16* Qs = reinterpret_cast<__nv_bfloat16*>(mla_smem_raw);   // [HB][kMLD]
@@ -722,6 +753,12 @@ __global__ void __launch_bounds__(256) mla_kernel(
     float* alpha = l_run + HB;
     int* valid = reinterpret_cast<int*>(alpha + HB);
     const int t = blockIdx.y, h0 = blockIdx.x * HB, sp = blockIdx.z, NS = gridDim.z;
+    if (koff) {
+        const int64_t o = koff[t];
+        cq += o * kLat;
+        cs += o * 4;
+        cr += o * 64;
+    }
     const int nh = min(HB, H - h0);
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, r = lane >> 2, qd = lane & 3;
     const int bnd = bound[t];
@@ -1386,10 +1423,13 @@ int glm_rows_copy(void* stream, const void* x, int64_t ldx, const void* rows, vo
     GRET;
 }
 
-int glm_positions(void* stream, const void* pos0, int T, int rank, int world, int spare, void* pos, void* rows, void* bound) {
+int glm_positions(void* stream, const void* pos0, int T, int rank, int world, int spare, void* pos, void* rows, void* bound,
+                  const void* lanes, int nl, void* koff) {
+    if (lanes && (nl < 1 || nl > kMaxLanes)) return (int)cudaErrorInvalidValue;
     positions_kernel<<<(T + 127) / 128, 128, 0, GST>>>(static_cast<const int*>(pos0), T, rank, world, spare,
                                                        static_cast<int*>(pos), static_cast<int*>(rows),
-                                                       static_cast<int*>(bound));
+                                                       static_cast<int*>(bound), static_cast<const int*>(lanes), nl,
+                                                       static_cast<int*>(koff));
     GRET;
 }
 
@@ -1405,12 +1445,13 @@ int glm_index_key(void* stream, const void* k, int64_t ldk, const void* w, const
 
 int glm_index_scores(void* stream, const void* q, const void* w, float wscale, const void* kq, const void* ks,
                      const void* pos, int T, int nmax, int stride, int off, int split_n, float inv_d, void* out,
-                     int64_t ldo) {
-    dim3 grid((unsigned)((nmax + kIKeys - 1) / kIKeys), (unsigned)((T + kIRows - 1) / kIRows));
+                     int64_t ldo, const void* lanes, int nl) {
+    if (lanes && (nl < 1 || nl > kMaxLanes || split_n)) return (int)cudaErrorInvalidValue;
+    dim3 grid((unsigned)((nmax + kIKeys - 1) / kIKeys), (unsigned)((T + kIRows - 1) / kIRows), lanes ? (unsigned)nl : 1u);
     index_scores_kernel<<<grid, 256, 0, GST>>>(static_cast<const __nv_bfloat16*>(q), static_cast<const float*>(w), wscale,
                                                static_cast<const uint8_t*>(kq), static_cast<const float*>(ks),
                                                static_cast<const int*>(pos), T, nmax, stride, off, split_n, inv_d,
-                                               static_cast<float*>(out), ldo);
+                                               static_cast<float*>(out), ldo, static_cast<const int*>(lanes));
     GRET;
 }
 
@@ -1464,8 +1505,9 @@ int glm_mla_smem(int mt) { return mt == 2 ? mla_smem<2>() : mla_smem<1>(); }
 int glm_mla(void* stream, int mt, const void* q, int64_t q_ldg, int64_t q_ldt, int64_t q_ldh, int hg, const void* cq,
             const void* cs, const void* cr, int split_n, const void* idx, int64_t ld_idx, int K, int ascending, const void* bound, int T,
             int H, float scale, int nsplit, int chunk, void* part_m, void* part_l, void* part_acc, void* out,
-            int64_t o_ldt, int64_t o_ldh) {
+            int64_t o_ldt, int64_t o_ldh, const void* koff) {
     if (mt != 1 && mt != 2) return (int)cudaErrorInvalidValue;
+    if (koff && split_n) return (int)cudaErrorInvalidValue;
     if (chunk % kMNT) return (int)cudaErrorInvalidValue;
     const int hb = 16 * mt;
     dim3 grid((unsigned)((H + hb - 1) / hb), (unsigned)T, (unsigned)nsplit);
@@ -1481,7 +1523,8 @@ int glm_mla(void* stream, int mt, const void* q, int64_t q_ldg, int64_t q_ldt, i
                                          static_cast<const __nv_bfloat16*>(cr), split_n, static_cast<const int*>(idx),
                                          ld_idx, K, ascending, static_cast<const int*>(bound), H, scale, chunk,
                                          static_cast<float*>(part_m), static_cast<float*>(part_l),
-                                         static_cast<float*>(part_acc), static_cast<__nv_bfloat16*>(out), o_ldt, o_ldh);
+                                         static_cast<float*>(part_acc), static_cast<__nv_bfloat16*>(out), o_ldt, o_ldh,
+                                         static_cast<const int*>(koff));
     };
     if (mt == 2) args(mla_kernel<2>, mla_smem<2>());
     else args(mla_kernel<1>, mla_smem<1>());

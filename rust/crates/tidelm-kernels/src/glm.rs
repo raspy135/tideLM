@@ -20,13 +20,15 @@ extern "C" {
     pub fn glm_rows_copy(stream: CudaStream, x: *const c_void, ldx: i64, rows: *const c_void, out: *mut c_void, t: c_int,
                          d: c_int) -> c_int;
     pub fn glm_positions(stream: CudaStream, pos0: *const c_void, t: c_int, rank: c_int, world: c_int, spare: c_int,
-                         pos: *mut c_void, rows: *mut c_void, bound: *mut c_void) -> c_int;
+                         pos: *mut c_void, rows: *mut c_void, bound: *mut c_void, lanes: *const c_void, nl: c_int,
+                         koff: *mut c_void) -> c_int;
     pub fn glm_index_key(stream: CudaStream, k: *const c_void, ldk: i64, w: *const c_void, b: *const c_void,
                          cos: *const c_void, sin: *const c_void, pos: *const c_void, rows: *const c_void, q: *mut c_void,
                          s: *mut c_void, t: c_int) -> c_int;
     pub fn glm_index_scores(stream: CudaStream, q: *const c_void, w: *const c_void, wscale: f32, kq: *const c_void,
                             ks: *const c_void, pos: *const c_void, t: c_int, nmax: c_int, stride: c_int, off: c_int,
-                            split_n: c_int, inv_d: f32, out: *mut c_void, ldo: i64) -> c_int;
+                            split_n: c_int, inv_d: f32, out: *mut c_void, ldo: i64, lanes: *const c_void,
+                            nl: c_int) -> c_int;
     pub fn glm_topk(stream: CudaStream, s: *const c_void, lds: i64, pos: *const c_void, stride: c_int, off: c_int,
                     nmax: c_int, k: c_int, t: c_int, idx: *mut c_void, ldi: i64, val: *mut c_void, ldv: i64) -> c_int;
     pub fn glm_split_share(stream: CudaStream, g: *const c_void, rank_stride: i64, row_stride: i64, val_off: i64,
@@ -41,7 +43,7 @@ extern "C" {
                    cq: *const c_void, cs: *const c_void, cr: *const c_void, split_n: c_int, idx: *const c_void,
                    ld_idx: i64, k: c_int, ascending: c_int, bound: *const c_void, t: c_int, h: c_int, scale: f32, nsplit: c_int,
                    chunk: c_int, part_m: *mut c_void, part_l: *mut c_void, part_acc: *mut c_void, out: *mut c_void,
-                   o_ldt: i64, o_ldh: i64) -> c_int;
+                   o_ldt: i64, o_ldh: i64, koff: *const c_void) -> c_int;
     pub fn glm_mla_combine(stream: CudaStream, pm: *const c_void, pl: *const c_void, pacc: *const c_void, t: c_int,
                            h: c_int, ns: c_int, out: *mut c_void, o_ldt: i64, o_ldh: i64, own_o: *mut c_void,
                            own_l: *mut c_void, send: *mut c_void, row_bytes: i64, hl: c_int, lo: c_int) -> c_int;
