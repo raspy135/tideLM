@@ -1,0 +1,13 @@
+note: server serves 'deepseek', using that
+== rust-ds41-prose-20261028: workload=prose isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=45 ttft=    900.3 ms  tpot=  31.10 ms  decode= 32.15 tok/s  out=1024 (length)
+          accept_len=1.7487179487179487  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=45 ttft=    531.8 ms  tpot=  30.88 ms  decode= 32.39 tok/s  out=1024 (length)
+          accept_len=1.7915936952714535  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=45 ttft=    524.4 ms  tpot=  30.62 ms  decode= 32.66 tok/s  out=1024 (length)
+          accept_len=1.7760416666666667  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=45 ttft=    520.4 ms  tpot=  30.14 ms  decode= 33.18 tok/s  out=1024 (length)
+          accept_len=1.8267857142857142  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=524.3668 ms  tpot=30.6158 ms  decode=32.6628 tok/s
+  -> ENGINE  accept_len=1.7916  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /tmp/claude-1000/-home-ryan-git-tidelm/ee5bdf57-c37e-4b07-b12d-be6b933bf449/scratchpad/bw/readme/prose.json

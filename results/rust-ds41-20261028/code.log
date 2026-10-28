@@ -1,0 +1,13 @@
+note: server serves 'deepseek', using that
+== rust-ds41-code-20261028: workload=code isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=62 ttft=    944.3 ms  tpot=  19.44 ms  decode= 51.44 tok/s  out=1024 (length)
+          accept_len=3.6405693950177938  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=62 ttft=    562.8 ms  tpot=  19.94 ms  decode= 50.14 tok/s  out=1024 (length)
+          accept_len=3.761029411764706  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=62 ttft=    562.5 ms  tpot=  20.22 ms  decode= 49.45 tok/s  out=1024 (length)
+          accept_len=3.3651315789473686  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=62 ttft=    551.3 ms  tpot=  19.60 ms  decode= 51.02 tok/s  out=1024 (length)
+          accept_len=3.5520833333333335  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=562.4722 ms  tpot=19.9444 ms  decode=50.1394 tok/s
+  -> ENGINE  accept_len=3.5521  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /tmp/claude-1000/-home-ryan-git-tidelm/ee5bdf57-c37e-4b07-b12d-be6b933bf449/scratchpad/bw/readme/code.json
