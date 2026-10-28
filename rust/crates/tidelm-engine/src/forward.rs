@@ -34,7 +34,7 @@ use std::ffi::c_void;
 use std::time::Instant;
 
 use tidelm_core::engram_hash::{EngramLayout, NgramHashState};
-use tidelm_cuda::{memcpy_async, DeviceBuffer, GraphExec, PinnedBuffer, Stream, MEMCPY_DEVICE_TO_HOST, MEMCPY_HOST_TO_DEVICE};
+use tidelm_cuda::{memcpy_async, DeviceBuffer, Event, GraphExec, PinnedBuffer, Stream, MEMCPY_DEVICE_TO_HOST, MEMCPY_HOST_TO_DEVICE};
 use tidelm_kernels::ds41::*;
 use tidelm_kernels::{engram as eg, fp4};
 use tidelm_model::{Checkpoint, ExpertReader, STAGE_BYTES};
@@ -257,8 +257,24 @@ pub(crate) enum Wt<'a> {
     Bf16 { w: *mut c_void, n: usize, k: usize },
 }
 
+/// Decode's L2 prefetch (Engine::side_prefetch): how much of each weight a latency-bound
+/// stretch brings in ahead of the kernel that reads it, set to what lands without crowding the
+/// stretch. Measured on the pair (2026-10-27, greedy, fixed residents; docs/gotchas.md): 2 MB of
+/// wo_a during the attention core (8 MB slowed attention 39 -> 57 us, as much as wo_a gained),
+/// 4 MB of wo_b at wo_a's gather, an mHC weight whole (13 -> 4 us a call) with the router gate
+/// or the head of wq_a. The routed experts' down rows were not worth prefetching.
+const PF_ATTN: usize = 2 << 20;
+const PF_WOB: usize = 4 << 20;
+const PF_GATE: usize = 4 << 20;
+const PF_QA: usize = 3 << 20;
+
+/// The first `bytes` of `buf` (all of it if shorter): an L2 prefetch range.
+fn span<T: Copy>(buf: &DeviceBuffer<T>, bytes: usize) -> (u64, u64) {
+    (buf.raw() as u64, (buf.len() * std::mem::size_of::<T>()).min(bytes) as u64)
+}
+
 /// y[m][n] = x[m][..k] W^T, bf16 out (f32 with `f32_out`). Up to FMA_ROWS rows the FMA
-/// kernel (row-invariant across m, ~230 GB/s of weights); above, the tensor-core kernel
+/// kernel (row-invariant across m, ~250 GB/s of cold weights at 4-6 rows); above, the tensor-core kernel
 /// (row-invariant within its tile tier, ~165 GB/s at 32 rows and ~133 at 64, rounding
 /// differently from the FMA kernel). Shapes it cannot take (K % 64) run the FMA kernel over
 /// 16-row slices.
@@ -1408,6 +1424,16 @@ pub struct Engine {
     pub pmax: usize,
     /// a prefill-sized (eager, never captured) step's device work is being issued
     eager_step: bool,
+    /// decode prefetches the next kernels' weights into L2 during latency-bound stretches
+    /// (side_prefetch; TIDELM_L2_PREFETCH=0 turns it off). It moves no value.
+    l2pf: bool,
+    /// what a layer's last gather prefetches: the next layer's attention mHC weights and wq_a
+    pf_next: L2Prefetch,
+    /// the prefetch branch's stream, its fork and join events, and whether a branch is open
+    pf_side: Stream,
+    pf_fork: Event,
+    pf_join: Event,
+    pf_open: std::cell::Cell<bool>,
 }
 
 impl Resident {
@@ -2015,6 +2041,12 @@ impl Engine {
             ring,
             pmax,
             eager_step: false,
+            l2pf: std::env::var("TIDELM_L2_PREFETCH").as_deref() != Ok("0"),
+            pf_next: L2Prefetch::NONE,
+            pf_side: Stream::new()?,
+            pf_fork: Event::new()?,
+            pf_join: Event::new()?,
+            pf_open: std::cell::Cell::new(false),
         })
     }
 
@@ -3765,6 +3797,10 @@ impl Engine {
                 }
             };
             self.times.weights_s += t0.elapsed().as_secs_f64();
+            self.pf_next = match self.resident.as_ref().and_then(|r| r.layers.get(l + 1)).and_then(|x| x.as_ref()) {
+                Some(nw) => L2Prefetch::ranges(span(&nw.hc_attn_fn, usize::MAX), span(&nw.wq_a.w, PF_QA)),
+                None => L2Prefetch::NONE,
+            };
             let tc = Instant::now();
             let res = (|| -> Result<()> {
                 if let Some(e) = &w.engram {
@@ -3818,7 +3854,7 @@ impl Engine {
             let v = cfg.vocab_size;
             ck(unsafe { ds_argmax_bf16(self.stream.raw(), np(&self.act.logits), v as i64, shape.head as i32, v as i32, np(&self.act.am)) }, "head argmax")?;
         }
-        Ok(())
+        self.prefetch_join()
     }
 
     /// The step's first device work: the embedding, and the all-visible compressed lists
@@ -4176,11 +4212,13 @@ impl Engine {
         let blocks = std::mem::take(&mut self.dspark.as_mut().unwrap().blocks);
         let res = (|| -> Result<()> {
             for (k, w) in blocks.iter().enumerate() {
+                self.pf_next = L2Prefetch::NONE;
                 self.block(w, Ctx::Draft { k }, rows)?;
             }
             Ok(())
         })();
         self.dspark.as_mut().unwrap().blocks = blocks;
+        self.prefetch_join()?;
         res?;
         let norm = np(&self.dspark.as_ref().unwrap().w.norm);
         self.head_dev(rows, None, norm, true)?;
@@ -4383,6 +4421,9 @@ impl Engine {
             _ => nul(),
         };
         if split_rows {
+            if !prompt_rows {
+                self.side_prefetch(&L2Prefetch::ranges(span(&w.wo_a.w, PF_ATTN), (0, 0)))?;
+            }
             ck(unsafe {
                 ds_attn_decode(sr, np(&a.q), np(ring), self.ring as i32, np(win_pos), cfg.window_size as i32, floor, ckv_ptr, cidx_ptr,
                                c as i32, np(&w.attn_sink), scale, np(&a.o), ti, h as i32, np(&a.lane), (self.ring * hd) as i64,
@@ -4408,8 +4449,10 @@ impl Engine {
         }
         // tensor parallel: this rank's heads made its wo_a groups; gather them whole, then
         // this rank's rows of wo_b, then gather those
+        self.side_prefetch(&L2Prefetch::ranges(span(&w.wo_b.w, PF_WOB), (0, 0)))?;
         self.tp_gather(np(&a.oa), t, w.wo_a.n, np(&a.oa_full))?;
         gemm(sr, &a.mma_part, np(&a.oa_full), og * cfg.o_lora_rank, Wt::Fp8(&w.wo_b), t, np(&a.attn_local), false, w.wo_b.n)?;
+        self.side_prefetch(&L2Prefetch::ranges(span(&w.hc_ffn_fn, usize::MAX), span(&w.gate_w, PF_GATE)))?;
         self.tp_gather(np(&a.attn_local), t, w.wo_b.n, np(&a.attn_out))
     }
 
@@ -4836,7 +4879,37 @@ impl Engine {
         }
         gemm(sr, part, np(&a.hcat_full), inter, Wt::Fp8(&w.sh_w2), t, np(&a.sh), false, dl)?;
         ck(unsafe { ds_moe_combine(sr, np(&a.parts), k as i32, ti, np(&a.sh), np(&a.moe_local), dl as i32) }, "moe combine (tp)")?;
+        self.side_prefetch(&self.pf_next)?;
         self.tp_gather(np(&a.moe_local), t, dl, np(&a.moe_out))
+    }
+
+    /// Bring `pf` into L2 from a branch off the main stream - a fork event, one small kernel of
+    /// TMA bulk prefetches on pf_side, a join event - so the main stream's next kernels start at
+    /// once and find what has landed. Decode only (a prefill step's kernels stream at the
+    /// memory's rate already); prefetch_join closes the branch before a capture does.
+    ///
+    /// The branch is what made it pay. Issued from inside the RoCE gather instead (its warps
+    /// idle while the peer's flag is awaited) the gather lasted until its prefetches landed: 6
+    /// MB of wo_b took the gather from 12.6 to 39 us for 26 us off wo_b, and the routed
+    /// experts' down rows cost the gather 45 us for 4.5 off down (docs/gotchas.md, 2026-10-27).
+    fn side_prefetch(&self, pf: &L2Prefetch) -> Result<()> {
+        if !self.l2pf || self.eager_step || self.pair.is_none() || pf.bytes[0] | pf.bytes[1] == 0 {
+            return Ok(());
+        }
+        self.pf_fork.record(&self.stream)?;
+        self.pf_side.wait_event(&self.pf_fork)?;
+        ck(unsafe { ds_l2_prefetch(self.pf_side.raw(), pf as *const L2Prefetch as *const c_void, 8) }, "l2 prefetch")?;
+        self.pf_join.record(&self.pf_side)?;
+        self.pf_open.set(true);
+        Ok(())
+    }
+
+    /// Join an open prefetch branch into the main stream (a captured graph must end joined).
+    fn prefetch_join(&self) -> Result<()> {
+        if self.pf_open.replace(false) {
+            self.stream.wait_event(&self.pf_join)?;
+        }
+        Ok(())
     }
 
     /// All-gather this rank's `[m][n]` bf16 shard of a tensor-parallel output over RoCE and

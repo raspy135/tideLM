@@ -279,6 +279,8 @@ extern "C" {
                           sentinel: c_int, rows: *const c_void) -> c_int;
     pub fn ds_greedy_accept(stream: CudaStream, am: *const c_void, block: *const c_void, t: c_int, pos: *const c_void, out: *mut c_void) -> c_int;
     pub fn ds_wait_flag(stream: CudaStream, flag: *const c_void, expect: c_int, timeout_ns: i64, err: *mut c_void) -> c_int;
+    /// L2 prefetch of `pf` (an L2Prefetch) by `grid` blocks of TMA bulk prefetches.
+    pub fn ds_l2_prefetch(stream: CudaStream, pf: *const c_void, grid: c_int) -> c_int;
 
     /// Tensor-core skinny GEMM over fp8 block-scaled weights, M <= 64 (rows_per_group > 0
     /// for the grouped wo_a form, as ds_linear_fp8_grouped). K % 64 == 0.
@@ -372,4 +374,21 @@ extern "C" {
         stream: CudaStream, x: *const c_void, ldx: i64, w: *const c_void, s: *const c_void, lds: i64, m: c_int, n: c_int,
         k: c_int, splits: c_int, y_bf16: *mut c_void, partial: *mut c_void, ng: c_int, depth: c_int,
     ) -> c_int;
+}
+
+/// Weights for ds_l2_prefetch to bring into L2: `bytes[r]` from `base[r]` (ds41.cu's L2Pf).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct L2Prefetch {
+    pub base: [u64; 2],
+    pub bytes: [u64; 2],
+}
+
+impl L2Prefetch {
+    pub const NONE: L2Prefetch = L2Prefetch { base: [0; 2], bytes: [0; 2] };
+
+    /// Two (address, bytes) ranges, either of them empty.
+    pub fn ranges(a: (u64, u64), b: (u64, u64)) -> Self {
+        L2Prefetch { base: [a.0, b.0], bytes: [a.1, b.1] }
+    }
 }

@@ -121,6 +121,13 @@ part; the 64-byte-wide tiles the kernel uses reach 193–197 GB/s effective at d
 against a ~210 GB/s practical copy ceiling on a nominally 273 GB/s box. If you retune
 `BM`/`BN`, watch the effective bandwidth, not the occupancy.
 
+The ceiling is higher than that (2026-10-27): a plain read with enough bytes in flight streams
+252-261 GB/s at the margin (128 -> 256 MiB, L2 evicted by reading another buffer before each
+pass), and the serving MoE kernels reach it. Readings near 210-230 came from reference kernels
+with too little work a block (tools/bench_fp4_moe_decode.py's Triton read: 8 KB a program) or
+from evicting L2 with a write (a memset leaves dirty lines whose write-back lands in the timed
+read: 235 GB/s at 128 MiB). See "DS decode bandwidth: ..." below.
+
 ## A native CUDA spelling is not automatically faster than Triton
 
 `tools/fp4_moe_cuda.cu` is a CUDA C++ decode implementation of the same packed-FP4
@@ -4770,3 +4777,58 @@ copies at enqueue, which CUDA does not promise.
 tools/bench_concurrency_http.py asserts a non-empty `content`: on GLM its reasoning_effort "none"
 is the template's Max, and 128-384 tokens of reasoning leave the answer empty, so it fails there.
 
+## DS decode bandwidth: GEMVs with reads in flight, and weights into L2 beside the waits (2026-10-27)
+
+Where a 4-row DS verify step on the pair goes (nsys, rank 0, fixed residents, greedy; nsys adds
+~7% to every kernel, the step 65 -> 71 ms): the routed experts' up and down 31 ms, at the memory's
+rate (each call within 3% of a plain read of its experts' bytes); the GEMVs (projections, router,
+mHC, heads) ~23 ms; ~11 ms not streaming weights - 197 RoCE gathers (median ~12 us each), the
+attention core (~40 us a layer), the mHC and router chains, ~2,190 kernel launches (1.25 ms of
+gaps) and ~5 host waits a step (1.8 ms).
+
+**The GEMVs** (ds41.cu skinny_kernel, every fp8 / bf16 / fp32 decode projection): a warp owned
+four rows and loaded one 16-byte tile of each before computing on it, so a lane had 64 bytes in
+flight; small N got few blocks (wkv's 512 rows: 16 blocks on 48 SMs; the router's 384: 12); and
+5-8 rows computed as 8. Now one row a warp with four tiles loaded ahead (two rows, two tiles past
+8 fp8 rows, where an 8-row block re-stages x for too few weight bytes) and the exact row tile up
+to 6. Neither changes a row's FMA chain: outputs byte-identical across 18 shapes x 1-16 rows
+(6.9 MB of outputs), the pair's logits digest identical. Cold weights, per rank, us a call at 4 /
+6 rows: wq_b 81.5 -> 81.2 / 102.9 -> 84.1, wkv 17.9 -> 13.9 / 22.4 -> 16.5, router gate 24.2 ->
+18.6 / 27.9 -> 18.1, the mHC projection 18.4 -> 11.1 / 22.7 -> 13.1, main_proj 173 -> 155.
+
+**L2 prefetch beside the latency-bound stretches.** TMA bulk prefetch (cp.async.bulk.prefetch.L2)
+lands what the next kernel reads: an 18.7 us spin that prefetched 4 MB of wo_b took 16 us off
+wo_b's 87 (bench, cold copies), while per-line prefetch.global.L2::evict_last hints gained 2 us or
+lost 6. In the engine it has to stay out of the main stream's way:
+- **From inside the gather (rejected).** The gather's warps idle while it awaits the peer's flag,
+  but a kernel does not finish before its bulk prefetches land, and a 2-block gather issues them
+  at ~150 GB/s: 6 MB of wo_b took the gather 12.6 -> 39 us for wo_b 102 -> 76 (no net), and each
+  routed expert's first 256 KB of down cost the gather 45 us for 4.5 us off down. Sized to fit
+  the wait (1-2 MB, no experts) it netted 0.7-1.2 ms a step.
+- **From a parallel graph branch (kept).** A fork event, one 8-block prefetch kernel on a side
+  stream, joined at the step's end: the main stream never waits. Prefetched kernels got faster
+  (wo_a 77 -> 53 us, router gate 21 -> 8, mHC projection 13 -> 4, wq_a 34 -> 20), but the traffic
+  slows what runs beside it: attention 39 -> 57 us under 8 MB of wo_a (2 MB keeps most of wo_a's
+  gain), each gather +4 us. Shipped: 2 MB of wo_a during attention, 4 MB of wo_b at its gather, the
+  ffn mHC weight whole and 4 MB of the router gate at wo_b's gather, the next layer's mHC weight and
+  3 MB of wq_a at the MoE's output gather. Down rows still not worth it.
+
+Measured on the pair (tidelm-generate --sweep-depth, 256 greedy tokens, 10,000 fixed residents
+from the demand file, both builds on the host; the same tokens at every depth in every arm),
+ms a step at verify depth 0 / 1 / 3 / 5, and the confidence policy's tok/s:
+
+| | code | code tok/s | prose | prose tok/s |
+| --- | --- | ---: | --- | ---: |
+| before | 42.0 / 54.1 / 66.0 / 82.2 | 44.6 | 42.0 / 53.9 / 66.6 / 82.1 | 30.4 |
+| GEMVs | 38.5 / 51.8 / 65.3 / 80.4 | 45.4 | 38.8 / 51.9 / 65.5 / 81.0 | 31.8 |
+| GEMVs + prefetch | 37.9 / 50.6 / 64.1 / 79.6 | 46.4 | 38.5 / 50.5 / 64.5 / 79.4 | 32.6 |
+
+The server (bench/bench.py, the README protocol, the ds41-mxfp4 profile, one boot an arm, each
+from the same copy of the routing history and an empty prefix cache): prose 31.88 -> 33.36 tok/s
+(31.08 / 31.88 / 31.98 -> 33.65 / 33.36 / 32.66), code 49.35 -> 50.17 (49.35 / 49.55 / 46.10 ->
+50.17 / 50.93 / 49.15), memory at boot unchanged (103.51 GiB a rank).
+
+What is left in the step is not bandwidth: the experts and GEMVs read at ~250 GB/s, and the
+~11 ms around them is gathers, attention, small kernels and launches. FP8 activations
+(DeepSeek's reference quantizes every fp8 / fp4 GEMM's input) would not move decode: a step's
+activations are kilobytes against gigabytes of weights; they would change the numerics.

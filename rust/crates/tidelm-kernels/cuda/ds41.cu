@@ -103,6 +103,9 @@ __device__ float block_max(float v, float* scratch) {
 // ds_splits_reduce adds them in split order (deterministic). gridDim.z tiles M in MT-row
 // blocks: a row's products and their order do not depend on MT or on its tile, so one launch
 // over M rows gives each row the bits of a launch of its 16-row slice alone.
+// UNR: a lane loads its next UNR 16-byte tiles of each row before computing on them, in the
+// order the loop would have, so neither UNR nor ROWS changes a row's FMA chain either: they
+// only set how many weight bytes are in flight and how many blocks a small N gets.
 
 template <int KIND> struct Lane;
 template <> struct Lane<0> { static constexpr int V = 16, ESZ = 1; };
@@ -136,7 +139,7 @@ __device__ __forceinline__ void load_x(const __nv_bfloat16* p, float* out) {
     }
 }
 
-template <int KIND, int ROWS, int MT>
+template <int KIND, int ROWS, int MT, int UNR>
 __global__ void __launch_bounds__(kThreads) skinny_kernel(
     const __nv_bfloat16* __restrict__ x, int64_t ldx, int64_t x_group_stride, int rows_per_group,
     const uint8_t* __restrict__ w, const uint8_t* __restrict__ s, int64_t lds,
@@ -170,39 +173,46 @@ __global__ void __launch_bounds__(kThreads) skinny_kernel(
             *reinterpret_cast<uint4*>(&xs[m][j]) = v;
         }
         __syncthreads();
-        for (int kk = 0; kk < kc; kk += VW) {
-            const int kl = kk + lane * V;
-            if (kl >= kc) continue;
-            const int k = k0 + kl;
-            uint4 raw[ROWS];
-            float scale[ROWS];
+        for (int kk = 0; kk < kc; kk += VW * UNR) {
+            uint4 raw[UNR][ROWS];
+            float scale[UNR][ROWS];
 #pragma unroll
-            for (int r = 0; r < ROWS; ++r) {
-                const int n = n0 + r;
-                // __ldcs (evict-first) here: no change (bench_skinny 2026-10-25, three runs, M = 1/6/16
-                // within run-to-run noise). x is staged in shared memory, so there is nothing in L2
-                // for streaming weights to evict; the MoE decode kernels, which re-read every
-                // pair's activations from L2, gain ~9% from it (bench_moe_bw).
-                raw[r] = n < N ? *reinterpret_cast<const uint4*>(w + ((int64_t)n * K + k) * ESZ)
-                               : make_uint4(0, 0, 0, 0);
-                scale[r] = 1.f;
-                if (KIND == 0 && n < N) scale[r] = e8m0_lin(s[(int64_t)(n >> 5) * lds + (k >> 5)]);
-            }
-            float wv[ROWS][V];
-#pragma unroll
-            for (int r = 0; r < ROWS; ++r) decode_w<KIND>(raw[r], wv[r]);
-#pragma unroll
-            for (int m = 0; m < MT; ++m) {
-                float xv[V];
-                load_x<V>(&xs[m][kl], xv);
+            for (int u = 0; u < UNR; ++u) {
+                const int kl = kk + u * VW + lane * V, k = k0 + kl;
 #pragma unroll
                 for (int r = 0; r < ROWS; ++r) {
-                    float p = 0.f;
+                    const int n = n0 + r;
+                    const bool ok = kl < kc && n < N;
+                    // __ldcs (evict-first) here: no change (bench_skinny 2026-10-25, three runs, M = 1/6/16
+                    // within run-to-run noise). x is staged in shared memory, so there is nothing in L2
+                    // for streaming weights to evict; the MoE decode kernels, which re-read every
+                    // pair's activations from L2, gain ~9% from it (bench_moe_bw).
+                    raw[u][r] = ok ? *reinterpret_cast<const uint4*>(w + ((int64_t)n * K + k) * ESZ)
+                                   : make_uint4(0, 0, 0, 0);
+                    scale[u][r] = 1.f;
+                    if (KIND == 0 && ok) scale[u][r] = e8m0_lin(s[(int64_t)(n >> 5) * lds + (k >> 5)]);
+                }
+            }
 #pragma unroll
-                    for (int v = 0; v < V; ++v) p = fmaf(wv[r][v], xv[v], p);
-                    // a power-of-two scale is exact, so scaling the 16-term partial equals
-                    // scaling each weight (the Triton kernel's dequant-then-dot)
-                    acc[r][m] = KIND == 0 ? fmaf(p, scale[r], acc[r][m]) : acc[r][m] + p;
+            for (int u = 0; u < UNR; ++u) {
+                const int kl = kk + u * VW + lane * V;
+                if (kl >= kc) break;
+                float wv[ROWS][V];
+#pragma unroll
+                for (int r = 0; r < ROWS; ++r) decode_w<KIND>(raw[u][r], wv[r]);
+#pragma unroll
+                for (int m = 0; m < MT; ++m) {
+                    float xv[V];
+                    load_x<V>(&xs[m][kl], xv);
+#pragma unroll
+                    for (int r = 0; r < ROWS; ++r) {
+                        float p = 0.f;
+#pragma unroll
+                        for (int v = 0; v < V; ++v) p = fmaf(wv[r][v], xv[v], p);
+                        // a power-of-two scale is exact, so scaling the 16-term partial equals
+                        // scaling each weight (the Triton kernel's dequant-then-dot)
+                        acc[r][m] = KIND == 0 ? fmaf(p, scale[u][r], acc[r][m]) : acc[r][m] + p;
+                    }
                 }
             }
         }
@@ -235,25 +245,46 @@ template <int KIND>
 int launch_skinny(cudaStream_t st, const void* x, int64_t ldx, int64_t gstride, int rpg,
                   const void* w, const void* s, int64_t lds, int M, int N, int K, int splits,
                   void* ybf, void* yf, int64_t ldy, void* partial) {
-    constexpr int ROWS = 4;
     if (M < 1 || splits < 1 || K % 32 || (splits > 1 && !partial)) return cudaErrorInvalidValue;
     // slice length: a multiple of 32 so slices never split a scale block
     const int ksplit = ((K + splits - 1) / splits + 31) / 32 * 32;
-    // past 16 rows, 16-row tiles over gridDim.z (the slices a caller used to launch one by one)
-    dim3 grid((N + kWarps * ROWS - 1) / (kWarps * ROWS), splits, (M + 15) / 16);
     auto xb = static_cast<const __nv_bfloat16*>(x);
     auto wb = static_cast<const uint8_t*>(w);
     auto sb = static_cast<const uint8_t*>(s);
     auto yb = static_cast<__nv_bfloat16*>(ybf);
     auto yff = static_cast<float*>(yf);
     auto pp = static_cast<float*>(partial);
-#define DS_SKINNY(MT) \
-    skinny_kernel<KIND, ROWS, MT><<<grid, kThreads, 0, st>>>(xb, ldx, gstride, rpg, wb, sb, lds, M, N, K, ksplit, yb, yff, ldy, pp)
-    if (M <= 1) DS_SKINNY(1);
-    else if (M <= 2) DS_SKINNY(2);
-    else if (M <= 4) DS_SKINNY(4);
-    else if (M <= 8) DS_SKINNY(8);
-    else DS_SKINNY(16);
+    // Rows a warp and tiles in flight, from a cold-weight sweep at the pair's per-rank shapes
+    // (2026-10-27, 1-16 rows, every layout bit-identical): one row a warp with four tiles in
+    // flight keeps the most bytes moving and gives a small N (wkv's 512 rows, the router's 384)
+    // four times the blocks of the old four rows a warp - fp8 wq_b at 6 rows 202 -> 252 GB/s,
+    // wkv 116 -> 159, the bf16 router gate at 4 rows 158 -> 222. Past 8 fp8 rows a block of 8
+    // rows re-stages x for too few weight bytes, and two rows a warp with two tiles wins
+    // (wq_b at 12 rows 143 -> 189, wo_b 201 -> 227). M takes the exact tile up to 6 rows and
+    // 8 / 12 / 16 above (the old tiers computed 6-row steps as 8).
+    const bool wide = KIND == 0 && M > 8;
+    const int rows = wide ? 2 : 1;
+    const int mt = M <= 6 ? M : M <= 8 ? 8 : M <= 12 ? 12 : 16;
+    // past 16 rows, 16-row tiles over gridDim.z (the slices a caller used to launch one by one)
+    dim3 grid((N + kWarps * rows - 1) / (kWarps * rows), splits, (M + mt - 1) / mt);
+#define DS_SKINNY(R, MT, U) \
+    skinny_kernel<KIND, R, MT, U><<<grid, kThreads, 0, st>>>(xb, ldx, gstride, rpg, wb, sb, lds, M, N, K, ksplit, yb, yff, ldy, pp)
+    if (wide) {
+        if (mt == 12) DS_SKINNY(2, 12, 2);
+        else DS_SKINNY(2, 16, 2);
+    } else {
+        switch (mt) {
+            case 1: DS_SKINNY(1, 1, 4); break;
+            case 2: DS_SKINNY(1, 2, 4); break;
+            case 3: DS_SKINNY(1, 3, 4); break;
+            case 4: DS_SKINNY(1, 4, 4); break;
+            case 5: DS_SKINNY(1, 5, 4); break;
+            case 6: DS_SKINNY(1, 6, 4); break;
+            case 8: DS_SKINNY(1, 8, 4); break;
+            case 12: DS_SKINNY(1, 12, 4); break;
+            default: DS_SKINNY(1, 16, 4);
+        }
+    }
 #undef DS_SKINNY
     return static_cast<int>(cudaGetLastError());
 }
@@ -3403,6 +3434,32 @@ __global__ void greedy_accept_kernel(const int* __restrict__ am, const int* __re
 // Spin until *flag == expect (a host thread writes it in mapped pinned memory once the
 // engram rows of this step have landed). Gives up after `timeout_ns` and records the miss
 // in *err, so a lost signal stalls one step instead of the GPU forever.
+// ------------------------------------------------------------------ L2 weight prefetch
+// The next kernels' weights into L2 from a parallel graph branch while the main stream runs
+// latency-bound work (a RoCE gather's wait, the attention core, the mHC chain): TMA bulk
+// prefetches (cp.async.bulk.prefetch.L2), fire and forget, so nothing on the main stream waits
+// for them; the branch joins at the step's end. bytes[r] from base[r], r = 0, 1 (the layout of
+// tidelm_kernels::ds41::L2Prefetch). Per-line prefetch.global.L2 hints instead gained nothing
+// in a cold-weight bench (and as touch kernels lost, 2026-10-08).
+struct L2Pf {
+    uint64_t base[2];
+    uint64_t bytes[2];
+};
+
+__global__ void __launch_bounds__(128) l2_prefetch_kernel(L2Pf a) {
+    constexpr uint64_t CH = 32u << 10;
+    const uint32_t w = blockIdx.x * blockDim.x + threadIdx.x, workers = gridDim.x * blockDim.x;
+    uint64_t j = 0;
+    for (int r = 0; r < 2; ++r) {
+        const uint64_t len = a.bytes[r] & ~static_cast<uint64_t>(15u);
+        for (uint64_t off = 0; off < len; off += CH, ++j) {
+            if (j % workers != w) continue;
+            const uint32_t n = static_cast<uint32_t>(min(CH, len - off));
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(a.base[r] + off), "r"(n) : "memory");
+        }
+    }
+}
+
 __global__ void wait_flag_kernel(const volatile int* flag, int expect, long long timeout_ns, int* err) {
     if (threadIdx.x != 0) return;
     const unsigned long long t0 = clock64();
@@ -3945,6 +4002,12 @@ int ds_greedy_accept(void* stream, const void* am, const void* block, int T, con
 
 int ds_wait_flag(void* stream, const void* flag, int expect, long long timeout_ns, void* err) {
     wait_flag_kernel<<<1, 32, 0, DS_ST>>>(static_cast<const volatile int*>(flag), expect, timeout_ns, static_cast<int*>(err));
+    DS_RET;
+}
+
+int ds_l2_prefetch(void* stream, const void* pf, int grid) {
+    if (grid < 1) return cudaErrorInvalidValue;
+    l2_prefetch_kernel<<<grid, 128, 0, DS_ST>>>(*static_cast<const L2Pf*>(pf));
     DS_RET;
 }
 
