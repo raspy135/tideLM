@@ -1083,7 +1083,9 @@ __global__ void __launch_bounds__(kE) router_kernel(const float* __restrict__ lo
                                                     const uint8_t* __restrict__ resident, float* __restrict__ hot,
                                                     const int* __restrict__ ex_ids, const float* __restrict__ ex_w,
                                                     float* __restrict__ demand, double* __restrict__ acc,
-                                                    const int* __restrict__ live) {
+                                                    const int* __restrict__ live, double* __restrict__ lane_acc,
+                                                    float* __restrict__ lane_demand, int64_t lane_stride,
+                                                    const int* __restrict__ row_lane) {
     __shared__ float sc[kE];
     const int t = blockIdx.x;
     int chosen[8];
@@ -1110,13 +1112,17 @@ __global__ void __launch_bounds__(kE) router_kernel(const float* __restrict__ lo
         }
     }
     if (live && t >= live[0]) return;
-    if (demand || acc) {
+    if (demand || acc || lane_acc || lane_demand) {
+        // lane_acc / lane_demand: the same per row's lane (row_lane[t], null 0) at lane * 4 /
+        // lane * lane_stride, a request's own counts beside another lane's rows
+        const int z = row_lane ? row_lane[t] : 0;
         double missed = 0.0, mass = 0.0, mmass = 0.0;
         for (int k = 0; k < K; ++k) {
             const int ex = ex_ids[t * K + k];
             const float ew = ex_w[t * K + k];
             if (ex < 0) continue;
             if (demand) atomicAdd(&demand[ex], ew);
+            if (lane_demand) atomicAdd(&lane_demand[z * lane_stride + ex], ew);
             const bool miss = allowed && !allowed[ex];
             missed += miss;
             mass += ew;
@@ -1127,6 +1133,12 @@ __global__ void __launch_bounds__(kE) router_kernel(const float* __restrict__ lo
             atomicAdd(&acc[1], missed);
             atomicAdd(&acc[2], mass);
             atomicAdd(&acc[3], mmass);
+        }
+        if (lane_acc) {
+            atomicAdd(&lane_acc[4 * z], (double)K);
+            atomicAdd(&lane_acc[4 * z + 1], missed);
+            atomicAdd(&lane_acc[4 * z + 2], mass);
+            atomicAdd(&lane_acc[4 * z + 3], mmass);
         }
     }
 }
@@ -1554,14 +1566,17 @@ int glm_mla_merge(void* stream, const void* own_o, const void* own_l, const void
 
 int glm_router(void* stream, const void* logits, const void* bias, const void* allowed, const void* lut, int T, int K,
                float scale, void* ids, void* w, const void* resident, void* hot, const void* ex_ids, const void* ex_w,
-               void* demand, void* acc, const void* live) {
+               void* demand, void* acc, const void* live, void* lane_acc, void* lane_demand, int64_t lane_stride,
+               const void* row_lane) {
     if (K > 8) return (int)cudaErrorInvalidValue;
     router_kernel<<<T, kE, 0, GST>>>(static_cast<const float*>(logits), static_cast<const float*>(bias),
                                      static_cast<const uint8_t*>(allowed), static_cast<const int*>(lut), K, scale,
                                      static_cast<int*>(ids), static_cast<float*>(w), static_cast<const uint8_t*>(resident),
                                      static_cast<float*>(hot), static_cast<const int*>(ex_ids),
                                      static_cast<const float*>(ex_w), static_cast<float*>(demand),
-                                     static_cast<double*>(acc), static_cast<const int*>(live));
+                                     static_cast<double*>(acc), static_cast<const int*>(live),
+                                     static_cast<double*>(lane_acc), static_cast<float*>(lane_demand), lane_stride,
+                                     static_cast<const int*>(row_lane));
     GRET;
 }
 

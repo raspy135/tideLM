@@ -306,9 +306,16 @@ struct Run {
     /// prefilling beside decoding lanes: the suffix and the rows of it done
     part: Option<(Vec<u32>, usize)>,
     stats: Stats,
-    /// at admission: the engine's residency counters and miss totals (the request line)
+    /// at admission: the engine's residency counters (the request line), and its lane's routing
+    /// counts at admission and at the prefill's end (Engine::lane_miss: DS's prune_miss_request)
     res0: crate::adapt::ResStats,
-    miss0: [f64; 4],
+    lane0: [f64; 4],
+    lane1: Option<[f64; 4]>,
+}
+
+/// A phase's routing counts, DS's Generation::miss order: [missed, picks, missed score, score].
+fn phase(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
+    [b[1] - a[1], b[0] - a[0], b[3] - a[3], b[2] - a[2]]
 }
 
 /// A lane's block in a round, between its drafting and its acceptance.
@@ -343,6 +350,8 @@ pub struct Server {
     pub stats: Stats,
     /// the disk prefix store's index (rank 0), when on
     pub store: Option<crate::prefix::Store>,
+    /// the DS engine's routing history beside GLM's (residency::DsHistory), when on
+    pub ds_history: Option<crate::residency::DsHistory>,
     /// each lane's candidate temperature as last set
     sampling: Vec<Option<f32>>,
     pub log: Box<dyn Fn(&str) + Send>,
@@ -362,7 +371,7 @@ impl Server {
         let round_log = std::env::var("TIDELM_GLM_ROUND_LOG").ok()
             .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
         let lanes = eng.lanes();
-        Server { eng, opt, cal, stats: Stats::default(), store: None, sampling: vec![None; lanes], log, round_log,
+        Server { eng, opt, cal, stats: Stats::default(), store: None, ds_history: None, sampling: vec![None; lanes], log, round_log,
                  runs: (0..lanes).map(|_| None).collect(), queue: VecDeque::new(), lru: (0..lanes).collect(), done: vec![] }
     }
 
@@ -562,10 +571,12 @@ impl Server {
         let mut g = g;
         g.cached = keep;
         let suffix = prompt[keep..].to_vec();
+        self.eng.take_lane_demand(lane)?; // the lane's demand restarts with this request
         let mut run = Run {
             job, g, lane, rng: Pcg64::from_seed(0), greedy, temp, top_p, depth, anchor: 0, z_anchor: None, anchor_cands: None,
             lookup: None, copier: None, copied: 0, synced: 0, out: vec![], next_adapt: self.opt.adapt_every, rounds: 0,
-            cancelled: false, part: None, stats: Stats::default(), res0: self.eng.res.stats.clone(), miss0: self.eng.miss_totals()?,
+            cancelled: false, part: None, stats: Stats::default(), res0: self.eng.res.stats.clone(), lane0: self.eng.lane_miss(lane)?,
+            lane1: None,
         };
         run.rng = Pcg64::from_seed(run.job.seed as u128);
         let beside = self.runs.iter().any(|r| r.is_some());
@@ -646,6 +657,12 @@ impl Server {
             run.anchor_cands = Some(self.eng.candidates(arow));
         }
         self.eng.keep_hidden(last)?;
+        // the prompt's routing: its counts, and its vote in the DS history
+        run.lane1 = Some(self.eng.lane_miss(run.lane)?);
+        let d = self.eng.take_lane_demand(run.lane)?;
+        if let Some(h) = self.ds_history.as_mut() {
+            h.fold(&d)?;
+        }
         let prompt = &run.job.prompt;
         run.lookup = (self.opt.lookup > 0 && run.depth > 0).then(|| Lookup::new(prompt, self.opt.lookup));
         run.copier = self.opt.copy.clone().filter(|_| run.job.copy_draft && run.depth > 0).map(|c| CopyDraft::new(prompt, c, None));
@@ -655,27 +672,36 @@ impl Server {
     }
 
     /// A request's end: its Done event, its prompt's rows to the disk store, its line.
-    fn finish(&mut self, run: Run, finish: Finish) -> Result<()> {
+    fn finish(&mut self, mut run: Run, finish: Finish) -> Result<()> {
         self.log_json(serde_json::json!({"tokens": run.g.tokens}));
         let ok = !matches!(finish, Finish::Error(_));
+        // the request's own routing by phase (its rows alone, beside another lane too), DS's
+        // prune_miss_request: a miss a pick that was not routable; the answer's vote in the history
+        let l2 = self.eng.lane_miss(run.lane)?;
+        let l1 = run.lane1.unwrap_or(l2);
+        let (p, d) = (phase(run.lane0, l1), phase(l1, l2));
+        run.g.miss = [p[0], p[1], p[2], p[3], d[0], d[1], d[2], d[3]];
+        let dem = self.eng.take_lane_demand(run.lane)?;
+        if let Some(h) = self.ds_history.as_mut() {
+            h.fold(&dem)?;
+        }
+        let pct = |a: f64, b: f64| if b > 0.0 { a / b * 100.0 } else { 0.0 };
         let s = &run.stats;
         let rounds = s.rounds.max(1) as f64;
         let r1 = &self.eng.res.stats;
-        let m1 = self.eng.miss_totals()?;
-        let m0 = run.miss0;
-        // the routed weight (prompt and answer) that went to substitutes: what more residents lower
-        let missed = if m1[2] > m0[2] { (m1[3] - m0[3]) / (m1[2] - m0[2]) * 100.0 } else { 0.0 };
         let r0 = &run.res0;
         let beside = if s.shared_rounds > 0 {
-            format!(" ({} of {} rounds beside another lane; missed, hot reads and swaps are the lanes')", s.shared_rounds, s.rounds)
+            format!(" ({} of {} rounds beside another lane; hot reads and swaps are the lanes')", s.shared_rounds, s.rounds)
         } else {
             String::new()
         };
         let line = format!("request {}, GLM: {:.2} drafted / {:.2} accepted a round, copy rounds {} ({} long, {} accepted), \
-                            routed weight missed {missed:.1}%, hot reads {} (kept {}, {:.2} s waited), swaps {}, fallbacks {}{beside}",
+                            miss rate {:.1}% (prompt {:.1}%, decode {:.1}%; by score {:.1}%), hot reads {} (kept {}, {:.2} s waited), \
+                            swaps {}, fallbacks {}{beside}",
                            run.job.id, s.drafted as f64 / rounds, s.accepted as f64 / rounds, s.copy_rounds, s.long_copies,
-                           s.copy_accepted, r1.hot_reads - r0.hot_reads, r1.hot_kept - r0.hot_kept, r1.hot_wait_s - r0.hot_wait_s,
-                           r1.swaps - r0.swaps, s.fallbacks);
+                           s.copy_accepted, pct(p[0] + d[0], p[1] + d[1]), pct(p[0], p[1]), pct(d[0], d[1]),
+                           pct(p[2] + d[2], p[3] + d[3]), r1.hot_reads - r0.hot_reads, r1.hot_kept - r0.hot_kept,
+                           r1.hot_wait_s - r0.hot_wait_s, r1.swaps - r0.swaps, s.fallbacks);
         let (id, lane, prompt) = (run.job.id, run.lane, run.job.prompt.clone());
         let mut job = run.job;
         (job.sink)(Event::Done(finish, run.g));
@@ -1109,10 +1135,10 @@ impl Server {
     }
 
     /// tp.warmup: two greedy generations on synthetic prompts (graphs captured, kernels warm)
-    /// and a sampled one, with no adaptation or gate learning; with lanes, two at once as well
+    /// and a sampled one, with no adaptation, gate learning or DS-history votes; with lanes, two at once as well
     /// (the shared passes' graphs); their demand forgotten after, every lane emptied.
     pub fn warmup(&mut self) -> Result<()> {
-        let (opt, cal) = (self.opt.clone(), self.cal.take());
+        let (opt, cal, dsh) = (self.opt.clone(), self.cal.take(), self.ds_history.take());
         self.opt.adapt = false;
         let stop = self.eng.cfg.eos.clone();
         let prompts: [Vec<u32>; 3] = [(0..192).map(|i| 1000 + i % 12).collect(), (0..64).map(|i| (i * 7919) % 50000 + 1000).collect(),
@@ -1136,6 +1162,7 @@ impl Server {
         }
         self.opt = opt;
         self.cal = cal;
+        self.ds_history = dsh;
         self.stats = Stats::default();
         self.eng.res.stats = Default::default();
         self.eng.zero_demand()?;

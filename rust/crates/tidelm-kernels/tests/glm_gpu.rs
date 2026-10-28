@@ -888,12 +888,17 @@ fn absorb_and_router() {
     let d_eids = DeviceBuffer::<i32>::zeroed(tt * 8).unwrap();
     let d_ew = DeviceBuffer::<f32>::zeroed(tt * 8).unwrap();
     let d_hot = DeviceBuffer::<f32>::zeroed(tt * 16).unwrap();
-    ok(unsafe { glm_router(st.raw(), p(&d_l), p(&d_bias), null(), null(), tt as i32, 8, 2.5, p(&d_eids), p(&d_ew), p(&d_al), p(&d_hot), null(), null(), null(), null(), null()) });
+    ok(unsafe { glm_router(st.raw(), p(&d_l), p(&d_bias), null(), null(), tt as i32, 8, 2.5, p(&d_eids), p(&d_ew), p(&d_al), p(&d_hot), null(), null(), null(), null(), null(), null(), null(), 0, null()) });
     let d_ids = DeviceBuffer::<i32>::zeroed(tt * 8).unwrap();
     let d_rw = DeviceBuffer::<f32>::zeroed(tt * 8).unwrap();
     let d_dem = DeviceBuffer::<f32>::zeroed(256).unwrap();
     let d_acc = DeviceBuffer::<f64>::zeroed(4).unwrap();
-    ok(unsafe { glm_router(st.raw(), p(&d_l), p(&d_bias), p(&d_al), p(&d_lut), tt as i32, 8, 2.5, p(&d_ids), p(&d_rw), null(), null(), p(&d_eids), p(&d_ew), p(&d_dem), p(&d_acc), null()) });
+    // the rows' lanes: row 0 lane 0, rows 1-2 lane 1 (each lane's counts and demand apart)
+    let rl = [0i32, 1, 1];
+    let d_rl = dev(&rl);
+    let d_lacc = DeviceBuffer::<f64>::zeroed(8).unwrap();
+    let d_ldem = DeviceBuffer::<f32>::zeroed(2 * 300).unwrap();
+    ok(unsafe { glm_router(st.raw(), p(&d_l), p(&d_bias), p(&d_al), p(&d_lut), tt as i32, 8, 2.5, p(&d_ids), p(&d_rw), null(), null(), p(&d_eids), p(&d_ew), p(&d_dem), p(&d_acc), null(), p(&d_lacc), p(&d_ldem), 300, p(&d_rl)) });
     last_ok();
     let (eids, ew, hot, ids, rw, dem, acc) = (d_eids.download().unwrap(), d_ew.download().unwrap(), d_hot.download().unwrap(),
                                               d_ids.download().unwrap(), d_rw.download().unwrap(), d_dem.download().unwrap(),
@@ -901,6 +906,7 @@ fn absorb_and_router() {
     let sig = |x: f32| 1.0 / (1.0 + (-x).exp());
     let mut want_dem = vec![0f64; 256];
     let mut missed = 0.0;
+    let (mut lane_dem, mut lane_acc) = (vec![0f64; 600], [0f64; 8]);
     for r in 0..tt {
         let pick = |mask: &dyn Fn(usize) -> bool| {
             let mut c: Vec<(f32, usize)> = (0..256).filter(|&e| mask(e)).map(|e| (sig(logits[r * 256 + e]) + bias[e], e)).collect();
@@ -921,6 +927,12 @@ fn absorb_and_router() {
             assert_eq!(hot[(r * 8 + k) * 2 + 1], ech[k] as f32);
             want_dem[ech[k]] += ewt[k] as f64;
             missed += miss as u32 as f64;
+            let z = rl[r] as usize;
+            lane_dem[z * 300 + ech[k]] += ewt[k] as f64;
+            lane_acc[4 * z] += 1.0;
+            lane_acc[4 * z + 1] += miss as u32 as f64;
+            lane_acc[4 * z + 2] += ewt[k] as f64;
+            lane_acc[4 * z + 3] += if miss { ewt[k] as f64 } else { 0.0 };
         }
     }
     for e in 0..256 {
@@ -928,4 +940,11 @@ fn absorb_and_router() {
     }
     assert_eq!(acc[0], (tt * 8) as f64);
     assert_eq!(acc[1], missed);
+    let (lacc, ldem) = (d_lacc.download().unwrap(), d_ldem.download().unwrap());
+    for i in 0..8 {
+        assert!((lacc[i] - lane_acc[i]).abs() < 1e-5, "lane counter {i}: {} vs {}", lacc[i], lane_acc[i]);
+    }
+    for i in 0..600 {
+        assert!((ldem[i] as f64 - lane_dem[i]).abs() < 1e-5, "lane demand {i}");
+    }
 }

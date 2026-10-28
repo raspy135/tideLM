@@ -250,6 +250,8 @@ fn now() -> u64 {
 /// muse_app's job.stats, from the Rust engine's Generation
 fn stats(prompt: usize, n: usize, gen: &Generation, first: Option<f64>, total: f64) -> Value {
     let round = |x: f64, d: i32| (x * 10f64.powi(d)).round() / 10f64.powi(d);
+    let m = &gen.miss;
+    let rate = |a: f64, b: f64| if b > 0.0 { round(a / b, 4) } else { 0.0 };
     json!({
         "prompt_tokens": prompt,
         "reused_prefix": gen.cached,
@@ -264,6 +266,12 @@ fn stats(prompt: usize, n: usize, gen: &Generation, first: Option<f64>, total: f
         "accept_len_mean": if gen.steps > 0 { n.saturating_sub(1) as f64 / gen.steps as f64 } else { 0.0 },
         "copy_steps": gen.copy_steps,
         "copy_accepted": gen.copy_accepted,
+        // adaptive residency: DS's prune_miss_request, the same fields (api.rs)
+        "prune_miss_request": {
+            "miss_rate": rate(m[0] + m[4], m[1] + m[5]), "missed_slots": (m[0] + m[4]) as u64, "slots": (m[1] + m[5]) as u64,
+            "score_miss_rate": rate(m[2] + m[6], m[3] + m[7]),
+            "prompt_miss_rate": rate(m[0], m[1]), "decode_miss_rate": rate(m[4], m[5]),
+        },
     })
 }
 

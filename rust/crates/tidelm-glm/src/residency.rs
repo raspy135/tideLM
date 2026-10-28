@@ -69,6 +69,57 @@ pub fn write_mass(path: &Path, mass: &[f64], layers: usize, experts: usize, toke
     Ok(())
 }
 
+/// The DS engine's routing history kept for GLM beside its own (tidelm_engine::adapt::fold): each
+/// fold a vote that sums to one per layer, the history decayed by 0.5^(1/10) a fold, a request
+/// folding at its prefill's end and at its end. GLM's residency does not read it; it puts the two
+/// models' routing on the same arithmetic (`mass` [layers][experts], `folds`).
+pub struct DsHistory {
+    path: std::path::PathBuf,
+    layers: usize,
+    experts: usize,
+    pub mass: Vec<f64>,
+    pub folds: u64,
+}
+
+impl DsHistory {
+    pub const HALFLIFE: f64 = 10.0;
+
+    /// The history at `path`, or an empty one when there is none (or it is not this shape).
+    pub fn open(path: &Path, layers: usize, experts: usize) -> Self {
+        let mut h = DsHistory { path: path.to_path_buf(), layers, experts, mass: vec![0.0; layers * experts], folds: 0 };
+        if let Ok(m) = std::fs::read(path).map_err(|e| e.to_string()).and_then(|b| tidelm_core::npz::parse(&b).map_err(|e| e.0)) {
+            if let (Some(a), Some(f)) = (m.get("mass").and_then(|a| a.to_f64().ok()), m.get("folds").and_then(|a| a.to_i64().ok())) {
+                if a.len() == layers * experts {
+                    h.mass = a;
+                    h.folds = f.first().copied().unwrap_or(0) as u64;
+                }
+            }
+        }
+        h
+    }
+
+    /// Fold one vote: `d` the routed weight per (layer, expert) of a request's phase.
+    pub fn fold(&mut self, d: &[f32]) -> Result<()> {
+        let decay = 0.5f64.powf(1.0 / Self::HALFLIFE);
+        let e = self.experts;
+        for l in 0..self.layers {
+            let r = l * e..(l + 1) * e;
+            let sm: f64 = d[r.clone()].iter().map(|&x| x as f64).sum::<f64>().max(1e-20);
+            for (h, &x) in self.mass[r].iter_mut().zip(&d[l * e..(l + 1) * e]) {
+                *h = *h * decay + x as f64 / sm;
+            }
+        }
+        self.folds += 1;
+        let mut m = BTreeMap::new();
+        m.insert("mass".to_string(), tidelm_core::npz::Array::f64s(vec![self.layers, e], &self.mass));
+        m.insert("folds".to_string(), tidelm_core::npz::Array::i64s(vec![1], &[self.folds as i64]));
+        let tmp = self.path.with_extension("tmp.npz");
+        tidelm_core::npz::write(&tmp, &m).map_err(|e| e.0)?;
+        std::fs::rename(&tmp, &self.path)?;
+        Ok(())
+    }
+}
+
 /// tp._db_resident: per swap layer its `floor` heaviest experts by mass, then the remaining
 /// slots by global mass (ties to the lower layer, then expert).
 pub fn placement(mass: &[f64], experts: usize, swap_layers: &[usize], slots: usize, floor: usize) -> Vec<(usize, usize)> {

@@ -52,7 +52,8 @@ extern "C" {
     pub fn glm_router(stream: CudaStream, logits: *const c_void, bias: *const c_void, allowed: *const c_void,
                       lut: *const c_void, t: c_int, k: c_int, scale: f32, ids: *mut c_void, w: *mut c_void,
                       resident: *const c_void, hot: *mut c_void, ex_ids: *const c_void, ex_w: *const c_void,
-                      demand: *mut c_void, acc: *mut c_void, live: *const c_void) -> c_int;
+                      demand: *mut c_void, acc: *mut c_void, live: *const c_void, lane_acc: *mut c_void,
+                      lane_demand: *mut c_void, lane_stride: i64, row_lane: *const c_void) -> c_int;
     pub fn glm_swiglu(stream: CudaStream, g: *const c_void, ldg: i64, u: *const c_void, ldu: i64, y: *mut c_void, ldy: i64,
                       t: c_int, n: c_int) -> c_int;
     pub fn glm_moe_out(stream: CudaStream, routed: *const c_void, shared: *const c_void, y: *mut c_void, n: i64) -> c_int;

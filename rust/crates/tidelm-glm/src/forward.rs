@@ -180,6 +180,8 @@ struct Act {
     mrows: DeviceBuffer<i32>,
     mbound: DeviceBuffer<i32>,
     mkoff: DeviceBuffer<i32>,
+    /// each decoder row's lane (the router's per-lane counts)
+    rlane: DeviceBuffer<i32>,
     h: DeviceBuffer<u16>,
     xn: DeviceBuffer<u16>,
     a: DeviceBuffer<u16>,
@@ -344,8 +346,14 @@ pub struct Engine {
     wide_from: usize,
     pub res: crate::adapt::Res,
     h_ids: tidelm_cuda::PinnedBuffer<i32>,
-    /// the lane tables' staging ([2][MAX_LANES][4], Act::lanes)
+    /// the lane tables' staging ([2][MAX_LANES][4], Act::lanes) and the decoder rows' lanes
     h_lanes: tidelm_cuda::PinnedBuffer<i32>,
+    h_rlane: tidelm_cuda::PinnedBuffer<i32>,
+    /// per lane, its decoder rows' routing (DS's prune_miss_request counts, the MTP layer left
+    /// out): [lane][picks, missed picks, routed weight, missed weight] since boot, and its routed
+    /// weight per (layer, expert) since take_lane_demand (rank 0 reads its own; rank 1's run on)
+    lane_miss: DeviceBuffer<f64>,
+    lane_demand: DeviceBuffer<f32>,
     h_tok: tidelm_cuda::PinnedBuffer<i32>,
     /// the disk prefix store's directory for this rank (None: off) and its pinned staging
     pub prefix_dir: Option<std::path::PathBuf>,
@@ -519,6 +527,9 @@ impl Engine {
             res: crate::adapt::Res::new(nl, e, n_slots, moe_layers_res, &placed),
             h_ids: tidelm_cuda::PinnedBuffer::zeroed(opt_chunk.max(HEAD_ROWS))?,
             h_lanes: tidelm_cuda::PinnedBuffer::zeroed(2 * MAX_LANES * 4)?,
+            h_rlane: tidelm_cuda::PinnedBuffer::zeroed(opt_chunk.max(HEAD_ROWS))?,
+            lane_miss: DeviceBuffer::zeroed(MAX_LANES * 4)?,
+            lane_demand: DeviceBuffer::zeroed(lanes * nl * e)?,
             h_tok: tidelm_cuda::PinnedBuffer::zeroed(HEAD_ROWS)?,
             prefix_dir: None,
             stage: None,
@@ -909,7 +920,8 @@ impl Engine {
         self.linear_f32w(at(&a.xn, r0 * h), h, router, n, e, h, np(&a.logits), if n <= MAX_ROWS { 6 } else { 1 })?;
         ck(unsafe { glm_router(self.st.raw(), np(&a.logits), np(bias), std::ptr::null(), std::ptr::null(), n as i32,
                                cfg.topk as i32, cfg.routed_scaling, np(&a.eids), np(&a.ew), allowed, hot, std::ptr::null(),
-                               std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null()) }, "router (exact)")
+                               std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut(),
+                               std::ptr::null_mut(), 0, std::ptr::null()) }, "router (exact)")
     }
 
     fn allowed_ptr(&self, l: usize) -> *mut c_void {
@@ -926,7 +938,10 @@ impl Engine {
         let (lut, arena) = if mtp { (np(&self.mtp_lut), self.mtp_arena.as_ref().unwrap()) } else { (at(&self.lut, l * e), &self.arena) };
         ck(unsafe { glm_router(self.st.raw(), np(&a.logits), np(bias), self.allowed_ptr(l), lut, n as i32, cfg.topk as i32,
                                cfg.routed_scaling, np(&a.pick), np(&a.wts), std::ptr::null(), std::ptr::null_mut(), np(&a.eids),
-                               np(&a.ew), at(&self.demand, l * e), np(&self.miss), std::ptr::null()) }, "router")?;
+                               np(&a.ew), at(&self.demand, l * e), np(&self.miss), std::ptr::null(),
+                               if mtp { std::ptr::null_mut() } else { np(&self.lane_miss) },
+                               if mtp { std::ptr::null_mut() } else { at(&self.lane_demand, l * e) },
+                               (self.cfg.n_layers() * e) as i64, at(&a.rlane, r0)) }, "router")?;
         self.moe_rows(sh_gate_up, sh_down, arena, at(&a.xn, r0 * h), n, prefill, at(&a.a, r0 * h))
     }
 
@@ -1055,6 +1070,11 @@ impl Engine {
         let slot = if mtp { 1 } else { 0 };
         let (mut row0, base) = (0usize, slot * MAX_LANES * 4);
         for (z, &(lane, n, pos0)) in groups.iter().enumerate() {
+            if !mtp {
+                for r in row0..row0 + n {
+                    self.h_rlane[r] = lane as i32;
+                }
+            }
             let stride = if mtp { self.kv[self.cfg.mtp_layer()].lane_rows } else { self.kv[0].lane_rows };
             self.h_lanes[base + 4 * z..base + 4 * z + 4].copy_from_slice(&[row0 as i32, n as i32, pos0 as i32, (lane * stride) as i32]);
             if row0 < HEAD_ROWS {
@@ -1076,6 +1096,10 @@ impl Engine {
                                       MAX_LANES * 16, tidelm_cuda::ffi::MEMCPY_HOST_TO_DEVICE, &self.st)?;
             tidelm_cuda::memcpy_async(at(&self.temp, slot * HEAD_ROWS), (self.h_temp.raw() as *mut f32).add(slot * HEAD_ROWS)
                                       as *const c_void, t.min(HEAD_ROWS) * 4, tidelm_cuda::ffi::MEMCPY_HOST_TO_DEVICE, &self.st)?;
+            if !mtp {
+                tidelm_cuda::memcpy_async(np(&self.act.rlane), self.h_rlane.raw(), t * 4, tidelm_cuda::ffi::MEMCPY_HOST_TO_DEVICE,
+                                          &self.st)?;
+            }
         }
         Ok(())
     }
@@ -1472,6 +1496,7 @@ impl Act {
             mrows: DeviceBuffer::zeroed(r)?,
             mbound: DeviceBuffer::zeroed(r)?,
             mkoff: DeviceBuffer::zeroed(r)?,
+            rlane: DeviceBuffer::zeroed(r)?,
             h: z(r * h)?,
             xn: z(r * h)?,
             a: z(r * h)?,
@@ -1690,6 +1715,27 @@ impl Engine {
 
     pub fn kv_held(&self, lane: usize) -> usize {
         self.paged.held(lane)
+    }
+
+    /// `lane`'s decoder rows' routing since boot: [picks, missed picks, routed weight, missed
+    /// weight] (rank 0's counters; a miss is a pick that was not routable, DS's definition).
+    pub fn lane_miss(&self, lane: usize) -> Result<[f64; 4]> {
+        self.st.synchronize()?;
+        let v = self.lane_miss.download()?;
+        Ok([v[4 * lane], v[4 * lane + 1], v[4 * lane + 2], v[4 * lane + 3]])
+    }
+
+    /// `lane`'s routed weight per (layer, expert) since the last call, which restarts it (rank 0
+    /// only: nothing is mirrored, rank 1's counts run on unread).
+    pub fn take_lane_demand(&mut self, lane: usize) -> Result<Vec<f32>> {
+        let n = self.cfg.n_layers() * self.cfg.experts;
+        self.st.synchronize()?;
+        let mut v = vec![0f32; n];
+        self.lane_demand.download_async(lane * n, &mut v, &self.st)?;
+        self.st.synchronize()?;
+        ck(unsafe { tidelm_cuda::ffi::cudaMemsetAsync(at(&self.lane_demand, lane * n), 0, n * 4, self.st.raw()) },
+           "lane demand reset")?;
+        Ok(v)
     }
 
     /// Truncate `lane` to its first `n` positions and give the pool back the chunks past them (an

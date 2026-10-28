@@ -178,6 +178,13 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
     }
     let mut srv = Server::new(eng, sopt, Box::new(|s: &str| eprintln!("{s}")));
     srv.store = store;
+    // DS's routing history for GLM's traffic, beside the state db (residency::DsHistory)
+    if let Some(p) = srv.eng.res.db_path.clone() {
+        let path = p.with_file_name("glm-ds-history.npz");
+        let h = tidelm_glm::residency::DsHistory::open(&path, srv.eng.cfg.n_layers(), srv.eng.cfg.experts);
+        eprintln!("boot: DS-rule routing history {} ({} folds)", path.display(), h.folds);
+        srv.ds_history = Some(h);
+    }
     if num("--warmup", 1.0)? > 0.0 {
         let tw = Instant::now();
         srv.warmup()?;
