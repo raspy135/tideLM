@@ -33,7 +33,7 @@ use tidelm_kernels::glm::*;
 
 use crate::arena::{Arena, Pack};
 use crate::config::GlmConfig;
-use crate::weights::{Exl3Mat, Exl3Scratch, Members, Mlp, Weights, DECODE_PF, MAX_ROWS};
+use crate::weights::{Exl3Mat, Exl3Scratch, Members, Mlp, Weights, DECODE_PF_ROUTED, MAX_ROWS};
 use crate::{ck, Result};
 
 /// Decode rows a graph or a verify step carries at most (MTP depth 7 + the anchor).
@@ -823,6 +823,9 @@ impl Engine {
         }
         if decode {
             self.join()?;
+            // kv_b's value rows (each head's rows 192..448 of 448, FP8 [512]: 32 runs of 128 KB) for
+            // absorb_o, during the gathers and the core
+            self.l2_runs(lw.kvb_q.raw() as u64 + (192 * 512) as u64, (256 * 512) as u64, (448 * 512) as u64, hl)?;
         }
         let scale = (cfg.qk_dim() as f32).powf(-0.5);
         let inv_d = (cfg.index_dim as f32).powf(-0.5);
@@ -1119,7 +1122,7 @@ impl Engine {
             } else {
                 exl3m_grouped(np(&a.xh0), np(&a.xh1), np(&arena.t1p), np(&arena.t3p), np(&arena.k2g), np(&arena.k2u), uids,
                               np(&a.ucount), np(&a.members), np(&a.zup), h as i32, il as i32, p as i32, 1, maxm, k as i32,
-                              nexp, 2, 8, 4, if decode { DECODE_PF } else { 2 }, 2, 10, arena.cb, st);
+                              nexp, 2, 8, 4, if decode { DECODE_PF_ROUTED } else { 2 }, 2, 10, arena.cb, st);
             }
             let suh2 = (arena.pool(5) as *mut u16).add(self.rank * il) as *const c_void;
             exl3m_gateup(np(&a.zup), np(&a.pick), arena.pool(6), arena.pool(7), suh2, np(&a.pair), n as i32, p as i32, il as i32,
@@ -1164,7 +1167,7 @@ impl Engine {
             } else {
                 exl3m_grouped(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d), uids,
                               np(&a.ucount), np(&a.members), np(&a.zd), kd as i32, dn as i32, p as i32, 1, maxm, k as i32,
-                              nexp, 1, 8, 4, if decode { DECODE_PF } else { 2 }, 2, 10, arena.cb, st);
+                              nexp, 1, 8, 4, if decode { DECODE_PF_ROUTED } else { 2 }, 2, 10, arena.cb, st);
             }
             exl3m_down_combine(np(&a.zd), np(&a.pick), arena.pool(8), np(&a.wts), np(&a.local), n as i32, p as i32, dn as i32, 1,
                                k as i32, slots, st);

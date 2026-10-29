@@ -4977,3 +4977,18 @@ two alternating rounds: base 86.0 / 130.8 / 147.3, this build (but the o_proj pr
 What is left in a one-row pass (~68 ms): five RoCE gathers a layer (~6 ms), the MLA core (~3-4 ms;
 its shared memory caps it at one block an SM), the router chain, ~4,700 kernels, and GEMVs at
 80-90% of a streaming read.
+
+Then (the same day, the pair's `--bench-width` in alternating boots):
+- **The routed experts at three stages** (DECODE_PF_ROUTED = -3; the dense matrices stay at two,
+  1-2 us slower at three): `glm_bench_moe` at split 1, gate+up / down, 1 row 173 / 100 -> 169 / 90
+  us, 4 rows 479 / 226 -> 444 / 218, 8 rows 868 / 418 -> 848 / 416. The pair, two rounds, 1 / 2 /
+  3 / 4 / 8 rows: 68.2-69.4 / 89.9-90.9 / 106.9-107.0 / 123.1-123.5 / 181.9-183.9 -> 68.2-68.3 /
+  87.3-87.5 / 103.3-103.8 / 119.0-121.7 / 172.8-179.6 ms.
+- **kv_b's value rows into L2** for absorb_o (each head's rows 192..448, 32 runs of 128 KB, after
+  the query path joins): four rounds against the above, 1 / 4 / 8 rows 66.2 / 118.1 / 174.9 ms
+  against 67.4 / 119.6 / 175.8 on average, inside the boots' spread (+-3%); kept, exact.
+- **Rejected: 4 n-tiles a warp** for the small matrices (twice the blocks, the same k ranges and
+  sums: the same bytes): `glm_bench_chain` within +-2 us of 8 on every matrix (q_a 44.3 -> 47.4,
+  kv_a 23.8 both, q_b 56.5 -> 55.6, wq_b 38.1 -> 36.1, the shared gate+up 54.5 -> 54.3, shared
+  down 29.9 both, o_proj 147.5 -> 145.6). The 2-10 MB matrices are bound by a kernel's ramp and
+  tail, not by its block count.

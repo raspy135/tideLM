@@ -54,7 +54,7 @@ fn main() -> Result<()> {
         let p = r * TOPK;
         for (name, mats, k, n, wq, tp0, tp1) in [("gate+up", 2, h, il, wgu, &t1p, &t3p), ("down", 1, kd, dn, wdn, &t2p, &t2p)] {
             let mut line = format!("R{r} U{u:>2} {name:>7}:");
-            for &(nt, pf) in &[(8usize, 1i32), (8, -2), (4, 2)] {
+            for &(nt, pf) in &[(8usize, 1i32), (8, -2), (8, -3)] {
                 line += &format!("  nt{nt}pf{pf}");
                 for sk in [1usize, 2, 4, 8] {
                     if (k / 16) % (sk * 4) != 0 {

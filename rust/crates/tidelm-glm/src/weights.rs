@@ -24,6 +24,12 @@ pub const MAX_ROWS: usize = 16;
 /// (glm_bench_chain, docs/gotchas.md).
 pub const DECODE_PF: i32 = -2;
 
+/// The routed experts' decode calls: three stages. At split 1 (glm_bench_moe, cold random 3-bit
+/// experts, gate+up / down) 1 row 173 / 100 -> 169 / 90 us, 2 rows 299 / 134 -> 267 / 128, 4 rows
+/// 479 / 226 -> 444 / 218, 8 rows 868 / 418 -> 848 / 416 against two; the dense matrices were
+/// 1-2 us slower with three (glm_bench_chain). The same bytes either way.
+pub const DECODE_PF_ROUTED: i32 = -3;
+
 /// How a rank cuts a matrix of the pair: output columns (N tiles, svh) or input rows (K tiles,
 /// suh; the outputs are partial sums), or not at all.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
