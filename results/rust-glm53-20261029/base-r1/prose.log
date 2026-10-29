@@ -1,0 +1,12 @@
+== p1-base-r1-prose: workload=prose isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=53 ttft=   1522.3 ms  tpot=  56.85 ms  decode= 17.59 tok/s  out=1024 (length)
+          accept_len=2.1536842105263156  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=53 ttft=    806.6 ms  tpot=  56.08 ms  decode= 17.83 tok/s  out=1024 (length)
+          accept_len=2.0920245398773005  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=53 ttft=    528.3 ms  tpot=  54.90 ms  decode= 18.22 tok/s  out=1024 (length)
+          accept_len=2.0877551020408163  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=53 ttft=    516.9 ms  tpot=  52.79 ms  decode= 18.94 tok/s  out=1024 (length)
+          accept_len=2.1627906976744184  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=528.2845 ms  tpot=54.8966 ms  decode=18.2161 tok/s
+  -> ENGINE  accept_len=2.092  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /home/ryan/tidelm-rust-state/glm-p1/base-r1/prose.json

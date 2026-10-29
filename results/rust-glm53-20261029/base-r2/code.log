@@ -1,0 +1,12 @@
+== p1-base-r2-code: workload=code isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=68 ttft=   1291.1 ms  tpot=  44.95 ms  decode= 22.25 tok/s  out=1024 (length)
+          accept_len=2.939655172413793  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=68 ttft=    602.7 ms  tpot=  45.14 ms  decode= 22.15 tok/s  out=1024 (length)
+          accept_len=2.922857142857143  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=68 ttft=    607.6 ms  tpot=  44.82 ms  decode= 22.31 tok/s  out=1024 (length)
+          accept_len=2.9312320916905446  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=68 ttft=    602.1 ms  tpot=  46.79 ms  decode= 21.37 tok/s  out=1024 (length)
+          accept_len=2.720744680851064  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=602.6543 ms  tpot=45.1407 ms  decode=22.1529 tok/s
+  -> ENGINE  accept_len=2.9229  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /home/ryan/tidelm-rust-state/glm-p1/base-r2/code.json

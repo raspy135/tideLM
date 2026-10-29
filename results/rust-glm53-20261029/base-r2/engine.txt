@@ -1,0 +1,15 @@
+boot: routing history /app/profiles/glm53-experts-v1.pt 
+[glm] dense weights: layer 12 (2.0 GB, 5 s)
+[glm] dense weights: layer 25 (3.1 GB, 7 s)
+[glm] dense weights: layer 38 (4.1 GB, 9 s)
+[glm] dense weights: layer 51 (5.1 GB, 12 s)
+[glm] dense weights: layer 64 (6.2 GB, 14 s)
+[glm] dense weights: layer 77 (7.2 GB, 17 s)
+[glm] dense weights 7.33 GB a rank in 18 s
+[glm] 12968 routed experts resident (86.8 GB; 2/2/2 x1506, 2/2/3 x1762, 3/3/3 x9202, 3/3/4 x201, 4/4/4 x297) in 9 s
+[glm] KV cache 9.25 GB a rank (327680 positions, split, 2 lanes sharing them)
+boot: prefix store /home/ryan/tidelm-rust-state/glm-p1/base-r2/prefix/fc5152fd41a915c6/rank-0 (0 segments, 20 GB)
+boot: DS-rule routing history /home/ryan/tidelm-rust-state/glm-p1/base-r2/glm-ds-history.npz (0 folds)
+boot: warm-up 10.7 s
+engine up in 43.2s; serving glm-5.3 on 0.0.0.0:8000 (GLM, depth 7, calibrated gate 0.36)
+memory at boot: device 101.57 GiB (+0.00 since up), pinned 0.08 GiB (+0.00), graphs 32 (0 made since up; 0.92 GiB, heap 0.41), host anon 1.47 GiB (heap in use 1.42, held free 0.13), file-backed 0.23 GiB
