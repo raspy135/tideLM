@@ -169,6 +169,10 @@ pub type Dist = Vec<(u32, f32)>;
 /// ranks' candidates, or None when they cannot prove it: the kept set must stay above every
 /// rank's smallest candidate and reach top_p.
 pub fn nucleus(rc: &RowCands, temp: f32, top_p: f32) -> Option<Dist> {
+    // a NaN logit proves nothing: the full row decides (Server::dist)
+    if rc.vals.iter().chain(rc.lse.iter().map(|x| &x.0)).chain(rc.lse.iter().map(|x| &x.1)).any(|v| v.is_nan()) {
+        return None;
+    }
     let m = rc.lse.iter().map(|x| x.0).fold(f32::NEG_INFINITY, f32::max);
     let z: f64 = rc.lse.iter().map(|&(mr, s)| s as f64 * (((mr - m) / temp) as f64).exp()).sum();
     let mut c: Vec<(f32, u32)> = rc.vals.iter().zip(&rc.ids).map(|(&v, &i)| (v, i)).collect();
@@ -199,7 +203,7 @@ pub fn nucleus(rc: &RowCands, temp: f32, top_p: f32) -> Option<Dist> {
 fn dist_from_logits(z: &[f32], temp: f32, top_p: f32) -> Dist {
     let p = tidelm_core::sampling::sample_probs(z, temp, top_p);
     let mut d: Dist = p.iter().enumerate().filter(|(_, &x)| x > 0.0).map(|(i, &x)| (i as u32, x)).collect();
-    d.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
+    d.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     d
 }
 
@@ -389,8 +393,20 @@ impl Server {
         }
         self.stats.fallbacks += 1;
         st.fallbacks += 1;
-        let z = self.eng.full_row(row)?;
-        Ok(dist_from_logits(&z, temp, top_p))
+        let mut z = self.eng.full_row(row)?;
+        // NaN logits once panicked the sampler's sort and stopped the pair (2026-10-29, a request
+        // past 162K; cause not found): logged, taken as -inf, the row sampled from what is left
+        let nan = z.iter().filter(|v| v.is_nan()).count();
+        if nan > 0 {
+            eprintln!("warning: {nan} NaN logits in row {row} of the last pass (lane {}, position {}); sampled as -inf",
+                      self.eng.lane, self.eng.pos);
+            z.iter_mut().filter(|v| v.is_nan()).for_each(|v| *v = f32::NEG_INFINITY);
+        }
+        let d = dist_from_logits(&z, temp, top_p);
+        if d.is_empty() {
+            return Err(format!("row {row}: no finite logits to sample from").into());
+        }
+        Ok(d)
     }
 
     /// Row `row`'s chain probability for a greedy draft: max softmax probability (T = 1).
@@ -762,7 +778,7 @@ impl Server {
                     // the anchor row's best other token
                     if let Some(rc) = r.anchor_cands.as_ref() {
                         let best = rc.vals.iter().zip(&rc.ids).filter(|(_, &i)| i != r.anchor)
-                            .max_by(|a, b| a.0.partial_cmp(b.0).unwrap().then(b.1.cmp(a.1))).map(|(_, &i)| i);
+                            .max_by(|a, b| a.0.total_cmp(b.0).then(b.1.cmp(a.1))).map(|(_, &i)| i);
                         if let Some(b) = best {
                             r.anchor = b;
                             self.stats.loop_breaks += 1;
