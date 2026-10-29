@@ -34,7 +34,7 @@ pub fn is_glm(model_dir: &std::path::Path) -> bool {
 }
 
 pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
-    const VALUED: [&str; 43] = ["--lanes", "--lane-chunk", "--bench-nll-out", "--bench-nll", "--bench-widths", "--copy", "--hot-async", "--bench-width", "--bench-ctx", "--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
+    const VALUED: [&str; 46] = ["--bench-nll-skip", "--bench-nll-rows", "--bench-nll-max", "--lanes", "--lane-chunk", "--bench-nll-out", "--bench-nll", "--bench-widths", "--copy", "--hot-async", "--bench-width", "--bench-ctx", "--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
                                 "--max-seq", "--chunk", "--hot", "--hot-keep", "--depth", "--cal", "--dyn", "--lookup",
                                 "--adapt", "--adapt-every", "--adapt-prefill", "--adapt-decode", "--bg-every", "--loop-break",
                                 "--two-pass", "--two-pass-miss", "--host", "--port", "--served-model-name", "--moe-rows",
@@ -196,7 +196,13 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
     if let Some(path) = arg(args, "--bench-nll") {
         let text = Text::load(&model_dir)?;
         let keep = num("--hot-keep", 32.0)? as usize;
-        return bench_nll(&mut srv.eng, &path, &text, keep, arg(args, "--bench-nll-out"));
+        // --bench-nll-skip N: prefill each text's first N tokens (default 32) before scoring;
+        // --bench-nll-rows A,B,..: the passes' rows, cycled (default 8; 17-33 take the wide decode
+        // path past its position); --bench-nll-max: tokens a text is cut at (default 4096)
+        let rows: Vec<usize> = arg(args, "--bench-nll-rows").unwrap_or_else(|| "8".into()).split(',')
+            .map(|v| v.trim().parse()).collect::<std::result::Result<_, _>>().map_err(|e| format!("--bench-nll-rows: {e}"))?;
+        let shape = (num("--bench-nll-skip", 32.0)? as usize, rows, num("--bench-nll-max", 4096.0)? as usize);
+        return bench_nll(&mut srv.eng, &path, &text, keep, arg(args, "--bench-nll-out"), &shape);
     }
     if let Some(path) = arg(args, "--bench-width") {
         let text = Text::load(&model_dir)?;
@@ -343,31 +349,37 @@ fn bench_widths(eng: &mut Engine, ids: &[u32], ctx: usize, widths: &[usize]) -> 
 /// reads, the background period's victims every 2 passes, an adaptation every 200 tokens). A row's
 /// next token's -log p at T = 1 comes from the pair's candidates, or the whole row when it is not
 /// among them; top-1 is the row's argmax. Texts are cut at 4,096 tokens.
-fn bench_nll(eng: &mut Engine, path: &str, text: &Text, keep: usize, out: Option<String>) -> tidelm_engine::Result<()> {
+fn bench_nll(eng: &mut Engine, path: &str, text: &Text, keep: usize, out: Option<String>,
+             (skip, rows, max): &(usize, Vec<usize>, usize)) -> tidelm_engine::Result<()> {
     eng.set_sampling(Some(1.0))?;
     // --bench-nll-out: each scored token's "category nll top1" a line, for paired comparisons
     let mut dump = out.map(std::fs::File::create).transpose()?;
     let mut acc: std::collections::BTreeMap<String, (f64, f64, f64, usize)> = Default::default();
     let t0 = Instant::now();
+    let mut nans = 0usize;
     for line in std::fs::read_to_string(path)?.lines().filter(|l| !l.trim().is_empty()) {
         let v: serde_json::Value = serde_json::from_str(line)?;
         let cat = v["category"].as_str().unwrap_or("all").to_string();
         let ids = text.encode(v["text"].as_str().unwrap_or("")).map_err(|e| format!("{path}: {e:?}"))?;
-        if ids.len() < 48 {
+        if ids.len() < skip + 16 {
             continue;
         }
-        let ids = &ids[..ids.len().min(4096)];
+        let ids = &ids[..ids.len().min(*max)];
         eng.set_pos(0)?;
-        eng.forward(&ids[..32], false)?;
+        eng.forward(&ids[..*skip], false)?;
         eng.adapt(512)?;
-        let (mut i, mut since, mut passes) = (32usize, 0usize, 0usize);
+        let (mut i, mut since, mut passes) = (*skip, 0usize, 0usize);
         let a = acc.entry(cat).or_default();
         while i + 1 < ids.len() {
-            let n = 8.min(ids.len() - 1 - i);
+            let n = rows[passes % rows.len()].min(ids.len() - 1 - i);
             let am = eng.forward(&ids[i..i + n], false)?;
             for r in 0..n {
                 let t = ids[i + r + 1];
                 let rc = eng.candidates(r);
+                if rc.vals.iter().chain(rc.lse.iter().map(|x| &x.0)).any(|v| v.is_nan()) {
+                    nans += 1;
+                    eprintln!("bench-nll: NaN in the candidates of row {r} of a {n}-row pass at position {i}");
+                }
                 let m = rc.lse.iter().map(|x| x.0).fold(f32::NEG_INFINITY, f32::max);
                 let z: f64 = rc.lse.iter().map(|&(mr, s)| s as f64 * ((mr - m) as f64).exp()).sum();
                 let zt = match rc.ids.iter().position(|&x| x == t) {
@@ -404,7 +416,8 @@ fn bench_nll(eng: &mut Engine, path: &str, text: &Text, keep: usize, out: Option
         tn += n;
         tsum += s;
     }
-    eprintln!("bench-nll: all: {tn} tokens, NLL {:.4}, {:.0} s", tsum / tn.max(1) as f64, t0.elapsed().as_secs_f64());
+    eprintln!("bench-nll: all: {tn} tokens, NLL {:.4}, {:.0} s, {nans} rows with NaN", tsum / tn.max(1) as f64,
+              t0.elapsed().as_secs_f64());
     eng.stop_follower()?;
     Ok(())
 }
