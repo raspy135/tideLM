@@ -1958,7 +1958,7 @@ impl Engine {
         };
         // programmatic dependent launch for the engine's kernels (ds41.cu, fp4_moe_cuda.cu): each
         // kernel's blocks launch while the one before finishes. 1.3-1.8 ms off a decode step on the
-        // pair, bit-identical (docs/gotchas.md); TIDELM_PDL=0 turns it off. GLM never sets it.
+        // pair, bit-identical (docs/gotchas.md); TIDELM_PDL=0 turns it off. The GLM engine sets its own.
         let pdl = std::env::var("TIDELM_PDL").as_deref() != Ok("0");
         unsafe {
             ds_set_pdl(pdl as i32);

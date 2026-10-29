@@ -124,6 +124,8 @@ __device__ float block_max(float v, float* scratch) {
 //   KIND 0: W fp8 e4m3 [N, K] + UE8M0 scales [ceil(N/32), ceil(K/32)] (tools/fp8_linear.py)
 //   KIND 1: W bf16 [N, K]                                          (F.linear, bf16 weight)
 //   KIND 2: W fp32 [N, K]                                          (F.linear on x.float())
+//   KIND 3: W fp16 [N, K], widened to fp32 in registers: KIND 2's lanes, loads and FMA chain at
+//           half the bytes, so a weight stored in fp16 (GLM's router) gives KIND 2's bits exactly
 // One warp owns ROWS consecutive output rows; lanes split K in 16-byte weight loads; x is
 // staged in shared memory. `rows_per_group` > 0 makes it the grouped wo_a GEMM: rows of
 // group g read x at x + g * x_group_stride (tools/fp8_linear.py::fp8_grouped_linear).
@@ -143,6 +145,7 @@ template <int KIND> struct Lane;
 template <> struct Lane<0> { static constexpr int V = 16, ESZ = 1; };
 template <> struct Lane<1> { static constexpr int V = 8, ESZ = 2; };
 template <> struct Lane<2> { static constexpr int V = 4, ESZ = 4; };
+template <> struct Lane<3> { static constexpr int V = 4, ESZ = 2; };
 
 template <int KIND>
 __device__ __forceinline__ void decode_w(uint4 raw, float* out) {
@@ -151,6 +154,10 @@ __device__ __forceinline__ void decode_w(uint4 raw, float* out) {
         fp8x4_to_f32(raw.z, out + 8); fp8x4_to_f32(raw.w, out + 12);
     } else if (KIND == 1) {
         bf16x8_to_f32(raw, out);
+    } else if (KIND == 3) {
+        const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&raw.x));
+        const float2 b = __half22float2(*reinterpret_cast<const __half2*>(&raw.y));
+        out[0] = a.x; out[1] = a.y; out[2] = b.x; out[3] = b.y;
     } else {
         out[0] = __uint_as_float(raw.x); out[1] = __uint_as_float(raw.y);
         out[2] = __uint_as_float(raw.z); out[3] = __uint_as_float(raw.w);
@@ -220,8 +227,14 @@ __global__ void __launch_bounds__(kThreads) skinny_kernel(
                     // within run-to-run noise). x is staged in shared memory, so there is nothing in L2
                     // for streaming weights to evict; the MoE decode kernels, which re-read every
                     // pair's activations from L2, gain ~9% from it (bench_moe_bw).
-                    raw[u][r] = ok ? *reinterpret_cast<const uint4*>(w + ((int64_t)n * K + k) * ESZ)
-                                   : make_uint4(0, 0, 0, 0);
+                    if (KIND == 3) {
+                        const uint2 h = ok ? *reinterpret_cast<const uint2*>(w + ((int64_t)n * K + k) * ESZ)
+                                           : make_uint2(0, 0);
+                        raw[u][r] = make_uint4(h.x, h.y, 0, 0);
+                    } else {
+                        raw[u][r] = ok ? *reinterpret_cast<const uint4*>(w + ((int64_t)n * K + k) * ESZ)
+                                       : make_uint4(0, 0, 0, 0);
+                    }
                     scale[u][r] = 1.f;
                     if (KIND == 0 && ok) scale[u][r] = e8m0_lin(s[(int64_t)(n >> 5) * lds + (k >> 5)]);
                 }
@@ -3598,6 +3611,13 @@ int ds_linear_bf16(void* stream, const void* x, int64_t ldx, const void* w, int 
 int ds_linear_f32w(void* stream, const void* x, int64_t ldx, const void* w, int M, int N, int K, int splits,
                    void* y_f32, int64_t ldy, void* partial) {
     return launch_skinny<2>(static_cast<cudaStream_t>(stream), x, ldx, 0, 0, w, nullptr, 0, M, N, K, splits,
+                            nullptr, y_f32, ldy, partial);
+}
+
+// ds_linear_f32w with the weight kept in fp16 (exact when the fp32 weight was widened from fp16)
+int ds_linear_f16w(void* stream, const void* x, int64_t ldx, const void* w, int M, int N, int K, int splits,
+                   void* y_f32, int64_t ldy, void* partial) {
+    return launch_skinny<3>(static_cast<cudaStream_t>(stream), x, ldx, 0, 0, w, nullptr, 0, M, N, K, splits,
                             nullptr, y_f32, ldy, partial);
 }
 

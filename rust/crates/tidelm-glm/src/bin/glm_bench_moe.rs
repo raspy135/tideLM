@@ -54,7 +54,7 @@ fn main() -> Result<()> {
         let p = r * TOPK;
         for (name, mats, k, n, wq, tp0, tp1) in [("gate+up", 2, h, il, wgu, &t1p, &t3p), ("down", 1, kd, dn, wdn, &t2p, &t2p)] {
             let mut line = format!("R{r} U{u:>2} {name:>7}:");
-            for &(nt, pf) in &[(8usize, 1usize), (8, 2), (4, 2)] {
+            for &(nt, pf) in &[(8usize, 1i32), (8, -2), (4, 2)] {
                 line += &format!("  nt{nt}pf{pf}");
                 for sk in [1usize, 2, 4, 8] {
                     if (k / 16) % (sk * 4) != 0 {
@@ -75,7 +75,7 @@ fn main() -> Result<()> {
                         unsafe {
                             exl3m_grouped(x0.raw(), x1.raw(), tp0.raw(), tp1.raw(), k2.raw(), k2.raw(), uids.raw(),
                                           ucount.raw(), members.raw(), z.raw(), k as i32, n as i32, p as i32, sk as i32,
-                                          MAX_MEMBERS, TOPK as i32, p as i32, mats, nt as i32, 4, pf as i32, 2, 10,
+                                          MAX_MEMBERS, TOPK as i32, p as i32, mats, nt as i32, 4, pf, 2, 10,
                                           CB_MUL1, st.raw());
                         }
                         e1.record(&st)?;

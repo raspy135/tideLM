@@ -27,13 +27,13 @@ use std::path::Path;
 use tidelm_cuda::{DeviceBuffer, Stream};
 use tidelm_engine::kv::{KvBuf, PagedKv, Spec};
 use tidelm_kernels::blas::{Blas, Mat, R_16BF};
-use tidelm_kernels::ds41::{ds_linear_bf16, ds_linear_f32w, ds_route_blocks, ds_route_large, ds_splits_reduce};
+use tidelm_kernels::ds41::{ds_linear_bf16, ds_linear_f16w, ds_linear_f32w, ds_route_blocks, ds_route_large, ds_splits_reduce};
 use tidelm_kernels::exl3::*;
 use tidelm_kernels::glm::*;
 
 use crate::arena::{Arena, Pack};
 use crate::config::GlmConfig;
-use crate::weights::{Exl3Mat, Exl3Scratch, Members, Mlp, Weights, MAX_ROWS};
+use crate::weights::{Exl3Mat, Exl3Scratch, Members, Mlp, Weights, DECODE_PF, MAX_ROWS};
 use crate::{ck, Result};
 
 /// Decode rows a graph or a verify step carries at most (MTP depth 7 + the anchor).
@@ -294,6 +294,17 @@ pub struct Engine {
     st2: Stream,
     ev_fork: tidelm_cuda::Event,
     ev_join: tidelm_cuda::Event,
+    /// L2 prefetch of the next weights from a parallel graph branch (l2_runs; decode passes,
+    /// TIDELM_L2_PREFETCH=0 off): its stream, fork / join events and whether a branch is open. It
+    /// moves no value.
+    l2pf: bool,
+    pf_side: Stream,
+    pf_fork: tidelm_cuda::Event,
+    pf_join: tidelm_cuda::Event,
+    pf_open: std::cell::Cell<bool>,
+    /// a decode MoE layer's shared gate/up still running on the side stream (moe_exact forks it,
+    /// moe_rows joins it after the routed gate/up)
+    sh_open: std::cell::Cell<bool>,
     blas: Blas,
     pub w: Weights,
     members: Members,
@@ -381,6 +392,15 @@ impl Engine {
     pub fn load(model_dir: &Path, opt: Options, rank: usize, world: usize, pair: Option<Pair>,
                 residents: &[(usize, usize)], log: &dyn Fn(&str)) -> Result<Self> {
         let cfg = GlmConfig::load(model_dir)?;
+        // programmatic dependent launch for every kernel of glm.cu, the EXL3 file and the ds41.cu ones
+        // GLM calls (each starts with griddepcontrol.wait): the next kernel launches while this one
+        // drains. Bit-identical; TIDELM_PDL=0 turns it off (docs/gotchas.md)
+        let pdl = (std::env::var("TIDELM_PDL").as_deref() != Ok("0")) as i32;
+        unsafe {
+            glm_set_pdl(pdl);
+            exl3m_set_pdl(pdl);
+            tidelm_kernels::ds41::ds_set_pdl(pdl);
+        }
         let st = Stream::new()?;
         let blas = Blas::new(st.raw())?;
         let hl = cfg.heads / world;
@@ -499,6 +519,12 @@ impl Engine {
             st2: Stream::new()?,
             ev_fork: tidelm_cuda::Event::new()?,
             ev_join: tidelm_cuda::Event::new()?,
+            l2pf: std::env::var("TIDELM_L2_PREFETCH").as_deref() != Ok("0"),
+            pf_side: Stream::new()?,
+            pf_fork: tidelm_cuda::Event::new()?,
+            pf_join: tidelm_cuda::Event::new()?,
+            pf_open: std::cell::Cell::new(false),
+            sh_open: std::cell::Cell::new(false),
             blas,
             w,
             arena,
@@ -645,12 +671,7 @@ impl Engine {
         }
     }
 
-    /// y fp32 [rows][n] = x bf16 [rows][k] . W^T, W fp32 [n][k] (F.linear(x.float(), w)).
-    fn linear_f32w(&self, x: *const c_void, ldx: usize, w: &DeviceBuffer<f32>, rows: usize, n: usize, k: usize,
-                   y: *mut c_void, splits: usize) -> Result<()> {
-        self.linear_f32w_on(&self.st, np(&self.act.split_part), x, ldx, w, rows, n, k, y, splits)
-    }
-
+    /// y fp32 [rows][n] = x bf16 [rows][k] . W^T, W fp32 [n][k] (F.linear(x.float(), w)), on `st`.
     #[allow(clippy::too_many_arguments)]
     fn linear_f32w_on(&self, st: &Stream, part: *mut c_void, x: *const c_void, ldx: usize, w: &DeviceBuffer<f32>, rows: usize,
                       n: usize, k: usize, y: *mut c_void, splits: usize) -> Result<()> {
@@ -674,6 +695,51 @@ impl Engine {
     fn join(&self) -> Result<()> {
         self.ev_join.record(&self.st2)?;
         self.st.wait_event(&self.ev_join)?;
+        Ok(())
+    }
+
+    /// `count` runs of `run` bytes, `stride` apart from `base`, into L2 from the prefetch branch:
+    /// it starts where the main stream is and nothing waits for it until the pass's end
+    /// (prefetch_join). Decode passes only; a prefill's GEMMs stream at the memory's rate.
+    fn l2_runs(&self, base: u64, run: u64, stride: u64, count: usize) -> Result<()> {
+        if !self.l2pf || run == 0 || count == 0 {
+            return Ok(());
+        }
+        self.pf_fork.record(&self.st)?;
+        self.pf_side.wait_event(&self.pf_fork)?;
+        ck(unsafe { glm_l2_runs(self.pf_side.raw(), base, run, stride, count as i32, 8) }, "l2 runs")?;
+        self.pf_join.record(&self.pf_side)?;
+        self.pf_open.set(true);
+        Ok(())
+    }
+
+    /// An EXL3 matrix's first `budget` bytes into L2, spread over its decode warps' k ranges
+    /// (Exl3Mat::warp_runs): each warp of the coming GEMV starts in L2.
+    fn l2_mat(&self, m: &Exl3Mat, rows: usize, budget: usize) -> Result<()> {
+        let (base, stride, count) = m.warp_runs(rows);
+        self.l2_runs(base, (budget / count).min(stride as usize) as u64, stride, count)
+    }
+
+    /// The routed experts' down GEMV (picks `pick`, `p` of them, in `arena`) into L2 from the prefetch
+    /// branch: `budget` bytes over the picks' warp ranges (the grouped kernel at split 1: 4 a matrix).
+    fn l2_experts(&self, pick: *mut c_void, p: usize, arena: &Arena, k: usize, n: usize, budget: usize) -> Result<()> {
+        if !self.l2pf || p == 0 {
+            return Ok(());
+        }
+        self.pf_fork.record(&self.st)?;
+        self.pf_side.wait_event(&self.pf_fork)?;
+        ck(unsafe { glm_l2_experts(self.pf_side.raw(), pick, p as i32, np(&arena.t2p), np(&arena.k2d), k as i32, n as i32, 4,
+                                   (budget / (4 * p)) as u64, 8) }, "l2 experts")?;
+        self.pf_join.record(&self.pf_side)?;
+        self.pf_open.set(true);
+        Ok(())
+    }
+
+    /// Join an open prefetch branch into the main stream (a captured graph must end joined).
+    fn prefetch_join(&self) -> Result<()> {
+        if self.pf_open.replace(false) {
+            self.st.wait_event(&self.pf_join)?;
+        }
         Ok(())
     }
 
@@ -782,11 +848,14 @@ impl Engine {
             }
             let hh = cfg.heads;
             let (ns, chunk) = decode_split(TOPK, hh, t);
-            ck(unsafe { glm_mla(st, 2, np(&a.gs), (nbytes / 2) as i64, (self.qrow / 2) as i64, 576, hl as i32, kv.cq.raw(), kv.cs.raw(),
+            ck(unsafe { glm_mla(st, MLA_DECODE_MT, np(&a.gs), (nbytes / 2) as i64, (self.qrow / 2) as i64, 576, hl as i32, kv.cq.raw(), kv.cs.raw(),
                                 kv.cr.raw(), 0, np(&a.idx), TOPK as i64, TOPK as i32, 0, bound, t as i32, hh as i32, scale,
                                 ns as i32, chunk as i32, np(&a.pm), np(&a.pl), np(&a.pacc), std::ptr::null_mut(), 0, 0,
                                 koff) },
                "mla (split)")?;
+            // o_proj's weights while the partials combine, the gather waits and absorb_o runs (memory
+            // nearly idle); issued before the core attends, they were evicted by its partials past 2 rows
+            self.l2_mat(&lw.o, t, PF_O)?;
             ck(unsafe { glm_mla_combine(st, np(&a.pm), np(&a.pl), np(&a.pacc), t as i32, hh as i32, ns as i32,
                                         std::ptr::null_mut(), 0, 0, np(&a.own_o), np(&a.own_l), np(&a.send2), self.row2 as i64,
                                         hl as i32, (self.rank * hl) as i32) }, "mla combine (split)")?;
@@ -806,9 +875,10 @@ impl Engine {
                                      TOPK as i64, std::ptr::null_mut(), 0) }, "topk")?;
             }
             let (ns, chunk) = decode_split(TOPK, hl, t);
-            ck(unsafe { glm_mla(st, 2, qbase, 0, qrow as i64, 576, hl as i32, kv.cq.raw(), kv.cs.raw(), kv.cr.raw(), 0,
+            ck(unsafe { glm_mla(st, MLA_DECODE_MT, qbase, 0, qrow as i64, 576, hl as i32, kv.cq.raw(), kv.cs.raw(), kv.cr.raw(), 0,
                                 np(&a.idx), TOPK as i64, TOPK as i32, 1, bound, t as i32, hl as i32, scale, ns as i32, chunk as i32,
                                 np(&a.pm), np(&a.pl), np(&a.pacc), std::ptr::null_mut(), 0, 0, koff) }, "mla")?;
+            self.l2_mat(&lw.o, t, PF_O)?;
             ck(unsafe { glm_mla_combine(st, np(&a.pm), np(&a.pl), np(&a.pacc), t as i32, hl as i32, ns as i32, np(&a.olat),
                                         (hl * 512) as i64, 512, std::ptr::null_mut(), std::ptr::null_mut(),
                                         std::ptr::null_mut(), 0, 0, 0) }, "mla combine")?;
@@ -865,6 +935,10 @@ impl Engine {
                                       R_16BF, (hl * 256) as i64, 256, hl)?;
         }
         self.exl3(&lw.o, np(&a.o), hl * 256, t, np(&a.f32buf), false)?;
+        if let (true, Mlp::Moe { router, .. }) = (decode, &lw.mlp) {
+            // the router's weights during the sum's gather and the norm
+            self.l2_runs(router.raw() as u64, (router.len() * 2) as u64, 0, 1)?;
+        }
         self.allreduce(np(&a.f32buf), t * h, np(&a.a), prefill)
     }
 
@@ -911,17 +985,62 @@ impl Engine {
     /// The MoE layer's router over rows [r0, r0 + n) of xn and its exact (unmasked) top-k: the
     /// demand, miss counters and hot-read candidates (decode rows only: a prefill's are never
     /// read, and its rows would overrun the candidates' buffer) come from these.
+    ///
+    /// Decode rows: the shared expert's gate/up and activation (shared_up) start on the side stream
+    /// here, beside the router chain, whose kernels leave the memory mostly idle, and run on beside
+    /// the routed gate/up; moe_rows joins them before the gather (sh_open).
     fn moe_exact(&self, l: usize, r0: usize, n: usize) -> Result<()> {
         let (cfg, a) = (&self.cfg, &self.act);
-        let Mlp::Moe { router, bias, .. } = &self.w.layers[l].mlp else { return Err("moe_exact on a dense layer".into()) };
+        let Mlp::Moe { router, bias, sh_gate_up, .. } = &self.w.layers[l].mlp else {
+            return Err("moe_exact on a dense layer".into());
+        };
         let (e, h) = (cfg.experts, cfg.hidden);
+        let decode = n * cfg.topk <= 64;
+        if decode {
+            self.fork()?;
+            self.shared_up(&self.st2, &a.x3s2, sh_gate_up, self.arena_of(l).inter_l, at(&a.xn, r0 * h), n)?;
+            self.sh_open.set(true);
+        }
         let allowed = self.allowed_ptr(l);
         let hot = if n <= MAX_ROWS { self.hot_region(l) } else { std::ptr::null_mut() };
-        self.linear_f32w(at(&a.xn, r0 * h), h, router, n, e, h, np(&a.logits), if n <= MAX_ROWS { 6 } else { 1 })?;
+        // the fp16 router read as the fp32 one it widens to: F.linear(x.float(), w.float())'s bits at half
+        // the bytes (6.3 -> 3.1 MB a layer)
+        let splits = if n <= MAX_ROWS { 6 } else { 1 };
+        let part = np(&a.split_part);
+        ck(unsafe { ds_linear_f16w(self.st.raw(), at(&a.xn, r0 * h), h as i64, np(router), n as i32, e as i32, h as i32,
+                                   splits as i32, if splits > 1 { part } else { np(&a.logits) }, e as i64, part) },
+           "router f16w")?;
+        if splits > 1 {
+            ck(unsafe { ds_splits_reduce(self.st.raw(), part, splits as i32, n as i32, e as i32, std::ptr::null_mut(),
+                                         np(&a.logits), e as i64) }, "router reduce")?;
+        }
         ck(unsafe { glm_router(self.st.raw(), np(&a.logits), np(bias), std::ptr::null(), std::ptr::null(), n as i32,
                                cfg.topk as i32, cfg.routed_scaling, np(&a.eids), np(&a.ew), allowed, hot, std::ptr::null(),
                                std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut(),
                                std::ptr::null_mut(), 0, std::ptr::null()) }, "router (exact)")
+    }
+
+    /// Join the shared gate/up moe_exact left running, if it did.
+    fn shared_join(&self) -> Result<()> {
+        if self.sh_open.replace(false) {
+            self.join()?;
+        }
+        Ok(())
+    }
+
+    /// Layer l's arena: the MTP layer's own, else the decoder's.
+    fn arena_of(&self, l: usize) -> &Arena {
+        if self.cfg.mtp && l == self.cfg.mtp_layer() { self.mtp_arena.as_ref().unwrap() } else { &self.arena }
+    }
+
+    /// The shared expert's gate/up over `n` rows of x -> its activation, into the pair buffer after
+    /// the routed rows (n x topk of them).
+    fn shared_up(&self, sst: &Stream, x3: &Exl3Scratch, sh_gate_up: &Exl3Mat, il: usize, x: *mut c_void, n: usize) -> Result<()> {
+        let a = &self.act;
+        self.exl3_on(sst, x3, sh_gate_up, x, self.cfg.hidden, n, np(&a.gu), true)?;
+        let hsh = at(&a.pair, n * self.cfg.topk * il * 2);
+        let (g, u, ld) = if n <= GEMV_ROWS { (np(&a.gu), at(&a.gu, il), 2 * il) } else { (np(&a.gu), at(&a.gu, n * il), il) };
+        ck(unsafe { glm_swiglu(sst.raw(), g, ld as i64, u, ld as i64, hsh, il as i64, n as i32, il as i32) }, "shared swiglu")
     }
 
     fn allowed_ptr(&self, l: usize) -> *mut c_void {
@@ -942,14 +1061,16 @@ impl Engine {
                                if mtp { std::ptr::null_mut() } else { np(&self.lane_miss) },
                                if mtp { std::ptr::null_mut() } else { at(&self.lane_demand, l * e) },
                                (self.cfg.n_layers() * e) as i64, at(&a.rlane, r0)) }, "router")?;
-        self.moe_rows(sh_gate_up, sh_down, arena, at(&a.xn, r0 * h), n, prefill, at(&a.a, r0 * h))
+        // the decoder's next layer, whose first weights load while this one's output is gathered
+        let next = if mtp || l + 1 >= cfg.layers { None } else { Some(&self.w.layers[l + 1]) };
+        self.moe_rows(sh_gate_up, sh_down, arena, at(&a.xn, r0 * h), n, prefill, at(&a.a, r0 * h), next)
     }
 
     /// One block of MoE rows (routing done: pick / wts): the shared expert and the routed picks,
     /// their intermediates in one gather, the summed hidden columns in another -> out bf16 [n][H].
     #[allow(clippy::too_many_arguments)]
     fn moe_rows(&self, sh_gate_up: &Exl3Mat, sh_down: &Exl3Mat, arena: &Arena, x: *mut c_void, n: usize, prefill: bool,
-                out: *mut c_void) -> Result<()> {
+                out: *mut c_void, next: Option<&crate::weights::Layer>) -> Result<()> {
         let (cfg, a) = (&self.cfg, &self.act);
         let st = self.st.raw();
         let h = cfg.hidden;
@@ -959,16 +1080,13 @@ impl Engine {
         let dn = arena.down_n;
         let w = self.world;
         // the shared expert's gate/up -> its activation, into the pair buffer after the routed rows
-        // (decode: on the side stream, next to the routed experts)
+        // (decode rows: already, beside the router chain: moe_exact)
         let decode = p <= 64;
         let (sst, x3) = if decode { (&self.st2, &a.x3s2) } else { (&self.st, &a.x3s) };
-        if decode {
-            self.fork()?;
+        if !decode {
+            self.shared_up(sst, x3, sh_gate_up, il, x, n)?;
         }
-        self.exl3_on(sst, x3, sh_gate_up, x, h, n, np(&a.gu), true)?;
         let hsh = at(&a.pair, p * il * 2);
-        let (g, u, ld) = if n <= GEMV_ROWS { (np(&a.gu), at(&a.gu, il), 2 * il) } else { (np(&a.gu), at(&a.gu, n * il), il) };
-        ck(unsafe { glm_swiglu(sst.raw(), g, ld as i64, u, ld as i64, hsh, il as i64, n as i32, il as i32) }, "shared swiglu")?;
         // routed: grouping, rotation, gate/up, the down projection's input rotation
         let slots = arena.slots as i32;
         let (maxm, nexp) = if decode {
@@ -1001,15 +1119,19 @@ impl Engine {
             } else {
                 exl3m_grouped(np(&a.xh0), np(&a.xh1), np(&arena.t1p), np(&arena.t3p), np(&arena.k2g), np(&arena.k2u), uids,
                               np(&a.ucount), np(&a.members), np(&a.zup), h as i32, il as i32, p as i32, 1, maxm, k as i32,
-                              nexp, 2, 8, 4, if decode { 1 } else { 2 }, 2, 10, arena.cb, st);
+                              nexp, 2, 8, 4, if decode { DECODE_PF } else { 2 }, 2, 10, arena.cb, st);
             }
             let suh2 = (arena.pool(5) as *mut u16).add(self.rank * il) as *const c_void;
             exl3m_gateup(np(&a.zup), np(&a.pick), arena.pool(6), arena.pool(7), suh2, np(&a.pair), n as i32, p as i32, il as i32,
                          1, k as i32, slots, cfg.moe_inter as i32, f32::INFINITY, 1, st);
         }
         ck(unsafe { tidelm_cuda::ffi::cudaGetLastError() }, "routed up")?;
+        self.shared_join()?;
         if decode {
-            self.join()?;
+            // during the gather: the routed experts' down rows (the critical path), then the shared
+            // down's, which then reads L2 beside them
+            self.l2_experts(np(&a.pick), p, arena, il * w, dn, PF_DOWN)?;
+            self.l2_mat(sh_down, n, PF_SH_DOWN)?;
         }
         // one gather: both ranks' [routed xd | shared act]
         let per = p * il * 2 + n * il * 2;
@@ -1042,7 +1164,7 @@ impl Engine {
             } else {
                 exl3m_grouped(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d), uids,
                               np(&a.ucount), np(&a.members), np(&a.zd), kd as i32, dn as i32, p as i32, 1, maxm, k as i32,
-                              nexp, 1, 8, 4, if decode { 1 } else { 2 }, 2, 10, arena.cb, st);
+                              nexp, 1, 8, 4, if decode { DECODE_PF } else { 2 }, 2, 10, arena.cb, st);
             }
             exl3m_down_combine(np(&a.zd), np(&a.pick), arena.pool(8), np(&a.wts), np(&a.local), n as i32, p as i32, dn as i32, 1,
                                k as i32, slots, st);
@@ -1050,6 +1172,11 @@ impl Engine {
         ck(unsafe { tidelm_cuda::ffi::cudaGetLastError() }, "routed down")?;
         if decode {
             self.join()?;
+            // the next layer's q_a and kv_a during the output's gather and the norms
+            if let Some(nw) = next {
+                self.l2_mat(&nw.q_a, n, PF_QA)?;
+                self.l2_mat(&nw.kv_a, n, PF_KVA)?;
+            }
         }
         ck(unsafe { glm_moe_out(st, np(&a.local), np(&a.shout), np(&a.mout), (n * dn) as i64) }, "moe out")?;
         self.gather_cols(np(&a.mout), n, dn, 2, out, prefill)
@@ -1154,6 +1281,7 @@ impl Engine {
             self.layer_pre(l, t, prefill)?;
             self.mlp(l, t, prefill)?;
         }
+        self.prefetch_join()?;
         self.norm(np(&self.act.h), true, &self.w.norm, np(&self.act.hn), t)
     }
 
@@ -1180,7 +1308,10 @@ impl Engine {
         if seg < moe.len() {
             self.layer_pre(end, t, false)?;
             self.moe_exact(end, 0, t)?;
+            self.prefetch_join()?;
             if let Some(h) = self.hot.as_ref().filter(|h| h.asynch.is_none()) {
+                // a segment its own graph (synchronous hot reads): its side work ends inside it
+                self.shared_join()?;
                 unsafe {
                     tidelm_cuda::memcpy_async(h.host.raw(), self.hot_region(end), t * self.cfg.topk * 8,
                                               tidelm_cuda::ffi::MEMCPY_DEVICE_TO_HOST, &self.st)?;
@@ -1190,6 +1321,7 @@ impl Engine {
         }
         self.norm(np(&self.act.h), true, &self.w.norm, np(&self.act.hn), t)?;
         self.head_dev(np(&self.act.hn), t, false)?;
+        self.prefetch_join()?;
         self.hot_table_copy()
     }
 
@@ -1330,6 +1462,7 @@ impl Engine {
         self.norm(np(&a.h), true, &lw.ln_post, np(&a.xn), t)?;
         self.mlp(l, t, prefill)?;
         self.norm(np(&a.h), true, &mx.sh_norm, np(&a.mhn), t)?;
+        self.prefetch_join()?;
         if logits {
             self.head_dev(np(&a.mhn), t, true)?;
         }
@@ -1433,6 +1566,23 @@ fn hidden_code(lane: usize, h: Hidden) -> u16 {
         Hidden::Target(f) => f as u16,
     }
 }
+
+/// Decode attention's 16-head m tiles a block (glm_mla's mt): 1, so a row's 64 heads over 16 splits
+/// are 64 blocks on the 48 SMs instead of 32. A head's scores, softmax and PV do not depend on the
+/// heads beside it in the tile, and decode_split still counts 32-head blocks: the same splits, the
+/// same partials, bit-identical.
+const MLA_DECODE_MT: i32 = 2;
+
+/// o_proj's bytes prefetched into L2 during a decode layer's attention core (of 31.5 MB a rank;
+/// the L2 holds 24 MB)
+const PF_O: usize = 12 << 20;
+/// during the MoE's gather the routed experts' down rows (of ~19 MB at one row) and the shared
+/// down's (of 3.9 MB); during its output's gather and the norms the next layer's q_a (of 7.9 MB) and
+/// kv_a (of 2.5 MB)
+const PF_DOWN: usize = 6 << 20;
+const PF_SH_DOWN: usize = 2 << 20;
+const PF_QA: usize = 3 << 20;
+const PF_KVA: usize = 1 << 20;
 
 /// A decode row's bytes in the split gather: its heads' absorbed queries (bf16 [hl][576]) then
 /// its top-2048 index scores (fp32).

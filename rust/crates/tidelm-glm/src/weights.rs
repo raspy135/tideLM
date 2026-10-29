@@ -17,6 +17,13 @@ use crate::{ck, Result};
 /// Decode calls take at most this many rows (exl3_dense.MAX_ROWS); more go the prefill path.
 pub const MAX_ROWS: usize = 16;
 
+/// The grouped kernel's trellis loads in decode calls, dense and routed: two stages of 16-byte
+/// cp.async through shared memory. The register path (pf 1: 4-byte loads a lane, one step ahead)
+/// read o_proj at 171 GB/s across the layers (184.5 us), q_b 153, q_a 142; staged 209 / 179 / 167
+/// (150.6 / 58.6 / 47.1 us), 3 and 4 stages no better; the outputs byte for byte the same
+/// (glm_bench_chain, docs/gotchas.md).
+pub const DECODE_PF: i32 = -2;
+
 /// How a rank cuts a matrix of the pair: output columns (N tiles, svh) or input rows (K tiles,
 /// suh; the outputs are partial sums), or not at all.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -92,9 +99,10 @@ pub struct Exl3Mat {
     pub split: usize,
     /// rows above which decode calls take `split_wide` (0: always `split`)
     pub wide_rows: usize,
-    /// the grouped kernel's trellis prefetch depth in decode calls (1 or 2) and n-tiles a warp
-    /// (8, or 4 with pf 2: half the reduction buffer, more blocks)
-    pub pf: usize,
+    /// the grouped kernel's trellis loads in decode calls: PF steps ahead in registers (1 or 2), or
+    /// -S, S stages of 16-byte cp.async through shared memory (DECODE_PF); and n-tiles a warp (8, or
+    /// 4 with pf 2: half the reduction buffer, more blocks)
+    pub pf: i32,
     pub nt: usize,
     pub split_wide: usize,
     tr: DeviceBuffer<u8>,
@@ -132,11 +140,21 @@ impl Exl3Mat {
             let (uids, count, members) = m.get(g, rows);
             exl3m_grouped(s.xh.raw(), s.xh.raw(), self.ptr.raw(), self.ptr.raw(), self.k2.raw(), self.k2.raw(), uids,
                           count, members, s.z.raw(), k as i32, n as i32, r as i32, split as i32, MAX_MEMBERS,
-                          g as i32, g as i32, 1, self.nt as i32, 4, self.pf as i32, 2, self.hi, CB_MUL1, st.raw());
+                          g as i32, g as i32, 1, self.nt as i32, 4, self.pf, 2, self.hi, CB_MUL1, st.raw());
             exl3m_dense_out(s.z.raw(), self.svh.raw(), out, r as i32, n as i32, split as i32, g as i32,
                             out_bf16 as i32, st.raw());
         }
         ck(unsafe { tidelm_cuda::ffi::cudaGetLastError() }, "exl3 decode")
+    }
+
+    /// Where a decode call's warps read: (the trellis, bytes between the starts of consecutive
+    /// warps' k ranges, ranges). A warp owns K / 16 / (split x 4) k tiles of all N tiles' rows of
+    /// its n block, and the trellis is [k tile][n tile], so warp w's tiles start at w x the stride
+    /// (G groups: each group's matrix is its own run of ranges).
+    pub fn warp_runs(&self, rows: usize) -> (u64, u64, usize) {
+        let split = if self.wide_rows > 0 && rows > self.wide_rows { self.split_wide } else { self.split };
+        let count = split * 4 * self.g;
+        (self.tr.raw() as u64, (self.tr.len() / count) as u64, count)
     }
 
     /// Prefill (any rows): group `grp`'s trellis unpacked to fp16, the rotated rows times it on
@@ -225,6 +243,14 @@ impl<'a> Loader<'a> {
         Ok(DeviceBuffer::from_slice(&self.f32s(name)?)?)
     }
 
+    /// An F16 tensor as it is (the routers: ds_linear_f16w widens it in registers).
+    pub fn f16_dev(&self, name: &str) -> Result<DeviceBuffer<u16>> {
+        if self.dtype(name)? != "F16" {
+            return Err(format!("{name}: not F16").into());
+        }
+        Ok(DeviceBuffer::from_slice(&u16s(&self.bytes(name)?))?)
+    }
+
     /// An F16 weight as BF16 (the indexer's wk: Lin(ck.get(wk)) runs it as a BF16 weight).
     pub fn bf16_from_f16(&self, name: &str) -> Result<DeviceBuffer<u16>> {
         let v: Vec<u16> = self.f32s(name)?.into_iter().map(bf16_from_f32).collect();
@@ -297,7 +323,7 @@ impl<'a> Loader<'a> {
         let ptr = DeviceBuffer::from_slice(&(0..g).map(|i| base + (i * tr_bytes) as i64).collect::<Vec<_>>())?;
         let k2 = DeviceBuffer::from_slice(&bits.iter().map(|&b| 2 * b as i32).collect::<Vec<_>>())?;
         let hi = if bits.iter().all(|&b| b <= 5) { 10 } else { 16 };
-        Ok(Exl3Mat { k, n, n_out: n_out.unwrap_or(n), g, bits, split, wide_rows: 0, split_wide: split, pf: 1, nt: 8, tr, tr_bytes,
+        Ok(Exl3Mat { k, n, n_out: n_out.unwrap_or(n), g, bits, split, wide_rows: 0, split_wide: split, pf: DECODE_PF, nt: 8, tr, tr_bytes,
                      suh: DeviceBuffer::from_slice(&suh_all)?,
                      svh: DeviceBuffer::from_slice(&svh_all)?, ptr, k2, hi })
     }
@@ -359,8 +385,9 @@ pub enum Mlp {
     /// layers 0-2: gate + up (G = 2, this rank's intermediate columns), down over the whole
     /// intermediate to this rank's hidden columns
     Dense { gate_up: Exl3Mat, down: Exl3Mat },
-    /// the router (fp32), its correction bias, the shared expert as Dense's halves
-    Moe { router: DeviceBuffer<f32>, bias: DeviceBuffer<f32>, sh_gate_up: Exl3Mat, sh_down: Exl3Mat },
+    /// the router (its checkpoint's fp16, computed as the fp32 weight it widens to), its correction
+    /// bias, the shared expert as Dense's halves
+    Moe { router: DeviceBuffer<u16>, bias: DeviceBuffer<f32>, sh_gate_up: Exl3Mat, sh_down: Exl3Mat },
 }
 
 pub struct MtpExtra {
@@ -465,7 +492,7 @@ impl Weights {
             } else {
                 let m = format!("{p}mlp.shared_experts.");
                 Mlp::Moe {
-                    router: ld.f32_dev(&format!("{p}mlp.gate.weight"))?,
+                    router: ld.f16_dev(&format!("{p}mlp.gate.weight"))?,
                     bias: ld.f32_dev(&format!("{p}mlp.gate.e_score_correction_bias"))?,
                     sh_gate_up: ld.exl3(&[&format!("{m}gate_proj"), &format!("{m}up_proj")], SPLIT_UP, Cut::N, None)?,
                     sh_down: ld.exl3(&[&format!("{m}down_proj")], SPLIT_DOWN, Cut::N, None)?,
@@ -503,7 +530,7 @@ impl Weights {
             }
             bytes += match &layer.mlp {
                 Mlp::Dense { gate_up, down } => gate_up.bytes() + down.bytes(),
-                Mlp::Moe { router, sh_gate_up, sh_down, .. } => 4 * router.len() + sh_gate_up.bytes() + sh_down.bytes(),
+                Mlp::Moe { router, sh_gate_up, sh_down, .. } => 2 * router.len() + sh_gate_up.bytes() + sh_down.bytes(),
             };
             if let Some(m) = &layer.mtp {
                 bytes += m.eh.bytes();

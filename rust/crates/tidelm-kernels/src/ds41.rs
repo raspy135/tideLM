@@ -37,6 +37,13 @@ extern "C" {
         k: c_int, splits: c_int, y_f32: *mut c_void, ldy: i64, partial: *mut c_void,
     ) -> c_int;
 
+    /// ds_linear_f32w with the weights stored in fp16 (widened in registers: the same bits when
+    /// the fp32 weights were fp16 to begin with).
+    pub fn ds_linear_f16w(
+        stream: CudaStream, x: *const c_void, ldx: i64, w: *const c_void, m: c_int, n: c_int,
+        k: c_int, splits: c_int, y_f32: *mut c_void, ldy: i64, partial: *mut c_void,
+    ) -> c_int;
+
     pub fn ds_splits_reduce(
         stream: CudaStream, partial: *const c_void, splits: c_int, m: c_int, n: c_int,
         y_bf16: *mut c_void, y_f32: *mut c_void, ldy: i64,

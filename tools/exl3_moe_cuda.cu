@@ -21,6 +21,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <utility>
 
 // EXL3_STREAM=1: decode's trellis words load evict-first (load_word); a benchmark switch, off: the
 // kernels gain 1-3% (routed) to 7-12% (the small dense matrices), ~1% of a decode pass (gotchas)
@@ -29,6 +30,28 @@
 #endif
 
 #define EXL3_CHECK(cond, msg) do { if (!(cond)) { fprintf(stderr, "exl3_moe_cuda: %s\n", msg); exit(2); } } while (0)
+
+// Programmatic dependent launch, as rust/crates/tidelm-kernels/cuda/ds41.cu's: every kernel here starts
+// with pdl_enter(); once the Rust GLM engine switches it on (exl3m_set_pdl; TIDELM_PDL=0 keeps it off)
+// every launch carries the programmatic-serialization attribute. griddepcontrol.wait precedes any global
+// access in every block, so the stream's order holds; without the attribute (the Python engine) both
+// instructions do nothing. Bit-identical either way.
+__device__ __forceinline__ void pdl_enter() {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+}
+static int g_pdl = 0;
+template <typename... P, typename... A>
+static inline void pdl_launch(void (*kernel)(P...), dim3 grid, dim3 block, size_t smem, cudaStream_t st, A&&... args) {
+    cudaLaunchConfig_t c = {};
+    c.gridDim = grid; c.blockDim = block; c.dynamicSmemBytes = smem; c.stream = st;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = 1;
+    c.attrs = at; c.numAttrs = g_pdl ? 1 : 0;
+    cudaLaunchKernelEx(&c, kernel, std::forward<A>(args)...);
+}
+extern "C" int exl3m_set_pdl(int on) { g_pdl = on; return 0; }
 
 namespace exl3 {
 
@@ -228,16 +251,85 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int N
     }
 }
 
+// cp.async of 16 bytes global -> shared, L1 bypassed (.cg): decode's trellis words read once a pass.
+__device__ __forceinline__ void cp_async16(void* smem_dst, const void* gmem_src) {
+    const unsigned s = (unsigned)__cvta_generic_to_shared(smem_dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem_src));
+}
+
+// warp_tiles with the trellis words staged through shared memory: a k step's NT tiles are one
+// contiguous run of NT * TW words, copied as 16-byte cp.async S - 1 steps ahead into this warp's ring
+// of S stages (`ring`, S * NT * TW words), then each lane reads its words of a tile from there. The
+// register path loads 4 bytes a lane: a warp instruction moves 128 bytes, and o_proj's pattern of 1.3 KB
+// runs 61 KB apart then reads at ~200 GB/s with one step in flight and ~180 with more (more requests,
+// not more bytes, in flight), against ~230 for the same runs as 16-byte loads (docs/gotchas.md).
+// The words, the decode and the mma chain are warp_tiles' exactly: the outputs are bit-identical.
+template <int CB, int K2, int NT, int S>
+__device__ __forceinline__ void warp_tiles_cp(const uint32_t* __restrict__ T, int NTILES, int kt0, int nkt, int nt0,
+                                              const half* x0, const half* x1, bool ok0, bool ok1, int lane,
+                                              float (&acc)[NT][2][4], uint32_t* ring) {
+    constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW, STEP = NT * TW, CH = STEP / 4;
+    static_assert(STEP % 4 == 0, "a step's run is whole 16-byte chunks");
+    const LaneMap<K2> map(lane);
+    const size_t kstride = (size_t)NTILES * TW;
+    const uint32_t* tp = T + ((size_t)kt0 * NTILES + nt0) * TW;
+    auto issue = [&](int it) {
+        const uint4* src = reinterpret_cast<const uint4*>(tp + (size_t)it * kstride);
+        uint4* dst = reinterpret_cast<uint4*>(ring + (it % S) * STEP);
+#pragma unroll
+        for (int c = lane; c < CH; c += 32) cp_async16(dst + c, src + c);
+    };
+#pragma unroll
+    for (int d = 0; d < S - 1; ++d) {
+        if (d < nkt) issue(d);
+        cp_commit();
+    }
+    for (int it = 0; it < nkt; ++it) {
+        cp_wait<S - 2>();
+        __syncwarp();
+        if (it + S - 1 < nkt) issue(it + S - 1);
+        cp_commit();
+        const uint32_t* sw = ring + (it % S) * STEP;
+        const int k = (kt0 + it) * 16;
+        uint32_t a[4] = {load_pair(x0 + k, ok0), load_pair(x1 + k, ok1), load_pair(x0 + k + 8, ok0),
+                         load_pair(x1 + k + 8, ok1)};
+#pragma unroll
+        for (int i = 0; i < NT; ++i) {
+            uint32_t w[LW];
+#pragma unroll
+            for (int l = 0; l < LW; ++l) {
+                if constexpr ((TW % 32) == 0)
+                    w[l] = sw[i * TW + l * 32 + lane];
+                else
+                    w[l] = (l * 32 + lane < TW) ? sw[i * TW + l * 32 + lane] : 0u;
+            }
+            uint32_t b0[2], b1[2];
+            decode_tile<CB, K2>(w, map, lane, b0, b1);
+            mma16816(acc[i][0], a, b0);
+            mma16816(acc[i][1], a, b1);
+        }
+    }
+    cp_wait<0>();
+}
+
 __host__ __device__ constexpr bool k2_supported(int k2) { return k2 >= 2 && k2 <= 16; }
 
 // Program (expert u, n block, split and member tile): up to 16 members times W_q over the split's K range.
-// Here `uids[u]` is an ARENA SLOT id; `tp*[slot]` is that slot's trellis pointer.
+// Here `uids[u]` is an ARENA SLOT id; `tp*[slot]` is that slot's trellis pointer. PF > 0: PF steps of
+// trellis words in registers (warp_tiles); PF = -S: S stages of them in shared memory (warp_tiles_cp),
+// the dynamic shared memory grouped_smem<NT, W, -PF, HI>() bytes.
+template <int NT, int W, int S, int HI>
+__host__ __device__ constexpr int grouped_smem() {
+    return (W * S * NT * 4 * HI * 4 > W * 16 * NT * 16 * 4) ? W * S * NT * 4 * HI * 4 : W * 16 * NT * 16 * 4;
+}
+
 template <int CB, int NT, int W, int PF, int LO, int HI>
 __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
     float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
+    pdl_enter();
     const int u = blockIdx.x;
     if (u >= ucount[0]) return;
     const int MT = (maxm + 15) / 16;
@@ -268,6 +360,8 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const int per_split = KT / SK, per_warp = per_split / W;
     const int kt0 = split * per_split + warp * per_warp;
     const int nt0 = blockIdx.y * NT;
+    extern __shared__ __align__(16) uint32_t dyn_sh[];
+    constexpr int ring_words = PF < 0 ? -PF * NT * 4 * HI : 0;
 
     float acc[NT][2][4];
 #pragma unroll
@@ -280,9 +374,13 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     switch (k2) {
 #define EXL3_CASE(K2_)                                                                                          \
     case K2_:                                                                                                   \
-        if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
-            warp_tiles<CB, K2_, NT, PF>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);    \
-        else                                                                                                    \
+        if constexpr (K2_ >= LO && K2_ <= HI) {                                                                 \
+            if constexpr (PF < 0)                                                                               \
+                warp_tiles_cp<CB, K2_, NT, -PF>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane,  \
+                                                acc, dyn_sh + warp * ring_words);                               \
+            else                                                                                                \
+                warp_tiles<CB, K2_, NT, PF>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc); \
+        } else                                                                                                  \
             __trap();                                                                                           \
         break;
         EXL3_CASE(2) EXL3_CASE(3) EXL3_CASE(4) EXL3_CASE(5) EXL3_CASE(6) EXL3_CASE(7) EXL3_CASE(8)
@@ -293,7 +391,14 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
             __trap();
     }
 
-    __shared__ float red[W][16][NT * 16];
+    float (*red)[16][NT * 16];
+    if constexpr (PF < 0) {
+        __syncthreads();   // every warp is done with its ring, which red overlays
+        red = reinterpret_cast<float (*)[16][NT * 16]>(dyn_sh);
+    } else {
+        __shared__ float red_st[W][16][NT * 16];
+        red = red_st;
+    }
 #pragma unroll
     for (int i = 0; i < NT; ++i)
 #pragma unroll
@@ -324,9 +429,12 @@ void grouped_launch(const void* x0, const void* x1, const int64_t* tp0, const in
     const int MT = (maxm + 15) / 16;
     dim3 grid((unsigned)nexp_max, (unsigned)(N / (16 * nt)), (unsigned)(mats * SK * MT));
 #define EXL3_LAUNCH(NT_, W_, PF_, LO_, HI_)                                                                     \
-    grouped_kernel<CB, NT_, W_, PF_, LO_, HI_><<<grid, W_ * 32, 0, stream>>>(                                   \
-        (const half*)x0, (const half*)x1, tp0, tp1, k2_0, k2_1, uids, ucount, members, z, K, N, P, SK, maxm,   \
-        slots)
+    do {                                                                                                        \
+        constexpr int smem_ = (PF_) < 0 ? grouped_smem<NT_, W_, -(PF_), HI_>() : 0;                             \
+        pdl_launch(grouped_kernel<CB, NT_, W_, PF_, LO_, HI_>, grid, W_ * 32, smem_, stream,                            \
+            (const half*)x0, (const half*)x1, tp0, tp1, k2_0, k2_1, uids, ucount, members, z, K, N, P, SK,      \
+            maxm, slots);                                                                                       \
+    } while (0)
 #define EXL3_RANGES(NT_, W_, PF_)                                                                               \
     if (lo == 8 && hi == 8) EXL3_LAUNCH(NT_, W_, PF_, 8, 8);                                                    \
     else if (lo >= 2 && hi <= 10) EXL3_LAUNCH(NT_, W_, PF_, 2, 10);                                             \
@@ -334,6 +442,9 @@ void grouped_launch(const void* x0, const void* x1, const int64_t* tp0, const in
     if (nt == 8 && warps == 4 && pf == 1) { EXL3_RANGES(8, 4, 1) }
     else if (nt == 8 && warps == 4 && pf == 2) { EXL3_RANGES(8, 4, 2) }
     else if (nt == 4 && warps == 4 && pf == 2) { EXL3_RANGES(4, 4, 2) }
+    else if (nt == 8 && warps == 4 && pf == -2) { EXL3_RANGES(8, 4, -2) }
+    else if (nt == 4 && warps == 4 && pf == -2) { EXL3_RANGES(4, 4, -2) }
+    else if (nt == 8 && warps == 4 && pf == -3) { EXL3_RANGES(8, 4, -3) }
     else { EXL3_CHECK(false, "unsupported tile setting"); }
 #undef EXL3_RANGES
 #undef EXL3_LAUNCH
@@ -411,6 +522,7 @@ __global__ void __launch_bounds__(W * 32) prefill_kernel(
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
     float* __restrict__ Z, int K, int N, int P, int slots) {
+    pdl_enter();
     const int u = blockIdx.y;
     if (u >= ucount[0]) return;
     const int e = uids[u];
@@ -489,7 +601,7 @@ void prefill_launch(const void* x0, const void* x1, const int64_t* tp0, const in
 #define EXL3_PLAUNCH(NT_, W_, PF_, MT_)                                                                         \
     {                                                                                                           \
         dim3 grid((unsigned)((ntiles + NT_ * W_ - 1) / (NT_ * W_)), (unsigned)nblocks, (unsigned)mats);         \
-        prefill_kernel<CB, NT_, W_, PF_, MT_, 4, 6><<<grid, W_ * 32, 0, stream>>>(                              \
+        pdl_launch(prefill_kernel<CB, NT_, W_, PF_, MT_, 4, 6>, grid, W_ * 32, 0, stream,                               \
             (const half*)x0, (const half*)x1, tp0, tp1, k2_0, k2_1, uids, ucount, members, z, K, N, P, slots);  \
     }
     if (bm == 64 && nt == 4 && warps == 4 && pf == 2) EXL3_PLAUNCH(4, 4, 2, 4)
@@ -799,6 +911,7 @@ __global__ void __launch_bounds__(W * 32) prefill_smem_kernel(
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
     float* __restrict__ Z, int K, int N, int P, int slots) {
+    pdl_enter();
     constexpr int BM = W * MTW * 16;
     constexpr int KS = (W >= NTB) ? W / NTB : 1;
     constexpr int STAGE = KS * NTB * 32 * 4;
@@ -890,7 +1003,7 @@ void prefill_smem_launch(const void* x0, const void* x1, const int64_t* tp0, con
         constexpr int KS_ = (W_ >= NTB_) ? W_ / NTB_ : 1;                                                       \
         EXL3_CHECK((K / 16) % KS_ == 0, "K must be a multiple of 16 * KS");                                     \
         dim3 grid((unsigned)(ntiles / NTB_), (unsigned)nblocks, (unsigned)mats);                                \
-        prefill_smem_kernel<CB, W_, MTW_, NTB_, PF_, 4, 6><<<grid, W_ * 32, 0, stream>>>(                       \
+        pdl_launch(prefill_smem_kernel<CB, W_, MTW_, NTB_, PF_, 4, 6>, grid, W_ * 32, 0, stream,                        \
             (const half*)x0, (const half*)x1, tp0, tp1, k2_0, k2_1, uids, ucount, members, z, K, N, P, slots);  \
     }
     if (warps == 8 && mtw == 1 && ntb == 8 && pf == 2) EXL3_SLAUNCH(8, 1, 8, 2)
@@ -922,7 +1035,7 @@ void prefill_smem_mode_launch(const void* x0, const void* x1, const int64_t* tp0
         constexpr int KS_ = (W_ >= NTB_) ? W_ / NTB_ : 1;                                                       \
         EXL3_CHECK((K / 16) % KS_ == 0, "K must be a multiple of 16 * KS");                                     \
         dim3 grid((unsigned)(ntiles / NTB_), (unsigned)nblocks, (unsigned)mats);                                \
-        prefill_smem_kernel<CB, W_, MTW_, NTB_, 2, 4, 6, MODE_><<<grid, W_ * 32, 0, stream>>>(                  \
+        pdl_launch(prefill_smem_kernel<CB, W_, MTW_, NTB_, 2, 4, 6, MODE_>, grid, W_ * 32, 0, stream,                   \
             (const half*)x0, (const half*)x1, tp0, tp1, k2_0, k2_1, uids, ucount, members, z, K, N, P, slots);  \
     }
 #define EXL3_MODES(W_, MTW_, NTB_)                                                                              \
@@ -952,7 +1065,7 @@ void prefill_smem_cb_launch(const void* x0, const void* x1, const int64_t* tp0, 
     EXL3_CHECK((N / 16) % NTB == 0, "N must be a multiple of 16 * NTB");
     EXL3_CHECK((K / 16) % KS == 0, "K must be a multiple of 16 * KS");
     dim3 grid((unsigned)((N / 16) / NTB), (unsigned)nblocks, (unsigned)mats);
-    prefill_smem_kernel<CB, W, MTW, NTB, 2, 4, HI, -4><<<grid, W * 32, 0, stream>>>(
+    pdl_launch(prefill_smem_kernel<CB, W, MTW, NTB, 2, 4, HI, -4>, grid, W * 32, 0, stream, 
         (const half*)x0, (const half*)x1, tp0, tp1, k2_0, k2_1, uids, ucount, members, z, K, N, P, slots);
 }
 
@@ -983,6 +1096,7 @@ template <typename TIN>
 __global__ void rot_in_kernel(const TIN* __restrict__ x, int x_stride, const int* __restrict__ pick,
                               const half* __restrict__ suh0, const half* __restrict__ suh1, half* __restrict__ out0,
                               half* __restrict__ out1, int K, int slots, int E) {
+    pdl_enter();
     const int p = blockIdx.x, blk = blockIdx.y, mat = blockIdx.z;
     const int row = p / slots;
     const int e = pick[p];
@@ -1005,6 +1119,7 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
                                        const half* __restrict__ svh_g, const half* __restrict__ svh_u,
                                        const half* __restrict__ suh_d, half* __restrict__ xd, int P, int N, int SK,
                                        int E, int suh_d_stride, float limit, int act_mode) {
+    pdl_enter();
     const int p = blockIdx.x, blk = blockIdx.y;
     const int e = pick[p];
     if (e < 0) return;
@@ -1051,6 +1166,7 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
 template <typename TIN>
 __global__ void dense_rot_kernel(const TIN* __restrict__ x, int x_stride, const half* __restrict__ suh,
                                  half* __restrict__ out, int K, int G) {
+    pdl_enter();
     const int r = blockIdx.x, blk = blockIdx.y, lane = threadIdx.x;
     const half* s = suh + (size_t)(r % G) * K + blk * 128 + 4 * lane;
     const TIN* xr = x + (size_t)r * x_stride + blk * 128 + 4 * lane;
@@ -1066,6 +1182,7 @@ __global__ void dense_rot_kernel(const TIN* __restrict__ x, int x_stride, const 
 // Splits summed in order, rotated, * svh of the row's group; bf16 (out_bf16) or fp32 out.
 __global__ void dense_out_kernel(const float* __restrict__ Z, const half* __restrict__ svh, void* __restrict__ out,
                                  int rows, int N, int SK, int G, int out_bf16) {
+    pdl_enter();
     const int r = blockIdx.x, blk = blockIdx.y, lane = threadIdx.x;
     const int n = blk * 128 + 4 * lane;
     float v[4];
@@ -1092,6 +1209,7 @@ __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __re
                                     const half* __restrict__ svh_d,
                                     const float* __restrict__ wts, float* __restrict__ out, int P, int D, int SK,
                                     int E, int slots) {
+    pdl_enter();
     __shared__ float4 part[32][32];
     const int r = blockIdx.x, blk = blockIdx.y;
     const int k = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -1140,6 +1258,7 @@ constexpr int GROUP_PER_THREAD = 4;
 __global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restrict__ pick, int* __restrict__ uids,
                                                               int* __restrict__ ucount, int* __restrict__ members,
                                                               int R, int slots, int E, int maxm) {
+    pdl_enter();
     extern __shared__ int sh_pick[];
     __shared__ int warp_tot[GROUP_THREADS / 32];
     const int n = R * slots;
@@ -1204,6 +1323,7 @@ __global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restr
 __global__ void __launch_bounds__(64) group_small_kernel(const int* __restrict__ pick, int* __restrict__ uids,
                                                          int* __restrict__ ucount, int* __restrict__ members,
                                                          int P, int slots, int maxm) {
+    pdl_enter();
     __shared__ int sp[64];
     __shared__ unsigned lead0;
     const int i = threadIdx.x, lane = i & 31;
@@ -1243,18 +1363,18 @@ void exl3m_group(const int* pick, int* uids, int* ucount, int* members, int R, i
     (void)E;
     const int P = R * slots;
     EXL3_CHECK(P <= 64, "decode grouping takes at most 64 picks");
-    exl3::group_small_kernel<<<1, 64, 0, s>>>(pick, uids, ucount, members, P, slots, maxm);
+    pdl_launch(exl3::group_small_kernel, 1, 64, 0, s, pick, uids, ucount, members, P, slots, maxm);
 }
 
 void exl3m_rot_in(const void* x, int x_stride, const int* pick, const void* suh0, const void* suh1, void* out0,
                   void* out1, int rows, int K, int slots, int E, int x_bf16, cudaStream_t s) {
     dim3 grid((unsigned)(rows * slots), (unsigned)(K / 128), 2);
     if (x_bf16)
-        exl3::rot_in_kernel<__nv_bfloat16><<<grid, 32, 0, s>>>((const __nv_bfloat16*)x, x_stride, pick,
+        pdl_launch(exl3::rot_in_kernel<__nv_bfloat16>, grid, 32, 0, s, (const __nv_bfloat16*)x, x_stride, pick,
                                                                (const half*)suh0, (const half*)suh1, (half*)out0,
                                                                (half*)out1, K, slots, E);
     else
-        exl3::rot_in_kernel<half><<<grid, 32, 0, s>>>((const half*)x, x_stride, pick, (const half*)suh0,
+        pdl_launch(exl3::rot_in_kernel<half>, grid, 32, 0, s, (const half*)x, x_stride, pick, (const half*)suh0,
                                                       (const half*)suh1, (half*)out0, (half*)out1, K, slots, E);
 }
 
@@ -1315,7 +1435,7 @@ void exl3m_gateup(const float* Z, const int* pick, const void* svh_g, const void
                   void* xd, int rows, int P, int N, int SK, int slots, int E, int suh_d_stride, float limit,
                   int act_mode, cudaStream_t s) {
     dim3 grid((unsigned)(rows * slots), (unsigned)(N / 128));
-    exl3::gateup_epilogue_kernel<<<grid, 32, 0, s>>>(Z, pick, (const half*)svh_g, (const half*)svh_u,
+    pdl_launch(exl3::gateup_epilogue_kernel, grid, 32, 0, s, Z, pick, (const half*)svh_g, (const half*)svh_u,
                                                      (const half*)suh_d, (half*)xd, P, N, SK, E, suh_d_stride,
                                                      limit, act_mode);
 }
@@ -1324,24 +1444,24 @@ void exl3m_dense_rot(const void* x, int x_stride, const void* suh, void* out, in
                      cudaStream_t s) {
     dim3 grid((unsigned)rows, (unsigned)(K / 128));
     if (x_bf16)
-        exl3::dense_rot_kernel<__nv_bfloat16><<<grid, 32, 0, s>>>((const __nv_bfloat16*)x, x_stride,
+        pdl_launch(exl3::dense_rot_kernel<__nv_bfloat16>, grid, 32, 0, s, (const __nv_bfloat16*)x, x_stride,
                                                                   (const half*)suh, (half*)out, K, G);
     else
-        exl3::dense_rot_kernel<half><<<grid, 32, 0, s>>>((const half*)x, x_stride, (const half*)suh, (half*)out,
+        pdl_launch(exl3::dense_rot_kernel<half>, grid, 32, 0, s, (const half*)x, x_stride, (const half*)suh, (half*)out,
                                                          K, G);
 }
 
 void exl3m_dense_out(const float* Z, const void* svh, void* out, int rows, int N, int SK, int G, int out_bf16,
                      cudaStream_t s) {
     dim3 grid((unsigned)rows, (unsigned)(N / 128));
-    exl3::dense_out_kernel<<<grid, 32, 0, s>>>(Z, (const half*)svh, out, rows, N, SK, G, out_bf16);
+    pdl_launch(exl3::dense_out_kernel, grid, 32, 0, s, Z, (const half*)svh, out, rows, N, SK, G, out_bf16);
 }
 
 void exl3m_down_combine(const float* Z, const int* pick, const void* svh_d, const float* wts, float* out,
                         int rows, int P, int D, int SK, int slots, int E, cudaStream_t s) {
     EXL3_CHECK(slots <= 32, "at most 32 slots a row");
     dim3 grid((unsigned)rows, (unsigned)(D / 128));
-    exl3::down_combine_kernel<<<grid, (unsigned)(32 * slots), 0, s>>>(Z, pick, (const half*)svh_d, wts, out, P, D,
+    pdl_launch(exl3::down_combine_kernel, grid, (unsigned)(32 * slots), 0, s, Z, pick, (const half*)svh_d, wts, out, P, D,
                                                                       SK, E, slots);
 }
 

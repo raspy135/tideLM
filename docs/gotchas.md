@@ -4894,3 +4894,86 @@ launches 0.13 ms; ~25 small input uploads a step, each its own copy, 0.08 ms; re
 turnarounds 0.10 ms. Recovering the Engram wait (segment 2 queued behind a `wait_flag_kernel` gate
 the host releases) would change both ranks' step structure for ~0.3 ms, ~0.5%: inside boot noise in
 tok/s, not built.
+
+## GLM decode: EXL3 loads through shared memory, weights into L2 beside the waits, PDL, a faster indexer top-k (2026-10-29)
+
+Where a one-row decode pass stood (the pair, `tidelm-server --bench-width`, 2,500 tokens of code as
+context, fixed residents, no hot reads): 78.2 ms, against ~42-47 ms for the 10.7 GB a rank it reads
+(6.72 GB of dense weights, layer-by-layer from the checkpoint under weights.rs's cuts, and 75 x 8
+routed halves of 6.7 MB) at 230-255 GB/s. nsys (per-node graph tracing) put the dense EXL3 GEMVs
+far below the rates `glm_bench_exl3` reports: o_proj 188 us in the pass against 145.
+
+**The micro bench was the outlier.** It re-reads one layer's matrix between head flushes; every
+layer's o_proj back to back (`glm_bench_chain`, new: one matrix kind over the 75 MoE layers, each
+call timed) takes 184 us, 171 GB/s, whatever is done between calls (a host sync, a head flush, 2
+MB of dirty lines: +2 us; 8 MB: +24). Ruled out with plain reads: the TLB (one buffer, 300
+separate cudaMallocs and 103 GB of allocations read the same), idle time before a read (0-2,000 us:
+none), clocks (2.41-2.49 GHz, no throttle reasons). **The cause was the loads:** o_proj's access
+pattern alone, without the decode math (1.3 KB a warp-step, steps 61 KB apart), reads 201 GB/s with
+the kernel's 4-byte lane loads one step ahead, 180 with 2-8 steps ahead (more requests in flight,
+not more bytes), and 230 as 16-byte loads at any depth. Laying the tiles out contiguously per warp
+or as one sweep a step changed nothing.
+
+**DECODE_PF = -2** (`warp_tiles_cp`, tools/exl3_moe_cuda.cu): a step's NT tiles are one contiguous
+run, copied with 16-byte cp.async two stages ahead into the warp's shared-memory ring, then each
+lane reads its words from there; the decode and the mma chain are the register path's. Across the
+layers: o_proj 184.5 -> 150.6 us, q_b 68.8 -> 58.6, q_a 55.5 -> 47.1; 3 and 4 stages no better.
+The routed experts read 213-218 GB/s either way (`glm_bench_moe`: a 3-bit tile is one word a lane).
+Byte for byte the same outputs (`CHECK=1 glm_bench_chain`: 6 layers x 1-16 rows x 2-3 stages,
+nt 8 and 4). The pass: 1 / 2 / 4 / 8 rows 78.2 / 96.8 / 132.0 / 188.8 -> 69.5 / 89.0 / 120.8 /
+174.5 ms, and the spread between runs fell from +-5 to +-1 ms.
+
+Then, each exact (scheduling or bytes only):
+- **Weights into L2 from a parallel graph branch** (`l2_runs`, `l2_experts`, the DS engine's
+  prefetch with strided runs; TIDELM_L2_PREFETCH=0 off): 12 MB of o_proj spread over its warps'
+  k ranges, issued after the MLA kernel (before it, the core's partials, 6-8 MB at 3-4 rows,
+  evicted it: o_proj 119 us at one row, 159 at four); the router during o_proj's sum; the routed
+  experts' down rows (6 MB, slots from the device's picks) and 2 MB of the shared down during the
+  MoE's gather; the next layer's q_a and kv_a during its output's gather. o_proj in the pass 150 ->
+  119 us, q_a 58 -> 37.
+- **The shared expert's gate/up beside the router chain** (forked in moe_exact, joined after the
+  routed gate/up): the routed gate/up 214-222 -> 176 us alone. Joined at the router chain's end it
+  was ~1 ms worse: its ~60 us chain outlasts the router's.
+- **The router in fp16** (ds41.cu skinny KIND 3: KIND 2's lanes and FMA chain from 8-byte loads):
+  F.linear(x.float(), w.float())'s bits at 3.1 MB a layer instead of 6.3.
+- **PDL** for glm.cu and the EXL3 file, as ds41.cu's (TIDELM_PDL=0 off): ~1 ms a pass.
+- **The indexer's top-k** (per-warp histograms, then each warp a contiguous segment placed by
+  ballots instead of 1,024-element rounds of two block scans): 125-137 -> 45-55 us a row of 60-63K
+  scores, the same output over random, zero-heavy, duplicate-heavy and masked rows. **Index scores**
+  at 128 keys a block for 1-3 rows, 256 for 4-8 (8 warps take 8 rows, so small passes left most
+  of them loading): 67.5 -> 51.2 us at one row of a 120K context's 60K keys.
+
+Rejected: the router's top-8 by one warp (no block barriers): slower beside the shared GEMV (12.7 /
+26.8 us for the exact / resident calls against 8.8 / 18); 16-head MLA blocks: 64 blocks for one row
+instead of 32, but shared memory holds one block an SM either way, so 4 rows took 148 us against
+114; fusing q_a with kv_a: their suh differ (two rotations regardless) and they already run side by
+side on two streams (37 + 36 us concurrent).
+
+Exactness: the per-token NLL dump (`--bench-nll-out`) is byte for byte the original's over
+corpus/heldout_quick (10,151 tokens, 8-row passes) and over 2,999 tokens at 160-163K of context
+with async hot reads, adaptation and background victims on, passes cycling 8 / 16 / 24 / 33 / 3 /
+1 rows (`--bench-nll-skip 160000 --bench-nll-rows ...`, new).
+
+Serving (`results/rust-glm53-20261029/`, the README protocol on the 320K two-lane profile, one boot an
+arm, alternating, two rounds): prose 18.22 / 18.25 -> 19.79 / 19.59 tok/s, code 22.13 / 22.15 ->
+23.74 / 22.63, ms a step -6.8% / -4.4% / -5.5% (prose / code / the 8K prompt's decode), tokens a
+step identical run for run, the 8K prompt's first token unchanged (19.5-20.2 s).
+
+The pair stopped once on this build in serving, before this commit: a NaN in a sampled row's
+candidates panicked `nucleus`'s sort (`serve.rs`) on the first request past 162K of context, after
+64 requests at 140-162K. The long-context NLL run above (async hot reads, 160-163K, 1-33 rows)
+found no NaN in either build and the same bytes from both; the paths it does not reach are two
+lanes at once and sampled MTP drafts. Not reproduced; the sampler now logs a NaN row and takes
+its NaN logits as -inf instead of stopping the pair.
+
+Measurement traps: the same binary measured 65.8 to 72 ms at one row across boots of one
+afternoon (+-5%), so builds are compared in alternating boots. A 2.2 GHz SM clock cap (`nvidia-smi
+-lgc`) made the pair ~9% slower (the base build, 1 / 3 / 4 rows at 2.5K and 120K: 81.7 / 120.3 /
+133.6 and 86.0 / 130.8 / 147.3 ms against 75.0 / 109.9 / 123.2 and 78.7 / 119.8 / 135.0): EXL3
+decode is not DRAM-bound. Capped runs repeated within ~1.5 ms. Under the cap, at 120K of context,
+two alternating rounds: base 86.0 / 130.8 / 147.3, this build (but the o_proj prefetch's move)
+72.4 / 119.9 / 135.6 ms.
+
+What is left in a one-row pass (~68 ms): five RoCE gathers a layer (~6 ms), the MLA core (~3-4 ms;
+its shared memory caps it at one block an SM), the router chain, ~4,700 kernels, and GEMVs at
+80-90% of a streaming read.

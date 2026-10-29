@@ -12,6 +12,32 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
+#include <utility>
+
+// Programmatic dependent launch, as ds41.cu's: every kernel here (but the L2 prefetch, launched on
+// its own branch) starts with pdl_enter(), and once the GLM engine switches it on (glm_set_pdl;
+// TIDELM_PDL=0 keeps it off) every launch carries the programmatic-serialization attribute, so the
+// next kernel's blocks launch while this one drains and wait on the GPU, not behind the launch
+// path. griddepcontrol.wait returns once the previous grid has completed and its writes are
+// visible, and it precedes any global access in every block: the stream's order holds,
+// transitively. Without the attribute both instructions do nothing. Bit-identical either way.
+__device__ __forceinline__ void pdl_enter() {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+}
+static int g_pdl = 0;
+template <typename... P, typename... A>
+static inline void pdl_launch(void (*kernel)(P...), dim3 grid, dim3 block, size_t smem, cudaStream_t st, A&&... args) {
+    cudaLaunchConfig_t c = {};
+    c.gridDim = grid; c.blockDim = block; c.dynamicSmemBytes = smem; c.stream = st;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = 1;
+    c.attrs = at; c.numAttrs = g_pdl ? 1 : 0;
+    cudaLaunchKernelEx(&c, kernel, std::forward<A>(args)...);
+}
+// the GLM engine's switch for this file's launches (graph captures made after it carry it)
+extern "C" int glm_set_pdl(int on) { g_pdl = on; return 0; }
 
 namespace {
 
@@ -129,6 +155,7 @@ __device__ __forceinline__ int block_rank(bool f, int* wtot, int& total) {
 // then sums the pair exactly). pos (nullable): zero rows at position 0 (the MTP layer's input).
 __global__ void embed_kernel(const int* __restrict__ ids, const int8_t* __restrict__ q, const float* __restrict__ sc,
                              int lo, int vl, int H, const int* __restrict__ pos, float* __restrict__ out) {
+    pdl_enter();
     const int t = blockIdx.x;
     const int id = ids[t] - lo;
     const bool in = id >= 0 && id < vl && !(pos && pos[t] == 0);
@@ -140,6 +167,7 @@ __global__ void embed_kernel(const int* __restrict__ ids, const int8_t* __restri
 // The pair's sum of a gathered [2][n] fp32 tensor in rank order (an all-reduce: both ranks
 // compute g0 + g1, the same bits) as bf16 or fp32.
 __global__ void sum2_kernel(const float* __restrict__ g, int64_t n, __nv_bfloat16* ob, float* of) {
+    pdl_enter();
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float v = g[i] + g[n + i];
@@ -148,6 +176,7 @@ __global__ void sum2_kernel(const float* __restrict__ g, int64_t n, __nv_bfloat1
 }
 
 __global__ void f32_bf16_kernel(const float* __restrict__ x, __nv_bfloat16* __restrict__ y, int64_t n) {
+    pdl_enter();
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = to_bf(x[i]);
 }
@@ -157,6 +186,7 @@ __global__ void f32_bf16_kernel(const float* __restrict__ x, __nv_bfloat16* __re
 template <typename T>
 __global__ void unshard_kernel(const T* __restrict__ src, int64_t rank_stride, T* __restrict__ dst, int M, int n,
                                int world) {
+    pdl_enter();
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t total = (int64_t)world * M * n;
     if (i >= total) return;
@@ -174,6 +204,7 @@ __global__ void __launch_bounds__(1024) rmsnorm_kernel(__nv_bfloat16* __restrict
                                                        const __nv_bfloat16* __restrict__ a, int64_t lda,
                                                        const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ y,
                                                        int64_t ldy, int N, float eps) {
+    pdl_enter();
     // the row in registers (N <= 12 x 1024): one read of h (and a), one write of each output
     __shared__ float red[32];
     constexpr int kPer = 12;
@@ -213,6 +244,7 @@ __global__ void __launch_bounds__(1024) rmsnorm_kernel(__nv_bfloat16* __restrict
 __global__ void rope_kernel(const __nv_bfloat16* x, int64_t xt, int64_t xh, __nv_bfloat16* y, int64_t yt, int64_t yh,
                             int H, const __nv_bfloat16* __restrict__ cs, const __nv_bfloat16* __restrict__ sn,
                             const int* __restrict__ pos) {
+    pdl_enter();
     const int t = blockIdx.x, h = blockIdx.y * 8 + (threadIdx.x >> 5), i = threadIdx.x & 31;
     if (h >= H) return;
     const int p = pos[t];
@@ -231,6 +263,7 @@ __global__ void rope_kernel(const __nv_bfloat16* x, int64_t xt, int64_t xh, __nv
 // (a division, RNE), at cache row rows[t]. One warp per (row, 128-block).
 __global__ void kv_fp8_kernel(const __nv_bfloat16* __restrict__ x, int64_t ldx, const int* __restrict__ rows,
                               uint8_t* __restrict__ q, float* __restrict__ s, int d) {
+    pdl_enter();
     const int t = blockIdx.x, b = blockIdx.y, l = threadIdx.x;
     const __nv_bfloat16* xr = x + (int64_t)t * ldx + b * 128 + 4 * l;
     float v[4], am = 0.f;
@@ -252,6 +285,7 @@ __global__ void kv_fp8_kernel(const __nv_bfloat16* __restrict__ x, int64_t ldx, 
 // rows of d bf16 values to cache rows rows[t] (the RoPE keys; tp's r_cache.index_copy_)
 __global__ void rows_copy_kernel(const __nv_bfloat16* __restrict__ x, int64_t ldx, const int* __restrict__ rows,
                                  __nv_bfloat16* __restrict__ out, int d) {
+    pdl_enter();
     const int t = blockIdx.x;
     const int64_t r = rows[t];
     for (int c = threadIdx.x; c < d; c += blockDim.x) out[r * d + c] = x[(int64_t)t * ldx + c];
@@ -275,6 +309,7 @@ __device__ __forceinline__ int lane_of(const int* lanes, int nl, int t) {
 __global__ void positions_kernel(const int* __restrict__ pos0, int T, int rank, int world, int spare,
                                  int* __restrict__ pos, int* __restrict__ rows, int* __restrict__ bound,
                                  const int* __restrict__ lanes, int nl, int* __restrict__ koff) {
+    pdl_enter();
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= T) return;
     int p = pos0 ? pos0[0] + t : 0, off = 0;
@@ -304,6 +339,7 @@ __global__ void index_key_kernel(const __nv_bfloat16* __restrict__ k, int64_t ld
                                  const float* __restrict__ b, const __nv_bfloat16* __restrict__ cs,
                                  const __nv_bfloat16* __restrict__ sn, const int* __restrict__ pos,
                                  const int* __restrict__ rows, uint8_t* __restrict__ q, float* __restrict__ s, int T) {
+    pdl_enter();
     __shared__ float buf[4][128];
     const int warp = threadIdx.x >> 5, l = threadIdx.x & 31;
     const int t = blockIdx.x * 4 + warp;
@@ -359,12 +395,14 @@ __global__ void index_key_kernel(const __nv_bfloat16* __restrict__ k, int64_t ld
 // lanes (null: rows 0..T, one cache): the [L][4] table of positions_kernel, a grid layer a lane
 // (gridDim.z = L), so a block's rows, which share its key tiles, are one lane's: lane z's rows
 // row0_z.. score that lane's keys, its cache rows koff_z on.
-constexpr int kIH = 32, kID = 128, kIT = 64, kILD = kID + 8, kIRows = 8, kIKeys = 512;
+constexpr int kIH = 32, kID = 128, kIT = 64, kILD = kID + 8, kIRows = 8;
 
+template <int kIKeys>
 __global__ void __launch_bounds__(256) index_scores_kernel(
     const __nv_bfloat16* __restrict__ q, const float* __restrict__ w, float wscale, const uint8_t* __restrict__ kq,
     const float* __restrict__ ks, const int* __restrict__ pos, int T, int nmax, int stride, int off, int split_n,
     float inv_d, float* __restrict__ out, int64_t ldo, const int* __restrict__ lanes) {
+    pdl_enter();
     __shared__ __align__(16) __nv_bfloat16 kt[kIT * kILD];
     __shared__ float kss[kIT];
     __shared__ int lim_s[kIRows];
@@ -469,20 +507,26 @@ __global__ void __launch_bounds__(256) index_scores_kernel(
 }
 
 // The indexer's top-k (torch.topk(min(2048, S)).indices) per row over its live entries s[0, n_t):
-// a radix select (4 x 8 bits of the orderable key) for the K-th largest value, then an ordered
-// compaction in rounds of the block's 1024 threads: the selected indices come out ascending, ties
-// at the threshold to the lowest indices. Rows with n_t <= K take all of them. -1 (value -inf)
-// past what was selected. n_t from pos as in index_scores_kernel (pos null: nmax).
+// a radix select (4 x 8 bits of the orderable key, counted in per-warp histograms) for the K-th
+// largest value, then an ordered compaction: each warp a contiguous segment, its counts scanned once
+// and its picks placed by ballots. The selected indices come out ascending, ties at the threshold to
+// the lowest indices. Rows with n_t <= K take all of them. -1 (value -inf) past what was selected.
+// n_t from pos as in index_scores_kernel (pos null: nmax). The first version counted into one
+// shared histogram and compacted in 1,024-element rounds of two block-wide scans: 125-137 us a row
+// of 60-63K scores (a 120K context's split layers), this one 45-55 with the same output, byte for
+// byte, over random, zero-heavy, duplicate-heavy and masked rows (docs/gotchas.md).
 constexpr int kTk = 1024;
 
 __global__ void __launch_bounds__(kTk) topk_kernel(const float* __restrict__ s, int64_t lds, const int* __restrict__ pos,
-                                                   int stride, int off, int nmax, int K, int* __restrict__ idx,
-                                                   int64_t ldi, float* __restrict__ val, int64_t ldv) {
-    __shared__ int hist[256];
-    __shared__ int wtot[32];
+                                                    int stride, int off, int nmax, int K, int* __restrict__ idx,
+                                                    int64_t ldi, float* __restrict__ val, int64_t ldv) {
+    pdl_enter();
+    constexpr int NW = kTk / 32;
+    __shared__ int hist[NW][257];
+    __shared__ int wgt[NW], weq[NW];
     __shared__ uint32_t sh_prefix;
     __shared__ int sh_need;
-    const int t = blockIdx.x, tid = threadIdx.x;
+    const int t = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     int n = nmax;
     if (pos) {
         const int p = pos[t];
@@ -502,18 +546,25 @@ __global__ void __launch_bounds__(kTk) topk_kernel(const float* __restrict__ s, 
     int need = K;
     for (int pass = 0; pass < 4; ++pass) {
         const int shift = 24 - 8 * pass;
-        if (tid < 256) hist[tid] = 0;
-        __syncthreads();
+        for (int b = lane; b < 256; b += 32) hist[warp][b] = 0;
+        __syncwarp();
         for (int j = tid; j < n; j += kTk) {
             const uint32_t u = fkey(row[j]);
-            if ((u & mask) == prefix) atomicAdd(&hist[(u >> shift) & 255], 1);
+            if ((u & mask) == prefix) atomicAdd(&hist[warp][(u >> shift) & 255], 1);
+        }
+        __syncthreads();
+        if (tid < 256) {
+            int c = 0;
+#pragma unroll 8
+            for (int w = 0; w < NW; ++w) c += hist[w][tid];
+            hist[0][tid] = c;
         }
         __syncthreads();
         if (tid == 0) {
             int acc = 0, b = 255;
             for (; b > 0; --b) {
-                if (acc + hist[b] >= need) break;
-                acc += hist[b];
+                if (acc + hist[0][b] >= need) break;
+                acc += hist[0][b];
             }
             sh_prefix = prefix | ((uint32_t)b << shift);
             sh_need = need - acc;
@@ -523,28 +574,55 @@ __global__ void __launch_bounds__(kTk) topk_kernel(const float* __restrict__ s, 
         need = sh_need;
         mask |= 0xffu << shift;
     }
-    int base = 0, eq_seen = 0;
-    for (int j0 = 0; j0 < n; j0 += kTk) {
-        const int j = j0 + tid;
-        uint32_t u = 0;
-        float v = 0.f;
-        if (j < n) {
-            v = row[j];
-            u = fkey(v);
-        }
-        const bool gt = j < n && u > prefix, eq = j < n && u == prefix;
-        int eq_tot, take_tot;
-        const int er = block_rank(eq, wtot, eq_tot);
-        const bool take = gt || (eq && eq_seen + er < need);
-        const int tr = block_rank(take, wtot, take_tot);
-        if (take && base + tr < K) {
-            io[base + tr] = j;
-            if (vo) vo[base + tr] = v;
-        }
-        base += take_tot;
-        eq_seen += eq_tot;
+    // output: warp w's segment [w S, w S + S), in order; the elements above the threshold key and the
+    // first `need` equal to it in index order, as topk_kernel takes them
+    const int S = ((n + NW - 1) / NW + 31) / 32 * 32;
+    const int j0 = min(n, warp * S), j1 = min(n, j0 + S);
+    int gt_c = 0, eq_c = 0;
+    for (int j = j0 + lane; j < j1; j += 32) {
+        const uint32_t u = fkey(row[j]);
+        gt_c += u > prefix;
+        eq_c += u == prefix;
     }
-    for (int j = base + tid; j < K; j += kTk) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        gt_c += __shfl_xor_sync(0xffffffffu, gt_c, o);
+        eq_c += __shfl_xor_sync(0xffffffffu, eq_c, o);
+    }
+    if (lane == 0) {
+        wgt[warp] = gt_c;
+        weq[warp] = eq_c;
+    }
+    __syncthreads();
+    int base = 0, eq_seen = 0, total = 0, e = 0;
+    for (int w = 0; w < NW; ++w) {
+        const int take = wgt[w] + min(weq[w], max(0, need - e));
+        if (w < warp) {
+            base += take;
+            eq_seen += weq[w];
+        }
+        total += take;
+        e += weq[w];
+    }
+    const unsigned lt = (1u << lane) - 1u;
+    for (int jb = j0; jb < j1; jb += 32) {
+        const int j = jb + lane;
+        const bool ok = j < j1;
+        const float v = ok ? row[j] : 0.f;
+        const uint32_t u = fkey(v);
+        const bool gt = ok && u > prefix, eq = ok && u == prefix;
+        const unsigned em = __ballot_sync(0xffffffffu, eq);
+        const bool take = gt || (eq && eq_seen + __popc(em & lt) < need);
+        const unsigned tm = __ballot_sync(0xffffffffu, take);
+        const int r = base + __popc(tm & lt);
+        if (take && r < K) {
+            io[r] = j;
+            if (vo) vo[r] = v;
+        }
+        base += __popc(tm);
+        eq_seen += __popc(em);
+    }
+    for (int j = total + tid; j < K; j += kTk) {
         io[j] = -1;
         if (vo) vo[j] = -INFINITY;
     }
@@ -558,6 +636,7 @@ __global__ void __launch_bounds__(kTk) topk_kernel(const float* __restrict__ s, 
 __global__ void __launch_bounds__(kTk) split_share_kernel(const uint8_t* __restrict__ g, int64_t rank_stride,
                                                           int64_t row_stride, int64_t val_off, int* __restrict__ idx,
                                                           int64_t ldi, int rank, int K) {
+    pdl_enter();
     __shared__ int hist[256];
     __shared__ int wtot[32];
     __shared__ uint32_t sh_prefix;
@@ -619,6 +698,7 @@ __global__ void __launch_bounds__(256) absorb_q_kernel(const __nv_bfloat16* __re
                                                        int64_t ldq_h, const uint8_t* __restrict__ w,
                                                        const float* __restrict__ ws, __nv_bfloat16* __restrict__ out,
                                                        int64_t ldo_t, int64_t ldo_h, int T) {
+    pdl_enter();
     // a block: one head's 128 output columns over up to 8 rows; a thread 4 adjacent columns (one
     // u32 of FP8) over a 24-row slice of n, its loads unrolled to keep them in flight; the 8
     // slices summed in shared memory
@@ -683,6 +763,7 @@ __global__ void __launch_bounds__(256) absorb_o_kernel(const __nv_bfloat16* __re
                                                        int64_t ldo_h, const uint8_t* __restrict__ w,
                                                        const float* __restrict__ ws, __nv_bfloat16* __restrict__ out,
                                                        int64_t ld_out, int T) {
+    pdl_enter();
     __shared__ __align__(16) float xs[16][kLat];
     const int h = blockIdx.x, warp = threadIdx.x >> 5, l = threadIdx.x & 31;
     for (int i = threadIdx.x; i < T * kLat; i += blockDim.x) {
@@ -712,6 +793,7 @@ __global__ void __launch_bounds__(256) absorb_o_kernel(const __nv_bfloat16* __re
 // The FP8 kv_b's effective weight as bf16 rows (prefill's absorb runs it through cuBLAS).
 __global__ void kvb_dequant_kernel(const uint8_t* __restrict__ w, const float* __restrict__ ws,
                                    __nv_bfloat16* __restrict__ out, int64_t rows) {
+    pdl_enter();
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * kLat) return;
     const int64_t r = i / kLat;
@@ -743,6 +825,7 @@ __global__ void __launch_bounds__(256) mla_kernel(
     const int* __restrict__ idx, int64_t ld_idx, int K, int ascending, const int* __restrict__ bound, int H, float scale,
     int chunk, float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,
     __nv_bfloat16* __restrict__ out, int64_t o_ldt, int64_t o_ldh, const int* __restrict__ koff) {
+    pdl_enter();
     constexpr int HB = 16 * MT;
     extern __shared__ __align__(16) unsigned char mla_smem_raw[];
     __nv_bfloat16* Qs = reinterpret_cast<__nv_bfloat16*>(mla_smem_raw);   // [HB][kMLD]
@@ -969,6 +1052,7 @@ __global__ void mla_combine_kernel(const float* __restrict__ pm, const float* __
                                    const float* __restrict__ pacc, int H, int NS, __nv_bfloat16* __restrict__ out,
                                    int64_t o_ldt, int64_t o_ldh, float* __restrict__ own_o, float* __restrict__ own_l,
                                    uint8_t* __restrict__ send, int64_t row_bytes, int hl, int lo) {
+    pdl_enter();
     const int t = blockIdx.x, h = blockIdx.y;
     const int64_t b = ((int64_t)t * H + h) * NS;
     float m = -1e30f;
@@ -1004,6 +1088,7 @@ __global__ void mla_combine_kernel(const float* __restrict__ pm, const float* __
 __global__ void mla_merge_kernel(const float* __restrict__ own_o, const float* __restrict__ own_l,
                                  const uint8_t* __restrict__ recv, int64_t row_bytes, int hl,
                                  __nv_bfloat16* __restrict__ out) {
+    pdl_enter();
     const int t = blockIdx.x, h = blockIdx.y;
     const float la = own_l[(int64_t)t * hl + h];
     const uint8_t* row = recv + (int64_t)t * row_bytes;
@@ -1086,6 +1171,7 @@ __global__ void __launch_bounds__(kE) router_kernel(const float* __restrict__ lo
                                                     const int* __restrict__ live, double* __restrict__ lane_acc,
                                                     float* __restrict__ lane_demand, int64_t lane_stride,
                                                     const int* __restrict__ row_lane) {
+    pdl_enter();
     __shared__ float sc[kE];
     const int t = blockIdx.x;
     int chosen[8];
@@ -1147,6 +1233,7 @@ __global__ void __launch_bounds__(kE) router_kernel(const float* __restrict__ lo
 // exl3_model.FixedMLP.act: bf16(g * sigmoid(g) * u), g and u the bf16 projections in fp32.
 __global__ void swiglu_kernel(const __nv_bfloat16* __restrict__ g, int64_t ldg, const __nv_bfloat16* __restrict__ u,
                               int64_t ldu, __nv_bfloat16* __restrict__ y, int64_t ldy, int n) {
+    pdl_enter();
     const int t = blockIdx.y;
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= n) return;
@@ -1157,6 +1244,7 @@ __global__ void swiglu_kernel(const __nv_bfloat16* __restrict__ g, int64_t ldg, 
 // exl3_model.mlp's sum: bf16(routed + shared down) (routed null: a dense layer's down alone).
 __global__ void moe_out_kernel(const float* __restrict__ routed, const float* __restrict__ shared,
                                __nv_bfloat16* __restrict__ y, int64_t n) {
+    pdl_enter();
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     y[i] = to_bf((routed ? routed[i] : 0.f) + shared[i]);
@@ -1167,6 +1255,7 @@ __global__ void moe_out_kernel(const float* __restrict__ routed, const float* __
 // bits) pairs [M][2] (gathered over the pair, then argmax_combine_kernel).
 __global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ x, int64_t ldx, int n, int offset,
                                                       int* __restrict__ pairs) {
+    pdl_enter();
     __shared__ float bv[32];
     __shared__ int bi[32];
     const float* row = x + (int64_t)blockIdx.x * ldx;
@@ -1207,6 +1296,7 @@ __global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ 
 
 // pairs [world][M][2] -> the argmax over ranks (ties: the lower id, rank 0's first)
 __global__ void argmax_combine_kernel(const int* __restrict__ pairs, int world, int M, int* __restrict__ out) {
+    pdl_enter();
     const int m = blockIdx.x * blockDim.x + threadIdx.x;
     if (m >= M) return;
     int bid = pairs[m * 2];
@@ -1228,6 +1318,7 @@ __global__ void argmax_combine_kernel(const int* __restrict__ pairs, int world, 
 // window state and the mul1 codebook value (1024 + the four bytes of state * 0x83DCD12D) times
 // scale plus bias, exact in fp32, rounded once to fp16. One block per (k tile, 128 columns).
 __global__ void exl3_unpack_kernel(const uint32_t* __restrict__ tr, int NT, int N, int bits, __half* __restrict__ W) {
+    pdl_enter();
     const int kt = blockIdx.x, c0 = blockIdx.y * 128;
     const int nw = 8 * bits;
     for (int i = threadIdx.x; i < 16 * 128; i += blockDim.x) {
@@ -1254,6 +1345,7 @@ __global__ void exl3_unpack_kernel(const uint32_t* __restrict__ tr, int NT, int 
 // fp4_moe.build_routing's member codes for the EXL3 kernels: a block's pair p -> (p / K) * 32 +
 // p % K (row, pick), -1 kept; and the used blocks' count (block_slot >= 0 is a prefix).
 __global__ void member_codes_kernel(const int* __restrict__ pair, int n, int K, int* __restrict__ out) {
+    pdl_enter();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const int p = pair[i];
@@ -1261,6 +1353,7 @@ __global__ void member_codes_kernel(const int* __restrict__ pair, int n, int K, 
 }
 
 __global__ void count_live_kernel(const int* __restrict__ block_slot, int nb, int* __restrict__ out) {
+    pdl_enter();
     __shared__ int wtot[32];
     int total = 0, sum = 0;
     for (int b0 = 0; b0 < nb; b0 += blockDim.x) {
@@ -1278,6 +1371,7 @@ __global__ void count_live_kernel(const int* __restrict__ block_slot, int nb, in
 // blocks [rows][4] (kvb_fp8.HeadFP8.from_rows). One block per (128 rows, 128 columns).
 __global__ void __launch_bounds__(256) quant_kvb_kernel(const __half* __restrict__ w, uint8_t* __restrict__ q,
                                                         float* __restrict__ s_rows) {
+    pdl_enter();
     __shared__ float red[32];
     const int rb = blockIdx.x, cb = blockIdx.y;
     float am = 0.f;
@@ -1306,6 +1400,7 @@ __global__ void __launch_bounds__(256) quant_kvb_kernel(const __half* __restrict
 // q = clamp(rint(x / sc), -127, 127). One warp per (row, 128 values).
 __global__ void quant_int8_rows_kernel(const __nv_bfloat16* __restrict__ x, int8_t* __restrict__ q,
                                        float* __restrict__ s, int H) {
+    pdl_enter();
     const int r = blockIdx.x, b = blockIdx.y, l = threadIdx.x;
     const __nv_bfloat16* xr = x + (int64_t)r * H + b * 128 + 4 * l;
     float v[4], am = 0.f;
@@ -1324,6 +1419,7 @@ __global__ void quant_int8_rows_kernel(const __nv_bfloat16* __restrict__ x, int8
 // rows t of x -> rows t * G + g of out for every g (an Exl3Matrix of G groups over one input)
 __global__ void dup_rows_kernel(const __nv_bfloat16* __restrict__ x, int64_t ldx, __nv_bfloat16* __restrict__ out,
                                 int K, int G) {
+    pdl_enter();
     const int t = blockIdx.x;
     for (int c = threadIdx.x; c < K; c += blockDim.x) {
         const __nv_bfloat16 v = x[(int64_t)t * ldx + c];
@@ -1338,6 +1434,7 @@ __global__ void dup_rows_kernel(const __nv_bfloat16* __restrict__ x, int64_t ldx
 __global__ void __launch_bounds__(1024) row_lse_kernel(const float* __restrict__ x, int64_t ldx, int n,
                                                        const float* __restrict__ temp, int temp_ld, float* __restrict__ out,
                                                        int64_t ldo) {
+    pdl_enter();
     __shared__ float red[32];
     const float* row = x + (int64_t)blockIdx.x * ldx;
     float m = -INFINITY;
@@ -1362,6 +1459,48 @@ __global__ void __launch_bounds__(1024) row_lse_kernel(const float* __restrict__
         out[(int64_t)blockIdx.x * ldo + 1] = s;
     }
 }
+// The weights a coming kernel reads into L2 from a parallel graph branch while the main stream runs
+// work that leaves the memory idle (the attention core, a RoCE gather's wait): `count` runs of `run`
+// bytes, `stride` apart from `base` - one run a warp's range of a decode GEMV, so each of its warps
+// finds the start of its range in L2. TMA bulk prefetches (cp.async.bulk.prefetch.L2), 32 KB a
+// request; the DS engine's l2_prefetch_kernel with strided runs (docs/gotchas.md, 2026-10-27).
+__global__ void __launch_bounds__(128) l2_runs_kernel(uint64_t base, uint64_t run, uint64_t stride, int count) {
+    constexpr uint64_t CH = 32u << 10;
+    const uint32_t w = blockIdx.x * blockDim.x + threadIdx.x, workers = gridDim.x * blockDim.x;
+    const uint64_t len = run & ~static_cast<uint64_t>(15u);
+    uint64_t j = 0;
+    for (int r = 0; r < count; ++r)
+        for (uint64_t off = 0; off < len; off += CH, ++j) {
+            if (j % workers != w) continue;
+            const uint32_t n = static_cast<uint32_t>(min(CH, len - off));
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(base + r * stride + off), "r"(n) : "memory");
+        }
+}
+
+// The routed experts' coming GEMV into L2 the same way, its picks known only on the device: pick[i] an
+// arena slot (or -1), tp[slot] its trellis, k2[slot] its half-bits a value. The grouped kernel's warps
+// read `ranges` contiguous k ranges of a matrix of K x N (N / 16 tiles of 16 x 16 values, 16 * k2 bytes
+// each, k-major); each range's first `run` bytes are requested. Repeated picks prefetch twice (harmless).
+__global__ void __launch_bounds__(128) l2_experts_kernel(const int* __restrict__ pick, int P, const int64_t* __restrict__ tp,
+                                                         const int* __restrict__ k2, int K, int N, int ranges,
+                                                         uint64_t run) {
+    constexpr uint64_t CH = 32u << 10;
+    const uint32_t w = blockIdx.x * blockDim.x + threadIdx.x, workers = gridDim.x * blockDim.x;
+    uint64_t j = 0;
+    for (int i = 0; i < P; ++i) {
+        const int slot = pick[i];
+        if (slot < 0) continue;
+        const uint64_t bytes = (uint64_t)(K / 16) * (N / 16) * 16 * k2[slot];
+        const uint64_t stride = bytes / ranges, len = min(run, stride) & ~static_cast<uint64_t>(15u);
+        const uint64_t base = static_cast<uint64_t>(tp[slot]);
+        for (int r = 0; r < ranges; ++r)
+            for (uint64_t off = 0; off < len; off += CH, ++j) {
+                if (j % workers != w) continue;
+                const uint32_t n = static_cast<uint32_t>(min(CH, len - off));
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(base + r * stride + off), "r"(n) : "memory");
+            }
+    }
+}
 }  // namespace
 
 // ---------------------------------------------------------------- C ABI
@@ -1370,21 +1509,21 @@ extern "C" {
 
 int glm_embed(void* stream, const void* ids, int T, const void* q, const void* sc, int lo, int vl, int H, const void* pos,
               void* out) {
-    embed_kernel<<<T, 256, 0, GST>>>(static_cast<const int*>(ids), static_cast<const int8_t*>(q),
+    pdl_launch(embed_kernel, T, 256, 0, GST, static_cast<const int*>(ids), static_cast<const int8_t*>(q),
                                      static_cast<const float*>(sc), lo, vl, H, static_cast<const int*>(pos),
                                      static_cast<float*>(out));
     GRET;
 }
 
 int glm_sum2(void* stream, const void* g, int64_t n, void* out_bf16, void* out_f32) {
-    sum2_kernel<<<(unsigned)((n + 255) / 256), 256, 0, GST>>>(static_cast<const float*>(g), n,
+    pdl_launch(sum2_kernel, (unsigned)((n + 255) / 256), 256, 0, GST, static_cast<const float*>(g), n,
                                                               static_cast<__nv_bfloat16*>(out_bf16),
                                                               static_cast<float*>(out_f32));
     GRET;
 }
 
 int glm_f32_bf16(void* stream, const void* x, void* y, int64_t n) {
-    f32_bf16_kernel<<<(unsigned)((n + 255) / 256), 256, 0, GST>>>(static_cast<const float*>(x),
+    pdl_launch(f32_bf16_kernel, (unsigned)((n + 255) / 256), 256, 0, GST, static_cast<const float*>(x),
                                                                   static_cast<__nv_bfloat16*>(y), n);
     GRET;
 }
@@ -1393,8 +1532,8 @@ int glm_unshard(void* stream, const void* src, int64_t rank_stride, void* dst, i
     const int64_t total = (int64_t)world * M * n;
     const unsigned g = (unsigned)((total + 255) / 256);
     if (!rank_stride) rank_stride = (int64_t)M * n;
-    if (esz == 2) unshard_kernel<uint16_t><<<g, 256, 0, GST>>>(static_cast<const uint16_t*>(src), rank_stride, static_cast<uint16_t*>(dst), M, n, world);
-    else if (esz == 4) unshard_kernel<uint32_t><<<g, 256, 0, GST>>>(static_cast<const uint32_t*>(src), rank_stride, static_cast<uint32_t*>(dst), M, n, world);
+    if (esz == 2) pdl_launch(unshard_kernel<uint16_t>, g, 256, 0, GST, static_cast<const uint16_t*>(src), rank_stride, static_cast<uint16_t*>(dst), M, n, world);
+    else if (esz == 4) pdl_launch(unshard_kernel<uint32_t>, g, 256, 0, GST, static_cast<const uint32_t*>(src), rank_stride, static_cast<uint32_t*>(dst), M, n, world);
     else return (int)cudaErrorInvalidValue;
     GRET;
 }
@@ -1405,11 +1544,11 @@ int glm_rmsnorm(void* stream, void* h, int64_t ldh, const void* a, int64_t lda, 
     const int nt = N >= 4096 ? 1024 : N >= 1024 ? 256 : 128;
     if (N > 12 * nt) return (int)cudaErrorInvalidValue;
     if (a)
-        rmsnorm_kernel<true><<<T, nt, 0, GST>>>(static_cast<__nv_bfloat16*>(h), ldh, static_cast<const __nv_bfloat16*>(a),
+        pdl_launch(rmsnorm_kernel<true>, T, nt, 0, GST, static_cast<__nv_bfloat16*>(h), ldh, static_cast<const __nv_bfloat16*>(a),
                                                  lda, static_cast<const __nv_bfloat16*>(w), static_cast<__nv_bfloat16*>(y),
                                                  ldy, N, eps);
     else
-        rmsnorm_kernel<false><<<T, nt, 0, GST>>>(static_cast<__nv_bfloat16*>(h), ldh, nullptr, 0,
+        pdl_launch(rmsnorm_kernel<false>, T, nt, 0, GST, static_cast<__nv_bfloat16*>(h), ldh, nullptr, 0,
                                                   static_cast<const __nv_bfloat16*>(w), static_cast<__nv_bfloat16*>(y),
                                                   ldy, N, eps);
     GRET;
@@ -1417,7 +1556,7 @@ int glm_rmsnorm(void* stream, void* h, int64_t ldh, const void* a, int64_t lda, 
 
 int glm_rope(void* stream, const void* x, int64_t xt, int64_t xh, void* y, int64_t yt, int64_t yh, int T, int H,
              const void* cos, const void* sin, const void* pos) {
-    rope_kernel<<<dim3(T, (H + 7) / 8), 256, 0, GST>>>(static_cast<const __nv_bfloat16*>(x), xt, xh,
+    pdl_launch(rope_kernel, dim3(T, (H + 7) / 8), 256, 0, GST, static_cast<const __nv_bfloat16*>(x), xt, xh,
                                                        static_cast<__nv_bfloat16*>(y), yt, yh, H,
                                                        static_cast<const __nv_bfloat16*>(cos),
                                                        static_cast<const __nv_bfloat16*>(sin), static_cast<const int*>(pos));
@@ -1426,13 +1565,13 @@ int glm_rope(void* stream, const void* x, int64_t xt, int64_t xh, void* y, int64
 
 int glm_kv_fp8(void* stream, const void* x, int64_t ldx, const void* rows, void* q, void* s, int T, int d) {
     if (d % 128) return (int)cudaErrorInvalidValue;
-    kv_fp8_kernel<<<dim3(T, d / 128), 32, 0, GST>>>(static_cast<const __nv_bfloat16*>(x), ldx, static_cast<const int*>(rows),
+    pdl_launch(kv_fp8_kernel, dim3(T, d / 128), 32, 0, GST, static_cast<const __nv_bfloat16*>(x), ldx, static_cast<const int*>(rows),
                                                     static_cast<uint8_t*>(q), static_cast<float*>(s), d);
     GRET;
 }
 
 int glm_rows_copy(void* stream, const void* x, int64_t ldx, const void* rows, void* out, int T, int d) {
-    rows_copy_kernel<<<T, 64, 0, GST>>>(static_cast<const __nv_bfloat16*>(x), ldx, static_cast<const int*>(rows),
+    pdl_launch(rows_copy_kernel, T, 64, 0, GST, static_cast<const __nv_bfloat16*>(x), ldx, static_cast<const int*>(rows),
                                         static_cast<__nv_bfloat16*>(out), d);
     GRET;
 }
@@ -1440,7 +1579,7 @@ int glm_rows_copy(void* stream, const void* x, int64_t ldx, const void* rows, vo
 int glm_positions(void* stream, const void* pos0, int T, int rank, int world, int spare, void* pos, void* rows, void* bound,
                   const void* lanes, int nl, void* koff) {
     if (lanes && (nl < 1 || nl > kMaxLanes)) return (int)cudaErrorInvalidValue;
-    positions_kernel<<<(T + 127) / 128, 128, 0, GST>>>(static_cast<const int*>(pos0), T, rank, world, spare,
+    pdl_launch(positions_kernel, (T + 127) / 128, 128, 0, GST, static_cast<const int*>(pos0), T, rank, world, spare,
                                                        static_cast<int*>(pos), static_cast<int*>(rows),
                                                        static_cast<int*>(bound), static_cast<const int*>(lanes), nl,
                                                        static_cast<int*>(koff));
@@ -1449,7 +1588,7 @@ int glm_positions(void* stream, const void* pos0, int T, int rank, int world, in
 
 int glm_index_key(void* stream, const void* k, int64_t ldk, const void* w, const void* b, const void* cos, const void* sin,
                   const void* pos, const void* rows, void* q, void* s, int T) {
-    index_key_kernel<<<(T + 3) / 4, 128, 0, GST>>>(static_cast<const __nv_bfloat16*>(k), ldk, static_cast<const float*>(w),
+    pdl_launch(index_key_kernel, (T + 3) / 4, 128, 0, GST, static_cast<const __nv_bfloat16*>(k), ldk, static_cast<const float*>(w),
                                                    static_cast<const float*>(b), static_cast<const __nv_bfloat16*>(cos),
                                                    static_cast<const __nv_bfloat16*>(sin), static_cast<const int*>(pos),
                                                    static_cast<const int*>(rows), static_cast<uint8_t*>(q),
@@ -1461,24 +1600,32 @@ int glm_index_scores(void* stream, const void* q, const void* w, float wscale, c
                      const void* pos, int T, int nmax, int stride, int off, int split_n, float inv_d, void* out,
                      int64_t ldo, const void* lanes, int nl) {
     if (lanes && (nl < 1 || nl > kMaxLanes || split_n)) return (int)cudaErrorInvalidValue;
-    dim3 grid((unsigned)((nmax + kIKeys - 1) / kIKeys), (unsigned)((T + kIRows - 1) / kIRows), lanes ? (unsigned)nl : 1u);
-    index_scores_kernel<<<grid, 256, 0, GST>>>(static_cast<const __nv_bfloat16*>(q), static_cast<const float*>(w), wscale,
-                                               static_cast<const uint8_t*>(kq), static_cast<const float*>(ks),
-                                               static_cast<const int*>(pos), T, nmax, stride, off, split_n, inv_d,
-                                               static_cast<float*>(out), ldo, static_cast<const int*>(lanes));
+    // keys a block: a block's 8 warps take 8 rows, so a decode pass of 1-3 rows leaves most of them
+    // loading only; more, smaller blocks then keep more of the GPU busy (a 120K context's 60K keys,
+    // 1 row: 67.5 -> 51.2 us at 128 a block; 4 rows 75.5 -> 62.7 at 256; 8 rows 95 -> 88 at 256).
+    // A key's arithmetic does not depend on its block: the same scores, byte for byte.
+    auto launch = [&](auto kernel, int keys) {
+        dim3 grid((unsigned)((nmax + keys - 1) / keys), (unsigned)((T + kIRows - 1) / kIRows), lanes ? (unsigned)nl : 1u);
+        pdl_launch(kernel, grid, 256, 0, GST, static_cast<const __nv_bfloat16*>(q), static_cast<const float*>(w), wscale,
+                   static_cast<const uint8_t*>(kq), static_cast<const float*>(ks), static_cast<const int*>(pos), T, nmax,
+                   stride, off, split_n, inv_d, static_cast<float*>(out), ldo, static_cast<const int*>(lanes));
+    };
+    if (T <= 3) launch(index_scores_kernel<128>, 128);
+    else if (T <= 8) launch(index_scores_kernel<256>, 256);
+    else launch(index_scores_kernel<512>, 512);
     GRET;
 }
 
 int glm_topk(void* stream, const void* s, int64_t lds, const void* pos, int stride, int off, int nmax, int K, int T,
              void* idx, int64_t ldi, void* val, int64_t ldv) {
-    topk_kernel<<<T, kTk, 0, GST>>>(static_cast<const float*>(s), lds, static_cast<const int*>(pos), stride, off, nmax, K,
+    pdl_launch(topk_kernel, T, kTk, 0, GST, static_cast<const float*>(s), lds, static_cast<const int*>(pos), stride, off, nmax, K,
                                     static_cast<int*>(idx), ldi, static_cast<float*>(val), ldv);
     GRET;
 }
 
 int glm_split_share(void* stream, const void* g, int64_t rank_stride, int64_t row_stride, int64_t val_off, void* idx,
                     int64_t ldi, int rank, int K, int T) {
-    split_share_kernel<<<T, kTk, 0, GST>>>(static_cast<const uint8_t*>(g), rank_stride, row_stride, val_off,
+    pdl_launch(split_share_kernel, T, kTk, 0, GST, static_cast<const uint8_t*>(g), rank_stride, row_stride, val_off,
                                            static_cast<int*>(idx), ldi, rank, K);
     GRET;
 }
@@ -1487,7 +1634,7 @@ int glm_absorb_q(void* stream, const void* q, int64_t ldq_t, int64_t ldq_h, cons
                  int64_t ldo_t, int64_t ldo_h, int T, int hl) {
     if (T < 1) return (int)cudaErrorInvalidValue;
     for (int t0 = 0; t0 < T; t0 += 8)
-        absorb_q_kernel<<<dim3(hl, kLat / 128), 256, 0, GST>>>(static_cast<const __nv_bfloat16*>(q) + t0 * ldq_t, ldq_t, ldq_h,
+        pdl_launch(absorb_q_kernel, dim3(hl, kLat / 128), 256, 0, GST, static_cast<const __nv_bfloat16*>(q) + t0 * ldq_t, ldq_t, ldq_h,
                                                                static_cast<const uint8_t*>(w), static_cast<const float*>(ws),
                                                                static_cast<__nv_bfloat16*>(out) + t0 * ldo_t, ldo_t, ldo_h,
                                                                T - t0 < 8 ? T - t0 : 8);
@@ -1499,7 +1646,7 @@ int glm_absorb_o(void* stream, const void* o, int64_t ldo_t, int64_t ldo_h, cons
     if (T < 1) return (int)cudaErrorInvalidValue;
     // 16 rows a launch (the kernel stages them in shared memory); each row's sums are its own
     for (int t0 = 0; t0 < T; t0 += 16)
-        absorb_o_kernel<<<dim3(hl, kVd / kAbsV), 256, 0, GST>>>(static_cast<const __nv_bfloat16*>(o) + t0 * ldo_t, ldo_t,
+        pdl_launch(absorb_o_kernel, dim3(hl, kVd / kAbsV), 256, 0, GST, static_cast<const __nv_bfloat16*>(o) + t0 * ldo_t, ldo_t,
                                                             ldo_h, static_cast<const uint8_t*>(w), static_cast<const float*>(ws),
                                                             static_cast<__nv_bfloat16*>(out) + t0 * ld_out, ld_out,
                                                             T - t0 < 16 ? T - t0 : 16);
@@ -1508,7 +1655,7 @@ int glm_absorb_o(void* stream, const void* o, int64_t ldo_t, int64_t ldo_h, cons
 
 int glm_kvb_dequant(void* stream, const void* w, const void* ws, void* out, int64_t rows) {
     const int64_t n = rows * kLat;
-    kvb_dequant_kernel<<<(unsigned)((n + 255) / 256), 256, 0, GST>>>(static_cast<const uint8_t*>(w),
+    pdl_launch(kvb_dequant_kernel, (unsigned)((n + 255) / 256), 256, 0, GST, static_cast<const uint8_t*>(w),
                                                                      static_cast<const float*>(ws),
                                                                      static_cast<__nv_bfloat16*>(out), rows);
     GRET;
@@ -1532,7 +1679,7 @@ int glm_mla(void* stream, int mt, const void* q, int64_t q_ldg, int64_t q_ldt, i
             cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             set = true;
         }
-        kernel<<<grid, 256, smem, GST>>>(static_cast<const __nv_bfloat16*>(q), q_ldg, q_ldt, q_ldh, hg,
+        pdl_launch(kernel, grid, 256, smem, GST, static_cast<const __nv_bfloat16*>(q), q_ldg, q_ldt, q_ldh, hg,
                                          static_cast<const uint8_t*>(cq), static_cast<const float*>(cs),
                                          static_cast<const __nv_bfloat16*>(cr), split_n, static_cast<const int*>(idx),
                                          ld_idx, K, ascending, static_cast<const int*>(bound), H, scale, chunk,
@@ -1548,7 +1695,7 @@ int glm_mla(void* stream, int mt, const void* q, int64_t q_ldg, int64_t q_ldt, i
 int glm_mla_combine(void* stream, const void* pm, const void* pl, const void* pacc, int T, int H, int NS, void* out,
                     int64_t o_ldt, int64_t o_ldh, void* own_o, void* own_l, void* send, int64_t row_bytes, int hl,
                     int lo) {
-    mla_combine_kernel<<<dim3(T, H), 128, 0, GST>>>(static_cast<const float*>(pm), static_cast<const float*>(pl),
+    pdl_launch(mla_combine_kernel, dim3(T, H), 128, 0, GST, static_cast<const float*>(pm), static_cast<const float*>(pl),
                                                     static_cast<const float*>(pacc), H, NS,
                                                     static_cast<__nv_bfloat16*>(out), o_ldt, o_ldh,
                                                     static_cast<float*>(own_o), static_cast<float*>(own_l),
@@ -1558,7 +1705,7 @@ int glm_mla_combine(void* stream, const void* pm, const void* pl, const void* pa
 
 int glm_mla_merge(void* stream, const void* own_o, const void* own_l, const void* recv, int64_t row_bytes, int T, int hl,
                   void* out) {
-    mla_merge_kernel<<<dim3(T, hl), 128, 0, GST>>>(static_cast<const float*>(own_o), static_cast<const float*>(own_l),
+    pdl_launch(mla_merge_kernel, dim3(T, hl), 128, 0, GST, static_cast<const float*>(own_o), static_cast<const float*>(own_l),
                                                    static_cast<const uint8_t*>(recv), row_bytes, hl,
                                                    static_cast<__nv_bfloat16*>(out));
     GRET;
@@ -1569,7 +1716,7 @@ int glm_router(void* stream, const void* logits, const void* bias, const void* a
                void* demand, void* acc, const void* live, void* lane_acc, void* lane_demand, int64_t lane_stride,
                const void* row_lane) {
     if (K > 8) return (int)cudaErrorInvalidValue;
-    router_kernel<<<T, kE, 0, GST>>>(static_cast<const float*>(logits), static_cast<const float*>(bias),
+    pdl_launch(router_kernel, T, kE, 0, GST, static_cast<const float*>(logits), static_cast<const float*>(bias),
                                      static_cast<const uint8_t*>(allowed), static_cast<const int*>(lut), K, scale,
                                      static_cast<int*>(ids), static_cast<float*>(w), static_cast<const uint8_t*>(resident),
                                      static_cast<float*>(hot), static_cast<const int*>(ex_ids),
@@ -1581,70 +1728,82 @@ int glm_router(void* stream, const void* logits, const void* bias, const void* a
 }
 
 int glm_swiglu(void* stream, const void* g, int64_t ldg, const void* u, int64_t ldu, void* y, int64_t ldy, int T, int n) {
-    swiglu_kernel<<<dim3((n + 255) / 256, T), 256, 0, GST>>>(static_cast<const __nv_bfloat16*>(g), ldg,
+    pdl_launch(swiglu_kernel, dim3((n + 255) / 256, T), 256, 0, GST, static_cast<const __nv_bfloat16*>(g), ldg,
                                                              static_cast<const __nv_bfloat16*>(u), ldu,
                                                              static_cast<__nv_bfloat16*>(y), ldy, n);
     GRET;
 }
 
 int glm_moe_out(void* stream, const void* routed, const void* shared, void* y, int64_t n) {
-    moe_out_kernel<<<(unsigned)((n + 255) / 256), 256, 0, GST>>>(static_cast<const float*>(routed),
+    pdl_launch(moe_out_kernel, (unsigned)((n + 255) / 256), 256, 0, GST, static_cast<const float*>(routed),
                                                                  static_cast<const float*>(shared),
                                                                  static_cast<__nv_bfloat16*>(y), n);
     GRET;
 }
 
 int glm_argmax(void* stream, const void* x, int64_t ldx, int M, int n, int offset, void* pairs) {
-    argmax_kernel<<<M, 1024, 0, GST>>>(static_cast<const float*>(x), ldx, n, offset, static_cast<int*>(pairs));
+    pdl_launch(argmax_kernel, M, 1024, 0, GST, static_cast<const float*>(x), ldx, n, offset, static_cast<int*>(pairs));
     GRET;
 }
 
 int glm_argmax_combine(void* stream, const void* pairs, int world, int M, void* out) {
-    argmax_combine_kernel<<<(M + 127) / 128, 128, 0, GST>>>(static_cast<const int*>(pairs), world, M,
+    pdl_launch(argmax_combine_kernel, (M + 127) / 128, 128, 0, GST, static_cast<const int*>(pairs), world, M,
                                                             static_cast<int*>(out));
     GRET;
 }
 
 int glm_exl3_unpack(void* stream, const void* trellis, int K, int N, int bits, void* w) {
     if (K % 16 || N % 128) return (int)cudaErrorInvalidValue;
-    exl3_unpack_kernel<<<dim3(K / 16, N / 128), 256, 0, GST>>>(static_cast<const uint32_t*>(trellis), N / 16, N, bits,
+    pdl_launch(exl3_unpack_kernel, dim3(K / 16, N / 128), 256, 0, GST, static_cast<const uint32_t*>(trellis), N / 16, N, bits,
                                                                static_cast<__half*>(w));
     GRET;
 }
 
 int glm_member_codes(void* stream, const void* pair, int n, int K, void* out) {
-    member_codes_kernel<<<(n + 255) / 256, 256, 0, GST>>>(static_cast<const int*>(pair), n, K, static_cast<int*>(out));
+    pdl_launch(member_codes_kernel, (n + 255) / 256, 256, 0, GST, static_cast<const int*>(pair), n, K, static_cast<int*>(out));
     GRET;
 }
 
 int glm_count_live(void* stream, const void* block_slot, int nb, void* out) {
-    count_live_kernel<<<1, 1024, 0, GST>>>(static_cast<const int*>(block_slot), nb, static_cast<int*>(out));
+    pdl_launch(count_live_kernel, 1, 1024, 0, GST, static_cast<const int*>(block_slot), nb, static_cast<int*>(out));
     GRET;
 }
 
 int glm_quant_kvb(void* stream, const void* w, int rows, void* q, void* s_rows) {
     if (rows % 128) return (int)cudaErrorInvalidValue;
-    quant_kvb_kernel<<<dim3(rows / 128, kLat / 128), 256, 0, GST>>>(static_cast<const __half*>(w),
+    pdl_launch(quant_kvb_kernel, dim3(rows / 128, kLat / 128), 256, 0, GST, static_cast<const __half*>(w),
                                                                   static_cast<uint8_t*>(q), static_cast<float*>(s_rows));
     GRET;
 }
 
 int glm_quant_int8_rows(void* stream, const void* x, int rows, int H, void* q, void* s) {
     if (H % 128) return (int)cudaErrorInvalidValue;
-    quant_int8_rows_kernel<<<dim3(rows, H / 128), 32, 0, GST>>>(static_cast<const __nv_bfloat16*>(x),
+    pdl_launch(quant_int8_rows_kernel, dim3(rows, H / 128), 32, 0, GST, static_cast<const __nv_bfloat16*>(x),
                                                                 static_cast<int8_t*>(q), static_cast<float*>(s), H);
     GRET;
 }
 
 int glm_dup_rows(void* stream, const void* x, int64_t ldx, void* out, int T, int K, int G) {
-    dup_rows_kernel<<<T, 256, 0, GST>>>(static_cast<const __nv_bfloat16*>(x), ldx, static_cast<__nv_bfloat16*>(out), K, G);
+    pdl_launch(dup_rows_kernel, T, 256, 0, GST, static_cast<const __nv_bfloat16*>(x), ldx, static_cast<__nv_bfloat16*>(out), K, G);
     GRET;
 }
 
 int glm_row_lse(void* stream, const void* x, int64_t ldx, int M, int n, const void* temp, int temp_ld, void* out,
                 int64_t ldo) {
-    row_lse_kernel<<<M, 1024, 0, GST>>>(static_cast<const float*>(x), ldx, n, static_cast<const float*>(temp), temp_ld,
+    pdl_launch(row_lse_kernel, M, 1024, 0, GST, static_cast<const float*>(x), ldx, n, static_cast<const float*>(temp), temp_ld,
                                         static_cast<float*>(out), ldo);
+    GRET;
+}
+
+int glm_l2_runs(void* stream, uint64_t base, uint64_t run, uint64_t stride, int count, int grid) {
+    l2_runs_kernel<<<grid, 128, 0, GST>>>(base, run, stride, count);
+    GRET;
+}
+
+int glm_l2_experts(void* stream, const void* pick, int P, const void* tp, const void* k2, int K, int N, int ranges,
+                   uint64_t run, int grid) {
+    l2_experts_kernel<<<grid, 128, 0, GST>>>(static_cast<const int*>(pick), P, static_cast<const int64_t*>(tp),
+                                             static_cast<const int*>(k2), K, N, ranges, run);
     GRET;
 }
 

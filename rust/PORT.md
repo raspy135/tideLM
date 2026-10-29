@@ -522,6 +522,14 @@ Where a decode pass goes (one row, graphs, the pair; nsys with node tracing): th
 GEMV ~60% (the same kernel as Python's), the RoCE gathers ~8% (five a layer: the split
 attention's two, o_proj's sum, the MoE's two), the router's fp32 GEMV ~4%.
 
+Correction (2026-10-29): the dense GEMVs were not at the roof. `glm_bench_exl3` re-reads one
+layer's matrix between head flushes and measured o_proj at 145 us; every layer's o_proj back to back
+(`glm_bench_chain`, the decode pass's case) takes 184 us, 171 GB/s, as nsys found in the pass. The
+kernel's 4-byte lane loads were the limit: the same access pattern without the math reads 180 GB/s
+that way and 230 as 16-byte loads. Decode calls now stage the trellis through shared memory with
+16-byte cp.async (DECODE_PF): o_proj 151 us, q_b 59, q_a 47 (docs/gotchas.md, 2026-10-29). The
+original paragraph follows.
+
 The GEMV is at the DRAM roof (2026-10-25, cold reads; `glm_bench_moe` on random 3-bit experts at
 the rank shapes, `glm_bench_exl3` on layer 40): routed experts at one row and 8 experts 212 GB/s
 gate+up and 190-205 down, 212-220 at 2-8 rows; o_proj 31 MB 208-217, the head 229-242, q_b 10.5 MB

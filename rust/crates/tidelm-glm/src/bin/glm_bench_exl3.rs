@@ -43,13 +43,16 @@ fn main() -> Result<()> {
     let out = DeviceBuffer::<f32>::new(16 * 2 * 77440)?;
     let flusher = if memset { None } else { Some(ld.exl3(&["lm_head"], 1, Cut::N, None)?) };
     let fout = DeviceBuffer::<f32>::new(2 * 77440)?;
+    // DIRTY_MB: that many MB written after the flush, before each timed call (lines the call evicts dirty)
+    let dirty_mb: usize = std::env::var("DIRTY_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let dirty = if dirty_mb > 0 { Some(DeviceBuffer::<u8>::zeroed(dirty_mb << 20)?) } else { None };
     for (name, pre, cut) in mats {
         let refs: Vec<&str> = pre.iter().map(|s| s.as_str()).collect();
         let mut mat = ld.exl3(&refs, 1, cut, None)?;
         let kt = mat.k / 16;
         let bytes = mat.bytes();
         let mut line = format!("{name:>15} K {:>5} N {:>6} x{}: ", mat.k, mat.n, mat.g);
-        for &(t, pf, nt) in &[(1usize, 1usize, 8usize), (1, 2, 4), (8, 1, 8), (8, 2, 4)] {
+        for &(t, pf, nt) in &[(1usize, 1i32, 8usize), (1, -2, 8), (8, 1, 8), (8, -2, 8)] {
             line += &format!(" T{t}nt{nt}:");
             mat.pf = pf;
             mat.nt = nt;
@@ -66,6 +69,9 @@ fn main() -> Result<()> {
                         f.decode(&st, &members, &scratch, x.raw(), f.k, 1, fout.raw(), true)?;
                     } else {
                         flush.zero_async(&st)?;
+                    }
+                    if let Some(d) = &dirty {
+                        d.zero_async(&st)?;
                     }
                     e0.record(&st)?;
                     mat.decode(&st, &members, &scratch, x.raw(), mat.k, t, out.raw(), true)?;
