@@ -246,9 +246,10 @@ fi
 # instead of a prefill chunk (default 32768, docs/gotchas.md); TIDELM_GLM_ROUND_LOG: GLM, a JSON
 # line a speculative round to this path (in a mounted directory) for offline gate studies;
 # TIDELM_PDL=0: kernels launched without programmatic dependent launch (default on);
-# TIDELM_L2_PREFETCH=0: no L2 prefetch of the next weights from a parallel graph branch (default on)
+# TIDELM_L2_PREFETCH=0: no L2 prefetch of the next weights from a parallel graph branch (default on);
+# TIDELM_GLM_EVICT_FIRST=0: GLM's decode weights read without the L2 evict-first policy (default on)
 for v in TIDELM_MEM_LOG_MB TIDELM_GRAPH_CACHE TIDELM_STEP_SPLIT TIDELM_GLM_WIDE_DECODE_FROM TIDELM_GLM_ROUND_LOG TIDELM_PDL \
-         TIDELM_L2_PREFETCH; do [[ -n "${!v:-}" ]] && envs+=("$v=${!v}"); done
+         TIDELM_L2_PREFETCH TIDELM_GLM_EVICT_FIRST; do [[ -n "${!v:-}" ]] && envs+=("$v=${!v}"); done
 for e in "${envs[@]}"; do envf+=(-e "$e"); done
 vols=() seen=" "
 for p in "${rw[@]}"; do [[ $seen == *" $p "* ]] && continue; seen+="$p "; vols+=(-v "$p:$p"); done

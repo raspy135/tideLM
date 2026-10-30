@@ -2,6 +2,11 @@
 //! per layer), each call timed by events. ONE=1: layer 3's matrix 75 times instead (one allocation);
 //! LAYER=l: layer l's loaded 75 times (75 allocations); FLUSH=1: the head's GEMV before each call;
 //! SYNC=1: the host waits after each call; DIRTY_MB: that many MB written before each call.
+//! --mat qb_iq: each full layer's q_b and indexer wq_b (one input), back to back on one stream
+//! against wq_b on a second stream beside q_b, a layer's pair timed from q_b's start to both ends.
+//! PDL=0: the EXL3 kernels without programmatic dependent launch (the engine runs them with it).
+//! EF=1: their staged trellis copies under an L2 evict-first policy.
+//! --mat norm: the residual add + RMSNorm of one row (GLM's glm_rmsnorm), 75 calls back to back.
 use std::path::PathBuf;
 use tidelm_cuda::{DeviceBuffer, Stream};
 use tidelm_glm::weights::{Cut, Exl3Mat, Exl3Scratch, Loader, Members, SPLIT_IQ, SPLIT_KVA, SPLIT_O, SPLIT_QA, SPLIT_QB,
@@ -23,6 +28,38 @@ fn main() -> Result<()> {
     let scratch = Exl3Scratch::new(16, 16384, 8, 32 * 16 * 77440)?;
     let x = DeviceBuffer::<u16>::from_slice(&vec![0x3c00u16; 16 * 16384])?;
     let out = DeviceBuffer::<f32>::new(16 * 2 * 77440)?;
+    if env("PDL").as_deref() != Some("0") {
+        unsafe { tidelm_kernels::exl3::exl3m_set_pdl(1) };
+    }
+    // EF=1: the staged trellis copies with an L2 evict-first policy
+    if env("EF").as_deref() == Some("1") {
+        unsafe { tidelm_kernels::exl3::exl3m_set_evict_first(1) };
+    }
+    if what == "qb_iq" {
+        return qb_iq(&ck, &ld, &st, &members, rows);
+    }
+    if what == "norm" {
+        // the residual add + RMSNorm of one 6144-wide row, 75 calls back to back, distinct rows
+        let (h, a) = (DeviceBuffer::<u16>::from_slice(&vec![0x3c00u16; 75 * 16 * 6144])?, DeviceBuffer::<u16>::from_slice(&vec![0x3c00u16; 75 * 16 * 6144])?);
+        let (w, y) = (DeviceBuffer::<u16>::from_slice(&vec![0x3c00u16; 6144])?, DeviceBuffer::<u16>::zeroed(16 * 6144)?);
+        let evs: Vec<_> = (0..2).map(|_| tidelm_cuda::Event::timing().unwrap()).collect();
+        for t in [1usize, 4, 8] {
+            for add in [true, false] {
+                evs[0].record(&st)?;
+                for i in 0..75 {
+                    unsafe {
+                        tidelm_kernels::glm::glm_rmsnorm(st.raw(), h.ptr_at(i * 16 * 6144), 6144,
+                                                         if add { a.ptr_at(i * 16 * 6144) as *const _ } else { std::ptr::null() }, 6144,
+                                                         w.raw(), y.raw(), 6144, t as i32, 6144, 1e-6);
+                    }
+                }
+                evs[1].record(&st)?;
+                evs[1].synchronize()?;
+                println!("rmsnorm rows {t} add {add}: {:.1} us a call", evs[1].elapsed_ms(&evs[0])? as f64 * 1e3 / 75.0);
+            }
+        }
+        return Ok(());
+    }
     let only: Option<usize> = env("LAYER").and_then(|v| v.parse().ok());
     let one = env("ONE").is_some();
     let mut mats: Vec<Exl3Mat> = vec![];
@@ -133,6 +170,53 @@ fn main() -> Result<()> {
         ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
         println!("{what} x{} ({} loaded) rows {rows} round {round}: median {:.1} us ({:.0} GB/s), min {:.1}, max {:.1}; chain {:.0} us",
                  seq.len(), mats.len(), ts[ts.len() / 2], bytes as f64 / ts[ts.len() / 2] / 1e3, ts[0], ts[ts.len() - 1], wall);
+    }
+    Ok(())
+}
+
+fn qb_iq(ck: &tidelm_model::Checkpoint, ld: &Loader, st: &Stream, members: &Members, rows: usize) -> Result<()> {
+    let mut pairs = vec![];
+    for l in 3..78 {
+        let a = format!("model.layers.{l}.self_attn.");
+        if ck.has(&format!("{a}indexer.wq_b.trellis")) {
+            pairs.push((ld.exl3(&[&format!("{a}q_b_proj")], SPLIT_QB, Cut::N, None)?,
+                        ld.exl3(&[&format!("{a}indexer.wq_b")], SPLIT_IQ, Cut::None, None)?));
+        }
+    }
+    let st3 = Stream::new()?;
+    let (s1, s3) = (Exl3Scratch::new(16, 2048, 8, 16 * 8192)?, Exl3Scratch::new(16, 2048, 8, 16 * 4096)?);
+    let x = DeviceBuffer::<u16>::from_slice(&vec![0x3c00u16; 16 * 2048])?;
+    let (o1, o3) = (DeviceBuffer::<u16>::new(16 * 8192)?, DeviceBuffer::<u16>::new(16 * 4096)?);
+    let (fork, join) = (tidelm_cuda::Event::new()?, tidelm_cuda::Event::new()?);
+    let evs: Vec<_> = (0..2 * pairs.len()).map(|_| tidelm_cuda::Event::timing().unwrap()).collect();
+    let bytes = pairs[0].0.bytes() + pairs[0].1.bytes();
+    for side in [false, true, false, true] {
+        let mut med = vec![];
+        for _round in 0..3 {
+            for (i, (qb, iq)) in pairs.iter().enumerate() {
+                evs[2 * i].record(st)?;
+                if side {
+                    fork.record(st)?;
+                    st3.wait_event(&fork)?;
+                    iq.decode(&st3, members, &s3, x.raw(), 2048, rows, o3.raw(), true)?;
+                    join.record(&st3)?;
+                }
+                qb.decode(st, members, &s1, x.raw(), 2048, rows, o1.raw(), true)?;
+                if side {
+                    st.wait_event(&join)?;
+                } else {
+                    iq.decode(st, members, &s1, x.raw(), 2048, rows, o3.raw(), true)?;
+                }
+                evs[2 * i + 1].record(st)?;
+            }
+            evs[2 * pairs.len() - 1].synchronize()?;
+            let mut ts: Vec<f64> = (0..pairs.len()).map(|i| evs[2 * i + 1].elapsed_ms(&evs[2 * i]).unwrap() as f64 * 1e3).collect();
+            ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            med.push(ts[ts.len() / 2]);
+        }
+        println!("q_b + wq_b x{} rows {rows} {}: a layer's pair {:.1} us median of rounds {:?} ({:.0} GB/s)", pairs.len(),
+                 if side { "on two streams" } else { "back to back " }, med[2],
+                 med.iter().map(|t| format!("{t:.1}")).collect::<Vec<_>>(), bytes as f64 / med[2] / 1e3);
     }
     Ok(())
 }

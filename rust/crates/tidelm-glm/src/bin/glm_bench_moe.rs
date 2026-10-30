@@ -16,14 +16,16 @@ use tidelm_glm::Result;
 use tidelm_kernels::exl3::*;
 
 const POOL: usize = 128;
-const BITS: usize = 3;
 const TOPK: usize = 8;
 
 fn main() -> Result<()> {
     tidelm_cuda::set_device(0)?;
     let st = Stream::new()?;
+    // BITS=2..4: the trellis width (default 3): equal times at every width mean the decode math, not
+    // the bytes, bounds the call
+    let bits: usize = std::env::var("BITS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
     let (h, il, kd, dn) = (6144usize, 1024usize, 2048usize, 3072usize);
-    let words = |k: usize, n: usize| (k / 16) * (n / 16) * 8 * BITS;
+    let words = |k: usize, n: usize| (k / 16) * (n / 16) * 8 * bits;
     let mut seed = 0x9E3779B97F4A7C15u64;
     let mut rnd = |n: usize| -> Vec<u32> {
         (0..n).map(|_| { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed as u32 }).collect()
@@ -36,7 +38,7 @@ fn main() -> Result<()> {
         Ok(DeviceBuffer::from_slice(&(0..POOL).map(|e| b.ptr_at(e * w) as i64).collect::<Vec<_>>())?)
     };
     let (t1p, t3p, t2p) = (ptrs(&t1, wgu)?, ptrs(&t3, wgu)?, ptrs(&t2, wdn)?);
-    let k2 = DeviceBuffer::from_slice(&vec![2 * BITS as i32; POOL])?;
+    let k2 = DeviceBuffer::from_slice(&vec![2 * bits as i32; POOL])?;
     let pmax = 8 * TOPK;
     let x0 = DeviceBuffer::<u16>::from_slice(&vec![0x3c00u16; pmax * h])?;
     let x1 = DeviceBuffer::<u16>::from_slice(&vec![0x3c00u16; pmax * h])?;

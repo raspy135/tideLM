@@ -39,6 +39,18 @@ static inline void pdl_launch(void (*kernel)(P...), dim3 grid, dim3 block, size_
 // the GLM engine's switch for this file's launches (graph captures made after it carry it)
 extern "C" int glm_set_pdl(int on) { g_pdl = on; return 0; }
 
+// Reads made once a decode pass, loaded evict-first (__ldcs) when their bit is set
+// (glm_set_stream_loads): 1 kv_b's FP8 rows in the absorbs (the GLM engine's default). Measured and
+// left plain: the MLA's latent and RoPE key rows (a row's two head blocks read the same picks: 1 /
+// 4 rows +2.9 / +1.6% at 2.5K, +0.6 / +0.1% at 120K) and the indexer's key rows (-0.3 / -0.1% at
+// 120K), in-boot A/B 2026-10-30.
+__constant__ int c_stream_loads = 0;
+extern "C" int glm_set_stream_loads(int mask) { return (int)cudaMemcpyToSymbol(c_stream_loads, &mask, sizeof(int)); }
+template <typename T>
+__device__ __forceinline__ T ld_once(const T* p, int bit) {
+    return (c_stream_loads & bit) ? __ldcs(p) : *p;
+}
+
 namespace {
 
 #define GST static_cast<cudaStream_t>(stream)
@@ -723,7 +735,7 @@ __global__ void __launch_bounds__(256) absorb_q_kernel(const __nv_bfloat16* __re
 #pragma unroll
     for (int i = 0; i < 24; ++i) {
         const int64_t r = (int64_t)h * kKvRows + sl * 24 + i;
-        wd[i] = *reinterpret_cast<const uint32_t*>(w + r * kLat + col);
+        wd[i] = ld_once(reinterpret_cast<const uint32_t*>(w + r * kLat + col), 1);
         sc[i] = ws[r * 4 + cb];
     }
 #pragma unroll
@@ -774,7 +786,7 @@ __global__ void __launch_bounds__(256) absorb_o_kernel(const __nv_bfloat16* __re
     for (int vi = 0; vi < kAbsV / 8; ++vi) {
         const int v = blockIdx.y * kAbsV + vi * 8 + warp;
         const int64_t r = (int64_t)h * kKvRows + kNope + v;
-        const uint4 raw = *reinterpret_cast<const uint4*>(w + r * kLat + l * 16);
+        const uint4 raw = ld_once(reinterpret_cast<const uint4*>(w + r * kLat + l * 16), 1);
         const float s = ws[r * 4 + (l * 16) / 128];
         const uint32_t wd[4] = {raw.x, raw.y, raw.z, raw.w};
         float wv[16];

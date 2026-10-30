@@ -52,6 +52,10 @@ static inline void pdl_launch(void (*kernel)(P...), dim3 grid, dim3 block, size_
     cudaLaunchKernelEx(&c, kernel, std::forward<A>(args)...);
 }
 extern "C" int exl3m_set_pdl(int on) { g_pdl = on; return 0; }
+// decode's staged trellis copies (warp_tiles_cp) with an L2 evict-first policy (1) or none (0): the
+// weights are read once a pass, and what the prefetch branch put in L2 is not (exl3m_set_evict_first)
+__constant__ int c_evict_first = 0;
+extern "C" int exl3m_set_evict_first(int on) { return (int)cudaMemcpyToSymbol(c_evict_first, &on, sizeof(int)); }
 
 namespace exl3 {
 
@@ -251,10 +255,20 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int N
     }
 }
 
-// cp.async of 16 bytes global -> shared, L1 bypassed (.cg): decode's trellis words read once a pass.
-__device__ __forceinline__ void cp_async16(void* smem_dst, const void* gmem_src) {
+// cp.async of 16 bytes global -> shared, L1 bypassed (.cg): decode's trellis words read once a pass;
+// with `ef`, under the L2 policy `pol` (l2_evict_first)
+__device__ __forceinline__ void cp_async16(void* smem_dst, const void* gmem_src, bool ef = false, uint64_t pol = 0) {
     const unsigned s = (unsigned)__cvta_generic_to_shared(smem_dst);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem_src));
+    if (ef)
+        asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem_src), "l"(pol));
+    else
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem_src));
+}
+
+__device__ __forceinline__ uint64_t l2_evict_first() {
+    uint64_t p;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(p));
+    return p;
 }
 
 // warp_tiles with the trellis words staged through shared memory: a k step's NT tiles are one
@@ -273,11 +287,13 @@ __device__ __forceinline__ void warp_tiles_cp(const uint32_t* __restrict__ T, in
     const LaneMap<K2> map(lane);
     const size_t kstride = (size_t)NTILES * TW;
     const uint32_t* tp = T + ((size_t)kt0 * NTILES + nt0) * TW;
+    const bool ef = c_evict_first != 0;
+    const uint64_t pol = ef ? l2_evict_first() : 0;
     auto issue = [&](int it) {
         const uint4* src = reinterpret_cast<const uint4*>(tp + (size_t)it * kstride);
         uint4* dst = reinterpret_cast<uint4*>(ring + (it % S) * STEP);
 #pragma unroll
-        for (int c = lane; c < CH; c += 32) cp_async16(dst + c, src + c);
+        for (int c = lane; c < CH; c += 32) cp_async16(dst + c, src + c, ef, pol);
     };
 #pragma unroll
     for (int d = 0; d < S - 1; ++d) {

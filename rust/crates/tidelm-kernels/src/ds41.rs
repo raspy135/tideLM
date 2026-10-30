@@ -290,6 +290,7 @@ extern "C" {
     pub fn ds_l2_prefetch(stream: CudaStream, pf: *const c_void, grid: c_int) -> c_int;
     /// Programmatic dependent launch on every launch of ds41.cu (pdl_launch): off until set.
     pub fn ds_set_pdl(on: c_int) -> c_int;
+    pub fn ds_set_stream_weights(on: c_int) -> c_int;
 
     /// Tensor-core skinny GEMM over fp8 block-scaled weights, M <= 64 (rows_per_group > 0
     /// for the grouped wo_a form, as ds_linear_fp8_grouped). K % 64 == 0.

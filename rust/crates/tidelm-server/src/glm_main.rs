@@ -34,7 +34,7 @@ pub fn is_glm(model_dir: &std::path::Path) -> bool {
 }
 
 pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
-    const VALUED: [&str; 46] = ["--bench-nll-skip", "--bench-nll-rows", "--bench-nll-max", "--lanes", "--lane-chunk", "--bench-nll-out", "--bench-nll", "--bench-widths", "--copy", "--hot-async", "--bench-width", "--bench-ctx", "--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
+    const VALUED: [&str; 48] = ["--bench-ab", "--bench-ab-rounds", "--bench-nll-skip", "--bench-nll-rows", "--bench-nll-max", "--lanes", "--lane-chunk", "--bench-nll-out", "--bench-nll", "--bench-widths", "--copy", "--hot-async", "--bench-width", "--bench-ctx", "--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
                                 "--max-seq", "--chunk", "--hot", "--hot-keep", "--depth", "--cal", "--dyn", "--lookup",
                                 "--adapt", "--adapt-every", "--adapt-prefill", "--adapt-decode", "--bg-every", "--loop-break",
                                 "--two-pass", "--two-pass-miss", "--host", "--port", "--served-model-name", "--moe-rows",
@@ -205,7 +205,12 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         let rows: Vec<usize> = arg(args, "--bench-nll-rows").unwrap_or_else(|| "8".into()).split(',')
             .map(|v| v.trim().parse()).collect::<std::result::Result<_, _>>().map_err(|e| format!("--bench-nll-rows: {e}"))?;
         let shape = (num("--bench-nll-skip", 32.0)? as usize, rows, num("--bench-nll-max", 4096.0)? as usize);
-        return bench_nll(&mut srv.eng, &path, &text, keep, arg(args, "--bench-nll-out"), &shape);
+        // with --bench-width too, the width bench follows in the same boot
+        let last = arg(args, "--bench-width").is_none();
+        bench_nll(&mut srv.eng, &path, &text, keep, arg(args, "--bench-nll-out"), &shape, last)?;
+        if last {
+            return Ok(());
+        }
     }
     if let Some(path) = arg(args, "--bench-width") {
         let text = Text::load(&model_dir)?;
@@ -213,8 +218,15 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
             Ok(arg(args, k).unwrap_or_else(|| d.into()).split(',').map(|v| v.trim().parse()).collect::<std::result::Result<_, _>>()
                 .map_err(|e| format!("{k}: {e}"))?)
         };
+        // --bench-ab KNOB[,KNOB..] (forward::BENCH_KNOBS): each context's widths with each knob off and
+        // on in turn, --bench-ab-rounds times (ABBA order), one knob after another, in this one boot
+        let ab = arg(args, "--bench-ab").map(|k| (k, num("--bench-ab-rounds", 3.0).map(|v| v as usize)));
+        let ab = match ab {
+            Some((k, r)) => Some((k, r?)),
+            None => None,
+        };
         return bench_width(&mut srv.eng, &path, &list("--bench-ctx", "2500")?, &list("--bench-widths", "1,2,4,6,8,9,12,16,17,24,32,33")?,
-                           &text);
+                           &text, ab);
     }
     let text = Text::load(&model_dir)?;
     let family = Family::load(&model_dir, &text)?;
@@ -296,9 +308,11 @@ fn engine_loop(mut srv: Server, rx: mpsc::Receiver<Cmd>) -> tidelm_engine::Resul
 /// then passes of --bench-widths rows of its continuation, each rolled back (20 timed after 5
 /// warm; past 16 rows the path wide_decode_from() picks), and the MTP draft pass a copy round
 /// skips.
-fn bench_width(eng: &mut Engine, path: &str, ctxs: &[usize], widths: &[usize], text: &Text) -> tidelm_engine::Result<()> {
+fn bench_width(eng: &mut Engine, path: &str, ctxs: &[usize], widths: &[usize], text: &Text, ab: Option<(String, usize)>)
+               -> tidelm_engine::Result<()> {
     let ids = text.encode(&std::fs::read_to_string(path)?).map_err(|e| format!("{path}: {e:?}"))?;
     let wmax = widths.iter().copied().max().unwrap_or(1);
+    eng.set_sampling(None)?;
     eng.set_pos(0)?;
     for &ctx in ctxs {
         if ids.len() < ctx + wmax || ctx <= eng.pos {
@@ -306,19 +320,46 @@ fn bench_width(eng: &mut Engine, path: &str, ctxs: &[usize], widths: &[usize], t
         }
         eng.forward(&ids[eng.pos..ctx], false)?;
         eng.keep_hidden(eng.last_rows - 1)?;
-        bench_widths(eng, &ids, ctx, widths)?;
+        let Some((knobs, rounds)) = &ab else {
+            bench_widths(eng, &ids, ctx, widths)?;
+            continue;
+        };
+        for knob in knobs.split(',').map(str::trim) {
+            // [arm][width (the MTP pass last)] -> each round's median
+            let mut by: [Vec<Vec<f64>>; 2] = [vec![vec![]; widths.len() + 1], vec![vec![]; widths.len() + 1]];
+            for r in 0..*rounds {
+                for on in if r % 2 == 0 { [false, true] } else { [true, false] } {
+                    eng.bench_knob(knob, on)?;
+                    eprintln!("bench-ab: {knob} {}, round {}", if on { "on" } else { "off" }, r + 1);
+                    for (i, m) in bench_widths(eng, &ids, ctx, widths)?.into_iter().enumerate() {
+                        by[on as usize][i].push(m);
+                    }
+                }
+            }
+            // the next knob is measured against the boot's own setting of this one
+            eng.bench_knob_reset(knob)?;
+            let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+            for (i, name) in widths.iter().map(|w| format!("{w:2} rows")).chain(["MTP pass".to_string()]).enumerate() {
+                let (a, b) = (mean(&by[0][i]), mean(&by[1][i]));
+                let f = |v: &[f64]| v.iter().map(|x| format!("{x:.2}")).collect::<Vec<_>>().join(" / ");
+                eprintln!("bench-ab: {knob} context {ctx}: {name}: off {a:.2} ms ({}), on {b:.2} ms ({}), {:+.1}%", f(&by[0][i]),
+                          f(&by[1][i]), 100.0 * (b - a) / a);
+            }
+        }
     }
     eng.stop_follower()?;
     Ok(())
 }
 
-fn bench_widths(eng: &mut Engine, ids: &[u32], ctx: usize, widths: &[usize]) -> tidelm_engine::Result<()> {
+/// Each width's verify median, then the MTP pass's (ms), as printed.
+fn bench_widths(eng: &mut Engine, ids: &[u32], ctx: usize, widths: &[usize]) -> tidelm_engine::Result<Vec<f64>> {
     let base = eng.pos;
     let median = |mut ts: Vec<f64>| -> (f64, f64, f64) {
         ts.sort_by(f64::total_cmp);
         (ts[ts.len() / 2], ts[0], ts[ts.len() - 1])
     };
     eprintln!("bench-width: context {base} tokens");
+    let mut out = vec![];
     for &w in widths {
         let block = &ids[ctx..ctx + w];
         let mut ts = Vec::new();
@@ -333,6 +374,7 @@ fn bench_widths(eng: &mut Engine, ids: &[u32], ctx: usize, widths: &[usize]) -> 
         }
         let (m, lo, hi) = median(ts);
         eprintln!("bench-width: {w:2} rows: verify {m:.2} ms (min {lo:.2}, max {hi:.2})");
+        out.push(m);
     }
     let mut ts = Vec::new();
     for i in 0..25 {
@@ -344,7 +386,8 @@ fn bench_widths(eng: &mut Engine, ids: &[u32], ctx: usize, widths: &[usize]) -> 
     }
     let (m, lo, hi) = median(ts);
     eprintln!("bench-width: MTP draft pass {m:.2} ms (min {lo:.2}, max {hi:.2})");
-    Ok(())
+    out.push(m);
+    Ok(out)
 }
 
 /// Teacher-forced NLL of each JSONL line's "text" (by its "category") through the serving path:
@@ -353,7 +396,7 @@ fn bench_widths(eng: &mut Engine, ids: &[u32], ctx: usize, widths: &[usize]) -> 
 /// next token's -log p at T = 1 comes from the pair's candidates, or the whole row when it is not
 /// among them; top-1 is the row's argmax. Texts are cut at 4,096 tokens.
 fn bench_nll(eng: &mut Engine, path: &str, text: &Text, keep: usize, out: Option<String>,
-             (skip, rows, max): &(usize, Vec<usize>, usize)) -> tidelm_engine::Result<()> {
+             (skip, rows, max): &(usize, Vec<usize>, usize), last: bool) -> tidelm_engine::Result<()> {
     eng.set_sampling(Some(1.0))?;
     // --bench-nll-out: each scored token's "category nll top1" a line, for paired comparisons
     let mut dump = out.map(std::fs::File::create).transpose()?;
@@ -421,6 +464,8 @@ fn bench_nll(eng: &mut Engine, path: &str, text: &Text, keep: usize, out: Option
     }
     eprintln!("bench-nll: all: {tn} tokens, NLL {:.4}, {:.0} s, {nans} rows with NaN", tsum / tn.max(1) as f64,
               t0.elapsed().as_secs_f64());
-    eng.stop_follower()?;
+    if last {
+        eng.stop_follower()?;
+    }
     Ok(())
 }

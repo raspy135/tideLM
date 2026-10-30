@@ -48,6 +48,10 @@ static inline void pdl_launch(void (*kernel)(P...), dim3 grid, dim3 block, size_
 }
 // the DS engine's switch for this file's launches (graph captures made after it carry it)
 extern "C" int ds_set_pdl(int on) { g_pdl = on; return 0; }
+// the skinny GEMV's weights through __ldcs (evict-first) when set: the GLM engine's router and
+// indexer projections, read once a pass beside its L2 prefetch (ds_set_stream_weights; DS leaves it off)
+__constant__ int c_stream_w = 0;
+extern "C" int ds_set_stream_weights(int on) { return (int)cudaMemcpyToSymbol(c_stream_w, &on, sizeof(int)); }
 
 namespace {
 
@@ -228,12 +232,12 @@ __global__ void __launch_bounds__(kThreads) skinny_kernel(
                     // for streaming weights to evict; the MoE decode kernels, which re-read every
                     // pair's activations from L2, gain ~9% from it (bench_moe_bw).
                     if (KIND == 3) {
-                        const uint2 h = ok ? *reinterpret_cast<const uint2*>(w + ((int64_t)n * K + k) * ESZ)
-                                           : make_uint2(0, 0);
+                        const uint2* p = reinterpret_cast<const uint2*>(w + ((int64_t)n * K + k) * ESZ);
+                        const uint2 h = ok ? (c_stream_w ? __ldcs(p) : *p) : make_uint2(0, 0);
                         raw[u][r] = make_uint4(h.x, h.y, 0, 0);
                     } else {
-                        raw[u][r] = ok ? *reinterpret_cast<const uint4*>(w + ((int64_t)n * K + k) * ESZ)
-                                       : make_uint4(0, 0, 0, 0);
+                        const uint4* p = reinterpret_cast<const uint4*>(w + ((int64_t)n * K + k) * ESZ);
+                        raw[u][r] = ok ? (c_stream_w ? __ldcs(p) : *p) : make_uint4(0, 0, 0, 0);
                     }
                     scale[u][r] = 1.f;
                     if (KIND == 0 && ok) scale[u][r] = e8m0_lin(s[(int64_t)(n >> 5) * lds + (k >> 5)]);

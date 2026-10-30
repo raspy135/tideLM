@@ -72,6 +72,12 @@ const OP_FULL_ROW: u32 = 6;
 const OP_FORWARD_LANES: u32 = 8;
 const OP_KV_SHRINK: u32 = 10;
 const OP_FORWARD_PART: u32 = 11;
+const OP_BENCH_KNOB: u32 = 12;
+
+/// Schedule knobs a benchmark can switch on both ranks inside one boot (Engine::bench_knob): each
+/// moves no value, only when and where kernels run.
+pub const BENCH_KNOBS: [&str; 5] = ["l2pf", "pdl", "evict_first", "evict_kvb", "evict_skinny"];
+
 /// Lanes a pass may carry (glm.cu kMaxLanes).
 pub const MAX_LANES: usize = 4;
 const OP_EXIT: u32 = 99;
@@ -402,10 +408,19 @@ impl Engine {
         // GLM calls (each starts with griddepcontrol.wait): the next kernel launches while this one
         // drains. Bit-identical; TIDELM_PDL=0 turns it off (docs/gotchas.md)
         let pdl = (std::env::var("TIDELM_PDL").as_deref() != Ok("0")) as i32;
+        // weights read once a pass loaded evict-first, so they no longer push out what the prefetch
+        // branch put in L2: decode's staged EXL3 copies (in-boot A/B, 1 / 4 / 8 rows -2.9 / -3.1 /
+        // -3.7%), then on top kv_b's rows in the absorbs (120K: -0.8 / -0.6 / -0.1%) and the router's
+        // and indexer's skinny GEMVs (-0.8 / -0.6 / -0.4%). The same values; TIDELM_GLM_EVICT_FIRST=0
+        // turns all three off
+        let ef = (std::env::var("TIDELM_GLM_EVICT_FIRST").as_deref() != Ok("0")) as i32;
         unsafe {
             glm_set_pdl(pdl);
             exl3m_set_pdl(pdl);
             tidelm_kernels::ds41::ds_set_pdl(pdl);
+            tidelm_kernels::exl3::exl3m_set_evict_first(ef);
+            tidelm_kernels::glm::glm_set_stream_loads(ef);
+            tidelm_kernels::ds41::ds_set_stream_weights(ef);
         }
         let st = Stream::new()?;
         let blas = Blas::new(st.raw())?;
@@ -833,6 +848,8 @@ impl Engine {
         let s_all = p0 + t; // positions [0, S) once this step's rows are written
         let dense_causal = prefill && s_all <= TOPK;
         if full {
+            // after q_b on this stream: on a third stream beside q_b it measured the same (in-boot
+            // A/B, 1 / 4 / 8 rows -0.2 / -0.2 / +0.1%; the pair reads at ~177 GB/s either way)
             let ix = lw.index.as_ref().unwrap();
             self.exl3(&ix.wq_b, np(&a.qr), cfg.q_lora, t, np(&a.qi), true)?;
             ck(unsafe { glm_rope(st, np(&a.qi), 4096, 128, np(&a.qi), 4096, 128, t as i32, 32, np(&self.w.cos), np(&self.w.sin),
@@ -1606,7 +1623,8 @@ fn hidden_code(lane: usize, h: Hidden) -> u16 {
 const MLA_DECODE_MT: i32 = 2;
 
 /// o_proj's bytes prefetched into L2 during a decode layer's attention core (of 31.5 MB a rank;
-/// the L2 holds 24 MB)
+/// the L2 holds 24 MB). These budgets x1.5 with the weights evict-first: 1 / 4 / 8 rows +0.6 / +0.1 /
+/// -0.5% (in-boot A/B, 2026-10-30)
 const PF_O: usize = 12 << 20;
 /// during the MoE's gather the routed experts' down rows (of ~19 MB at one row) and the shared
 /// down's (of 3.9 MB); during its output's gather and the norms the next layer's q_a (of 7.9 MB) and
@@ -2183,6 +2201,52 @@ impl Engine {
         Ok(())
     }
 
+    /// Rank 0, benchmarks only: switch BENCH_KNOBS[name] on both ranks and drop the captured graphs, so
+    /// two schedules alternate in one boot instead of across boots (+-3-5% apart on one binary).
+    pub fn bench_knob(&mut self, name: &str, on: bool) -> Result<()> {
+        let code = BENCH_KNOBS.iter().position(|&k| k == name)
+            .ok_or_else(|| format!("bench knob {name}: one of {BENCH_KNOBS:?}"))? as u32;
+        self.mirror(|m| {
+            m.u32(OP_BENCH_KNOB).u32(code).u32(on as u32);
+        })?;
+        self.bench_knob_local(code, on)
+    }
+
+    /// Rank 0: BENCH_KNOBS[name] back to what the boot set (on, unless its environment switch
+    /// turned it off).
+    pub fn bench_knob_reset(&mut self, name: &str) -> Result<()> {
+        let var = match name {
+            "l2pf" => "TIDELM_L2_PREFETCH",
+            "pdl" => "TIDELM_PDL",
+            _ => "TIDELM_GLM_EVICT_FIRST",
+        };
+        self.bench_knob(name, std::env::var(var).as_deref() != Ok("0"))
+    }
+
+    fn bench_knob_local(&mut self, code: u32, on: bool) -> Result<()> {
+        self.st.synchronize()?;
+        match code {
+            0 => self.l2pf = on,
+            1 => unsafe {
+                glm_set_pdl(on as i32);
+                exl3m_set_pdl(on as i32);
+                tidelm_kernels::ds41::ds_set_pdl(on as i32);
+            },
+            2 => unsafe {
+                tidelm_kernels::exl3::exl3m_set_evict_first(on as i32);
+            },
+            3 => unsafe {
+                tidelm_kernels::glm::glm_set_stream_loads(on as i32);
+            },
+            4 => unsafe {
+                tidelm_kernels::ds41::ds_set_stream_weights(on as i32);
+            },
+            _ => return Err(format!("bench knob {code}").into()),
+        }
+        self.graphs_map.clear();
+        Ok(())
+    }
+
     /// Rank 0: release rank 1's follow loop.
     pub fn stop_follower(&mut self) -> Result<()> {
         self.mirror(|m| {
@@ -2261,6 +2325,10 @@ impl Engine {
                 crate::adapt::OP_ADAPT_BG => self.follow_adapt_bg(&mut r)?,
                 op @ (crate::prefix::OP_DISK_SAVE | crate::prefix::OP_DISK_LOAD) => self.follow_disk(op, &mut r)?,
                 crate::adapt::OP_BG => self.follow_bg(&mut r)?,
+                OP_BENCH_KNOB => {
+                    let (code, on) = (r.u32()?, r.u32()? != 0);
+                    self.bench_knob_local(code, on)?;
+                }
                 OP_ZERO_DEMAND => {
                     self.demand.zero_async(&self.st)?;
                     self.miss.zero_async(&self.st)?;

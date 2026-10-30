@@ -21,6 +21,7 @@ pub const MAX_MEMBERS: c_int = 16;
 
 extern "C" {
     pub fn exl3m_set_pdl(on: c_int) -> c_int;
+    pub fn exl3m_set_evict_first(on: c_int) -> c_int;
     pub fn exl3m_group(pick: *const c_void, uids: *mut c_void, ucount: *mut c_void, members: *mut c_void, r: c_int,
                        slots: c_int, e: c_int, maxm: c_int, s: CudaStream);
     pub fn exl3m_rot_in(x: *const c_void, x_stride: c_int, pick: *const c_void, suh0: *const c_void,
