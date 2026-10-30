@@ -5,13 +5,13 @@ so far -- falls below ``GLM_MTP_DYN``. That product is not the acceptance it cla
 recorded rounds of five texts at temperature 1.0, always drafting 7 (``results/glm-dyn/cal1.json``,
 2026-10-19), a stated chain probability of 0.4-0.6 at draft 2 was in the accepted prefix 28% of the
 time; 0.2-0.4 at draft 3, 10%; and a stated chain of 0.5-0.7 accepted about a third
-(``docs/gotchas.md`` 2026-10-16). The profile compensates with a high threshold (0.9) on a number
+(2026-10-16). The profile compensates with a high threshold (0.9) on a number
 whose scale is off by up to 3x, and the chain then stops at ~1.2 drafts.
 
 A verify row is worth its *marginal* acceptance -- P(prefix accepted through draft k), which is
 what one cell of this table measures -- and it should be kept while that exceeds the row's share
 of the round: (row + draft) ms over the round's ms a token, 26.5/73 = 0.36 at 12-14 tok/s with the
-measured 22 ms row (``docs/gotchas.md`` 2026-10-17). Replayed over the same records with the table
+measured 22 ms row (2026-10-17). Replayed over the same records with the table
 fitted leave-one-prompt-out and that cost model (95 ms fixed + 22 ms a row + 4.5 ms a draft):
 calibrated at 0.36, 14.03 tok/s; the flat stated gate at 0.8, 13.63; this profile's 0.9, 13.22.
 The result is flat from 0.25 to 0.5, so the threshold is not delicate.
@@ -23,8 +23,8 @@ the rank that drafts and decides), so the table corrects itself for temperature,
 context depth; the counts below are only a starting point.
 
 Off by default because it changes which drafts are made and, with them, the text a sampled reply
-follows. ``docs/gotchas.md`` 2026-10-23 records the offline numbers and the cost model they rest
-on; the on-box A/B is still missing.
+follows. The offline numbers and their cost model are from 2026-10-23; the on-box A/B is still
+missing.
 
     GLM_MTP_CAL        threshold on the calibrated probability; 0 (default) keeps the flat gate
     GLM_MTP_CAL_PRIOR  1 (default): start from the counts below; 0: learn from this process only
@@ -131,7 +131,7 @@ class LadderGate:
     (the product of everything so far), so a ladder that falls with depth asks for a yield the
     row's cost may not justify. Replayed over results/glm-dyn/cal1.json at temperature 1.0 it
     modelled 12.7-13.3 tok/s against the flat 0.9's 13.22 and the calibrated gate's 14.03
-    (docs/gotchas.md 2026-10-23). Kept as a knob because the cost side is what decides -- on code
+    (2026-10-23). Kept as a knob because the cost side is what decides -- on code
     at temperature 0.6 the flat 0.9 was drafting 3.3 drafts a round at 73% acceptance, which no
     table measured on prose-like text predicts -- and because counting outcomes (``rates``) makes
     the two comparable in one A/B.

@@ -105,8 +105,8 @@ drafter (~2-3 GB), KV at 128K (4.2 GB; only the 16 full layers grow: ~32 KB a to
 17 GB at 512K) and runtime, roughly **85 GB a rank for experts: ~6,000 of 15,872 (~38-40%)**.
 V4.1 runs at 64-68% resident with 11-13% of picks missing; Muse activates twice V4.1's share
 of experts per token (8/256 vs 6/384), so expect **15-25% misses on mixed work** until a trace
-says otherwise. On V4.1, 11% misses cost coding +0.006 nats but general text +0.23
-(docs/gotchas.md), so misses are not free.
+says otherwise. On V4.1, 11% misses cost coding +0.006 nats but general text +0.23,
+so misses are not free.
 
 ## Optimizations to try
 

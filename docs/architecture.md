@@ -229,8 +229,7 @@ the activation tile is loaded with stride 2 instead, so the weights need no layo
 (T=6, 30 experts, 2.9 ms), against a ~210 GB/s practical copy ceiling on a nominally
 273 GB/s box; relative error 4.4e-3 against the dequantised reference. Prefill (T=512) is
 compute-bound at ~23 TFLOPs and unoptimised. Tile width matters more than it should here:
-16-byte-wide tiles cap at ~130 GB/s on GB10, 64-byte tiles do not — see
-[gotchas](gotchas.md).
+16-byte-wide tiles cap at ~130 GB/s on GB10, 64-byte tiles do not.
 
 If Triton is unavailable the engine falls back to a dequantise-then-GEMM path
 (`engine/moe_fallback.py`), which is correct and slow; `/health`'s `engine_config.kernel`
@@ -241,5 +240,4 @@ says which one you got.
 * [`NOTES.md`](../NOTES.md) — the running log, with the checkpoint layout, the router,
   hyper-connections, the full landscape survey, and every measurement in context.
 * [`LIMITATIONS.md`](../LIMITATIONS.md) — what does not work and exactly why.
-* [gotchas](gotchas.md) — the failure modes this design has, in the order you will meet them.
 * [benchmarking](benchmarking.md) — how to measure it without fooling yourself.

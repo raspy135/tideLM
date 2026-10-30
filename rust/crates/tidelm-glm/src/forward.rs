@@ -43,7 +43,7 @@ pub const VERIFY_ROWS: usize = 8;
 /// one prefill chunk below wide_decode_from() positions and on the decode path from there: the
 /// prefill chunk gathers a split cache's every position in every layer (gigabytes a pass at 100K
 /// context) where the decode path's split attention sends only the rows' queries, but on a short
-/// context its rows are cheaper (docs/gotchas.md, 2026-10-27).
+/// context its rows are cheaper (2026-10-27).
 pub const HEAD_ROWS: usize = 33;
 
 /// The position from which a pass of MAX_ROWS + 1 ..= HEAD_ROWS rows runs the decode path
@@ -406,7 +406,7 @@ impl Engine {
         let cfg = GlmConfig::load(model_dir)?;
         // programmatic dependent launch for every kernel of glm.cu, the EXL3 file and the ds41.cu ones
         // GLM calls (each starts with griddepcontrol.wait): the next kernel launches while this one
-        // drains. Bit-identical; TIDELM_PDL=0 turns it off (docs/gotchas.md)
+        // drains. Bit-identical; TIDELM_PDL=0 turns it off
         let pdl = (std::env::var("TIDELM_PDL").as_deref() != Ok("0")) as i32;
         // weights read once a pass loaded evict-first, so they no longer push out what the prefetch
         // branch put in L2: decode's staged EXL3 copies (in-boot A/B, 1 / 4 / 8 rows -2.9 / -3.1 /

@@ -12,7 +12,7 @@ cancelled and borrowed records all share one byte budget, including across plans
 Experimental only; not connected to serving. On 32 real checkpoint experts with
 four retained payloads and two readers, owning-copy staging took 104.23 ms versus
 77.53 ms for the existing serial leased reader (+34.4%, three samples per arm,
-no simulated install delay). See docs/gotchas.md before revisiting this path.
+no simulated install delay).
 """
 
 from __future__ import annotations

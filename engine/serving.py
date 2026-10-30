@@ -53,7 +53,7 @@ def lane_reserve_bytes(args, max_context: int, n: int | None = None) -> int:
 
     The arena is sized against KEEP_FREE_GB before the lanes exist, so without this every byte a
     lane holds comes out of the safety margin -- on a profile at its ceiling, that is how rank 1
-    reached the memory watchdog (docs/gotchas.md). Per extra lane: the window ring (fixed, 0.18
+    reached the memory watchdog. Per extra lane: the window ring (fixed, 0.18
     GB), compressed KV and indexer keys and RoPE tables (per context token), decoder buffers, and
     its graphs, whose attention-core scratch grows with the context bucket. Plus lane 0's own
     attention-core graphs and the shared batched graphs. DSV41_LANE_RESERVE_GB replaces the
@@ -101,7 +101,7 @@ class ScheduledPeer:
         keep_going is identical on both ranks here, because every input to it is.
 
         Keeping each rank's own value instead (the earlier version) left rank 1 at the placeholder
-        0 -- a root-only verify against rank 0's full block (docs/gotchas.md)."""
+        0 -- a root-only verify against rank 0's full block."""
         keep = self.peer.control(keep_going, value, flag)
         self.control_value, self.control_flag = self.peer.control_value, self.peer.control_flag
         return keep

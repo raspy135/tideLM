@@ -7,7 +7,7 @@ The port exists for performance, so it inherits the repo's rule in its strongest
 no stage ships on a claim. Every milestone below has a measured gate against the Python
 engine on the same box and workload, and a stage that loses decode tok/s does not merge
 until the number says otherwise. Decode tok/s is the primary metric; prefill is
-secondary. Negative results get recorded in `docs/gotchas.md` like everything else.
+secondary. Negative results get recorded at the site and in the commit message.
 
 User-set goals, in order:
 1. No Python in prefill/decode at runtime.
@@ -489,8 +489,7 @@ What is ported, by the DS port's feature list:
 - **Copy rounds**: the DS copy drafter's rule (tidelm-engine copy.rs, `GLM_COPY`, on) for copies
   of the prompt of 7-32 tokens, verified in one pass of up to 33 rows (a prefill chunk below
   32,768 positions, the decode path from there); lookup_draft.ExactDraftCache v2 (`GLM_LOOKUP`)
-  behind it. A file rewrite 36.7 -> 56.2 tok/s, a re-run tool call 33.5 -> 39.5 (2026-10-27,
-  docs/gotchas.md).
+  behind it. A file rewrite 36.7 -> 56.2 tok/s, a re-run tool call 33.5 -> 39.5 (2026-10-27).
 - **Adaptive residency** (`adapt.rs`): tp.adapt after the prefill and every 200 tokens, the
   two-pass prefill, bg_step's victims, hot reads kept over victims, synchronous or read during the
   next round (`GLM_HOT_ASYNC`, opt-in: 5-7% faster a round, at the quality cost Python measured);
@@ -499,7 +498,7 @@ What is ported, by the DS port's feature list:
   down widths and the mcg codebook (Mia's AI Lab's 2.75bpw checkpoint); the arena holds a class
   of slots a width triple, every swap and hot read stays in its class, the boot placement fills
   a byte budget (`GLM_SLOTS` 3-bit experts' worth), and prefill runs a mixed-width instantiation
-  of the smem tile. 13,320 residents for 12,500 in the same 89 GB (docs/gotchas.md).
+  of the smem tile. 13,320 residents for 12,500 in the same 89 GB.
 - **Prefix cache**: the live sequence's prefix in RAM, and the disk store (`prefix.rs`).
 - **Server**: the OpenAI routes, the Anthropic Messages route, tool calls (GLM's XML), the GLM
   template and parser (`tidelm-text/src/glm.rs`, fixture-tested against glm_app.py).
@@ -508,7 +507,7 @@ What is ported, by the DS port's feature list:
   `tidelm_engine::kv`); a pass's lane table gives each row its lane's positions and cache rows
   (glm.cu positions / index scores / MLA); `serve.rs` runs a round per decoding lane's phases
   together (batched MTP drafts, one verify, one MTP fill), prefills a prompt beside them in parts.
-  One request at a time is byte for byte the single-lane engine (docs/gotchas.md).
+  One request at a time is byte for byte the single-lane engine.
 
 Not ported, and why: vision (GLM-5.3 has none), the bounded replay (GLM has no sliding window),
 GLM_MISS=stream, MXFP4 experts, FP4 KV (a WIP port is on branch glm-kv-fp4, not built or tested).
@@ -527,7 +526,7 @@ layer's matrix between head flushes and measured o_proj at 145 us; every layer's
 (`glm_bench_chain`, the decode pass's case) takes 184 us, 171 GB/s, as nsys found in the pass. The
 kernel's 4-byte lane loads were the limit: the same access pattern without the math reads 180 GB/s
 that way and 230 as 16-byte loads. Decode calls now stage the trellis through shared memory with
-16-byte cp.async (DECODE_PF): o_proj 151 us, q_b 59, q_a 47 (docs/gotchas.md, 2026-10-29). The
+16-byte cp.async (DECODE_PF): o_proj 151 us, q_b 59, q_a 47 (2026-10-29). The
 original paragraph follows.
 
 The GEMV is at the DRAM roof (2026-10-25, cold reads; `glm_bench_moe` on random 3-bit experts at

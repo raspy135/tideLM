@@ -24,8 +24,7 @@ tokens per step at depth 3 → depth 5.
 - Depth 5 makes every step ~16% slower, and pays that back only where the drafter is right.
 - Depth 1's step is 18% faster, but its 2-token cap loses on every workload. It was measured
   with a single sample and rejected.
-- Depth 7 was not measured. It lies past the drafter's trained horizon of 5; see
-  `docs/gotchas.md` on the wider verify block.
+- Depth 7 was not measured. It lies past the drafter's trained horizon of 5.
 
 ## How
 
@@ -36,8 +35,8 @@ tokens per step at depth 3 → depth 5.
    ahead of time would be wrong: its warm-up forward writes KV past the step, and in the
    128-slot window ring that overwrites entries the current step still attends to.
 4. `engine/spec_depth.py` holds the policy. It re-decides at most once per
-   `DSV41_BLOCK_DYNAMIC_TOKENS` (default 60; the DS profile sets 8 since 2026-10-22, see
-   docs/gotchas.md) output tokens and needs a 3% win to switch.
+   `DSV41_BLOCK_DYNAMIC_TOKENS` (default 60; the DS profile sets 8 since
+   2026-10-22) output tokens and needs a 3% win to switch.
    - **At depth 5**, it knows the depth-3 alternative exactly: `min(accepted, 3) + 1` tokens per
      step.
    - **At depth 3**, it estimates depth 5 from saturated steps, using the extra acceptance
@@ -50,7 +49,7 @@ tokens per step at depth 3 → depth 5.
 Greedy output is identical under any depth schedule, because verification accepts exactly the
 target model's argmax -- with frozen expert placement. Hot reads load experts by the verify
 block's routing, drafted rows included, so in serving a different schedule can change which
-experts are resident and with them the greedy text (docs/gotchas.md, 2026-10-22). With sampling the output distribution is unchanged, but the random stream
+experts are resident and with them the greedy text (2026-10-22). With sampling the output distribution is unchanged, but the random stream
 depends on the schedule.
 
 ## Full-engine check, 2026-09-23
@@ -353,8 +352,7 @@ copy when present, and callers that omit MTP loading do not allocate it.
 
   Copied steps averaged 3.6 tokens (801 / 223) against DSpark's 5.6 on the same text. The only way
   this pays is a deeper copy than DSpark can draft: a copy-only verify graph at T = 10 (9 copied;
-  `build_routing_small` caps P at 64 pairs). That costs ~34% a step (the T=10 entry in
-  `gotchas.md`) and is worth it only where copies stay ~97% accepted, so it would help edit-style
+  `build_routing_small` caps P at 64 pairs). That costs ~34% a step (at T=10) and is worth it only where copies stay ~97% accepted, so it would help edit-style
   replies and nothing else. Default stays off.
 * `DSV41_TP_DRAFT_HEAD=1 DSV41_DRAFT_HEAD_FMT=fp8` builds a separate quantized
   local vocabulary shard. It uses the existing vocabulary all-gather; the BF16

@@ -11,7 +11,7 @@ the prefix cache's bit-invariance (resume == cold) is untouched, and the drafter
 numerics change -- EXL3 reconstructs the base weights with its own error, on fp16 activations without
 the FP8 activation fake-quant -- so it is opt-in and pinned in the boot guard with the pack digest.
 
-MEASURED AND OFF (2026-10-08, RESULTS.md / docs/gotchas.md): paired over 24 prompts it saved
+MEASURED AND OFF (2026-10-08, RESULTS.md): paired over 24 prompts it saved
 1.30 +- 0.53 ms a step but cost 0.071 +- 0.024 accepted tokens a step (the drafter was trained on
 the FP8 target; teacher-forced top-1 vs FP8 is 0.976), net -0.22 +- 0.53 tok/s. Kept for the next
 attempt: fused rotations and a drafter that matches the target are the preconditions.

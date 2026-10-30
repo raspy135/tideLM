@@ -9,8 +9,8 @@ tok/s, acceptance -0.0013 +- 0.0013**, 24/24 greedy outputs bit-identical. The d
 
 The drafter's two heads were 2.26 ms of a 5.66 ms draft pass after `DSV41_EXL3_DRAFT_DENSE`
 (docs/exl3-draft.md): the fp8 vocabulary head (331 MB a rank, 1.47 ms) and the Markov bias head
-(33 MB of bf16 read five times, 0.79 ms). docs/gotchas.md 2026-10-11 records that a smaller
-*format* did not make them faster. This changes their *row count* instead: the draft scores only a
+(33 MB of bf16 read five times, 0.79 ms). A smaller *format* did not make
+them faster (2026-10-11). This changes their *row count* instead: the draft scores only a
 listed vocabulary, through the same kernels at the same bytes per row.
 
 The draft only proposes and the verifier accepts exactly the target's argmax, so a token the draft
@@ -109,7 +109,7 @@ process loaded with `DSV41_DRAFT_VOCAB_ROWS=40960 DSV41_BENCH_DRAFT_VOCAB_AB=1`,
 | greedy outputs | 24 / 24 identical |
 
 The same A/B without `--warm-each` read **-0.02 +- 0.70** (`ab-40960/`). That run is not a second
-opinion; it is the driver's first-run penalty (docs/gotchas.md 2026-10-11, "the first run of each
+opinion; it is the driver's first-run penalty (2026-10-11, "the first run of each
 prompt"): split by which arm ran first, it gives -1.56 and +1.68, i.e. an arm effect of +0.06 with
 a +1.62 ms penalty on whichever arm went first, and a per-prompt SD of 3.3 ms against 1.74 with the
 warm-up.

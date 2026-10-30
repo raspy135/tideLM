@@ -21,7 +21,7 @@ pub const MAX_ROWS: usize = 16;
 /// cp.async through shared memory. The register path (pf 1: 4-byte loads a lane, one step ahead)
 /// read o_proj at 171 GB/s across the layers (184.5 us), q_b 153, q_a 142; staged 209 / 179 / 167
 /// (150.6 / 58.6 / 47.1 us), 3 and 4 stages no better; the outputs byte for byte the same
-/// (glm_bench_chain, docs/gotchas.md).
+/// (glm_bench_chain).
 pub const DECODE_PF: i32 = -2;
 
 /// The routed experts' decode calls: three stages. At split 1 (glm_bench_moe, cold random 3-bit
@@ -101,7 +101,7 @@ pub struct Exl3Mat {
     pub n_out: usize,
     pub g: usize,
     pub bits: Vec<usize>,
-    /// split-K of decode calls: it fixes their summation order (docs/gotchas.md)
+    /// split-K of decode calls: it fixes their summation order
     pub split: usize,
     /// rows above which decode calls take `split_wide` (0: always `split`)
     pub wide_rows: usize,
@@ -432,8 +432,8 @@ pub struct Weights {
     pub bytes: usize,
 }
 
-/// The decode split-K counts per projection (exl3_model.py; docs/gotchas.md: other splits move
-/// the outputs' bits).
+/// The decode split-K counts per projection (exl3_model.py; other splits move the outputs'
+/// bits).
 pub const SPLIT_QA: usize = 8;
 pub const SPLIT_KVA: usize = 8;
 pub const SPLIT_QB: usize = 1;

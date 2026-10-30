@@ -50,8 +50,9 @@ The profile combines two published quantizations of the same GLM-5.3: the routed
 [`Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold`](https://huggingface.co/Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold)
 (each expert at 2-4 bits, 2.75 on average) and the non-expert weights of
 [`bertholomus/GLM-5.3-EXL3-3.0bpw`](https://huggingface.co/bertholomus/GLM-5.3-EXL3-3.0bpw)
-(EXL3, ~5-6 bits; Mia's checkpoint has them in BF16, twice the memory). Why, and what it
-measured: [gotchas](gotchas.md), "GLM-5.3 with Mia's 2-4-bit experts".
+(EXL3, ~5-6 bits; Mia's checkpoint has them in BF16, twice the memory). Against bertholomus's own
+3.0bpw experts: 13,320 residents for 12,500 in the same memory, 15-25% less routed weight
+missed, held-out NLL -0.0076 +- 0.0049, decode at parity.
 
 On the head, the checkpoint (`pip install -U huggingface_hub` gives `hf`):
 
@@ -125,7 +126,7 @@ The API is OpenAI-compatible (tool calls; images with DeepSeek) with an Anthropi
 route for Claude Code ([OpenAI API](openai-api.md)). It binds `HOST` (0.0.0.0) with no
 authentication: keep it on a trusted network.
 
-Next: [architecture](architecture.md) · [benchmarking](benchmarking.md) · [gotchas](gotchas.md)
+Next: [architecture](architecture.md) · [benchmarking](benchmarking.md)
 
 ## The single-box Python engine
 

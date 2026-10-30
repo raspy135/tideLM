@@ -117,7 +117,7 @@ every token, every layer L:
 ```
 
 Traffic per verify block (6 rows × 5120 × fp32 ≈ 123 KB) × 40 layers ≈ **5 MB/token-block**
-over a ~24.5 GB/s aggregate link (measured; see gotchas.md — each half is behind PCIe Gen5 x4)
+over a ~24.5 GB/s aggregate link (measured; each half is behind PCIe Gen5 x4)
 — latency-bound, not bandwidth-bound. Budget **~2–4 ms per generated
 token** for the ~40 small cross-node collectives (measure in Phase 0; if each round trip is
 >100 µs the estimate needs revisiting).

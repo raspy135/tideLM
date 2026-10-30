@@ -224,12 +224,12 @@ class GlmTP:
             raise ValueError("GLM_KV_SPLIT=1 needs GLM_INDEX_KERNEL=1 and GLM_ATTN_KERNEL=1")
         self.s_loc = -(-self.max_seq // self.world) if self.kv_split else self.max_seq
         self.exl3_attn = self.exl3_checkpoint or env("GLM_EXL3_ATTN", "0") == "1"
-        # Dense weights still wider than FP8 (docs/gotchas.md): GLM_KVB_FP8=1 keeps MLA's absorbed
+        # Dense weights still wider than FP8: GLM_KVB_FP8=1 keeps MLA's absorbed
         # kv_b (w_uk, w_uv) in FP8 (engine/glm/kvb_fp8.py; 1.16 -> 0.58 GB a rank): Quark's bytes, or
         # the native EXL3 checkpoint's FP16 quantized at load to the same blocks (exl3_model.py),
         # GLM_EMBED_8BIT=int8 (or fp8) the embedding rows in 8 bits with a scale per 128 values
         # (0.95 -> 0.49; a lookup, never a matmul, so INT8's uniform grid can be used: fp8 moved the
-        # exact-model logits KL 0.015 / 5.2% top-1 flips, docs/gotchas.md),
+        # exact-model logits KL 0.015 / 5.2% top-1 flips),
         # GLM_ROUTER_BF16=1 the routers in BF16 with fp32 sums (0.48 -> 0.24).
         self.kvb_fp8 = env("GLM_KVB_FP8", "0") == "1"
         if self.exl3_checkpoint and env('GLM_HEAD', 'exl3') != 'exl3':
@@ -340,7 +340,7 @@ class GlmTP:
         # copies them to the host once at its end; the heaviest (the same threshold and step cap)
         # are read on the io threads while the next round drafts, and go into kept-victim slots
         # before the next forward. A read serves the steps after the one that wanted it, where the
-        # sync path computes that step's own pick exactly. Measured 2026-10-19 (docs/gotchas.md):
+        # sync path computes that step's own pick exactly. Measured 2026-10-19:
         # ~5 ms off a decode round (the reads leave it; the 75 host waits cost almost nothing by
         # themselves) for KL 0.086 -> 0.137 against the exact model -- GLM's heavy misses rarely
         # recur, so a read a step late seldom finds its expert wanted again. Off by default.
@@ -360,7 +360,7 @@ class GlmTP:
         # GLM_FUSE_QKV_A=1 (default): q_a and kv_a read the same input, so the FP8 pair is one
         # [2,624, 6,144] weight (q_a's 2,048 rows, then kv_a's 576; 2,048 is a multiple of the
         # 128-row scale block, so every block scale stays where it was) and a layer launches one
-        # projection kernel instead of two over x. Bit-identical (docs/gotchas.md 2026-10-18:
+        # projection kernel instead of two over x. Bit-identical (2026-10-18:
         # 24 us a layer in the graph microbenchmark). Not under GLM_EXL3_ATTN (other matrices).
         self.fuse_qkv_a = env("GLM_FUSE_QKV_A", "1") == "1" and not self.exl3_attn
         # GLM_PREFILL_REDUCE: how a prefill chunk's o_proj partials (fp32 [rows, hidden]: 50 MB a
@@ -383,7 +383,7 @@ class GlmTP:
         # GLM_HOT_KEEP_AUDIT=1 (measurement only, rank 0, syncs per keep): how many kept reads a
         # rank gate -- adapt()'s rule, score beats the victim's by GLM_ADAPT_MARGIN -- would drop.
         self.hot_audit = env("GLM_HOT_KEEP_AUDIT", "0") == "1" and self.rank == 0
-        # Repetition loops (docs/gotchas.md, 2026-10-18). A served Japanese answer that switched to
+        # Repetition loops (2026-10-18). A served Japanese answer that switched to
         # English ("sports drinks") and then repeated " sports" until stopped, replayed 8 times
         # from each point: just before the loop, 2 of 8 continuations looped with substituted
         # experts and 0 of 8 with every expert exact; from inside it, 5 of 8 and 3 of 8 (the exact
@@ -467,8 +467,7 @@ class GlmTP:
         # GLM_PREFILL_TWO_PASS=N (needs GLM_ADAPT): prefill a new suffix of 4..N tokens twice,
         # adapting residency to its routing in between (prefill()). Japanese turns, against every
         # expert exact: EXL3 KL 0.096 -> 0.074 (Tokyo set), 0.110 -> 0.084 (a new topic on a cached
-        # conversation); MXFP4 0.144 -> 0.136, 0.211 -> 0.154. +1-3 s to the first token
-        # (docs/gotchas.md).
+        # conversation); MXFP4 0.144 -> 0.136, 0.211 -> 0.154. +1-3 s to the first token.
         self.two_pass = int(env("GLM_PREFILL_TWO_PASS", "0"))
         self.two_passed = False
         self.mtp_fill = True
@@ -477,7 +476,7 @@ class GlmTP:
         # round's worth of tokens after them, verifies that continuation instead of MTP drafts: same
         # rows, no draft passes. 8 from Claude Code transcripts: 24% of agent output sits in exact
         # copies past 8 matched tokens (repeated tool calls, Edit quotes); prose almost never
-        # copies (docs/gotchas.md 2026-10-23). 0: off.
+        # copies (2026-10-23). 0: off.
         self.lookup_n = int(env("GLM_LOOKUP", "0"))
         self.spec_cal = None            # [(draft index, confidence product, accepted)] when a tool asks
         self.spec_cal_overlap = False   # sampled rounds: also each draft's overlap with the target
@@ -2679,7 +2678,7 @@ class GlmTP:
                     d = int(torch.multinomial(q, 1, generator=gen)) if self.rank == 0 else 0
                     if self.spec_cal is not None and self.rank == 0:
                         # Tools: the drawn token's probability and the MTP's largest (the gate's
-                        # signal and the greedy one -- the latter did no better, docs/gotchas.md).
+                        # signal and the greedy one -- the latter did no better).
                         p, pm = torch.stack([q[d], q.max()]).tolist()
                         sig.append((p, pm))
                         if self.spec_cal_overlap:

@@ -526,7 +526,7 @@ __global__ void __launch_bounds__(256) index_scores_kernel(
 // n_t from pos as in index_scores_kernel (pos null: nmax). The first version counted into one
 // shared histogram and compacted in 1,024-element rounds of two block-wide scans: 125-137 us a row
 // of 60-63K scores (a 120K context's split layers), this one 45-55 with the same output, byte for
-// byte, over random, zero-heavy, duplicate-heavy and masked rows (docs/gotchas.md).
+// byte, over random, zero-heavy, duplicate-heavy and masked rows.
 constexpr int kTk = 1024;
 
 __global__ void __launch_bounds__(kTk) topk_kernel(const float* __restrict__ s, int64_t lds, const int* __restrict__ pos,
@@ -1490,7 +1490,7 @@ __global__ void __launch_bounds__(1024) rank1_kernel(__nv_bfloat16* __restrict__
 // work that leaves the memory idle (the attention core, a RoCE gather's wait): `count` runs of `run`
 // bytes, `stride` apart from `base` - one run a warp's range of a decode GEMV, so each of its warps
 // finds the start of its range in L2. TMA bulk prefetches (cp.async.bulk.prefetch.L2), 32 KB a
-// request; the DS engine's l2_prefetch_kernel with strided runs (docs/gotchas.md, 2026-10-27).
+// request; the DS engine's l2_prefetch_kernel with strided runs (2026-10-27).
 __global__ void __launch_bounds__(128) l2_runs_kernel(uint64_t base, uint64_t run, uint64_t stride, int count) {
     constexpr uint64_t CH = 32u << 10;
     const uint32_t w = blockIdx.x * blockDim.x + threadIdx.x, workers = gridDim.x * blockDim.x;

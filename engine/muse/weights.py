@@ -162,7 +162,7 @@ class Checkpoint:
 
     def drop_cache(self) -> None:
         """Ask the kernel to drop this checkpoint's pages from the page cache. On GB10 the page
-        cache and GPU allocations share one pool and reclaim is lazy (docs/gotchas.md: the box
+        cache and GPU allocations share one pool and reclaim is lazy (the box
         can hard-reset near zero MemAvailable); weights read once must not linger there."""
         import os
         for f in set(self._handles) | set(getattr(self, "_headers", {})):

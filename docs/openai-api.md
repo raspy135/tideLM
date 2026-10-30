@@ -126,4 +126,4 @@ curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' -
 }'
 ```
 
-Next: [benchmarking](benchmarking.md) · [gotchas](gotchas.md) · [architecture](architecture.md)
+Next: [benchmarking](benchmarking.md) · [architecture](architecture.md)

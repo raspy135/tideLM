@@ -8,7 +8,7 @@ or -1 on the EXL3 arena, whose decode grouping skips negative picks. Either way 
 never read, so a verify block reads fewer distinct experts.
 
 The kept picks keep the router's own weights; nothing is renormalized. Measured 2026-10-11 on
-held-out NLL with every position pruned (docs/gotchas.md): 0.90 keeps 91.8% of picks at -0.0020 +-
+held-out NLL with every position pruned: 0.90 keeps 91.8% of picks at -0.0020 +-
 0.0018 / -0.0004 +- 0.0034 nats (code / general); 0.85 keeps 80.9% at +0.0138 / +0.0106;
 renormalizing the kept weights (TensorFold's production rule) costs +0.021 on both, so it is not
 offered. Decode only: prompt rows keep all six, and the DSpark drafter's own router is untouched.

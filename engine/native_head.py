@@ -4,7 +4,7 @@ Keep sign/mantissa bytes and exponent deltas in K-group-major tiles. Unusually
 wide exponent groups use an escape table, so every BF16 bit survives packing.
 The decode kernel explicitly keeps native MMA kWidth=2: byte-derived ordinary
 Triton dot picked kWidth=4 and failed the cancellation regression despite exact
-weight reconstruction. See tools/head_packed_gluon.py and docs/gotchas.md.
+weight reconstruction. See tools/head_packed_gluon.py.
 """
 import os
 

@@ -2,7 +2,7 @@
 
 The replay reads the recorded draft records (results/glm-dyn/cal1.json: 545 rounds of five texts,
 temperature 1.0, always drafting 7) and scores a gate policy with the decode round's cost model
-from docs/gotchas.md (95 ms fixed + 22 ms a verify row + 4.5 ms a draft). It is a regression test
+(95 ms fixed + 22 ms a verify row + 4.5 ms a draft). It is a regression test
 on the *claim* in engine/glm/mtp_cal.py's docstring, not a serving measurement: the calibrated
 gate must stay ahead of the flat stated threshold on the same records.
 """

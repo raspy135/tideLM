@@ -8,8 +8,7 @@ DSV41_PRUNE_UNIT (routing slots vs requests). They only ever expressed two decis
       or a number s in (0, 0.5): the newest request's share of the observed demand, so the
       half-life is ln 0.5 / ln(1 - s) requests. `medium` is the 2026-09 serving profile
       (half-life 20). Higher follows a changing workload faster and swaps more experts per
-      request; too high chases each prompt and raises the miss rate (docs/gotchas.md,
-      "The demand half-life has to be read against your traffic").
+      request; too high chases each prompt and raises the miss rate.
   DSV41_ADAPT_PRIOR  how many requests' worth of weight the shipped routing trace keeps
       against observed demand (default 8). Lower lets this server's own traffic dominate sooner.
 

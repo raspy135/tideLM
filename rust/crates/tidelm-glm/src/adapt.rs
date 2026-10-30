@@ -19,12 +19,12 @@
 //!   a decode pass, per MoE layer its heaviest missed pick at or above the same threshold, the
 //!   heaviest of those up to the same step cap, each into the next queued victim's slot on the
 //!   reader threads while the next round drafts; routable from the next decoder pass. The token
-//!   that missed the expert keeps its substitute (KL 0.086 -> 0.137 in Python, docs/gotchas.md).
+//!   that missed the expert keeps its substitute (KL 0.086 -> 0.137 in Python).
 //! - adapt_background(max_swaps), the decode-time adaptation: the same plan, but the victims
 //!   leave routing at once and the newcomers' records load on reader threads while the pair
 //!   decodes, routable from the ADAPT_BG_PASSES-th decoder pass after (a pass waits for reads not
 //!   yet done). Both ranks count the same passes, so they switch between the same two. In line,
-//!   a 256-expert adaptation stopped the GPU for ~166 ms every 200 tokens (docs/gotchas.md).
+//!   a 256-expert adaptation stopped the GPU for ~166 ms every 200 tokens.
 
 use std::os::raw::c_void;
 use std::sync::mpsc;

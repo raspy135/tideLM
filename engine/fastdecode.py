@@ -168,7 +168,7 @@ def _dynamic_depths():
         depths = tuple(sorted({int(x) for x in v.split(",")}))
     except ValueError:
         raise ValueError(f"DSV41_BLOCK_DYNAMIC: {v!r}; use two odd depths, e.g. 3,5") from None
-    # T_VERIFY <= 10 is the graph-capturable routing limit (docs/gotchas.md, wider verify block)
+    # T_VERIFY <= 10 is the graph-capturable routing limit (wider verify block)
     if len(depths) != 2 or any(d > 9 or d < (0 if VERIFY_ODD else 1)
                              or (not VERIFY_ODD and d % 2 == 0) for d in depths):
         allowed = "depths in 0..9" if VERIFY_ODD else "odd depths in 1..9"

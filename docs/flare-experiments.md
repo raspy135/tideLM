@@ -35,7 +35,7 @@ cost calibration remain separate follow-ups; no collective was added here.
 ### Keep the negative attention result
 
 The previous direct-cache tile implementation lost **236 us versus 47.7 us**
-for BF16 staging at T=4, H=32, N=1152 (`docs/gotchas.md`, October 7). It unpacked
+for BF16 staging at T=4, H=32, N=1152 (October 7). It unpacked
 the same keys separately for every 32-column PV tile. The new experiment reuses
 each tile for QK and the full 512-column PV accumulator. Key partitions supply
 more blocks at small query widths; a merge combines their partial accumulators.

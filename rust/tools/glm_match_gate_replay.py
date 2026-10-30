@@ -6,7 +6,7 @@ accepted of 7); cost = the verify by rows tidelm-server --bench-width measured +
 Three questions, in order: does agreement with a 3-6-token match predict acceptance, and does a
 calibrated gate that knows it draft better (tables fitted leave-one-request-out); does raising an
 agreeing draft's probability by 0.2-0.5 by match length do better; and at MTP's rejections, did the
-match hold the right token. docs/gotchas.md 2026-10-27 has the answers."""
+match hold the right token (2026-10-27)."""
 import json, sys, collections
 VER = {1: 89, 2: 115, 3: 132.5, 4: 150, 5: 163, 6: 176, 7: 188, 8: 200}   # bench-width, 2.5K, ms
 MTP = 3.2

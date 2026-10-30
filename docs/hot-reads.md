@@ -1,8 +1,8 @@
 # Hot reads: the heaviest missing experts, read at decode (DSV41_HOT_READS)
 
 The pruned decode router can only pick resident experts: a non-resident pick is replaced by the
-next resident one (`substitute`, docs/gotchas.md "Skipping a missing expert costs more than
-substituting it"). Hot reads read the missing picks that carry the most routed weight from NVMe
+next resident one (`substitute`: skipping a missing expert costs more than
+substituting it). Hot reads read the missing picks that carry the most routed weight from NVMe
 and make them routable. Ported from the GLM-5.3 engine (`GLM_HOT`), where reading one heavy
 missing pick a layer cut KL to the exact model 0.369 -> 0.135. Code: `engine/hot_reads.py`,
 `FastDecoder._split_resolve` (sync) and `_hot_async_begin` / `_hot_async_end` (async).

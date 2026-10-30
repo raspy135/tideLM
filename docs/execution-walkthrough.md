@@ -5,7 +5,6 @@ Python/CUDA-adjacent systems but new to transformer inference. Every claim about
 *order* is read from the source, with `file:line`. Every number is either marked
 *measured* (taken from an artifact in `results/` or a doc) or *estimated* (arithmetic
 from a measured envelope). Read
-[gotchas.md](gotchas.md) before touching anything; read
 [architecture.md](architecture.md) for why the design is shaped this way.
 
 ---
@@ -391,7 +390,7 @@ tokens-per-step (`v41_engine.py:1302`).
 decreasing. Cost is *not* linear in `V`: dense weights are read once per step whatever the
 row count, but more rows route to more **distinct** routed experts and each distinct expert
 is read once. Measured: T=6 → 21.13 distinct experts/layer → 7.94 GB/step; T=10 → 29.85 →
-11.23 GB/step (`docs/gotchas.md`). Past the drafter's trained horizon
+11.23 GB/step. Past the drafter's trained horizon
 (`dspark_block_size=5`), `p→0` and the extra positions are paid for and never collected.
 
 Measured, one run per setting, same prompt, ±5 % acceptance spread (`RESULTS.md:499`,
@@ -552,8 +551,7 @@ They move different things:
   `docs/prefill-replicas.md`.
 * "Why doesn't decode hit 40 tok/s?" → `docs/decode-timeline.md`,
   `docs/decode-host-work.md`.
-* "Why did my change silently break quality?" → `docs/gotchas.md`,
-  `docs/nesting-regression-tp.md`.
+* "Why did my change silently break quality?" → `docs/nesting-regression-tp.md`.
 * "Where does the memory go?" → `docs/architecture.md`, `docs/tp-memory.md`.
 * "How do I measure without fooling myself?" → `docs/benchmarking.md`,
   `AGENTS.md` ("Measure before claiming").

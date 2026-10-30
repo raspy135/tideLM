@@ -233,7 +233,7 @@ with what each setting measured.
 | `RUST_LANES=2` | — | Concurrent requests; the lanes share the one hot-read ring. |
 | `SPEC=1`, `RUST_DEPTH=confidence` | `GLM_MTP=1`, `GLM_MTP_DEPTH=7`, `GLM_MTP_CAL=0.36` | Speculative decoding and its depth policy. |
 | `DSV41_PREFIX_CACHE=1`, `DSV41_PREFIX_DISK=1` | `GLM_PREFIX_DISK=1`, `GLM_KV_SPLIT=1` | Prompt caching; GLM's KV cache split across the ranks. |
-| — | `GLM_KV=fp8` | GLM's KV cache format, the one the Rust engine serves. The Python engine's 4-bit latent with the first and last ten layers in FP8 fits 320K in less memory and measured KL +0.004 against FP8 on the long eval, but in use the model's recall of its context was visibly worse ([gotchas](docs/gotchas.md)). |
+| — | `GLM_KV=fp8` | GLM's KV cache format, the one the Rust engine serves. The Python engine's 4-bit latent with the first and last ten layers in FP8 fits 320K in less memory and measured KL +0.004 against FP8 on the long eval, but in use the model's recall of its context was visibly worse. |
 | — | `GLM_LOOP_BREAK=12` | Stops a short cycle of tokens from repeating a 12th time (repetition loops start where experts are substituted). |
 
 ## Documentation
@@ -241,8 +241,6 @@ with what each setting measured.
 - [Install guide](docs/install.md): each setup step in full
 - [Hot reads: design and measurements](docs/hot-reads.md)
 - [Adaptive expert loading](docs/adaptive-experts.md), [GLM-5.3 engine plan](docs/glm53-plan.md)
-- [Known issues and rejected experiments](docs/gotchas.md) — kept on purpose: several plausible
-  ideas were measured and lost here, and are recorded so they are not tried twice
 - [Results](RESULTS.md), [TP memory](docs/tp-memory.md), [packed KV](docs/packed-kv.md),
   [speculative decoding](docs/decode-dynamic-depth.md), [decode dashboard](docs/decode-probe.md)
 

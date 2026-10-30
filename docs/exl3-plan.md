@@ -3,7 +3,7 @@
 Status (2026-10-08): P0-P5 done -- EXL3 is a serving profile (`.env.example.exl3`, packs from
 `scripts/exl3-packs.sh`), decode 31.0 / 64.4 / 46.7 tok/s and prefill at FP4 parity (README).
 P6 (two-tier arena) and exact-size slots for the 2-bit layers remain. Written for an agent working in this
-repository; read `CLAUDE.md`, `docs/gotchas.md` (especially the 2026-10-07/08 entries) and the
+repository; read `CLAUDE.md` and the
 last `RESULTS.md` sections first.
 
 ## Progress (2026-10-08)
@@ -182,7 +182,7 @@ volume. It holds a JSON header (layer → bits, `(layer, expert)` → byte offse
 each expert's **rank slice stored contiguously**: w1, w3, w2 trellis slices, then suh/svh. Records
 are 4096-aligned so `O_DIRECT` loads one expert in one `preadv` (`engine/experts.py` already does
 this for FP4 via `ShardFile` spans). Never `mmap` the pack in serving: page-faulted reads stalled
-the GPU through reclaim/compaction (docs/gotchas.md, 2026-10-08).
+the GPU through reclaim/compaction (2026-10-08).
 
 Disk (2026-10-08, after cleanup): node 0 has ~470 GB free, node 1 ~1 TB; a rank pack is ~98 GB.
 Check space again before writing. Node 1 needs either the source checkpoint copied
@@ -233,7 +233,7 @@ Route choice: first try porting TensorFold's `experts.cu`/`experts_grouped.cuh` 
 extension built into the image (as `fp4_moe_cuda` is), adapting its call interface to our
 slot/routing tensors. Fall back to Triton if the port fights the build. Either way, data-dependent
 sizes (tokens, pairs, resident counts) must be **runtime arguments with `do_not_specialize`**,
-never `tl.constexpr` (docs/gotchas.md, 2026-10-08). Keep row-invariant arithmetic (a row's result
+never `tl.constexpr` (2026-10-08). Keep row-invariant arithmetic (a row's result
 must not depend on the chunk), so the prefix cache's resume == cold invariant holds. Rank partials
 are added in rank order.
 
@@ -253,7 +253,7 @@ pure EXL3 is measured.
 | P2 | `Exl3Arena`, store reader, `EXPERT_FORMAT=exl3`, reference MoE | Both ranks boot, the guard agrees, generation runs; reference-path MoE matches `format.forward` to fp32 tolerance on random inputs |
 | P3 | Decode kernel in graphs | Matches the reference path (stated tolerance) at T = 1–6; decode A/B done (below) |
 | P4 | Prefill kernel | Matches the reference; row-invariance unit test; prefill A/B done |
-| P5 | Serving profile, `.env.example`, README/RESULTS/gotchas | Live numbers recorded; rollback is `EXPERT_FORMAT=fp4` |
+| P5 | Serving profile, `.env.example`, README/RESULTS | Live numbers recorded; rollback is `EXPERT_FORMAT=fp4` |
 | P6 (optional) | Two-tier arena | Measured against pure EXL3 and pure FP4 |
 
 ## Measurement protocol

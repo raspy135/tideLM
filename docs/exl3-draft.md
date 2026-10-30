@@ -107,7 +107,7 @@ rows alone, consistent with 21 MB of listed Markov rows fitting the L2 that the 
 not), and the step **-1.06 +- 0.37 ms**,
 acceptance -0.0013 +- 0.0013. "At the memory ceiling" was right about the format; it was not the
 end of the bytes lever. Separately, the +0.29 +- 1.03 above carries the A/B driver's first-run
-penalty (docs/gotchas.md, 2026-10-11); it is unbiased but its error bar is roughly twice what
+penalty (2026-10-11); it is unbiased but its error bar is roughly twice what
 `--warm-each` gives.
 
 ## Where the remaining gap is

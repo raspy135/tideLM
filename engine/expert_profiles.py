@@ -3,7 +3,7 @@
 The fixed topic profiles that lived here (DSV41_EXPERT_TOPICS, DSV41_PRUNE_SOURCE=saliency,
 DSV41_PRUNE_RANK=maxmin; the maxmin ranker ported from 0xBakeer/deepseek-v41-flash-spark) were
 removed on 2026-10-17: measured 2026-10-06, they did not qualify as a default (9/14 against 12/14
-on separate questions, 27% raw misses against 14%; docs/gotchas.md, docs/expert-profiles.md,
+on separate questions, 27% raw misses against 14%; docs/expert-profiles.md,
 RESULTS.md). Residency ranks the shipped coding/general traces, adapted by the demand DB.
 """
 import hashlib

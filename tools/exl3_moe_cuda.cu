@@ -24,7 +24,7 @@
 #include <utility>
 
 // EXL3_STREAM=1: decode's trellis words load evict-first (load_word); a benchmark switch, off: the
-// kernels gain 1-3% (routed) to 7-12% (the small dense matrices), ~1% of a decode pass (gotchas)
+// kernels gain 1-3% (routed) to 7-12% (the small dense matrices), ~1% of a decode pass
 #ifndef EXL3_STREAM
 #define EXL3_STREAM 0
 #endif
@@ -276,7 +276,7 @@ __device__ __forceinline__ uint64_t l2_evict_first() {
 // of S stages (`ring`, S * NT * TW words), then each lane reads its words of a tile from there. The
 // register path loads 4 bytes a lane: a warp instruction moves 128 bytes, and o_proj's pattern of 1.3 KB
 // runs 61 KB apart then reads at ~200 GB/s with one step in flight and ~180 with more (more requests,
-// not more bytes, in flight), against ~230 for the same runs as 16-byte loads (docs/gotchas.md).
+// not more bytes, in flight), against ~230 for the same runs as 16-byte loads.
 // The words, the decode and the mma chain are warp_tiles' exactly: the outputs are bit-identical.
 template <int CB, int K2, int NT, int S>
 __device__ __forceinline__ void warp_tiles_cp(const uint32_t* __restrict__ T, int NTILES, int kt0, int nkt, int nt0,
@@ -646,7 +646,7 @@ void prefill_launch(const void* x0, const void* x1, const int64_t* tp0, const in
 // 32-row routing block of the 2026-10-08 sweep, where 4 m-tiles' accumulators cut occupancy. An
 // expert with ~100 rows in a 2,048-row chunk is therefore decoded three or four times, and the
 // decode (integer ALU: the codebook hash, the bit windows), not the mma and not the DRAM bytes, is
-// where a GLM prefill MoE layer's ~29 ms went (2026-10-20, docs/gotchas.md). Here a block owns
+// where a GLM prefill MoE layer's ~29 ms went (2026-10-20). Here a block owns
 // BM = W * MTW * 16 rows of one routing block and NTB n-tiles. Each k-step the warps decode the
 // step's KS x NTB tiles between them -- TPW tiles a warp -- into shared memory, and every warp
 // multiplies all of them into its own MTW m-tiles: the trellis is decoded once for BM rows. A is

@@ -53,7 +53,7 @@ Raw local reports: `results/glm-perf-20261021/baseline-*.json` and
 The old hybrid profile never set `GLM_EXL3_ATTN`: it ran Quark's FP8 attention
 with q_a/kv_a fused, an FP8 head and FP8 kv_b. The native path changed all of
 them at once. Microbenchmarks, one GB10, rank-0 shapes, real weights, CUDA graph
-replays (decode), L2-cold over 16 layers (`docs/gotchas.md`, same date):
+replays (decode), L2-cold over 16 layers (same date):
 
 | Change | Before | After | Per verify forward |
 | --- | --- | --- | --- |
@@ -101,5 +101,4 @@ context bucket and keys graphs by that bound. It matched all teacher-forced
 logits at 96 checked positions and all greedy output hashes on both ranks,
 but complete-round timings did not show a consistent improvement. It remains
 off. Lower MTP confidence thresholds also failed to improve consistently;
-`GLM_MTP_DYN=0.9` remains the profile setting. Exact measurements and the graph
-pool / 4-bit prefill failures are recorded in `docs/gotchas.md`.
+`GLM_MTP_DYN=0.9` remains the profile setting. 

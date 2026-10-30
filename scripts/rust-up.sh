@@ -28,7 +28,7 @@
 #   RUST_TRACE=results/trace-union-1017/stats/coverage.json   the routing trace the history blends
 #                            with, a host path (relative: to the checkout): the trace corpora routed
 #                            by 1017. results/trace-union, routed by the original V4.1-Flash,
-#                            differs by 0.038 a layer (docs/gotchas.md)
+#                            differs by 0.038 a layer
 #   RUST_PREFIX_DIR=~/tidelm-rust-state/prefix-cache     the prefix cache's disk tier
 #   RUST_EXPERT_TOPP         unset: off (DSV41_EXPERT_TOPP=0.90 measured slower in Rust, rust/PORT.md)
 #   RUST_COPY_DRAFT=1        the copy drafter (CPU prompt lookup in front of DSpark; 0 off)
@@ -243,7 +243,7 @@ fi
 # TIDELM_GRAPH_CACHE: how many step graphs the engine keeps (default 128, ~4-8 MB each);
 # TIDELM_STEP_SPLIT: a line per request splitting its decode step's time;
 # TIDELM_GLM_WIDE_DECODE_FROM: GLM, the position from which a 17-33-row verify runs the decode path
-# instead of a prefill chunk (default 32768, docs/gotchas.md); TIDELM_GLM_ROUND_LOG: GLM, a JSON
+# instead of a prefill chunk (default 32768); TIDELM_GLM_ROUND_LOG: GLM, a JSON
 # line a speculative round to this path (in a mounted directory) for offline gate studies;
 # TIDELM_PDL=0: kernels launched without programmatic dependent launch (default on);
 # TIDELM_L2_PREFETCH=0: no L2 prefetch of the next weights from a parallel graph branch (default on);

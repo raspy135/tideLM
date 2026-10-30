@@ -4,8 +4,8 @@
 // GB10 a gap means another context (Xorg, gnome-shell, a browser or Electron GPU process, another
 // CUDA process) held the GPU. The decode probe's in-graph events see the same stalls as a random
 // cheap kernel (rope, rmsnorm, residual) taking ~1 ms on one node, followed by the peer waiting the
-// same amount in the next collective. Run it with the engine idle on each node and compare;
-// see "A desktop session on one node stalls the pair" in docs/gotchas.md.
+// same amount in the next collective. Run it with the engine idle on each node and compare
+// (a desktop session on one node stalls the pair).
 //
 //   nvcc -O2 -arch=native -o /tmp/gpu_gaps tools/gpu_timeslice_gaps.cu
 //   /tmp/gpu_gaps [seconds=5] [threshold_ns=50000]

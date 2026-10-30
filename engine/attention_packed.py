@@ -1,7 +1,7 @@
 """Packed-cache attention with one unpack per key tile and head group.
 
 The rejected decode_attn_staged.attention_direct re-read and unpacked keys for
-every 32-column PV tile (236 us versus 47.7 us for staging, gotchas 2026-10-07).
+every 32-column PV tile (236 us versus 47.7 us for staging, 2026-10-07).
 Here each program keeps its whole [16 heads, 512 columns] value accumulator
 and reuses the unpacked tile for QK and PV. Nothing materializes full keys or
 the probability matrix. FP32 online softmax changes reduction order, so this

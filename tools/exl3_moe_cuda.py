@@ -40,8 +40,8 @@ PREFILL_BM = int(os.environ.get("DSV41_EXL3_PREFILL_BM", "32"))
 # "smem" = exl3m_prefill_smem: a block of W warps x MTW m-tiles each (BM = W * MTW * 16 rows) decodes
 # every trellis tile of its NTB n-tiles once into shared memory and all the warps multiply it
 # (exl3_moe_cuda.cu, smem_tiles). WxMTWxNTBxPF. Bit-identical to "tile"; the routing block follows
-# from the setting, DSV41_EXL3_PREFILL_BM is not read. Measured on GLM-5.3's shapes (2026-10-20,
-# docs/gotchas.md): no faster than "tile" at 2,048 rows, 10% faster at 4,096 with 4x1x8x2; wider
+# from the setting, DSV41_EXL3_PREFILL_BM is not read. Measured on GLM-5.3's shapes (2026-10-20):
+# no faster than "tile" at 2,048 rows, 10% faster at 4,096 with 4x1x8x2; wider
 # blocks (8x1x8, 16x1x8) and MTW = 2 are slower. The GLM profile selects it (GLM_EXL3_PREFILL).
 PREFILL_SMEM_TILE = os.environ.get("DSV41_EXL3_PREFILL_SMEM_TILE", "4x1x8x2")
 # "ca" = exl3m_prefill_smem_mode with mode -S: "smem" with the raw trellis words staged

@@ -14,7 +14,7 @@ question, including the ones that said "no".
 ## Negative results are kept, not deleted
 
 When something is measured and rejected, record it where the next person will look: a comment
-at the site, `docs/gotchas.md`, or both. Several ideas here look plausible enough to be tried
+at the site, with the number, and the commit message. Several ideas here look plausible enough to be tried
 twice — dense TP, a wider verify block, pinned Engram staging, the prefill EP overlap — and
 one of them makes GPU utilization *better* while making throughput worse.
 

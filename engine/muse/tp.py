@@ -285,7 +285,7 @@ class MuseTP:
             # reclaimable but cudaMemGetInfo counts it as used. MemAvailable does not.
             self.ck.drop_cache()
             free = max(torch.cuda.mem_get_info(self.dev)[0], mem_available())
-            # V4.1's rule (docs/gotchas.md): a hard floor under MemAvailable, and only a share of
+            # V4.1's rule: a hard floor under MemAvailable, and only a share of
             # the rest -- page cache and pinned memory come back lazily on this box.
             reserve = float(env("GLM_RESERVE_GB", "20")) * 1e9
             if env("GLM_DRAFTER", ""):

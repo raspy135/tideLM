@@ -260,14 +260,14 @@ memory first).
   (the convention for live pairs) made the down kernel write zeros for every one of them: one of
   four lanes active cost 56.2 ms in M; key -1 (skipped) brought it to 47.9.
 * **`DSV41_ROCE_MAX_KB=1024`** to keep the 387 KB MoE gather on RoCE: every graph got slower,
-  199.4 -> 253.2 ms at four lanes (docs/gotchas.md). Keep 256.
+  199.4 -> 253.2 ms at four lanes. Keep 256.
 * **64-row decode tiles** run at 1.5-2x the 6-row time (cold L2, `wq_a`‖`wkv` 62 -> 139 us), against
   1.05-1.4x for 32-row tiles: past five lanes at depth 5 the dense calls lose much of their sharing.
   Depth 3 (`DSV41_BLOCK=3`, 4 rows a lane) fits eight lanes in 32 rows; not measured.
 * **Two defects in the lane code this replaced**, both silent or rank-1-only: every lane shared one
   verify-block buffer (`_vbufs`), and rank 1 chose a root-only verify because the cooperative
   control value is never broadcast (`KeyError: 2` on rank 1's first decode step here). The old
-  two-lane runtime has the same code paths. Both are in docs/gotchas.md with the fix.
+  two-lane runtime has the same code paths.
 
 ## Not done
 

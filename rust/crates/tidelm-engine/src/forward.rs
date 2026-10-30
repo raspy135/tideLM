@@ -259,7 +259,7 @@ pub(crate) enum Wt<'a> {
 
 /// Decode's L2 prefetch (Engine::side_prefetch): how much of each weight a latency-bound
 /// stretch brings in ahead of the kernel that reads it, set to what lands without crowding the
-/// stretch. Measured on the pair (2026-10-27, greedy, fixed residents; docs/gotchas.md): 2 MB of
+/// stretch. Measured on the pair (2026-10-27, greedy, fixed residents): 2 MB of
 /// wo_a during the attention core (8 MB slowed attention 39 -> 57 us, as much as wo_a gained),
 /// 4 MB of wo_b at wo_a's gather, an mHC weight whole (13 -> 4 us a call) with the router gate
 /// or the head of wq_a. The routed experts' down rows were not worth prefetching.
@@ -1958,7 +1958,7 @@ impl Engine {
         };
         // programmatic dependent launch for the engine's kernels (ds41.cu, fp4_moe_cuda.cu): each
         // kernel's blocks launch while the one before finishes. 1.3-1.8 ms off a decode step on the
-        // pair, bit-identical (docs/gotchas.md); TIDELM_PDL=0 turns it off. The GLM engine sets its own.
+        // pair, bit-identical; TIDELM_PDL=0 turns it off. The GLM engine sets its own.
         let pdl = std::env::var("TIDELM_PDL").as_deref() != Ok("0");
         unsafe {
             ds_set_pdl(pdl as i32);
@@ -4899,7 +4899,7 @@ impl Engine {
     /// The branch is what made it pay. Issued from inside the RoCE gather instead (its warps
     /// idle while the peer's flag is awaited) the gather lasted until its prefetches landed: 6
     /// MB of wo_b took the gather from 12.6 to 39 us for 26 us off wo_b, and the routed
-    /// experts' down rows cost the gather 45 us for 4.5 off down (docs/gotchas.md, 2026-10-27).
+    /// experts' down rows cost the gather 45 us for 4.5 off down (2026-10-27).
     fn side_prefetch(&self, pf: &L2Prefetch) -> Result<()> {
         if !self.l2pf || self.eager_step || self.pair.is_none() || pf.bytes[0] | pf.bytes[1] == 0 {
             return Ok(());

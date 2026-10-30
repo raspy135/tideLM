@@ -8,7 +8,7 @@
 //! y <- y - alpha r (r . y) on the attention's output and on the MLP's, the experts we serve
 //! (EXL3 packs of the stock weights) untouched and nothing re-quantized. The directions were
 //! recovered from the two BF16 checkpoints by range requests, layer by layer
-//! (tools/glm_ablit_fit.py; docs/gotchas.md, 2026-10-29).
+//! (tools/glm_ablit_fit.py, 2026-10-29).
 //!
 //! The file: safetensors with `glm_ablit.layers` I32 [n], `glm_ablit.alpha` F32 [n] and
 //! `glm_ablit.r` F32 [n, hidden]. It changes the model by design, so it is off unless set; its

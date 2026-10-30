@@ -6,7 +6,7 @@ No section named runs them all. Decode timings are CUDA graph replays (as decode
 7; prefill timings eager, median of 5. merge and prefill also check the new code against the
 code it replaced (kept here as old_mlp / old_prefill). Aborts below GLM_BENCH_MIN_AVAIL GB of
 MemAvailable (default 5): on GB10 an over-commit hangs the box instead of raising.
-Results and their reading: docs/gotchas.md, 2026-10-22.
+Measured 2026-10-22.
 """
 import os
 import sys

@@ -77,7 +77,7 @@ def load_dense(eng):
         # amax scales (weights._fp8_quant; a rank's rows start on a 128 boundary): against
         # Quark's FP8 kv_b, layers 0/3/40/77/78 gave identical scales and 99.9% identical bytes,
         # relative error to FP16 0.02645 vs Quark's 0.02646 (2026-10-22). That is the
-        # configuration whose quality docs/gotchas.md measured; decode reads half the bytes.
+        # configuration whose quality was measured; decode reads half the bytes.
         kvb = ck.get_rows(a + 'kv_b_proj.weight', r * eng.hl * hv, (r + 1) * eng.hl * hv)
         if eng.kvb_fp8:
             from .kvb_fp8 import HeadFP8

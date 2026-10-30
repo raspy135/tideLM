@@ -29,7 +29,7 @@ as many requests.
 A number in `[0, 0.5)` sets the newest vote's share directly. Higher sensitivity swaps
 more experts per request (roughly 2x from `medium` to `high`). Judge it by the `routed-miss`
 rate in the request logs, not by swap counts: too high a setting chases each prompt and makes
-misses worse (see [gotchas](gotchas.md)).
+misses worse.
 
 Fixed by the engine:
 - demand counted per request, not per routing slot;
@@ -81,8 +81,7 @@ one streaming discovery prefill followed by one resident prefill after admission
 so the chosen experts affect the first answer token as well. It requires
 concurrency 1, `PRUNE_MISS=1`, disabled prefix/response caches and prefill graphs,
 and enough transient slots for every cold expert in one layer. Plain-text
-documents bundled into the question need a client boundary. Details and paired
-trial limitations are in [gotchas](gotchas.md).
+documents bundled into the question need a client boundary.
 
 `DSV41_USER_PROMPT_MAX_LOADS=100` limits temporary streaming cold expert loads
 across one request. Default `0` is unlimited. Each visited layer selects cold

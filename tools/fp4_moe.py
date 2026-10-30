@@ -53,7 +53,7 @@ INTER = 2304  # expert intermediate size (N of w1/w3, K of w2)
 DOT_SCALED = os.environ.get("DSV41_FP4_DOT_SCALED", "0") == "1"
 # Separate arithmetic arm for prompt encoding and bounded decoder replay, including
 # tiny prefills. Ordinary verification and DSpark stay on their existing kernels:
-# dispatch uses the caller's phase, not a token-count guess. See docs/gotchas.md.
+# dispatch uses the caller's phase, not a token-count guess.
 PREFILL_DOT_SCALED = os.environ.get("DSV41_FP4_PREFILL_DOT_SCALED", "0") == "1"
 # Prefill-sized scaled calls (P > 1024, BM=64 by default) on 32-row blocks: the scaled-arithmetic
 # sweep at TP shapes (results/prefill-expert-20261008/sweep.json, 66 cells, every one bit-identical
@@ -61,7 +61,7 @@ PREFILL_DOT_SCALED = os.environ.get("DSV41_FP4_PREFILL_DOT_SCALED", "0") == "1"
 # (BM32, BN128, 4, 4) 9.78 vs 10.56 ms at 2,048 rows. Scaled prefill only; read at call time.
 PREFILL_SCALED_TILES = os.environ.get("DSV41_FP4_PREFILL_SCALED_TILES", "0") == "1"
 # Native CUDA is the default BM=16 decode path; prefill and unsupported shapes use Triton.
-# Set DSV41_FP4_CUDA=0 to restore Triton throughout. Measured scope is in docs/gotchas.md.
+# Set DSV41_FP4_CUDA=0 to restore Triton throughout.
 CUDA_DECODE = os.environ.get("DSV41_FP4_CUDA", "1") == "1"
 
 GROUP = 32  # K elements per UE8M0 scale

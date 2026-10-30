@@ -248,7 +248,7 @@ shape a wider split would need to fix.
 at parity (python 102.4/102.8 ms). `all` drives the dense family lower (20.6 ms) but adds ~800
 combine launches, which land in the profiler's "small" family and cancel the gain, and the shared
 experts are the quality-sensitive group. `attn,wo_a` is the setting worth having; the quality caveat
-in `gotchas.md` (a nesting-depth probe) still applies, so the default stays `off`.
+of the nesting-depth probe still applies, so the default stays `off`.
 
 ### Two code fixes it needed
 

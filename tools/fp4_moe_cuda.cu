@@ -6,8 +6,7 @@
 // output row, stream a coalesced 64-byte FP4 weight tile, and do work only for the real pairs in the
 // block. Pair-outer loops keep one pair's state live; activation loads are vectorized. The default
 // FP4_RELAXED_REDUCE removes more shuffles by changing summation order; set it to 0 to retain the
-// original CUDA arithmetic order. BF16 output boundaries remain intact in both modes. See
-// docs/gotchas.md for the measured tradeoffs and remaining whole-engine validation scope.
+// original CUDA arithmetic order. BF16 output boundaries remain intact in both modes.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -24,7 +23,7 @@
 // and writes keep the plain stream's order (transitively too: no grid completes before the one it waited
 // on). Without the attribute both instructions do nothing: other callers (GLM, the Python engine) launch
 // as before. The same kernels and arithmetic either way, bit-identical. The pair, 2026-10-28: 1.3-1.8 ms
-// off a decode step (docs/gotchas.md).
+// off a decode step.
 __device__ __forceinline__ void pdl_enter() {
     asm volatile("griddepcontrol.wait;" ::: "memory");
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");

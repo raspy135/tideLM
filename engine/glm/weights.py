@@ -11,7 +11,7 @@ Read from the release's shard headers (2026-10-15):
 * layer 78 is the MTP layer (eh_proj, enorm, hnorm, shared_head.norm, a full decoder layer).
 
 The raw reader is engine/muse/weights.Checkpoint (preadv; safetensors slices leaked host memory
-on this box, docs/gotchas.md).
+on this box).
 """
 
 from __future__ import annotations
