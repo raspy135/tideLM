@@ -1,7 +1,8 @@
 //! Adaptive expert residency (engine/glm/tp.py: adapt, bg_step, _replay_split's hot reads,
 //! _hot_keep): which routed experts hold the arena's slots, and how that follows demand.
 //!
-//! - adapt(max_swaps): after a prefill (512) and every 200 decoded tokens (256): score =
+//! - adapt(max_swaps): after a prefill (512) and every 200 decoded tokens (256: adapt_background,
+//!   below): score =
 //!   0.9 * score + demand; across the swap layers, the non-resident experts with the highest
 //!   score replace the residents with the lowest while the newcomer beats the victim by x1.5,
 //!   never taking a layer below 2 x top-k residents. Rank 0 plans, both ranks load the same
@@ -19,6 +20,11 @@
 //!   heaviest of those up to the same step cap, each into the next queued victim's slot on the
 //!   reader threads while the next round drafts; routable from the next decoder pass. The token
 //!   that missed the expert keeps its substitute (KL 0.086 -> 0.137 in Python, docs/gotchas.md).
+//! - adapt_background(max_swaps), the decode-time adaptation: the same plan, but the victims
+//!   leave routing at once and the newcomers' records load on reader threads while the pair
+//!   decodes, routable from the ADAPT_BG_PASSES-th decoder pass after (a pass waits for reads not
+//!   yet done). Both ranks count the same passes, so they switch between the same two. In line,
+//!   a 256-expert adaptation stopped the GPU for ~166 ms every 200 tokens (docs/gotchas.md).
 
 use std::os::raw::c_void;
 use std::sync::mpsc;
@@ -36,6 +42,10 @@ pub const ADAPT_MARGIN: f64 = 1.5;
 const BG_DECAY: f64 = 0.7;
 const BG_COLD: f64 = 0.01;
 const BG_PROTECT: u64 = 8;
+/// decoder passes between a background adaptation's start and its newcomers becoming routable
+pub const ADAPT_BG_PASSES: u64 = 6;
+/// the background adaptation's reader threads
+const ADAPT_READERS: usize = 8;
 
 /// The residency bookkeeping both ranks keep identical (rank 0's plans are mirrored).
 pub struct Res {
@@ -68,6 +78,8 @@ pub struct ResStats {
     pub hot_s: f64,
     /// async: host seconds waiting for a round's reads before the next decoder pass
     pub hot_wait_s: f64,
+    /// background adaptations: host seconds a decoder pass waited for their reads
+    pub adapt_wait_s: f64,
 }
 
 /// Synchronous hot reads' settings and per-step state.
@@ -102,6 +114,16 @@ pub struct HotAsync {
     pending: Vec<(usize, usize, usize, mpsc::Receiver<std::result::Result<(), String>>)>,
 }
 
+/// A background adaptation in flight: its reads (slot, layer, expert, done), the decoder pass
+/// from which its newcomers are routable, and its own reader threads.
+pub struct AdaptAsync {
+    jobs: mpsc::Sender<ReadJob>,
+    pending: Vec<(usize, usize, usize, mpsc::Receiver<std::result::Result<(), String>>)>,
+    /// layer * experts + expert of every pending newcomer (hot reads leave them alone)
+    pub newcomers: std::collections::HashSet<usize>,
+    install_at: u64,
+}
+
 /// One record for a reader thread: where it is in the pack, where its nine tensors go.
 struct ReadJob {
     off: u64,
@@ -111,41 +133,46 @@ struct ReadJob {
 }
 
 impl HotAsync {
-    /// `threads` readers, each with its own O_DIRECT handle, staging buffer and stream (made
-    /// here, so a reader that cannot start fails the boot, not a read).
     fn new(pack: &Pack, threads: usize, table_len: usize) -> Result<Self> {
-        let (tx, rx) = mpsc::channel::<ReadJob>();
-        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
-        for _ in 0..threads {
-            let rx = rx.clone();
-            let data0 = pack.data0;
-            let file = DirectFile::open(&pack.path)?;
-            let st = Stream::new()?;
-            let mut buf = PinnedBuffer::<u8>::uninit(align_up(pack.max_record))?;
-            std::thread::spawn(move || {
-                let dev = tidelm_cuda::set_device(0).map_err(|e| e.to_string());
-                loop {
-                    let Ok(job) = rx.lock().unwrap().recv() else { return };
-                    let mut run = || -> Result<()> {
-                        dev.clone()?;
-                        file.pread_exact(&mut buf[..align_up(job.nbytes)], data0 + job.off, job.nbytes)?;
-                        let mut off = 0;
-                        for &(dst, n) in &job.dsts {
-                            unsafe {
-                                tidelm_cuda::memcpy_async(dst as *mut c_void, buf[off..].as_ptr() as *const c_void, n,
-                                                          tidelm_cuda::ffi::MEMCPY_HOST_TO_DEVICE, &st)?;
-                            }
-                            off += n;
-                        }
-                        st.synchronize()?;
-                        Ok(())
-                    };
-                    let _ = job.done.send(run().map_err(|e| e.to_string()));
-                }
-            });
-        }
-        Ok(HotAsync { table: PinnedBuffer::zeroed(table_len)?, jobs: tx, pending: vec![] })
+        Ok(HotAsync { table: PinnedBuffer::zeroed(table_len)?, jobs: readers(pack, threads)?, pending: vec![] })
     }
+}
+
+/// `threads` readers, each with its own O_DIRECT handle, staging buffer and stream (made here, so a
+/// reader that cannot start fails its caller, not a read): a job's record read from the pack and
+/// copied into its slot's tensors, then `done`.
+fn readers(pack: &Pack, threads: usize) -> Result<mpsc::Sender<ReadJob>> {
+    let (tx, rx) = mpsc::channel::<ReadJob>();
+    let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+    for _ in 0..threads {
+        let rx = rx.clone();
+        let data0 = pack.data0;
+        let file = DirectFile::open(&pack.path)?;
+        let st = Stream::new()?;
+        let mut buf = PinnedBuffer::<u8>::uninit(align_up(pack.max_record))?;
+        std::thread::spawn(move || {
+            let dev = tidelm_cuda::set_device(0).map_err(|e| e.to_string());
+            loop {
+                let Ok(job) = rx.lock().unwrap().recv() else { return };
+                let mut run = || -> Result<()> {
+                    dev.clone()?;
+                    file.pread_exact(&mut buf[..align_up(job.nbytes)], data0 + job.off, job.nbytes)?;
+                    let mut off = 0;
+                    for &(dst, n) in &job.dsts {
+                        unsafe {
+                            tidelm_cuda::memcpy_async(dst as *mut c_void, buf[off..].as_ptr() as *const c_void, n,
+                                                      tidelm_cuda::ffi::MEMCPY_HOST_TO_DEVICE, &st)?;
+                        }
+                        off += n;
+                    }
+                    st.synchronize()?;
+                    Ok(())
+                };
+                let _ = job.done.send(run().map_err(|e| e.to_string()));
+            }
+        });
+    }
+    Ok(tx)
 }
 
 impl Res {
@@ -163,6 +190,7 @@ impl Res {
 
 pub(crate) const OP_ADAPT: u32 = 20;
 pub(crate) const OP_BG: u32 = 21;
+pub(crate) const OP_ADAPT_BG: u32 = 22;
 
 impl Engine {
     fn read_demand(&self) -> Result<Vec<f64>> {
@@ -204,6 +232,37 @@ impl Engine {
     pub fn adapt(&mut self, max_swaps: usize) -> Result<usize> {
         let t0 = Instant::now();
         self.hot_install()?;
+        self.adapt_install(true)?;
+        let plan = self.adapt_plan(max_swaps)?;
+        let flat: Vec<u32> = plan.iter().flat_map(|&(a, b, c, d)| [a as u32, b as u32, c as u32, d as u32]).collect();
+        self.mirror_msg(|m| {
+            m.u32(OP_ADAPT).u32s(&flat);
+        })?;
+        self.adapt_apply(&plan)?;
+        self.save_db()?;
+        self.res.stats.adapt_s += t0.elapsed().as_secs_f64();
+        Ok(plan.len())
+    }
+
+    /// adapt() with the newcomers loaded in the background (rank 0, mirrored): the victims stop
+    /// being routable now, the newcomers from the ADAPT_BG_PASSES-th decoder pass on.
+    pub fn adapt_background(&mut self, max_swaps: usize) -> Result<usize> {
+        let t0 = Instant::now();
+        self.hot_install()?;
+        self.adapt_install(true)?;
+        let plan = self.adapt_plan(max_swaps)?;
+        let flat: Vec<u32> = plan.iter().flat_map(|&(a, b, c, d)| [a as u32, b as u32, c as u32, d as u32]).collect();
+        self.mirror_msg(|m| {
+            m.u32(OP_ADAPT_BG).u32s(&flat);
+        })?;
+        self.adapt_begin(&plan)?;
+        self.save_db()?;
+        self.res.stats.adapt_s += t0.elapsed().as_secs_f64();
+        Ok(plan.len())
+    }
+
+    /// Rank 0: the demand folded into the score and the history, the swaps planned toward it.
+    fn adapt_plan(&mut self, max_swaps: usize) -> Result<Vec<(usize, usize, usize, usize)>> {
         let demand = self.read_demand()?;
         if let Some(m) = self.res.db_mass.as_mut() {
             for (a, d) in m.iter_mut().zip(&demand) {
@@ -215,15 +274,77 @@ impl Engine {
         for (s, d) in self.res.score.iter_mut().zip(&demand) {
             *s = *s * ADAPT_DECAY + d;
         }
-        let plan = self.plan_swaps(max_swaps);
-        let flat: Vec<u32> = plan.iter().flat_map(|&(a, b, c, d)| [a as u32, b as u32, c as u32, d as u32]).collect();
-        self.mirror_msg(|m| {
-            m.u32(OP_ADAPT).u32s(&flat);
-        })?;
-        self.adapt_apply(&plan)?;
-        self.save_db()?;
-        self.res.stats.adapt_s += t0.elapsed().as_secs_f64();
-        Ok(plan.len())
+        Ok(self.plan_swaps(max_swaps))
+    }
+
+    /// Both ranks: the demand restarts; each victim leaves routing (its slot is about to be
+    /// overwritten: the stream is idle, and the next pass sees its lut entry first) and its slot's
+    /// newcomer starts loading on the reader threads.
+    pub(crate) fn adapt_begin(&mut self, plan: &[(usize, usize, usize, usize)]) -> Result<()> {
+        let e = self.cfg.experts;
+        self.demand.zero_async(self.stream())?;
+        self.res.bg_last.iter_mut().for_each(|x| *x = 0.0);
+        self.stream().synchronize()?;
+        if self.adapt_bg.is_none() {
+            self.adapt_bg = Some(AdaptAsync { jobs: readers(&self.pack, ADAPT_READERS)?, pending: vec![],
+                                              newcomers: Default::default(), install_at: 0 });
+        }
+        for &(l, c, vl, v) in plan {
+            let slot = self.lut_h[vl * e + v];
+            if slot < 0 {
+                return Err(format!("adapt: victim ({vl}, {v}) is not resident").into());
+            }
+            let slot = slot as usize;
+            let r = self.pack.record(l, c)?;
+            if r.bits != self.arena.bits(slot) {
+                return Err(format!("adapt: expert ({l}, {c}) is {:?} bits, its slot {slot} {:?}", r.bits, self.arena.bits(slot)).into());
+            }
+            self.lut_h[vl * e + v] = -1;
+            self.allowed_h[vl * e + v] = 0;
+            self.lut_entry(vl * e + v)?;
+            self.res.owner[slot] = Some((l, c));
+            let (tx, rx) = mpsc::channel();
+            let job = ReadJob { off: r.off, nbytes: r.nbytes, dsts: self.arena.slot_dsts(slot), done: tx };
+            let a = self.adapt_bg.as_mut().unwrap();
+            a.jobs.send(job).map_err(|_| "adapt: the reader threads are gone")?;
+            a.pending.push((slot, l, c, rx));
+            a.newcomers.insert(l * e + c);
+        }
+        let at = self.passes + ADAPT_BG_PASSES;
+        self.adapt_bg.as_mut().unwrap().install_at = at;
+        self.res.stats.swaps += plan.len();
+        Ok(())
+    }
+
+    /// Both ranks, before every decoder pass (`force`: before an adaptation): a background
+    /// adaptation's newcomers made routable once its pass has come, waiting for reads not done.
+    pub(crate) fn adapt_install(&mut self, force: bool) -> Result<()> {
+        let e = self.cfg.experts;
+        let passes = self.passes;
+        let Some(a) = self.adapt_bg.as_mut() else { return Ok(()) };
+        if a.pending.is_empty() || (!force && passes < a.install_at) {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut a.pending);
+        a.newcomers.clear();
+        let t0 = Instant::now();
+        for (_, l, x, rx) in &pending {
+            // a read that failed on one rank would leave the pair routing differently: fatal
+            rx.recv().map_err(|_| "adapt: the reader threads are gone")?.map_err(|err| format!("adapt read ({l}, {x}): {err}"))?;
+        }
+        self.res.stats.adapt_wait_s += t0.elapsed().as_secs_f64();
+        for (slot, l, x, _) in pending {
+            let i = l * e + x;
+            self.lut_h[i] = slot as i32;
+            self.allowed_h[i] = 1;
+            self.lut_entry(i)?;
+        }
+        Ok(())
+    }
+
+    /// Whether (layer, expert) is a background adaptation's newcomer still loading.
+    fn adapt_pending(&self, i: usize) -> bool {
+        self.adapt_bg.as_ref().is_some_and(|a| a.newcomers.contains(&i))
     }
 
     /// Both ranks: the demand restarts, the plan's experts load.
@@ -237,9 +358,18 @@ impl Engine {
 
     pub(crate) fn follow_adapt(&mut self, r: &mut tidelm_comm::Reader) -> Result<()> {
         self.hot_install()?;
+        self.adapt_install(true)?;
         let plan: Vec<(usize, usize, usize, usize)> =
             r.u32s()?.chunks(4).map(|c| (c[0] as usize, c[1] as usize, c[2] as usize, c[3] as usize)).collect();
         self.adapt_apply(&plan)
+    }
+
+    pub(crate) fn follow_adapt_bg(&mut self, r: &mut tidelm_comm::Reader) -> Result<()> {
+        self.hot_install()?;
+        self.adapt_install(true)?;
+        let plan: Vec<(usize, usize, usize, usize)> =
+            r.u32s()?.chunks(4).map(|c| (c[0] as usize, c[1] as usize, c[2] as usize, c[3] as usize)).collect();
+        self.adapt_begin(&plan)
     }
 
     pub(crate) fn follow_bg(&mut self, r: &mut tidelm_comm::Reader) -> Result<()> {
@@ -393,7 +523,7 @@ impl Engine {
             }
         }
         let Some((_, x)) = best else { return Ok(()) };
-        if self.lut_h[l * e + x] >= 0 {
+        if self.lut_h[l * e + x] >= 0 || self.adapt_pending(l * e + x) {
             return Ok(());
         }
         let t0 = Instant::now();
@@ -473,7 +603,8 @@ impl Engine {
             let mut best: Option<(f32, usize)> = None;
             for j in 0..t * k {
                 let (v, x) = (row[2 * j], row[2 * j + 1] as usize);
-                if v >= h.min_share && self.lut_h[l * e + x] < 0 && best.is_none_or(|(bv, bx)| v > bv || (v == bv && x < bx)) {
+                if v >= h.min_share && self.lut_h[l * e + x] < 0 && !self.adapt_pending(l * e + x)
+                    && best.is_none_or(|(bv, bx)| v > bv || (v == bv && x < bx)) {
                     best = Some((v, x));
                 }
             }

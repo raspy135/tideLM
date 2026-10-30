@@ -1,0 +1,38 @@
+boot: routing history /app/profiles/glm53-experts-v1.pt 
+[glm] dense weights: layer 12 (2.0 GB, 5 s)
+[glm] dense weights: layer 25 (3.0 GB, 7 s)
+[glm] dense weights: layer 38 (4.0 GB, 10 s)
+[glm] dense weights: layer 51 (5.0 GB, 13 s)
+[glm] dense weights: layer 64 (6.0 GB, 16 s)
+[glm] dense weights: layer 77 (7.0 GB, 19 s)
+[glm] dense weights 7.09 GB a rank in 19 s
+[glm] 12968 routed experts resident (86.8 GB; 2/2/2 x1506, 2/2/3 x1762, 3/3/3 x9202, 3/3/4 x201, 4/4/4 x297) in 9 s
+[glm] KV cache 9.25 GB a rank (327680 positions, split, 2 lanes sharing them)
+boot: prefix store /home/ryan/tidelm-rust-state/glm-p1/p2-r2/prefix/fc5152fd41a915c6/rank-0 (0 segments, 20 GB)
+boot: DS-rule routing history /home/ryan/tidelm-rust-state/glm-p1/p2-r2/glm-ds-history.npz (0 folds)
+boot: warm-up 10.2 s
+engine up in 44.3s; serving glm-5.3 on 0.0.0.0:8000 (GLM, depth 7, calibrated gate 0.36)
+memory at boot: device 101.35 GiB (+0.00 since up), pinned 0.08 GiB (+0.00), graphs 32 (0 made since up; 1.27 GiB, heap 0.51), host anon 1.58 GiB (heap in use 1.53, held free 0.13), file-backed 0.23 GiB
+request 1: prompt 53, prefill 53 in 1.52 s (35 tok/s), decode 1024 in 54.60 s (18.74 tok/s, 2.15 a step), length
+request 1, GLM: 2.11 drafted / 1.16 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 14.0% (prompt 20.9%, decode 13.5%; by score 10.9%), hot reads 1478 (kept 1478, 0.43 s waited), swaps 1792, fallbacks 0
+request 2: prompt 53 (13 cached), prefill 40 in 0.81 s (49 tok/s), decode 1024 in 53.77 s (19.03 tok/s, 2.09 a step), length
+request 2, GLM: 1.88 drafted / 1.09 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 4.7% (prompt 8.7%, decode 4.6%; by score 3.3%), hot reads 399 (kept 399, 0.26 s waited), swaps 1390, fallbacks 0
+request 3: prompt 53 (13 cached), prefill 40 in 0.52 s (78 tok/s), decode 1024 in 52.45 s (19.50 tok/s, 2.09 a step), length
+request 3, GLM: 1.75 drafted / 1.09 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 4.5% (prompt 11.1%, decode 4.3%; by score 3.1%), hot reads 298 (kept 298, 0.22 s waited), swaps 265, fallbacks 0
+request 4: prompt 53 (13 cached), prefill 40 in 0.51 s (79 tok/s), decode 1024 in 50.14 s (20.40 tok/s, 2.16 a step), length
+request 4, GLM: 1.73 drafted / 1.16 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 4.2% (prompt 11.4%, decode 3.9%; by score 2.8%), hot reads 245 (kept 245, 0.21 s waited), swaps 186, fallbacks 0
+request 5: prompt 68 (12 cached), prefill 56 in 1.31 s (43 tok/s), decode 1024 in 43.53 s (23.50 tok/s, 2.94 a step), length
+request 5, GLM: 2.34 drafted / 1.94 accepted a round, copy rounds 1 (0 long, 4 accepted), miss rate 17.2% (prompt 21.8%, decode 16.8%; by score 14.1%), hot reads 2361 (kept 2358, 0.53 s waited), swaps 846, fallbacks 0
+request 6: prompt 68 (14 cached), prefill 54 in 0.61 s (89 tok/s), decode 1024 in 43.62 s (23.45 tok/s, 2.92 a step), length
+request 6, GLM: 2.42 drafted / 1.92 accepted a round, copy rounds 4 (0 long, 7 accepted), miss rate 11.6% (prompt 13.0%, decode 11.5%; by score 8.9%), hot reads 990 (kept 993, 0.32 s waited), swaps 377, fallbacks 0
+request 7: prompt 68 (14 cached), prefill 54 in 0.61 s (89 tok/s), decode 1024 in 43.29 s (23.63 tok/s, 2.93 a step), length
+request 7, GLM: 2.40 drafted / 1.93 accepted a round, copy rounds 1 (0 long, 1 accepted), miss rate 10.0% (prompt 12.3%, decode 9.9%; by score 7.6%), hot reads 827 (kept 827, 0.26 s waited), swaps 298, fallbacks 0
+request 8: prompt 68 (14 cached), prefill 54 in 0.60 s (89 tok/s), decode 1024 in 44.70 s (22.89 tok/s, 2.72 a step), length
+request 8, GLM: 2.24 drafted / 1.72 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 9.1% (prompt 12.1%, decode 9.0%; by score 7.0%), hot reads 857 (kept 856, 0.25 s waited), swaps 244, fallbacks 0
+request 9: prompt 8219 (9 cached), prefill 8210 in 19.55 s (420 tok/s), decode 256 in 13.82 s (18.45 tok/s, 1.88 a step), length
+request 9, GLM: 1.39 drafted / 0.88 accepted a round, copy rounds 1 (1 long, 4 accepted), miss rate 37.6% (prompt 38.3%, decode 20.3%; by score 37.4%), hot reads 832 (kept 828, 0.17 s waited), swaps 768, fallbacks 0
+request 10: prompt 8211 (10 cached), prefill 8201 in 19.44 s (422 tok/s), decode 252 in 11.54 s (21.76 tok/s, 2.46 a step), stop
+request 10, GLM: 1.89 drafted / 1.46 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 17.1% (prompt 17.0%, decode 18.5%; by score 15.1%), hot reads 631 (kept 632, 0.19 s waited), swaps 768, fallbacks 0
+request 11: prompt 8225 (11 cached), prefill 8214 in 19.56 s (420 tok/s), decode 256 in 12.15 s (20.98 tok/s, 2.36 a step), length
+request 11, GLM: 1.89 drafted / 1.37 accepted a round, copy rounds 2 (2 long, 0 accepted), miss rate 9.2% (prompt 8.9%, decode 18.5%; by score 8.0%), hot reads 586 (kept 589, 0.16 s waited), swaps 768, fallbacks 0
+request 12: prompt 8205 (11 cached), prefill 8194 in 19.29 s (425 tok/s), decode 256 in 13.16 s (19.38 tok/s, 2.32 a step), length

@@ -356,6 +356,10 @@ pub struct Engine {
     /// wide_decode_from(), read once at load
     wide_from: usize,
     pub res: crate::adapt::Res,
+    /// a background adaptation in flight (adapt_background) and the decoder passes so far, which
+    /// both ranks count alike: its newcomers become routable at a pass both reach
+    pub(crate) adapt_bg: Option<crate::adapt::AdaptAsync>,
+    pub(crate) passes: u64,
     h_ids: tidelm_cuda::PinnedBuffer<i32>,
     /// the lane tables' staging ([2][MAX_LANES][4], Act::lanes) and the decoder rows' lanes
     h_lanes: tidelm_cuda::PinnedBuffer<i32>,
@@ -551,6 +555,8 @@ impl Engine {
             hot: None,
             wide_from: wide_decode_from(),
             res: crate::adapt::Res::new(nl, e, n_slots, moe_layers_res, &placed),
+            adapt_bg: None,
+            passes: 0,
             h_ids: tidelm_cuda::PinnedBuffer::zeroed(opt_chunk.max(HEAD_ROWS))?,
             h_lanes: tidelm_cuda::PinnedBuffer::zeroed(2 * MAX_LANES * 4)?,
             h_rlane: tidelm_cuda::PinnedBuffer::zeroed(opt_chunk.max(HEAD_ROWS))?,
@@ -1950,8 +1956,11 @@ impl Engine {
         let mtp = mtp_fill && self.cfg.mtp;
         let lane = self.lane;
         self.kv_ensure(lane, self.pos + t)?;
-        // async hot reads planned after the last decode pass become routable for this one
+        // async hot reads planned after the last decode pass become routable for this one, and a
+        // background adaptation's newcomers once its pass has come
         self.hot_install()?;
+        self.passes += 1;
+        self.adapt_install(false)?;
         if next.is_none() && (t <= MAX_ROWS || (t <= HEAD_ROWS && self.pos >= self.wide_from)) {
             let p0 = self.pos;
             let out = self.decode_pass(ids, &[(lane, t, p0)])?;
@@ -2067,6 +2076,8 @@ impl Engine {
             groups.push((l, ids.len(), p));
         }
         self.hot_install()?;
+        self.passes += 1;
+        self.adapt_install(false)?;
         let ids: Vec<u32> = blocks.iter().flat_map(|b| b.1.iter().copied()).collect();
         let out = self.decode_pass(&ids, &groups)?;
         let sel = self.lane;
@@ -2224,6 +2235,7 @@ impl Engine {
                     self.full_row_local(row)?;
                 }
                 crate::adapt::OP_ADAPT => self.follow_adapt(&mut r)?,
+                crate::adapt::OP_ADAPT_BG => self.follow_adapt_bg(&mut r)?,
                 op @ (crate::prefix::OP_DISK_SAVE | crate::prefix::OP_DISK_LOAD) => self.follow_disk(op, &mut r)?,
                 crate::adapt::OP_BG => self.follow_bg(&mut r)?,
                 OP_ZERO_DEMAND => {

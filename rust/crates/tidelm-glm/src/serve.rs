@@ -713,11 +713,11 @@ impl Server {
         };
         let line = format!("request {}, GLM: {:.2} drafted / {:.2} accepted a round, copy rounds {} ({} long, {} accepted), \
                             miss rate {:.1}% (prompt {:.1}%, decode {:.1}%; by score {:.1}%), hot reads {} (kept {}, {:.2} s waited), \
-                            swaps {}, fallbacks {}{beside}",
+                            swaps {} ({:.2} s waited), fallbacks {}{beside}",
                            run.job.id, s.drafted as f64 / rounds, s.accepted as f64 / rounds, s.copy_rounds, s.long_copies,
                            s.copy_accepted, pct(p[0] + d[0], p[1] + d[1]), pct(p[0], p[1]), pct(d[0], d[1]),
                            pct(p[2] + d[2], p[3] + d[3]), r1.hot_reads - r0.hot_reads, r1.hot_kept - r0.hot_kept,
-                           r1.hot_wait_s - r0.hot_wait_s, r1.swaps - r0.swaps, s.fallbacks);
+                           r1.hot_wait_s - r0.hot_wait_s, r1.swaps - r0.swaps, r1.adapt_wait_s - r0.adapt_wait_s, s.fallbacks);
         let (id, lane, prompt) = (run.job.id, run.lane, run.job.prompt.clone());
         let mut job = run.job;
         (job.sink)(Event::Done(finish, run.g));
@@ -795,7 +795,8 @@ impl Server {
                 }
             }
             if opt.adapt && opt.adapt_every > 0 && r.out.len() >= r.next_adapt {
-                self.eng.adapt(opt.adapt_decode)?;
+                // the newcomers load while the pair decodes (in line this stopped the GPU ~166 ms)
+                self.eng.adapt_background(opt.adapt_decode)?;
                 r.next_adapt += opt.adapt_every;
             }
             r.rounds += 1;

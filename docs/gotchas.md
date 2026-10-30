@@ -4992,3 +4992,24 @@ Then (the same day, the pair's `--bench-width` in alternating boots):
   kv_a 23.8 both, q_b 56.5 -> 55.6, wq_b 38.1 -> 36.1, the shared gate+up 54.5 -> 54.3, shared
   down 29.9 both, o_proj 147.5 -> 145.6). The 2-10 MB matrices are bound by a kernel's ramp and
   tail, not by its block count.
+
+## GLM decode-time adaptation in the background: the 166 ms stall every 200 tokens gone (2026-10-29)
+
+Where a serving round's GPU idles (nsys inside the rank-0 container, graphs traced whole, 12 s of a
+prose request at 320K two-lane, 103 rounds): 3.8 ms of a 116.4 ms round. Between MTP drafts the host
+takes 0.11 ms (p90 0.12), so a device-side draft chain would win ~0.2 ms a round, and the MTP fill
+fused into the next round's first draft ~0.3: not built. The idle time was elsewhere: one 166 ms
+gap, the decode-time adaptation (every 200 tokens, up to 256 swaps: 256 preads and ~2,300 copies on
+twelve threads load_slots spawns with their streams and pinned buffers each time, the GPU waiting),
+~1.5% of decode; and ~1 ms before a verify (futex waits, the async hot reads' install; not pursued).
+
+`adapt_background` (serve.rs's decode-time call; the prefill's stays in line): rank 0 plans as
+before and mirrors the plan (OP_ADAPT_BG); both ranks take each victim out of routing at once (the
+stream idle, its lut entry ahead of the next pass) and queue its slot's newcomer on eight persistent
+reader threads (the async hot reads' pool); the newcomers become routable at the sixth decoder pass
+after, a pass both ranks count alike, waiting there for any read not done. The next adaptation
+installs what is still pending first; hot reads leave pending newcomers alone. Serving (the README
+protocol, alternating boots, `results/rust-glm53-20261029-bgadapt/`): prose 19.54 -> 19.99 tok/s,
+code 23.17 -> 23.89, the 8K prompt's decode 20.20 -> 20.43; decode miss rates within a few tenths
+request by request; no pass waited for a read. Output is not byte for byte the in-line adaptation's:
+the newcomers route six passes (~15 tokens) later.
