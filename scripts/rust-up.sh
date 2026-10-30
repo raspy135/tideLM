@@ -270,10 +270,15 @@ fi
 
 rank0=("${pair[@]}")
 [[ -n "${PEER:-}" ]] && rank0+=(--rank 0)
+# API_KEY: the key clients must send (Authorization: Bearer <key> or x-api-key: <key>; several,
+# comma-separated); unset or empty, the server answers anyone. Handed to rank 0 (the HTTP server)
+# by name, so the value is on no command line.
+keyf=()
+if [[ -n "${API_KEY:-}" ]]; then export TIDELM_API_KEY="$API_KEY"; keyf=(-e TIDELM_API_KEY); fi
 docker rm -f tidelm-rank0 > /dev/null 2>&1 || true
 docker run "${dflags[@]}" --name tidelm-rank0 --user "$(id -u):$(id -g)" -e HOME="$HOME" \
     --health-cmd "curl -fsS http://127.0.0.1:${PORT:-8000}/health || exit 1" --health-interval 30s \
-    --health-start-period 10m "${vols[@]}" "${r0vols[@]}" "${envf[@]}" "${bin[@]}" \
+    --health-start-period 10m "${vols[@]}" "${r0vols[@]}" "${envf[@]}" "${keyf[@]}" "${bin[@]}" \
     "$IMAGE" "$guard" tidelm-server "${args[@]}" "${rank0[@]}" > /dev/null
 if [[ -n "${PEER:-}" ]]; then
     ssh -n "$PEER" "docker rm -f tidelm-rank1 > /dev/null 2>&1; docker run $(printf '%q ' "${dflags[@]}") \

@@ -205,8 +205,12 @@ and top-1 60.22 -> 59.95%.
 ## Use
 
 - API: `http://<head>:8000/v1` (OpenAI-compatible chat completions, streaming included). Model
-  names: `deepseek` and `glm-5.3` (`SERVED_MODEL_NAME`). No authentication: bind it to a trusted
-  interface (`HOST`).
+  names: `deepseek` and `glm-5.3` (`SERVED_MODEL_NAME`).
+- Authentication: with `API_KEY=<key>` in the profile (several: comma-separated), every route but
+  `/health` wants the key, as OpenAI clients send it (`Authorization: Bearer <key>`) or Anthropic's
+  (`x-api-key: <key>`; Claude Code's `ANTHROPIC_API_KEY`, or `ANTHROPIC_AUTH_TOKEN` as a Bearer
+  token); a request without it gets 401. Unset, the server answers anyone: then bind it to a trusted
+  interface (`HOST`). `bench/bench.py` takes `--api-key`.
 - Works with Open WebUI and other OpenAI clients; streamed responses end with `usage` and the
   engine's own statistics (`x_engine_stats`).
 - Logs: `scripts/tide.sh logs -f`, a line a request with its prefill and decode speeds

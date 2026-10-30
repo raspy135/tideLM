@@ -69,6 +69,16 @@ pub struct Ctx {
     pub family: Family,
     /// /v1/messages: each answer's reasoning, put back when a client sends the turn again
     pub memo: anthropic::ReasoningMemo,
+    /// the keys a request must carry (empty: none needed), from api_keys()
+    pub api_keys: Vec<String>,
+}
+
+/// TIDELM_API_KEY: the keys clients authenticate with, comma-separated (unset or empty: the
+/// server answers anyone, as before). Read from the environment, not a flag, so that no key shows in
+/// a process list.
+pub fn api_keys() -> Vec<String> {
+    std::env::var("TIDELM_API_KEY").unwrap_or_default().split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty())
+        .collect()
 }
 
 
@@ -390,12 +400,17 @@ fn main() -> tidelm_engine::Result<()> {
         next_id: AtomicU64::new(1),
         family: Family::Ds,
         memo: anthropic::ReasoningMemo::default(),
+        api_keys: api_keys(),
     });
     let addr = format!("{}:{}", arg(&args, "--host").unwrap_or_else(|| "0.0.0.0".into()),
                        arg(&args, "--port").unwrap_or_else(|| "8000".into()));
     let listener = TcpListener::bind(&addr)?;
     eprintln!("engine up in {:.1}s; serving {} on {addr} ({lanes} lane{}, depth {depth:?})", t0.elapsed().as_secs_f64(),
               ctx.model, if lanes == 1 { "" } else { "s" });
+    eprintln!("api keys: {}", match ctx.api_keys.len() {
+        0 => "none (TIDELM_API_KEY unset: every client is answered)".to_string(),
+        n => format!("{n} (Authorization: Bearer or x-api-key; /health open)"),
+    });
     tidelm_cuda::mem::mark_up();
     eprintln!("memory at boot: {}", tidelm_cuda::mem::report());
     {

@@ -40,7 +40,7 @@ impl Engine {
 
 /// A server on 127.0.0.1 with `family`; the engine thread answers every job with
 /// `engine.answer`, three tokens a step, reusing 7 prompt tokens.
-fn serve(text: Text, family: Family, eos: u32, max_seq: usize) -> (String, Arc<Engine>, Arc<Ctx>) {
+fn serve(text: Text, family: Family, eos: u32, max_seq: usize, api_keys: Vec<String>) -> (String, Arc<Engine>, Arc<Ctx>) {
     let (tx, rx) = mpsc::channel::<Cmd>();
     let engine = Arc::new(Engine::default());
     let ctx = Arc::new(Ctx {
@@ -56,6 +56,7 @@ fn serve(text: Text, family: Family, eos: u32, max_seq: usize) -> (String, Arc<E
         next_id: AtomicU64::new(1),
         family,
         memo: ReasoningMemo::default(),
+        api_keys,
     });
     let e = engine.clone();
     std::thread::spawn(move || {
@@ -95,9 +96,14 @@ fn serve(text: Text, family: Family, eos: u32, max_seq: usize) -> (String, Arc<E
 
 /// (status, content type, body)
 fn post(addr: &str, path: &str, body: &Value) -> (u16, String, String) {
-    let body = body.to_string();
+    request(addr, "POST", path, "", &body.to_string())
+}
+
+/// `method path` with extra header lines `headers` ("Name: value\r\n" each)
+fn request(addr: &str, method: &str, path: &str, headers: &str, body: &str) -> (u16, String, String) {
     let mut s = TcpStream::connect(addr).unwrap();
-    write!(s, "POST {path} HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+    write!(s, "{method} {path} HTTP/1.1\r\nHost: test\r\n{headers}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+           body.len()).unwrap();
     let mut out = String::new();
     s.read_to_string(&mut out).unwrap();
     let (head, body) = out.split_once("\r\n\r\n").unwrap();
@@ -115,12 +121,16 @@ fn sse_data(body: &str) -> Vec<Value> {
 }
 
 fn glm() -> Option<(String, Arc<Engine>, Arc<Ctx>)> {
+    glm_keyed(vec![])
+}
+
+fn glm_keyed(api_keys: Vec<String>) -> Option<(String, Arc<Engine>, Arc<Ctx>)> {
     let d = dir("GLM_TOKENIZER_DIR", "models/GLM-5.3-EXL3-3.0bpw")?;
     let text = Text::load(&d).unwrap();
     let ids = GlmIds::load(&d, &text).unwrap();
     let eos = ids.stop[0];
     let g = GlmSettings { ids, default_effort: "low".into(), default_max_tokens: 4096, temperature: 1.0, top_p: 1.0 };
-    Some(serve(text, Family::Glm(g), eos, 65536))
+    Some(serve(text, Family::Glm(g), eos, 65536, api_keys))
 }
 
 /// server/test_anthropic_api.py's REQ
@@ -345,7 +355,7 @@ fn ds_messages_route() {
     };
     let text = Text::load(&d).unwrap();
     let eos = text.encode(tidelm_text::chat::EOS).unwrap()[0];
-    let (addr, engine, ctx) = serve(text, Family::Ds, eos, 65536);
+    let (addr, engine, ctx) = serve(text, Family::Ds, eos, 65536, vec![]);
     let answer = "Let me look.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"Bash\">\n<｜DSML｜ parameter name=\"command\" string=\"true\">ls -la\
                   </｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>";
     *engine.answer.lock().unwrap() = ctx.text.encode(answer).unwrap();
@@ -479,4 +489,37 @@ fn glm_routes_answer_as_muse_app() {
 /// the fixture's first /v1/messages body: the request a follow-up extends
 fn anthropic_req_of(cases: &[Value]) -> Value {
     cases.iter().find(|c| c["path"] == "/v1/messages" && c.get("body").is_some()).unwrap()["body"].clone()
+}
+
+#[test]
+fn api_key_auth() {
+    let Some((addr, engine, ctx)) = glm_keyed(vec!["k-one".into(), "k-two".into()]) else {
+        eprintln!("GLM tokenizer not present; skipping");
+        return;
+    };
+    *engine.answer.lock().unwrap() = ctx.text.encode("Hello.<|user|>").unwrap();
+    let chat = json!({"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 8}).to_string();
+    let msg = json!({"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 8}).to_string();
+    // the health check stays open; everything else wants a key
+    assert_eq!(request(&addr, "GET", "/health", "", "").0, 200);
+    let (status, _, body) = request(&addr, "GET", "/v1/models", "", "");
+    assert_eq!(status, 401);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["error"]["code"], "invalid_api_key");
+    // OpenAI's shape on its routes, Anthropic's on /v1/messages
+    let (status, _, body) = request(&addr, "POST", "/v1/chat/completions", "Authorization: Bearer wrong\r\n", &chat);
+    assert_eq!(status, 401);
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["error"]["message"], "invalid API key");
+    let (status, _, body) = request(&addr, "POST", "/v1/messages?beta=true", "", &msg);
+    assert_eq!(status, 401);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!((v["type"].as_str(), v["error"]["type"].as_str()), (Some("error"), Some("authentication_error")));
+    assert!(engine.jobs.lock().unwrap().is_empty(), "a refused request reached the engine");
+    // either header, any of the keys, the scheme in any case
+    assert_eq!(request(&addr, "POST", "/v1/chat/completions", "Authorization: Bearer k-one\r\n", &chat).0, 200);
+    assert_eq!(request(&addr, "POST", "/v1/chat/completions", "authorization: bearer k-two\r\n", &chat).0, 200);
+    assert_eq!(request(&addr, "POST", "/v1/messages", "x-api-key: k-two\r\nanthropic-version: 2023-06-01\r\n", &msg).0, 200);
+    assert_eq!(request(&addr, "GET", "/v1/models", "X-Api-Key: k-one\r\n", "").0, 200);
+    assert_eq!(request(&addr, "POST", "/v1/chat/completions", "Authorization: Bearer k-one-and-more\r\n", &chat).0, 401);
+    assert_eq!(engine.jobs.lock().unwrap().len(), 3);
 }
