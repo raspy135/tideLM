@@ -1459,6 +1459,21 @@ __global__ void __launch_bounds__(1024) row_lse_kernel(const float* __restrict__
         out[(int64_t)blockIdx.x * ldo + 1] = s;
     }
 }
+// x [T][ldx] bf16 <- x - alpha r (r . x) a row: one direction taken out of a residual write (the
+// abliteration of tidelm-glm's ablit.rs: W' = W - alpha r r^T W on every writer of a layer is this
+// on the layer's summed output). The dot in fp32 by the fixed-tree block sum, so both ranks of a
+// pair, which apply it to the same gathered rows, get the same bits.
+__global__ void __launch_bounds__(1024) rank1_kernel(__nv_bfloat16* __restrict__ x, int64_t ldx,
+                                                     const float* __restrict__ r, float alpha, int H) {
+    pdl_enter();
+    __shared__ float scratch[32];
+    __nv_bfloat16* xr = x + (int64_t)blockIdx.x * ldx;
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < H; i += blockDim.x) acc = fmaf(r[i], bf(xr[i]), acc);
+    const float ad = alpha * block_sum(acc, scratch);
+    for (int i = threadIdx.x; i < H; i += blockDim.x) xr[i] = to_bf(bf(xr[i]) - ad * r[i]);
+}
+
 // The weights a coming kernel reads into L2 from a parallel graph branch while the main stream runs
 // work that leaves the memory idle (the attention core, a RoCE gather's wait): `count` runs of `run`
 // bytes, `stride` apart from `base` - one run a warp's range of a decode GEMV, so each of its warps
@@ -1804,6 +1819,11 @@ int glm_l2_experts(void* stream, const void* pick, int P, const void* tp, const 
                    uint64_t run, int grid) {
     l2_experts_kernel<<<grid, 128, 0, GST>>>(static_cast<const int*>(pick), P, static_cast<const int64_t*>(tp),
                                              static_cast<const int*>(k2), K, N, ranges, run);
+    GRET;
+}
+
+int glm_rank1(void* stream, void* x, int64_t ldx, const void* r, float alpha, int T, int H) {
+    pdl_launch(rank1_kernel, T, 1024, 0, GST, static_cast<__nv_bfloat16*>(x), ldx, static_cast<const float*>(r), alpha, H);
     GRET;
 }
 

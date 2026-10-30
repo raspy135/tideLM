@@ -111,9 +111,9 @@ impl Options {
         let exe = std::fs::read(std::env::current_exe()?)?;
         let s = format!(
             "glm-boot v1\nconfig {:x}\nexe {:x}\nmax_seq {}\nchunk {}\nslots {}\nkv_split {}\nreduce_bf16 {}\nmoe_rows {}\n\
-             lanes {}\npack_source {}\nenv {}\nflags {}\n",
+             lanes {}\npack_source {}\nablit {}\nenv {}\nflags {}\n",
             sha2::Sha256::digest(&cfg), sha2::Sha256::digest(&exe), self.max_seq, self.chunk, self.slots, self.kv_split,
-            self.prefill_reduce_bf16, self.moe_rows, self.lanes, pack.source_sha256,
+            self.prefill_reduce_bf16, self.moe_rows, self.lanes, pack.source_sha256, crate::ablit::digest()?,
             ["TIDELM_GLM_HOT", "TIDELM_GLM_WIDE_DECODE_FROM", "NCCL_PROTO"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
                 .collect::<Vec<_>>().join(" "), self.guard_extra);
         Ok(s.into_bytes())
@@ -356,6 +356,8 @@ pub struct Engine {
     /// wide_decode_from(), read once at load
     wide_from: usize,
     pub res: crate::adapt::Res,
+    /// GLM_ABLIT's directions (ablit.rs), when set: projected out of the edited layers' outputs
+    ablit: Option<crate::ablit::Ablit>,
     /// a background adaptation in flight (adapt_background) and the decoder passes so far, which
     /// both ranks count alike: its newcomers become routable at a pass both reach
     pub(crate) adapt_bg: Option<crate::adapt::AdaptAsync>,
@@ -477,6 +479,14 @@ impl Engine {
             }
         }
         let paged = PagedKv::new(lanes, &specs, pool)?;
+        // GLM_ABLIT: the abliteration's directions (ablit.rs), applied to the edited layers' outputs
+        let ablit = crate::ablit::load(cfg.layers, cfg.hidden)?;
+        if let (Some(ab), Some(p)) = (ablit.as_ref(), crate::ablit::path()) {
+            let (lo, hi) = (ab.layers.iter().min().unwrap(), ab.layers.iter().max().unwrap());
+            log(&format!("[glm] ablit: {} layers ({lo}-{hi}), alpha {:.3}-{:.3}, from {} (sha256 {})", ab.layers.len(),
+                         ab.alpha.iter().cloned().fold(f32::INFINITY, f32::min), ab.alpha.iter().cloned().fold(0.0, f32::max),
+                         p.display(), crate::ablit::digest()?));
+        }
         let mut kv = Vec::with_capacity(nl);
         let mut i = 0;
         for l in 0..nl {
@@ -557,6 +567,7 @@ impl Engine {
             res: crate::adapt::Res::new(nl, e, n_slots, moe_layers_res, &placed),
             adapt_bg: None,
             passes: 0,
+            ablit,
             h_ids: tidelm_cuda::PinnedBuffer::zeroed(opt_chunk.max(HEAD_ROWS))?,
             h_lanes: tidelm_cuda::PinnedBuffer::zeroed(2 * MAX_LANES * 4)?,
             h_rlane: tidelm_cuda::PinnedBuffer::zeroed(opt_chunk.max(HEAD_ROWS))?,
@@ -948,7 +959,17 @@ impl Engine {
             // the router's weights during the sum's gather and the norm
             self.l2_runs(router.raw() as u64, (router.len() * 2) as u64, 0, 1)?;
         }
-        self.allreduce(np(&a.f32buf), t * h, np(&a.a), prefill)
+        self.allreduce(np(&a.f32buf), t * h, np(&a.a), prefill)?;
+        self.ablit_rows(l, np(&a.a), t)
+    }
+
+    /// GLM_ABLIT: layer l's direction projected out of `t` rows of a residual write at `x` (bf16
+    /// [t][hidden]), when l is edited. Both ranks hold the same full rows here (after the sum or
+    /// the gather), so both compute the same bits.
+    fn ablit_rows(&self, l: usize, x: *mut c_void, t: usize) -> Result<()> {
+        let Some((r, alpha)) = self.ablit.as_ref().and_then(|ab| ab.of(l)) else { return Ok(()) };
+        let h = self.cfg.hidden;
+        ck(unsafe { glm_rank1(self.st.raw(), x, h as i64, r, alpha, t as i32, h as i32) }, "ablit")
     }
 
     // ------------------------------------------------------------------ MLP
@@ -967,7 +988,8 @@ impl Engine {
                 self.gather_cols(np(&a.dact), t, n, 2, np(&a.dfull), prefill)?;
                 self.exl3(down, np(&a.dfull), n * w, t, np(&a.shout), false)?;
                 ck(unsafe { glm_moe_out(st, std::ptr::null(), np(&a.shout), np(&a.mout), (t * down.n) as i64) }, "dense out")?;
-                self.gather_cols(np(&a.mout), t, down.n, 2, np(&a.a), prefill)
+                self.gather_cols(np(&a.mout), t, down.n, 2, np(&a.a), prefill)?;
+                self.ablit_rows(l, np(&a.a), t)
             }
             Mlp::Moe { .. } => {
                 // rows in sub-chunks: the routed scratch is sized for moe_rows
@@ -1072,7 +1094,8 @@ impl Engine {
                                (self.cfg.n_layers() * e) as i64, at(&a.rlane, r0)) }, "router")?;
         // the decoder's next layer, whose first weights load while this one's output is gathered
         let next = if mtp || l + 1 >= cfg.layers { None } else { Some(&self.w.layers[l + 1]) };
-        self.moe_rows(sh_gate_up, sh_down, arena, at(&a.xn, r0 * h), n, prefill, at(&a.a, r0 * h), next)
+        self.moe_rows(sh_gate_up, sh_down, arena, at(&a.xn, r0 * h), n, prefill, at(&a.a, r0 * h), next)?;
+        self.ablit_rows(l, at(&a.a, r0 * h), n)
     }
 
     /// One block of MoE rows (routing done: pick / wts): the shared expert and the routed picks,

@@ -126,6 +126,13 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
     fi
     envs=(NCCL_PROTO=Simple GLM_REASONING_EFFORT="${GLM_REASONING_EFFORT:-medium}"
           GLM_DEFAULT_MAX_TOKENS="${GLM_DEFAULT_MAX_TOKENS:-4096}")
+    # GLM_ABLIT: the abliteration's directions (rust/crates/tidelm-glm/src/ablit.rs), a host path
+    # mounted at that path on both ranks; unset serves the stock model
+    if [[ -n "${GLM_ABLIT:-}" ]]; then
+        [[ -f "$GLM_ABLIT" ]] || err "GLM_ABLIT=$GLM_ABLIT is not a file on this box"
+        [[ -z "${PEER:-}" ]] || ssh -n "$PEER" "test -f '$GLM_ABLIT'" || err "GLM_ABLIT=$GLM_ABLIT is not a file on $PEER"
+        envs+=(TIDELM_GLM_ABLIT="$GLM_ABLIT"); ro+=("$(dirname "$GLM_ABLIT")")
+    fi
     for v in NCCL_SOCKET_IFNAME NCCL_IB_HCA NCCL_IB_ADDR_FAMILY NCCL_IB_ADDR_RANGE NCCL_IB_ROCE_VERSION_NUM \
              NCCL_IB_MERGE_NICS NCCL_CROSS_NIC; do
         [[ -n "${!v:-}" ]] && envs+=("$v=${!v}")

@@ -161,6 +161,9 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         let cfg_bytes = std::fs::read(model_dir.join("config.json"))?;
         let key = format!("glm-rust-kv v1 {:x} {} {} {} {}", sha2::Sha256::digest(&cfg_bytes), eng.pack.source_sha256,
                           eng.opt.max_seq, eng.opt.kv_split, world);
+        // GLM_ABLIT changes every row past its first edited layer: its own namespace (stock: unchanged)
+        let ablit = tidelm_glm::ablit::digest()?;
+        let key = if ablit.is_empty() { key } else { format!("{key} ablit {ablit}") };
         let ns = format!("{:x}", sha2::Sha256::digest(key.as_bytes()))[..16].to_string();
         let gb = num("--prefix-disk-gb", 20.0)?;
         let st = tidelm_glm::prefix::Store::open(&root, &ns, rank, (gb * 1e9) as u64, num("--prefix-min", 256.0)? as usize)?;

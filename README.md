@@ -174,6 +174,34 @@ For the Python engine, set the **container path** instead in a Python DeepSeek p
 DSV41_ABLIT_WOB=/models/dsv41-1017-wo-b-ablit/wo_b_l10_35_1017.safetensors
 ```
 
+## Abliterated GLM-5.3
+
+The Rust engine serves GLM-5.3 abliterated with the edit of
+[`Blackfrost-Research/GLM-5.3-DERISKED-BF16`](https://huggingface.co/Blackfrost-Research/GLM-5.3-DERISKED-BF16):
+one direction a layer, projected out of layers 2-49's attention and MLP outputs at run time (alpha
+3). That is the same model as its edited weights, the routed experts included, so the EXL3 packs
+stay the stock ones. The directions are a 1.2 MB file, recovered from that checkpoint and the BF16
+base (`zai-org/GLM-5.3-BF16`) by HTTP range requests: both repos are public, ~5 GB is fetched a
+tensor at a time, and nothing but the file is kept. It needs numpy:
+
+```bash
+python3 tools/glm_ablit_fit.py --alpha 3 --out ~/models/glm53-ablit/glm53-derisked-l2-49.safetensors
+```
+
+Copy the file to **both nodes** at the same path and set it in the GLM profile, then start it
+(`scripts/tide.sh start .env.glm53-exl3`); the log shows
+`[glm] ablit: 48 layers (2-49), alpha 3.000-3.000, from ... (sha256 ...)`:
+
+```bash
+GLM_ABLIT=/home/you/models/glm53-ablit/glm53-derisked-l2-49.safetensors
+```
+
+As with the DeepSeek overlay, both ranks refuse to pair over different files (the sha256 is in the
+boot guard), and the disk prefix store keeps the abliterated model's prompts apart from the stock
+model's: the first request of a conversation after switching prefills its whole prompt again. On
+held-out text (`corpus/heldout_quick.jsonl`, 10,151 tokens) it costs NLL +0.018 +- 0.005 (+1.0%)
+and top-1 60.22 -> 59.95%.
+
 ## Use
 
 - API: `http://<head>:8000/v1` (OpenAI-compatible chat completions, streaming included). Model

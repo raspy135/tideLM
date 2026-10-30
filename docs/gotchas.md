@@ -5013,3 +5013,28 @@ protocol, alternating boots, `results/rust-glm53-20261029-bgadapt/`): prose 19.5
 code 23.17 -> 23.89, the 8K prompt's decode 20.20 -> 20.43; decode miss rates within a few tenths
 request by request; no pass waited for a read. Output is not byte for byte the in-line adaptation's:
 the newcomers route six passes (~15 tokens) later.
+
+## Abliterated GLM-5.3 as a run-time projection: Blackfrost's edit recovered by range requests (2026-10-29)
+
+`Blackfrost-Research/GLM-5.3-DERISKED-BF16` is the BF16 base with its residual writers edited.
+`tools/glm_ablit_fit.py` fetches a writer of each layer from both checkpoints (each shard's
+header, then the tensor's byte range) and fits D = W' - W: layers 0-1 and 50-77 and the MTP layer
+are byte for byte the base's; layers 2-49 (the dense down_proj of layer 2, the shared expert's
+down_proj of 3-49) are rank-1 output projections, W' = W - alpha r (r^T W): s1 / s2 229-459, alpha
+2.996-3.003, the residual 2.5-4.2% of D (BF16 rounding), |D| / |W| 3.9-6.6%. The same layer's
+o_proj (layers 2, 25, 49) and routed experts (10 / 17 and 200, 40 / 3, 49 / 255) carry the same r
+(|cos| >= 0.999997) and alpha; q_a, an expert's up_proj and layer 50's o_proj are unedited. One r
+a layer, different between layers (adjacent |cos| median 0.88, layers 2 and 49 0.01).
+
+A layer's writers sum into the residual, so the edit is y <- y - alpha r (r . y) on its attention
+output (after the pair's sum) and its MLP output (after the gather): `rank1_kernel` (glm.cu), the
+dot in fp32 by the fixed-tree block sum on rows both ranks hold, 96 launches a pass. No weight is
+touched or re-quantized; the routed experts' edit, which drowzeys' EXL3 builds of it leave out
+(they would need re-quantizing), comes with the rest. GLM_ABLIT / TIDELM_GLM_ABLIT (ablit.rs):
+the file's sha256 in the boot config and the prefix store's namespace. Unset, the per-token NLL
+dump is byte for byte the build's before.
+
+Held-out text (corpus/heldout_quick, 10,151 tokens, `--bench-nll`, paired by token), stock ->
+abliterated: NLL +0.0182 +- 0.0047 (1.8494 -> 1.8676), top-1 60.22 -> 59.95%; coding +0.0203 +-
+0.0055 (65.67 -> 65.39%), general +0.0141 +- 0.0086 (49.76 -> 49.53%). For scale, the 2.75bpw
+experts against the 3.0bpw ones moved it -0.0076 +- 0.0049. Refusal behaviour not measured here.
