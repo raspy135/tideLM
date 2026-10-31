@@ -209,17 +209,24 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         let last = arg(args, "--bench-width").is_none();
         // --bench-nll-ab KNOB: the NLL twice in this boot, the knob off then on, the dumps to
         // --bench-nll-out's path with .off / .on appended
-        if let Some(knob) = arg(args, "--bench-nll-ab") {
+        if let Some(knobs) = arg(args, "--bench-nll-ab") {
+            // KNOB[,KNOB..]: each in turn, with no adaptation in the bench itself; exact with
+            // GLM_HOT=0 (hot reads in one arm would change what the next routes to)
             let out = arg(args, "--bench-nll-out");
-            for on in [false, true] {
-                srv.eng.bench_knob(&knob, on)?;
-                eprintln!("bench-nll-ab: {knob} {}", if on { "on" } else { "off" });
-                let o = out.as_ref().map(|p| format!("{p}.{}", if on { "on" } else { "off" }));
-                bench_nll(&mut srv.eng, &path, &text, keep, o, &shape, last && on)?;
+            let knobs: Vec<&str> = knobs.split(',').map(str::trim).collect();
+            for (i, knob) in knobs.iter().enumerate() {
+                for on in [false, true] {
+                    srv.eng.bench_knob(knob, on)?;
+                    eprintln!("bench-nll-ab: {knob} {}", if on { "on" } else { "off" });
+                    let o = out.as_ref().map(|p| format!("{p}.{knob}.{}", if on { "on" } else { "off" }));
+                    // no adaptation inside the A/B: it moved residents between arms (each run of one
+                    // setting differed from the last, the second of a boot 0.027 NLL better)
+                    bench_nll(&mut srv.eng, &path, &text, keep, o, &shape, last && on && i + 1 == knobs.len(), false)?;
+                }
+                srv.eng.bench_knob_reset(knob)?;
             }
-            srv.eng.bench_knob_reset(&knob)?;
         } else {
-            bench_nll(&mut srv.eng, &path, &text, keep, arg(args, "--bench-nll-out"), &shape, last)?;
+            bench_nll(&mut srv.eng, &path, &text, keep, arg(args, "--bench-nll-out"), &shape, last, true)?;
         }
         if last {
             return Ok(());
@@ -443,7 +450,7 @@ fn bench_widths(eng: &mut Engine, ids: &[u32], ctx: usize, widths: &[usize]) -> 
 /// next token's -log p at T = 1 comes from the pair's candidates, or the whole row when it is not
 /// among them; top-1 is the row's argmax. Texts are cut at 4,096 tokens.
 fn bench_nll(eng: &mut Engine, path: &str, text: &Text, keep: usize, out: Option<String>,
-             (skip, rows, max): &(usize, Vec<usize>, usize), last: bool) -> tidelm_engine::Result<()> {
+             (skip, rows, max): &(usize, Vec<usize>, usize), last: bool, adapt: bool) -> tidelm_engine::Result<()> {
     eng.set_sampling(Some(1.0))?;
     // --bench-nll-out: each scored token's "category nll top1" a line, for paired comparisons
     let mut dump = out.map(std::fs::File::create).transpose()?;
@@ -460,7 +467,9 @@ fn bench_nll(eng: &mut Engine, path: &str, text: &Text, keep: usize, out: Option
         let ids = &ids[..ids.len().min(*max)];
         eng.set_pos(0)?;
         eng.forward(&ids[..*skip], false)?;
-        eng.adapt(512)?;
+        if adapt {
+            eng.adapt(512)?;
+        }
         let (mut i, mut since, mut passes) = (*skip, 0usize, 0usize);
         let a = acc.entry(cat).or_default();
         while i + 1 < ids.len() {
@@ -496,7 +505,9 @@ fn bench_nll(eng: &mut Engine, path: &str, text: &Text, keep: usize, out: Option
                 eng.bg_step(keep)?;
             }
             if since >= 200 {
-                eng.adapt(256)?;
+                if adapt {
+                    eng.adapt(256)?;
+                }
                 since = 0;
             }
         }

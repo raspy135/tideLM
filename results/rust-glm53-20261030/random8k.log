@@ -1,0 +1,12 @@
+== p2-random: workload=random isl=8192 osl=256 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=8219 ttft=  17404.9 ms  tpot=  50.00 ms  decode= 20.00 tok/s  out=256 (length)
+          accept_len=1.9921875  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=8211 ttft=  17300.7 ms  tpot=  53.90 ms  decode= 18.55 tok/s  out=256 (length)
+          accept_len=1.7586206896551724  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=8225 ttft=  17501.1 ms  tpot=  49.51 ms  decode= 20.20 tok/s  out=256 (length)
+          accept_len=1.9921875  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=8205 ttft=  17722.6 ms  tpot=  50.86 ms  decode= 19.66 tok/s  out=256 (length)
+          accept_len=2.236842105263158  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=17501.0752 ms  tpot=50.8576 ms  decode=19.6627 tok/s
+  -> ENGINE  accept_len=1.9922  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote results/rust-glm53-20261030/random8k.json

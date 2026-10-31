@@ -205,7 +205,10 @@ fn prefill(st: &Stream, t1p: &DeviceBuffer<i64>, t3p: &DeviceBuffer<i64>, t2p: &
         let cols: std::collections::BTreeSet<usize> = a.iter().zip(&b).enumerate().filter(|(_, (x, y))| x != y).map(|(i, _)| (i % il) / 128).collect();
         println!("  differing rows {} (first {:?}), 128-col blocks {:?}", rows.len(), rows.iter().take(6).collect::<Vec<_>>(), cols);
     }
-    for kernel in ["smem_mode (3-bit mul1)", "smem_cb mul1", "smem_cb mcg", "fat mul1", "fat mcg"] {
+    for kernel in ["smem_mode (3-bit mul1)", "smem_cb mul1", "fat mul1", "smem_cb mcg", "fat mcg"] {
+        if kernel.starts_with("smem_mode") && std::env::var("BITS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(3) != 3 {
+            continue; // built for 2-3-bit trellis only
+        }
         for (name, mats, x0p, x1p, tp0, tp1, z, k_, n, wq) in [("gate+up", 2, &x0, &x1, t1p, t3p, &zup, h, il, wgu),
                                                               ("down", 1, &xd, &xd, t2p, t2p, &zd, kd, dn, wdn)] {
             let mut ts = vec![];
@@ -228,12 +231,12 @@ fn prefill(st: &Stream, t1p: &DeviceBuffer<i64>, t3p: &DeviceBuffer<i64>, t2p: &
                     st.synchronize()?;
                     ok(unsafe { tidelm_cuda::ffi::cudaGetLastError() }, kernel)?;
                     let zref = if mats == 2 { &zref_up } else { &zref_dn };
-                    if check && kernel == "smem_cb mul1" {
+                    if check && kernel.starts_with("smem_cb") {
                         zref.copy_from(0, z, 0, z.len(), st)?;
-                    } else if check && kernel == "fat mul1" {
+                    } else if check && kernel.starts_with("fat") {
                         let (a, b) = (zref.download()?, z.download()?);
                         let bad = a.iter().zip(&b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
-                        println!("{kernel:>24} {name:>7}: {bad} of {} values differ from smem_cb mul1", a.len());
+                        println!("{kernel:>24} {name:>7}: {bad} of {} values differ from smem_cb {}", a.len(), &kernel[4..]);
                     }
                 }
                 e1.record(st)?;
