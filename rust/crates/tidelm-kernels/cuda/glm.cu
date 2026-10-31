@@ -46,6 +46,18 @@ extern "C" int glm_set_pdl(int on) { g_pdl = on; return 0; }
 // 120K), in-boot A/B 2026-10-30.
 __constant__ int c_stream_loads = 0;
 extern "C" int glm_set_stream_loads(int mask) { return (int)cudaMemcpyToSymbol(c_stream_loads, &mask, sizeof(int)); }
+// decode attention's split partials stored as fp16 of each split's normalized output (acc / l)
+// instead of fp32 unnormalized acc: a row's partials are 64 heads x NS x 512 x 4 B = 2 MB at 16
+// splits, written by mla_kernel and read back by mla_combine_kernel - more bytes than the 1.3 MB of
+// keys the row attends. bench_mla (L2 cold, mla + combine, engine splits): 1 / 4 / 8 rows 47.5 /
+// 136.9 / 211.7 -> 44.3 / 116.0 / 188.2 us; the pair's verify pass (in-boot A/B, 2026-10-30) at
+// 2.5K / 8K / 16K of context: 1 row +0.1 / -0.6 / -0.7%, 4 rows -2.3 / -1.9 / -2.1%, 8 rows -2.7 /
+// -1.0 / -2.0%, the MTP pass -1.3 / -1.5 / -4.4%. Not the same bits (TIDELM_GLM_MLA_HALF=0 keeps fp32).
+__device__ int c_mla_half = 1;
+extern "C" int glm_set_mla_half(int on) { return (int)cudaMemcpyToSymbol(c_mla_half, &on, sizeof(int)); }
+// bench probes (bench_mla --probe): bit 1 no key loads, 2 no score mma, 4 no PV, 8 no Q load, 16 no convert
+__device__ int c_mla_probe = 0;
+extern "C" int glm_set_mla_probe(int v) { return (int)cudaMemcpyToSymbol(c_mla_probe, &v, sizeof(int)); }
 template <typename T>
 __device__ __forceinline__ T ld_once(const T* p, int bit) {
     return (c_stream_loads & bit) ? __ldcs(p) : *p;
@@ -865,7 +877,7 @@ __global__ void __launch_bounds__(256) mla_kernel(
     for (int i = tid; i < HB * (kMD / 8); i += blockDim.x) {
         const int hh = i / (kMD / 8), c = i % (kMD / 8);
         uint4 v = make_uint4(0, 0, 0, 0);
-        if (hh < nh) {
+        if (hh < nh && !(c_mla_probe & 8)) {
             const int h = h0 + hh;
             v = reinterpret_cast<const uint4*>(q + (int64_t)(h / hg) * q_ldg + (int64_t)t * q_ldt +
                                                (int64_t)(h % hg) * q_ldh)[c];
@@ -887,11 +899,18 @@ __global__ void __launch_bounds__(256) mla_kernel(
     // A thread's 5 of a tile's 32 x 40 pieces (32 latent pieces of 16 FP8 values and 8 RoPE
     // pieces of 8 BF16 values a key), fetched into registers a tile ahead: the next tile's two
     // dependent loads (its pick, then its key) are in flight while this one is scored.
+    // ... kPF tiles ahead. Two slots (a block is alone on its SM, so the registers are there)
+    // measured the same as one (bench_mla, L2 cold, 2026-10-30: 1 / 4 / 8 rows 44 / 116 / 188 us
+    // either way): the key loads are not what a tile waits for. With every load and every mma
+    // off (--probe 31) the kernel still takes 17 / 59 us at 1 / 4 rows - the per-block skeleton of
+    // one 80 KB-smem block an SM in 3 waves, its syncs, softmax and partial stores - so the next
+    // lever here is two blocks an SM (FP8-staged keys), not deeper loads.
     constexpr int kPieces = kMNT * 40 / 256;
-    uint4 pre_raw[kPieces];
-    float pre_s[kPieces];
-    bool pre_ok[kPieces];
-    auto prefetch = [&](int n0) {
+    constexpr int kPF = 1;
+    uint4 pre_raw[kPF][kPieces];
+    float pre_s[kPF][kPieces];
+    bool pre_ok[kPF][kPieces];
+    auto prefetch = [&](int n0, uint4 (&raw)[kPieces], float (&sc)[kPieces], bool (&okv)[kPieces]) {
 #pragma unroll
         for (int u = 0; u < kPieces; ++u) {
             const int i = tid + 256 * u, j = i / 40, c = i % 40;
@@ -899,38 +918,44 @@ __global__ void __launch_bounds__(256) mla_kernel(
             int key = -1;
             if (n < k_hi) key = idx ? idx[(int64_t)t * ld_idx + n] : n;
             const bool ok = key >= 0 && key <= bnd;
-            pre_ok[u] = ok;
-            pre_raw[u] = make_uint4(0, 0, 0, 0);
-            pre_s[u] = 0.f;
-            if (ok) {
+            okv[u] = ok;
+            raw[u] = make_uint4(0, 0, 0, 0);
+            sc[u] = 0.f;
+            if (ok && !(c_mla_probe & 1)) {
                 const int64_t kr = key_row(key, split_n);
                 if (c < 32) {
-                    pre_raw[u] = *reinterpret_cast<const uint4*>(cq + kr * kLat + c * 16);
-                    pre_s[u] = rbf(cs[kr * 4 + c / 8]);
+                    raw[u] = *reinterpret_cast<const uint4*>(cq + kr * kLat + c * 16);
+                    sc[u] = rbf(cs[kr * 4 + c / 8]);
                 } else {
-                    pre_raw[u] = reinterpret_cast<const uint4*>(cr + kr * 64)[c - 32];
+                    raw[u] = reinterpret_cast<const uint4*>(cr + kr * 64)[c - 32];
                 }
             }
         }
     };
-    if (k_lo < k_hi) prefetch(k_lo);
-    for (int n0 = k_lo; n0 < k_hi; n0 += kMNT) {
+#pragma unroll
+    for (int sl = 0; sl < kPF; ++sl)
+        if (k_lo + sl * kMNT < k_hi) prefetch(k_lo + sl * kMNT, pre_raw[sl], pre_s[sl], pre_ok[sl]);
+    for (int nb = k_lo; nb < k_hi; nb += kPF * kMNT) {
+#pragma unroll
+    for (int sl = 0; sl < kPF; ++sl) {
+        const int n0 = nb + sl * kMNT;
+        if (n0 >= k_hi) break;
         __syncthreads();  // the previous tile's PV is done with Ks / Ps
 #pragma unroll
         for (int u = 0; u < kPieces; ++u) {
             const int i = tid + 256 * u, j = i / 40, c = i % 40;
             if (c < 32) {
                 uint4 o[2] = {make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0)};
-                if (pre_ok[u]) fp8x16_bf16(pre_raw[u], pre_s[u], true, o);
+                if (pre_ok[sl][u] && !(c_mla_probe & 16)) fp8x16_bf16(pre_raw[sl][u], pre_s[sl][u], true, o);
                 *reinterpret_cast<uint4*>(Ks + j * kMLD + c * 16) = o[0];
                 *reinterpret_cast<uint4*>(Ks + j * kMLD + c * 16 + 8) = o[1];
             } else {
-                *reinterpret_cast<uint4*>(Ks + j * kMLD + kLat + (c - 32) * 8) = pre_raw[u];
+                *reinterpret_cast<uint4*>(Ks + j * kMLD + kLat + (c - 32) * 8) = pre_raw[sl][u];
             }
-            if (c == 0) valid[j] = pre_ok[u];
+            if (c == 0) valid[j] = pre_ok[sl][u];
         }
         __syncthreads();
-        if (n0 + kMNT < k_hi) prefetch(n0 + kMNT);
+        if (n0 + kPF * kMNT < k_hi) prefetch(n0 + kPF * kMNT, pre_raw[sl], pre_s[sl], pre_ok[sl]);
         // scores: (m tile, 8 keys) jobs over the warps
         for (int job = warp; job < MT * (kMNT / 8); job += 8) {
             const int mt = job / (kMNT / 8), kb = job % (kMNT / 8);
@@ -938,7 +963,7 @@ __global__ void __launch_bounds__(256) mla_kernel(
             const __nv_bfloat16* kn = Ks + (kb * 8 + r) * kMLD;
             const __nv_bfloat16* qa = Qs + (mt * 16) * kMLD;
 #pragma unroll 4
-            for (int ks = 0; ks < kMD / 16; ++ks) {
+            for (int ks = 0; ks < ((c_mla_probe & 2) ? 0 : kMD / 16); ++ks) {
                 const int d0 = ks * 16;
                 const uint32_t a0 = *reinterpret_cast<const uint32_t*>(qa + r * kMLD + d0 + 2 * qd);
                 const uint32_t a1 = *reinterpret_cast<const uint32_t*>(qa + (r + 8) * kMLD + d0 + 2 * qd);
@@ -988,7 +1013,7 @@ __global__ void __launch_bounds__(256) mla_kernel(
         }
         // PV: warp w takes latent dims w * 64 .. + 64; p rounded to bf16 (as tl.dot(p.to(bf16), c))
 #pragma unroll
-        for (int ks = 0; ks < kMNT / 16; ++ks) {
+        for (int ks = 0; ks < ((c_mla_probe & 4) ? 0 : kMNT / 16); ++ks) {
             const int k0 = ks * 16;
             uint32_t ah[MT][4];
 #pragma unroll
@@ -1009,6 +1034,7 @@ __global__ void __launch_bounds__(256) mla_kernel(
                 for (int mt = 0; mt < MT; ++mt) mma_bf16(acc[mt][nt], ah[mt][0], ah[mt][1], ah[mt][2], ah[mt][3], b0, b1);
             }
         }
+    }
     }
     __syncthreads();
     if (out) {
@@ -1036,6 +1062,13 @@ __global__ void __launch_bounds__(256) mla_kernel(
         part_m[b] = m_run[tid];
         part_l[b] = l_run[tid];
     }
+    const bool halfp = c_mla_half != 0;
+    if (halfp) {
+        // each head's split output normalized by its own l (fp16 then holds values the size of
+        // the latents, not of their sum); nothing attended: l = 0, the partial 0
+        if (tid < HB) alpha[tid] = l_run[tid] > 0.f ? 1.f / l_run[tid] : 0.f;
+        __syncthreads();
+    }
 #pragma unroll
     for (int mt = 0; mt < MT; ++mt)
 #pragma unroll
@@ -1043,14 +1076,24 @@ __global__ void __launch_bounds__(256) mla_kernel(
             const int d = warp * 64 + nt * 8 + 2 * qd;
             const int ha = mt * 16 + r, hb = ha + 8;
             if (ha < nh) {
-                float* o = part_acc + (((int64_t)t * H + h0 + ha) * NS + sp) * kLat + d;
-                o[0] = acc[mt][nt][0];
-                o[1] = acc[mt][nt][1];
+                const int64_t at = (((int64_t)t * H + h0 + ha) * NS + sp) * kLat + d;
+                if (halfp) {
+                    *reinterpret_cast<__half2*>(reinterpret_cast<__half*>(part_acc) + at) =
+                        __floats2half2_rn(acc[mt][nt][0] * alpha[ha], acc[mt][nt][1] * alpha[ha]);
+                } else {
+                    part_acc[at] = acc[mt][nt][0];
+                    part_acc[at + 1] = acc[mt][nt][1];
+                }
             }
             if (hb < nh) {
-                float* o = part_acc + (((int64_t)t * H + h0 + hb) * NS + sp) * kLat + d;
-                o[0] = acc[mt][nt][2];
-                o[1] = acc[mt][nt][3];
+                const int64_t at = (((int64_t)t * H + h0 + hb) * NS + sp) * kLat + d;
+                if (halfp) {
+                    *reinterpret_cast<__half2*>(reinterpret_cast<__half*>(part_acc) + at) =
+                        __floats2half2_rn(acc[mt][nt][2] * alpha[hb], acc[mt][nt][3] * alpha[hb]);
+                } else {
+                    part_acc[at] = acc[mt][nt][2];
+                    part_acc[at + 1] = acc[mt][nt][3];
+                }
             }
         }
 }
@@ -1076,9 +1119,16 @@ __global__ void mla_combine_kernel(const float* __restrict__ pm, const float* __
     const int hh = h - lo;
     const bool own = !out && hh >= 0 && hh < hl;
     const int ho = h < lo ? h : h - hl;
+    const bool halfp = c_mla_half != 0;
     for (int d = threadIdx.x; d < kLat; d += blockDim.x) {
         float a = 0.f;
-        for (int s = 0; s < NS; ++s) a += pacc[(b + s) * kLat + d] * expf(pm[b + s] - m);
+        if (halfp) {
+            // the fp16 partials are each split's normalized output: weight by l * exp(m_s - m)
+            for (int s = 0; s < NS; ++s)
+                a += __half2float(reinterpret_cast<const __half*>(pacc)[(b + s) * kLat + d]) * (pl[b + s] * expf(pm[b + s] - m));
+        } else {
+            for (int s = 0; s < NS; ++s) a += pacc[(b + s) * kLat + d] * expf(pm[b + s] - m);
+        }
         const float o = a * inv;
         if (out) {
             out[(int64_t)t * o_ldt + (int64_t)h * o_ldh + d] = to_bf(o);

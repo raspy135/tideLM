@@ -74,6 +74,8 @@ extern "C" {
     pub fn glm_l2_runs(stream: CudaStream, base: u64, run: u64, stride: u64, count: c_int, grid: c_int) -> c_int;
     pub fn glm_set_pdl(on: c_int) -> c_int;
     pub fn glm_set_stream_loads(mask: c_int) -> c_int;
+    pub fn glm_set_mla_half(on: c_int) -> c_int;
+    pub fn glm_set_mla_probe(v: c_int) -> c_int;
     pub fn glm_l2_experts(stream: CudaStream, pick: *const c_void, p: c_int, tp: *const c_void, k2: *const c_void, k: c_int,
                           n: c_int, ranges: c_int, run: u64, grid: c_int) -> c_int;
     pub fn glm_rank1(stream: CudaStream, x: *mut c_void, ldx: i64, r: *const c_void, alpha: f32, t: c_int, h: c_int) -> c_int;

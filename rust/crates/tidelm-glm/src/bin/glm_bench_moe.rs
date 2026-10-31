@@ -131,16 +131,82 @@ fn prefill(st: &Stream, t1p: &DeviceBuffer<i64>, t3p: &DeviceBuffer<i64>, t2p: &
                                broute.raw(), 64) }, "route")?;
     ok(unsafe { glm_member_codes(st.raw(), bpair.raw(), (nb * 64) as i32, TOPK as i32, members.raw()) }, "members")?;
     ok(unsafe { glm_count_live(st.raw(), bslot.raw(), nb as i32, ucount.raw()) }, "live")?;
-    let x0 = DeviceBuffer::<u16>::from_slice(&vec![0x3c00u16; p * h])?;
-    let x1 = DeviceBuffer::<u16>::from_slice(&vec![0x3c00u16; p * h])?;
-    let xd = DeviceBuffer::<u16>::from_slice(&vec![0x3c00u16; p * kd])?;
+    // random small fp16 activations, so a row mix-up shows up in the check
+    let mut hv = |n: usize| -> Vec<u16> {
+        (0..n).map(|_| { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; 0x3000u16 | (seed & 0x83ff) as u16 }).collect()
+    };
+    let x0 = DeviceBuffer::<u16>::from_slice(&hv(p * h))?;
+    let x1 = DeviceBuffer::<u16>::from_slice(&hv(p * h))?;
+    let xd = DeviceBuffer::<u16>::from_slice(&hv(p * kd))?;
     let zup = DeviceBuffer::<f32>::new(2 * p * il)?;
     let zd = DeviceBuffer::<f32>::new(p * dn)?;
     println!("prefill expert GEMM, {rows} rows x top-{TOPK} over {POOL} experts (median of 8, ms / GB/s of trellis bytes)");
     // the shipped mul1 2-3-bit tile, then exl3m_prefill_smem_cb (mixed widths, up to 4 bits) on the same
     // 3-bit experts in both codebooks
-    for kernel in ["smem_mode (3-bit mul1)", "smem_cb mul1", "smem_cb mcg"] {
-        for (name, mats, x0p, x1p, tp0, tp1, z, k, n, wq) in [("gate+up", 2, &x0, &x1, t1p, t3p, &zup, h, il, wgu),
+    // the fat tile (exl3m_prefill_fat) against smem_cb mul1 on the same words: CHECK=1 compares every byte
+    let check = std::env::var("CHECK").is_ok();
+    let zref_up = DeviceBuffer::<f32>::new(2 * p * il)?;
+    let zref_dn = DeviceBuffer::<f32>::new(p * dn)?;
+    // the fused gate/up epilogue (exl3m_prefill_fat_gateup) against smem_cb + exl3m_gateup, on random scales
+    let svh_g = DeviceBuffer::<u16>::from_slice(&hv(POOL * il))?;
+    let svh_u = DeviceBuffer::<u16>::from_slice(&hv(POOL * il))?;
+    let suh_d = DeviceBuffer::<u16>::from_slice(&hv(POOL * kd))?;
+    let xd_ref = DeviceBuffer::<u16>::new(p * il)?;
+    let xd_fat = DeviceBuffer::<u16>::new(p * il)?;
+    {
+        let mut tref = vec![];
+        let mut tfat = vec![];
+        for i in 0..10 {
+            e0.record(st)?;
+            unsafe {
+                exl3m_prefill_smem_cb(x0.raw(), x1.raw(), t1p.raw(), t3p.raw(), k2.raw(), k2.raw(), bslot.raw(), ucount.raw(),
+                                      members.raw(), zup.raw(), h as i32, il as i32, p as i32, TOPK as i32, nb as i32, 2, CB_MUL1, 8,
+                                      st.raw());
+                exl3m_gateup(zup.raw(), pick.raw(), svh_g.raw(), svh_u.raw(), suh_d.raw(), xd_ref.raw(), rows as i32, p as i32,
+                             il as i32, 1, TOPK as i32, POOL as i32, kd as i32, f32::INFINITY, 1, st.raw());
+            }
+            e1.record(st)?;
+            e1.synchronize()?;
+            let a = e1.elapsed_ms(e0)? as f64;
+            e0.record(st)?;
+            unsafe {
+                exl3m_prefill_fat_gateup(x0.raw(), x1.raw(), t1p.raw(), t3p.raw(), k2.raw(), k2.raw(), bslot.raw(), ucount.raw(),
+                                         members.raw(), h as i32, il as i32, p as i32, TOPK as i32, nb as i32, CB_MUL1, 8,
+                                         svh_g.raw(), svh_u.raw(), suh_d.raw(), kd as i32, f32::INFINITY, xd_fat.raw(), st.raw());
+            }
+            e1.record(st)?;
+            e1.synchronize()?;
+            ok(unsafe { tidelm_cuda::ffi::cudaGetLastError() }, "fat gateup")?;
+            if i >= 2 {
+                tref.push(a);
+                tfat.push(e1.elapsed_ms(e0)? as f64);
+            }
+        }
+        tref.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        tfat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let (a, b) = (xd_ref.download()?, xd_fat.download()?);
+        let bad = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+        println!("gate+up with the epilogue: smem_cb + gateup {:.2} ms, fat fused {:.2} ms; {bad} of {} xd values differ",
+                 tref[tref.len() / 2], tfat[tfat.len() / 2], a.len());
+        let h2f = |v: u16| -> f32 { let s = ((v >> 15) & 1) as i32; let e = ((v >> 10) & 0x1f) as i32; let m = (v & 0x3ff) as f32;
+                                    let f = if e == 0 { m / 1024.0 * 2f32.powi(-14) } else { (1.0 + m / 1024.0) * 2f32.powi(e - 15) };
+                                    if s == 1 { -f } else { f } };
+        let mut shown = 0;
+        let mut rows = std::collections::BTreeMap::new();
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            if x != y {
+                *rows.entry(i / il).or_insert(0) += 1;
+                if shown < 8 {
+                    println!("  xd[{}][{}]: ref {:#06x} ({}) fat {:#06x} ({})", i / il, i % il, x, h2f(*x), y, h2f(*y));
+                    shown += 1;
+                }
+            }
+        }
+        let cols: std::collections::BTreeSet<usize> = a.iter().zip(&b).enumerate().filter(|(_, (x, y))| x != y).map(|(i, _)| (i % il) / 128).collect();
+        println!("  differing rows {} (first {:?}), 128-col blocks {:?}", rows.len(), rows.iter().take(6).collect::<Vec<_>>(), cols);
+    }
+    for kernel in ["smem_mode (3-bit mul1)", "smem_cb mul1", "smem_cb mcg", "fat mul1", "fat mcg"] {
+        for (name, mats, x0p, x1p, tp0, tp1, z, k_, n, wq) in [("gate+up", 2, &x0, &x1, t1p, t3p, &zup, h, il, wgu),
                                                               ("down", 1, &xd, &xd, t2p, t2p, &zd, kd, dn, wdn)] {
             let mut ts = vec![];
             for i in 0..10 {
@@ -148,11 +214,26 @@ fn prefill(st: &Stream, t1p: &DeviceBuffer<i64>, t3p: &DeviceBuffer<i64>, t2p: &
                 unsafe {
                     match kernel {
                         "smem_mode (3-bit mul1)" => exl3m_prefill_smem_mode(x0p.raw(), x1p.raw(), tp0.raw(), tp1.raw(), k2.raw(),
-                            k2.raw(), bslot.raw(), ucount.raw(), members.raw(), z.raw(), k as i32, n as i32, p as i32, TOPK as i32,
+                            k2.raw(), bslot.raw(), ucount.raw(), members.raw(), z.raw(), k_ as i32, n as i32, p as i32, TOPK as i32,
                             nb as i32, mats, 4, 1, 8, -4, st.raw()),
+                        k if k.starts_with("fat") => exl3m_prefill_fat(x0p.raw(), x1p.raw(), tp0.raw(), tp1.raw(), k2.raw(), k2.raw(),
+                            bslot.raw(), ucount.raw(), members.raw(), z.raw(), k_ as i32, n as i32, p as i32, TOPK as i32, nb as i32,
+                            mats, if kernel.ends_with("mcg") { CB_MCG } else { CB_MUL1 }, 8, st.raw()),
                         _ => exl3m_prefill_smem_cb(x0p.raw(), x1p.raw(), tp0.raw(), tp1.raw(), k2.raw(), k2.raw(), bslot.raw(),
-                            ucount.raw(), members.raw(), z.raw(), k as i32, n as i32, p as i32, TOPK as i32, nb as i32, mats,
+                            ucount.raw(), members.raw(), z.raw(), k_ as i32, n as i32, p as i32, TOPK as i32, nb as i32, mats,
                             if kernel.ends_with("mcg") { CB_MCG } else { CB_MUL1 }, 8, st.raw()),
+                    }
+                }
+                if i == 0 {
+                    st.synchronize()?;
+                    ok(unsafe { tidelm_cuda::ffi::cudaGetLastError() }, kernel)?;
+                    let zref = if mats == 2 { &zref_up } else { &zref_dn };
+                    if check && kernel == "smem_cb mul1" {
+                        zref.copy_from(0, z, 0, z.len(), st)?;
+                    } else if check && kernel == "fat mul1" {
+                        let (a, b) = (zref.download()?, z.download()?);
+                        let bad = a.iter().zip(&b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+                        println!("{kernel:>24} {name:>7}: {bad} of {} values differ from smem_cb mul1", a.len());
                     }
                 }
                 e1.record(st)?;

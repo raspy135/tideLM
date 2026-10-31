@@ -547,6 +547,27 @@ prefetching prefill attention's key tiles. The next levers: the ~40% of a decode
 GEMV, and prefill attention (5.1 of an 8K prefill's 19.4 s: its 32-key tiles are bound by
 shared-memory work; Triton's 64-key tiles were ~1.8x faster per pick).
 
+2026-10-30, after the proposal measured against TensorFold's and MiaAI's GLM-5.3-Flash kits
+(`~/git/glm53-tensorfold-spark`, `~/git/GLM-5.3-Flash-EXL3-2x-DGX-Sparks`):
+- **Prefill's routed experts through the fat tile** (`exl3m_prefill_fat`, `exl3m_prefill_fat_gateup`:
+  MiaAI's E3 / TensorFold's fat kernel on this pack's trellis - a warp decodes one tile a k16 into
+  mma B fragments and multiplies it into 64 member rows that arrive by cp.async and ldmatrix; the
+  shipped smem tile stored every decoded tile to shared memory and re-read all eight for each 16
+  rows, with 4-byte global A loads). Bit for bit the smem tile's (CHECK=1 glm_bench_moe --prefill),
+  gate / up's epilogue fused. 2,048 rows x top-8: gate+up 12.8 -> 6.6 ms with the epilogue, down
+  5.6 -> 3.1; the pair's 8K prefill 18.29 -> 15.82 s (`--bench-prefill-ab fat`, two ABBA rounds).
+  The expert GEMM is no longer the prefill's largest piece: attention (sparse 2.7 s, dense
+  projections 3.3 s of an 8K prefill) is.
+- **Decode is near its floor.** A 4-row verify reads ~6.5 GB of dense weights and ~11 GB of
+  experts at 200-220 GB/s; what was left measured small: fp16 split partials in the MLA core (a
+  row's fp32 partials were 2 MB against 1.3 MB of keys; 4 / 8 rows -2%, the MTP pass -1.5 to
+  -4.4%, held-out NLL 1.8642 -> 1.8604, paired -0.004 +- 0.003: noise), the indexer's chain on the
+  side stream (exact; 1 row -0.5 to -1.3%, the MTP pass -2 to -8%). Measured null: more
+  flash-decoding splits, a 2-deep key prefetch; the MLA kernel's probes put 59 of 107 us at 4 rows in
+  the block skeleton (one 80 KB-smem block an SM, 3 waves), so two blocks an SM (FP8-staged keys)
+  is the next lever there. The levers left are quality trades (4-bit dense, async hot reads) or
+  1-2% fusions.
+
 ## Rules carried over from the Python engine
 
 - **The pair fails silently.** Anything that changes numerics or control flow per rank

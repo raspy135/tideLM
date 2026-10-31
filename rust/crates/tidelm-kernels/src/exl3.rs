@@ -53,6 +53,18 @@ extern "C" {
                                  k2_0: *const c_void, k2_1: *const c_void, uids: *const c_void, ucount: *const c_void,
                                  members: *const c_void, z: *mut c_void, k: c_int, n: c_int, p: c_int, slots: c_int,
                                  nblocks: c_int, mats: c_int, cb: c_int, hi: c_int, s: CudaStream);
+    /// The fat tile (prefill_fat_kernel): mats 2 gate / up over x0 / x1, mats 1 one matrix over x0; `z`
+    /// as exl3m_prefill_smem's, bit for bit; codebook `cb`, widths up to `hi`.
+    pub fn exl3m_prefill_fat(x0: *const c_void, x1: *const c_void, tp0: *const c_void, tp1: *const c_void,
+                             k2_0: *const c_void, k2_1: *const c_void, uids: *const c_void, ucount: *const c_void,
+                             members: *const c_void, z: *mut c_void, k: c_int, n: c_int, p: c_int, slots: c_int,
+                             nblocks: c_int, mats: c_int, cb: c_int, hi: c_int, s: CudaStream);
+    /// exl3m_prefill_fat (mats 2) with exl3m_gateup's epilogue fused: xd [P][N] fp16, bit for bit.
+    pub fn exl3m_prefill_fat_gateup(x0: *const c_void, x1: *const c_void, tp0: *const c_void, tp1: *const c_void,
+                                    k2_0: *const c_void, k2_1: *const c_void, uids: *const c_void, ucount: *const c_void,
+                                    members: *const c_void, k: c_int, n: c_int, p: c_int, slots: c_int, nblocks: c_int,
+                                    cb: c_int, hi: c_int, svh_g: *const c_void, svh_u: *const c_void, suh_d: *const c_void,
+                                    suh_d_stride: c_int, limit: f32, xd: *mut c_void, s: CudaStream);
     pub fn exl3m_gateup(z: *const c_void, pick: *const c_void, svh_g: *const c_void, svh_u: *const c_void,
                         suh_d: *const c_void, xd: *mut c_void, rows: c_int, p: c_int, n: c_int, sk: c_int,
                         slots: c_int, e: c_int, suh_d_stride: c_int, limit: f32, act_mode: c_int, s: CudaStream);

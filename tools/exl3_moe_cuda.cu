@@ -1085,9 +1085,322 @@ void prefill_smem_cb_launch(const void* x0, const void* x1, const int64_t* tp0, 
         (const half*)x0, (const half*)x1, tp0, tp1, k2_0, k2_1, uids, ucount, members, z, K, N, P, slots);
 }
 
+// ---------------------------------------------------------------- prefill: the fat tile (MiaAI's E3 / TensorFold's fat kernel)
+//
+// Program (128-column block, routing block u): FAT_MB * 16 = 64 member rows x NS streams of 128
+// columns. The trellis words and the member rows are staged global -> shared by 16-byte cp.async,
+// FAT_STAGES deep, K advancing 32 a stage. Each warp owns one 16-column block of each stream: it
+// decodes that tile once a k16 step into mma B fragments (lane l holding word l, as the register
+// path) and multiplies them into every m-block, whose A fragments come by ldmatrix from the
+// swizzled row stage. A decoded tile thus serves 64 rows from registers, where smem_tiles stores
+// every decoded tile to shared memory and each warp reads all NTB of them back for its 16 rows, with
+// its A operands as 4-byte global loads. The operands and the k order of each (16-row block, n8)
+// accumulation are smem_tiles': the outputs are bit-identical (CHECK=1 glm_bench_moe --prefill).
+// Measured there (2,048 rows x top-8 over 128 3-bit experts, one GB10, 2026-10-30): gate+up 11.5 ->
+// 6.5 ms, down 5.6 -> 3.1 (smem 4x1x8 at cp.async depth 4 -> fat); the pair's 8K prefill 18.29 ->
+// 15.82 s with the epilogue fused (EPI below). 2 CTAs an SM (launch bounds), ~44-48 KB of shared
+// memory each at K2 6 / 8.
+// Streams: NS = 2 as two matrices over the same columns, each with its own rotated input (gate /
+// up: TP0 / X0 and TP1 / X1, NB_STRIDE 0, AX 2), or as adjacent 128-column halves of one matrix
+// (down: NB_STRIDE 8, AX 1).
+constexpr int FAT_THREADS = 256, FAT_WARPS = 8, FAT_MB = 4, FAT_TILE_K = 32, FAT_STAGES = 4;
+constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
+__device__ __forceinline__ void fwht128(float (&v)[4], int lane);
+__device__ __forceinline__ float swiglu_act(float g, float u, float svg, float svu, float limit);
+
+template <int K2, int NS, int AX>
+__host__ __device__ constexpr int fat_smem_bytes() {
+    return FAT_STAGES * (AX * FAT_MB * 16 * FAT_TILE_K * 2 + NS * 2 * FAT_WARPS * Fmt<K2>::TW * 4);
+}
+
+__device__ __forceinline__ void ldsm_x4_a(uint32_t (&r)[4], const void* p) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(a));
+}
+
+// XOR swizzle of the 16-byte chunk inside a 32-half (64 B) A row: an ldmatrix phase's 8 rows hit 8
+// distinct bank groups
+__device__ __forceinline__ int fat_swz(int row, int chunk) { return chunk ^ ((row >> 1) & 3); }
+
+template <int CB, int K2, int NS, int AX, int NB_STRIDE>
+__device__ __forceinline__ void fat_tiles(const uint32_t* __restrict__ T0, const uint32_t* __restrict__ T1,
+                                          int NTILES, int KT, int nb0, const half* __restrict__ X0,
+                                          const half* __restrict__ X1, int K, const int* rows_sh, int nmb, int warp,
+                                          int lane, unsigned char* smem, float (&acc)[NS][FAT_MB][2][4]) {
+    constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW;
+    constexpr int A_ROWS = FAT_MB * 16;
+    constexpr int A_STAGE = AX * A_ROWS * FAT_TILE_K;          // halves a stage
+    constexpr int A_CHUNKS = AX * A_ROWS * 4;                   // 16-byte chunks a stage
+    static_assert(A_CHUNKS % FAT_THREADS == 0, "A chunks over the threads");
+    constexpr int B_TC = TW / 4;                                // 16-byte chunks a tile
+    constexpr int B_STAGE = NS * 2 * FAT_WARPS * TW;            // words a stage
+    constexpr int B_CHUNKS = NS * 2 * FAT_WARPS * B_TC;
+    static_assert(TW % 4 == 0, "a tile is whole 16-byte chunks");
+    half* sh_a = reinterpret_cast<half*>(smem);
+    uint32_t* sh_b = reinterpret_cast<uint32_t*>(smem + FAT_STAGES * A_STAGE * 2);
+    const LaneMap<K2> map(lane);
+    const int tid = warp * 32 + lane;
+    const int ktiles = KT / 2;                                  // 32-wide k stages
+    auto load_stage = [&](int stage, int kt) {
+        half* sa = sh_a + stage * A_STAGE;
+#pragma unroll
+        for (int i = 0; i < A_CHUNKS / FAT_THREADS; ++i) {
+            const int c = i * FAT_THREADS + tid;
+            const int x = c / (A_ROWS * 4), rc = c % (A_ROWS * 4);
+            const int row = rc >> 2, chunk = rc & 3;
+            const int r = rows_sh[row];                         // a dead row stages row 0: not stored
+            const half* src = (x ? X1 : X0) + (size_t)(r < 0 ? 0 : r) * K + kt * FAT_TILE_K + chunk * 8;
+            cp_async16(sa + (x * A_ROWS + row) * FAT_TILE_K + fat_swz(row, chunk) * 8, src);
+        }
+        uint32_t* sb = sh_b + stage * B_STAGE;
+        for (int c = tid; c < B_CHUNKS; c += FAT_THREADS) {
+            const int s = c / (2 * FAT_WARPS * B_TC), r = c % (2 * FAT_WARPS * B_TC);
+            const int j = r / (FAT_WARPS * B_TC), w = (r / B_TC) % FAT_WARPS, q = r % B_TC;
+            const uint32_t* T = (NB_STRIDE == 0 && s) ? T1 : T0;
+            const uint32_t* src = T + ((size_t)(kt * 2 + j) * NTILES + nb0 + s * NB_STRIDE + w) * TW + q * 4;
+            cp_async16(sb + ((s * 2 + j) * FAT_WARPS + w) * TW + q * 4, src);
+        }
+    };
+#pragma unroll
+    for (int s = 0; s < FAT_STAGES - 1; ++s) {
+        if (s < ktiles) load_stage(s, s);
+        cp_commit();
+    }
+    const int a_row = (lane & 7) + 8 * ((lane >> 3) & 1), a_hi = lane >> 4;
+    for (int kt = 0; kt < ktiles; ++kt) {
+        cp_wait<FAT_STAGES - 2>();
+        __syncthreads();                                        // the stage reloaded below was consumed last step
+        const int nk = kt + FAT_STAGES - 1;
+        if (nk < ktiles) load_stage(nk % FAT_STAGES, nk);
+        cp_commit();
+        const int stage = kt % FAT_STAGES;
+        const half* sa = sh_a + stage * A_STAGE;
+        const uint32_t* sb = sh_b + stage * B_STAGE;
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            uint32_t fb[NS][2][2];
+#pragma unroll
+            for (int s = 0; s < NS; ++s) {
+                const uint32_t* wt = sb + ((s * 2 + j) * FAT_WARPS + warp) * TW;
+                uint32_t w[LW];
+#pragma unroll
+                for (int l = 0; l < LW; ++l) {
+                    if constexpr ((TW % 32) == 0)
+                        w[l] = wt[l * 32 + lane];
+                    else
+                        w[l] = (l * 32 + lane < TW) ? wt[l * 32 + lane] : 0u;
+                }
+                decode_tile<CB, K2>(w, map, lane, fb[s][0], fb[s][1]);
+            }
+            const int chunk = j * 2 + a_hi;
+#pragma unroll
+            for (int mb = 0; mb < FAT_MB; ++mb) {
+                if (mb < nmb) {
+                    const int row = mb * 16 + a_row;
+                    uint32_t a[AX][4];
+#pragma unroll
+                    for (int x = 0; x < AX; ++x) ldsm_x4_a(a[x], sa + (x * A_ROWS + row) * FAT_TILE_K + fat_swz(row, chunk) * 8);
+#pragma unroll
+                    for (int s = 0; s < NS; ++s) {
+                        mma16816(acc[s][mb][0], a[AX == 1 ? 0 : s], fb[s][0]);
+                        mma16816(acc[s][mb][1], a[AX == 1 ? 0 : s], fb[s][1]);
+                    }
+                }
+            }
+        }
+    }
+    cp_wait<0>();
+}
+
+// Program (128-column block, routing block u): 64 member rows (build_routing's block, -1 padded, as
+// prefill_smem_kernel's) x NS streams; Z [mats][P][N] fp32 as prefill_smem_kernel writes it.
+// EPI (gate / up only): gateup_epilogue_kernel's arithmetic on the block's 128 columns in place of the
+// fp32 Z store - rotate, * svh, SwiGLU (act_mode 1), * suh_d (the caller's rank slice, stride
+// suh_d_stride), rotate, fp16 into xd [P][N] - bit for bit the two-kernel path's (the block's 128
+// columns are one Hadamard block, lane l holding columns 4l..4l+3 as there).
+template <int CB, int NS, int AX, int NB_STRIDE, int LO, int HI, bool EPI = false>
+__global__ void __launch_bounds__(FAT_THREADS, 2) prefill_fat_kernel(
+    const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
+    const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
+    const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
+    float* __restrict__ Z, int K, int N, int P, int slots, const half* __restrict__ svh_g,
+    const half* __restrict__ svh_u, const half* __restrict__ suh_d, int suh_d_stride, float limit,
+    half* __restrict__ xd) {
+    pdl_enter();
+    constexpr int BM = FAT_MB * 16;
+    extern __shared__ __align__(16) unsigned char fat_smem[];
+    __shared__ int rows_sh[BM];
+    const int u = blockIdx.y;
+    if (u >= ucount[0]) return;
+    const int e = uids[u];
+    if (e < 0) return;
+    for (int i = threadIdx.x; i < BM; i += FAT_THREADS) {
+        const int code = members[(size_t)u * BM + i];
+        rows_sh[i] = code >= 0 ? (code >> 5) * slots + (code & 31) : -1;
+    }
+    __syncthreads();
+    int nmb = 0;
+#pragma unroll
+    for (int m = 0; m < FAT_MB; ++m)
+        if (rows_sh[m * 16] >= 0) nmb = m + 1;
+    if (nmb == 0) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int NTILES = N >> 4, KT = K >> 4;
+    const int nb0 = blockIdx.x * (NB_STRIDE ? NS * FAT_WARPS : FAT_WARPS);
+    if (nb0 >= NTILES) return;
+    const uint32_t* T0 = reinterpret_cast<const uint32_t*>(TP0[e]);
+    const uint32_t* T1 = reinterpret_cast<const uint32_t*>(NB_STRIDE ? TP0[e] : TP1[e]);
+    const int k2 = K2_0[e];
+    if (NB_STRIDE == 0 && K2_1[e] != k2) __trap();              // gate and up of one expert share a width
+
+    float acc[NS][FAT_MB][2][4];
+#pragma unroll
+    for (int s = 0; s < NS; ++s)
+#pragma unroll
+        for (int m = 0; m < FAT_MB; ++m)
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+#pragma unroll
+                for (int c = 0; c < 4; ++c) acc[s][m][h][c] = 0.f;
+
+    switch (k2) {
+#define EXL3_FCASE(K2_)                                                                                         \
+    case K2_:                                                                                                   \
+        if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
+            fat_tiles<CB, K2_, NS, AX, NB_STRIDE>(T0, T1, NTILES, KT, nb0, X0, X1, K, rows_sh, nmb, warp, lane,  \
+                                                  fat_smem, acc);                                               \
+        else                                                                                                    \
+            __trap();                                                                                           \
+        break;
+        EXL3_FCASE(4) EXL3_FCASE(5) EXL3_FCASE(6) EXL3_FCASE(7) EXL3_FCASE(8)
+#undef EXL3_FCASE
+        default:
+            __trap();
+    }
+
+    if constexpr (EPI) {
+        static_assert(!EPI || (NS == 2 && NB_STRIDE == 0), "the fused epilogue is gate / up's");
+        __syncthreads();                                        // the pipeline's smem is reused
+        float* sh_c = reinterpret_cast<float*>(fat_smem);       // [16][2 * 128]
+        const int n0 = nb0 * 16;                                // the block's first column
+#pragma unroll
+        for (int m = 0; m < FAT_MB; ++m) {
+            if (m >= nmb) break;
+#pragma unroll
+            for (int s = 0; s < NS; ++s)
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int col = s * 128 + warp * 16 + h * 8 + 2 * t;
+                    *reinterpret_cast<float2*>(sh_c + g * 256 + col) = make_float2(acc[s][m][h][0], acc[s][m][h][1]);
+                    *reinterpret_cast<float2*>(sh_c + (g + 8) * 256 + col) = make_float2(acc[s][m][h][2], acc[s][m][h][3]);
+                }
+            __syncthreads();
+#pragma unroll
+            for (int rr = 0; rr < 2; ++rr) {
+                const int r = warp + rr * FAT_WARPS;            // row of the m-block
+                const int p = rows_sh[m * 16 + r];
+                if (p >= 0) {
+                    const int n = n0 + 4 * lane;
+                    const float4 gq = *reinterpret_cast<const float4*>(sh_c + r * 256 + 4 * lane);
+                    const float4 uq = *reinterpret_cast<const float4*>(sh_c + r * 256 + 128 + 4 * lane);
+                    float gv[4] = {gq.x, gq.y, gq.z, gq.w}, uv[4] = {uq.x, uq.y, uq.z, uq.w};
+                    fwht128(gv, lane);
+                    fwht128(uv, lane);
+                    float v[4];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const float act = swiglu_act(gv[j], uv[j], __half2float(svh_g[(size_t)e * N + n + j]),
+                                                     __half2float(svh_u[(size_t)e * N + n + j]), limit);
+                        v[j] = __fmul_rn(act, __half2float(suh_d[(size_t)e * suh_d_stride + n + j]));
+                    }
+                    fwht128(v, lane);
+                    half* o = xd + (size_t)p * N + n;
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(__fmul_rn(v[j], HAD_SCALE));
+                }
+            }
+            __syncthreads();
+        }
+        return;
+    }
+#pragma unroll
+    for (int s = 0; s < NS; ++s) {
+        float* Zs = Z + (NB_STRIDE ? 0 : (size_t)s * P * N);
+#pragma unroll
+        for (int m = 0; m < FAT_MB; ++m) {
+            if (m >= nmb) break;
+            const int r0 = rows_sh[m * 16 + g], r1 = rows_sh[m * 16 + g + 8];
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int col = (nb0 + s * NB_STRIDE + warp) * 16 + h * 8 + 2 * t;
+                if (r0 >= 0)
+                    *reinterpret_cast<float2*>(Zs + (size_t)r0 * N + col) = make_float2(acc[s][m][h][0], acc[s][m][h][1]);
+                if (r1 >= 0)
+                    *reinterpret_cast<float2*>(Zs + (size_t)r1 * N + col) = make_float2(acc[s][m][h][2], acc[s][m][h][3]);
+            }
+        }
+    }
+}
+
+// mats 2: gate / up (NS 2 matrices over N columns, each its own X); mats 1: one matrix in 256-column
+// blocks. Widths K2 4..hi (hi 6 or 8).
+template <int CB, int HI>
+void prefill_fat_launch(const void* x0, const void* x1, const int64_t* tp0, const int64_t* tp1, const int* k2_0,
+                        const int* k2_1, const int* uids, const int* ucount, const int* members, float* z, int K,
+                        int N, int P, int slots, int nblocks, int mats, cudaStream_t stream) {
+    EXL3_CHECK(K % FAT_TILE_K == 0, "fat prefill: K must be a multiple of 32");
+    static bool set2 = false, set1 = false;
+    if (mats == 2) {
+        EXL3_CHECK(N % 128 == 0, "fat prefill: N must be a multiple of 128");
+        constexpr int smem = fat_smem_bytes<HI, 2, 2>();
+        auto kernel = prefill_fat_kernel<CB, 2, 2, 0, 4, HI>;
+        if (!set2) { cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); set2 = true; }
+        dim3 grid((unsigned)(N / 128), (unsigned)nblocks, 1);
+        pdl_launch(kernel, grid, FAT_THREADS, smem, stream, (const half*)x0, (const half*)x1, tp0, tp1, k2_0, k2_1, uids,
+                   ucount, members, z, K, N, P, slots, (const half*)nullptr, (const half*)nullptr, (const half*)nullptr, 0,
+                   0.f, (half*)nullptr);
+    } else {
+        EXL3_CHECK(N % 256 == 0, "fat prefill: N must be a multiple of 256 for one matrix");
+        constexpr int smem = fat_smem_bytes<HI, 2, 1>();
+        auto kernel = prefill_fat_kernel<CB, 2, 1, FAT_WARPS, 4, HI>;
+        if (!set1) { cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); set1 = true; }
+        dim3 grid((unsigned)(N / 256), (unsigned)nblocks, 1);
+        pdl_launch(kernel, grid, FAT_THREADS, smem, stream, (const half*)x0, (const half*)x0, tp0, tp0, k2_0, k2_0, uids,
+                   ucount, members, z, K, N, P, slots, (const half*)nullptr, (const half*)nullptr, (const half*)nullptr, 0,
+                   0.f, (half*)nullptr);
+    }
+}
+
+// gate / up with the fused epilogue: xd [P][N] fp16 as exl3m_gateup writes it from the fat tile's Z.
+template <int CB, int HI>
+void prefill_fat_gateup_launch(const void* x0, const void* x1, const int64_t* tp0, const int64_t* tp1, const int* k2_0,
+                               const int* k2_1, const int* uids, const int* ucount, const int* members, int K, int N,
+                               int P, int slots, int nblocks, const void* svh_g, const void* svh_u, const void* suh_d,
+                               int suh_d_stride, float limit, void* xd, cudaStream_t stream) {
+    EXL3_CHECK(K % FAT_TILE_K == 0 && N % 128 == 0, "fat prefill: K a multiple of 32, N of 128");
+    static bool set = false;
+    constexpr int smem = fat_smem_bytes<HI, 2, 2>();
+    static_assert(smem >= 16 * 256 * 4, "the epilogue's staging fits the pipeline's smem");
+    auto kernel = prefill_fat_kernel<CB, 2, 2, 0, 4, HI, true>;
+    if (!set) { cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); set = true; }
+    dim3 grid((unsigned)(N / 128), (unsigned)nblocks, 1);
+    pdl_launch(kernel, grid, FAT_THREADS, smem, stream, (const half*)x0, (const half*)x1, tp0, tp1, k2_0, k2_1, uids,
+               ucount, members, (float*)nullptr, K, N, P, slots, (const half*)svh_g, (const half*)svh_u, (const half*)suh_d,
+               suh_d_stride, limit, (half*)xd);
+}
+
 // ---------------------------------------------------------------- rotations / epilogues (TensorFold experts.cu)
 
-constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
+// gateup_epilogue_kernel's SwiGLU (act_mode 1) on one rotated gate / up value: every op rounded
+// where written, so the two kernels that inline it agree bit for bit
+__device__ __forceinline__ float swiglu_act(float g, float u, float svg, float svu, float limit) {
+    const float gg = fminf(__fmul_rn(__fmul_rn(g, HAD_SCALE), svg), limit);
+    const float uu = fminf(fmaxf(__fmul_rn(__fmul_rn(u, HAD_SCALE), svu), -limit), limit);
+    return __fmul_rn(__fdiv_rn(gg, __fadd_rn(1.f, expf(-gg))), uu);
+}
 
 __device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
     float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
@@ -1164,17 +1477,18 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
                              limit);
             act = bf16r(bf16r(gg / (1.f + expf(-gg))) * uu);
         } else {
-            float gg = fminf(gv[j] * HAD_SCALE * __half2float(svh_g[(size_t)e * N + n + j]), limit);
-            float uu = fminf(fmaxf(uv[j] * HAD_SCALE * __half2float(svh_u[(size_t)e * N + n + j]), -limit), limit);
-            act = gg / (1.f + expf(-gg)) * uu;
+            // explicit roundings (no fma contraction across expf's inlined tail), so the fused
+            // epilogue of prefill_fat_kernel computes the same bits
+            act = swiglu_act(gv[j], uv[j], __half2float(svh_g[(size_t)e * N + n + j]),
+                             __half2float(svh_u[(size_t)e * N + n + j]), limit);
         }
-        v[j] = act * __half2float(suh_d[(size_t)e * suh_d_stride + n + j]);   // rank slice: caller offsets
-                                                                              // suh_d and passes the full K
+        v[j] = __fmul_rn(act, __half2float(suh_d[(size_t)e * suh_d_stride + n + j]));   // rank slice: caller
+                                                                                        // offsets suh_d, full K
     }
     fwht128(v, lane);
     half* o = xd + (size_t)p * N + n;
 #pragma unroll
-    for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
+    for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(__fmul_rn(v[j], HAD_SCALE));
 }
 
 // Dense matrices (engine/exl3_dense.py): one program per (row, 128-block of K). Row r belongs to
@@ -1445,6 +1759,39 @@ void exl3m_prefill_smem_cb(const void* X0, const void* X1, const int64_t* tp0, c
         exl3::prefill_smem_cb_launch<2, 8>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots,
                                            nblocks, mats, s);
     else EXL3_CHECK(false, "smem prefill (mixed widths): codebook mul1 or mcg, widths up to 4 bits");
+}
+
+// The fat tile (prefill_fat_kernel) for a mixed-width arena: codebook cb (2 mul1, 1 mcg), widths up to
+// hi (K2 = 2 x bits: 6 or 8); mats 2 gate / up over X0 / X1, mats 1 the down matrix over X0. Z as
+// exl3m_prefill_smem's, bit for bit.
+void exl3m_prefill_fat(const void* X0, const void* X1, const int64_t* tp0, const int64_t* tp1, const int* k2_0,
+                       const int* k2_1, const int* uids, const int* ucount, const int* members, float* Z, int K,
+                       int N, int P, int slots, int nblocks, int mats, int cb, int hi, cudaStream_t s) {
+    if (cb == 1 && hi <= 6)
+        exl3::prefill_fat_launch<1, 6>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots, nblocks, mats, s);
+    else if (cb == 1 && hi <= 8)
+        exl3::prefill_fat_launch<1, 8>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots, nblocks, mats, s);
+    else if (cb == 2 && hi <= 6)
+        exl3::prefill_fat_launch<2, 6>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots, nblocks, mats, s);
+    else if (cb == 2 && hi <= 8)
+        exl3::prefill_fat_launch<2, 8>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots, nblocks, mats, s);
+    else EXL3_CHECK(false, "fat prefill: codebook mul1 or mcg, widths up to 4 bits");
+}
+
+// exl3m_prefill_fat (mats 2) and exl3m_gateup in one launch: the rotated, activated down input xd
+// [P][N] fp16, bit for bit the pair's.
+void exl3m_prefill_fat_gateup(const void* X0, const void* X1, const int64_t* tp0, const int64_t* tp1, const int* k2_0,
+                              const int* k2_1, const int* uids, const int* ucount, const int* members, int K, int N,
+                              int P, int slots, int nblocks, int cb, int hi, const void* svh_g, const void* svh_u,
+                              const void* suh_d, int suh_d_stride, float limit, void* xd, cudaStream_t s) {
+#define EXL3_FG(CB_, HI_) exl3::prefill_fat_gateup_launch<CB_, HI_>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, K, N, P, \
+                                                                   slots, nblocks, svh_g, svh_u, suh_d, suh_d_stride, limit, xd, s)
+    if (cb == 1 && hi <= 6) EXL3_FG(1, 6);
+    else if (cb == 1 && hi <= 8) EXL3_FG(1, 8);
+    else if (cb == 2 && hi <= 6) EXL3_FG(2, 6);
+    else if (cb == 2 && hi <= 8) EXL3_FG(2, 8);
+    else EXL3_CHECK(false, "fat prefill: codebook mul1 or mcg, widths up to 4 bits");
+#undef EXL3_FG
 }
 
 void exl3m_gateup(const float* Z, const int* pick, const void* svh_g, const void* svh_u, const void* suh_d,

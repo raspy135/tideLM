@@ -248,8 +248,11 @@ fi
 # TIDELM_PDL=0: kernels launched without programmatic dependent launch (default on);
 # TIDELM_L2_PREFETCH=0: no L2 prefetch of the next weights from a parallel graph branch (default on);
 # TIDELM_GLM_EVICT_FIRST=0: GLM's decode weights read without the L2 evict-first policy (default on)
+# TIDELM_GLM_MLA_HALF=0: GLM decode attention's split partials in fp32 (default fp16);
+# TIDELM_GLM_INDEX_SIDE=0: GLM, the indexer chain of a decode pass on the main stream (default beside q_b)
+# TIDELM_GLM_FAT=0: GLM, prefill's routed experts through the smem tile instead of the fat tile (same bits)
 for v in TIDELM_MEM_LOG_MB TIDELM_GRAPH_CACHE TIDELM_STEP_SPLIT TIDELM_GLM_WIDE_DECODE_FROM TIDELM_GLM_ROUND_LOG TIDELM_PDL \
-         TIDELM_L2_PREFETCH TIDELM_GLM_EVICT_FIRST; do [[ -n "${!v:-}" ]] && envs+=("$v=${!v}"); done
+         TIDELM_L2_PREFETCH TIDELM_GLM_EVICT_FIRST TIDELM_GLM_MLA_HALF TIDELM_GLM_INDEX_SIDE TIDELM_GLM_FAT; do [[ -n "${!v:-}" ]] && envs+=("$v=${!v}"); done
 for e in "${envs[@]}"; do envf+=(-e "$e"); done
 vols=() seen=" "
 for p in "${rw[@]}"; do [[ $seen == *" $p "* ]] && continue; seen+="$p "; vols+=(-v "$p:$p"); done

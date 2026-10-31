@@ -76,7 +76,7 @@ const OP_BENCH_KNOB: u32 = 12;
 
 /// Schedule knobs a benchmark can switch on both ranks inside one boot (Engine::bench_knob): each
 /// moves no value, only when and where kernels run.
-pub const BENCH_KNOBS: [&str; 5] = ["l2pf", "pdl", "evict_first", "evict_kvb", "evict_skinny"];
+pub const BENCH_KNOBS: [&str; 8] = ["l2pf", "pdl", "evict_first", "evict_kvb", "evict_skinny", "mla_half", "index_side", "fat"];
 
 /// Lanes a pass may carry (glm.cu kMaxLanes).
 pub const MAX_LANES: usize = 4;
@@ -120,7 +120,7 @@ impl Options {
              lanes {}\npack_source {}\nablit {}\nenv {}\nflags {}\n",
             sha2::Sha256::digest(&cfg), sha2::Sha256::digest(&exe), self.max_seq, self.chunk, self.slots, self.kv_split,
             self.prefill_reduce_bf16, self.moe_rows, self.lanes, pack.source_sha256, crate::ablit::digest()?,
-            ["TIDELM_GLM_HOT", "TIDELM_GLM_WIDE_DECODE_FROM", "NCCL_PROTO"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
+            ["TIDELM_GLM_HOT", "TIDELM_GLM_WIDE_DECODE_FROM", "NCCL_PROTO", "TIDELM_GLM_MLA_HALF", "TIDELM_GLM_FAT"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
                 .collect::<Vec<_>>().join(" "), self.guard_extra);
         Ok(s.into_bytes())
     }
@@ -311,6 +311,19 @@ pub struct Engine {
     /// a decode MoE layer's shared gate/up still running on the side stream (moe_exact forks it,
     /// moe_rows joins it after the routed gate/up)
     sh_open: std::cell::Cell<bool>,
+    /// decode rows: a full layer's indexer query chain, scores and top-k on the side stream beside
+    /// q_b / absorb_q (its inputs - qr, the key cache - are ready before q_b; TIDELM_GLM_INDEX_SIDE=0
+    /// runs them after, on the main stream, as before). Same values either way. In-boot A/B
+    /// (2026-10-30), 2.5K / 8K / 16K of context: 1 row -1.3 / -0.8 / -0.5%, 4 rows -0.4 / -0.2 /
+    /// -0.4%, 8 rows -0.6 / 0.0 / +0.1%, the MTP pass (whole cache, unsplit) -0.8 / -7.6 / -1.9%.
+    index_side: bool,
+    ev_fork2: tidelm_cuda::Event,
+    /// prefill's routed expert GEMMs through the fat tile (exl3m_prefill_fat: a decoded trellis tile
+    /// feeds 64 rows from registers, gate / up with the epilogue fused) instead of the smem tile and
+    /// exl3m_gateup; the same bits. glm_bench_moe --prefill (2,048 rows x top-8, 3-bit): gate+up
+    /// 11.5 -> 6.5 ms, with the epilogue 12.8 -> 6.6, down 5.6 -> 3.1; the pair's 8K prefill
+    /// (--bench-prefill-ab, 2026-10-30) 18.29 -> 15.82 s. TIDELM_GLM_FAT=0 off.
+    fat: bool,
     blas: Blas,
     pub w: Weights,
     members: Members,
@@ -414,7 +427,11 @@ impl Engine {
         // and indexer's skinny GEMVs (-0.8 / -0.6 / -0.4%). The same values; TIDELM_GLM_EVICT_FIRST=0
         // turns all three off
         let ef = (std::env::var("TIDELM_GLM_EVICT_FIRST").as_deref() != Ok("0")) as i32;
+        // decode attention's split partials in fp16 (glm.cu c_mla_half; bench_mla: mla + combine at
+        // 1 / 4 / 8 rows 47.5 / 136.9 / 211.7 -> 44.3 / 116.0 / 188.2 us); TIDELM_GLM_MLA_HALF=0 keeps fp32
+        let mla_half = (std::env::var("TIDELM_GLM_MLA_HALF").as_deref() != Ok("0")) as i32;
         unsafe {
+            glm_set_mla_half(mla_half);
             glm_set_pdl(pdl);
             exl3m_set_pdl(pdl);
             tidelm_kernels::ds41::ds_set_pdl(pdl);
@@ -554,6 +571,9 @@ impl Engine {
             pf_join: tidelm_cuda::Event::new()?,
             pf_open: std::cell::Cell::new(false),
             sh_open: std::cell::Cell::new(false),
+            index_side: std::env::var("TIDELM_GLM_INDEX_SIDE").as_deref() != Ok("0"),
+            fat: std::env::var("TIDELM_GLM_FAT").as_deref() != Ok("0"),
+            ev_fork2: tidelm_cuda::Event::new()?,
             blas,
             w,
             arena,
@@ -825,10 +845,44 @@ impl Engine {
                                       rowsb, kv.iq.unwrap().raw(), kv.is.unwrap().raw(), t as i32) }, "index key")?;
             self.linear_f32w_on(sst, part2, np(&a.xn), h, &ix.wp, t, 32, h, np(&a.iw), if prefill { 1 } else { 24 })?;
         }
+        let inv_d = (cfg.index_dim as f32).powf(-0.5);
+        let wscale = (cfg.index_heads as f32).powf(-0.5);
+        // decode: the indexer's query chain, scores and top-k, on `ist`; split: each rank scores its
+        // own positions and sends its top-k scores with the queries
+        let index_decode = |ist: &Stream, x3: &Exl3Scratch| -> Result<()> {
+            let ix = lw.index.as_ref().unwrap();
+            let s = ist.raw();
+            self.exl3_on(ist, x3, &ix.wq_b, np(&a.qr), cfg.q_lora, t, np(&a.qi), true)?;
+            ck(unsafe { glm_rope(s, np(&a.qi), 4096, 128, np(&a.qi), 4096, 128, t as i32, 32, np(&self.w.cos), np(&self.w.sin),
+                                 posb) }, "rope index q")?;
+            let (ix_q, ix_s) = (kv.iq.unwrap().raw(), kv.is.unwrap().raw());
+            if split {
+                let lim = self.s_loc.min(self.opt.max_seq.div_ceil(self.world));
+                ck(unsafe { glm_index_scores(s, np(&a.qi), np(&a.iw), wscale, ix_q, ix_s, posb, t as i32, lim as i32,
+                                             self.world as i32, self.rank as i32, 0, inv_d, np(&a.scores), lim as i64, lanes, nl) },
+                   "index scores")?;
+                let vals = at(&a.qsend, hl * 576 * 2);
+                ck(unsafe { glm_topk(s, np(&a.scores), lim as i64, posb, self.world as i32, self.rank as i32, lim as i32,
+                                     TOPK as i32, t as i32, np(&a.idx), TOPK as i64, vals, (self.qrow / 4) as i64) }, "topk")
+            } else {
+                let lim = self.opt.max_seq;
+                ck(unsafe { glm_index_scores(s, np(&a.qi), np(&a.iw), wscale, ix_q, ix_s, posb, t as i32, lim as i32, 1, 0, 0,
+                                             inv_d, np(&a.scores), lim as i64, lanes, nl) }, "index scores")?;
+                ck(unsafe { glm_topk(s, np(&a.scores), lim as i64, posb, 1, 0, lim as i32, TOPK as i32, t as i32, np(&a.idx),
+                                     TOPK as i64, std::ptr::null_mut(), 0) }, "topk")
+            }
+        };
         // q_a, its norm, q_b (this rank's heads), RoPE on its last 64 dims, the absorbed query
         self.exl3(&lw.q_a, np(&a.xn), h, t, np(&a.qa), true)?;
         ck(unsafe { glm_rmsnorm(st, np(&a.qa), cfg.q_lora as i64, std::ptr::null(), 0, np(&lw.q_norm), np(&a.qr),
                                 cfg.q_lora as i64, t as i32, cfg.q_lora as i32, 1e-6) }, "q norm")?;
+        if full && decode && self.index_side {
+            // the side stream, past the key chain it runs: wq_b, the scores and the top-k beside
+            // q_b, RoPE and absorb_q (their inputs, qr and the key cache, are ready here)
+            self.ev_fork2.record(&self.st)?;
+            sst.wait_event(&self.ev_fork2)?;
+            index_decode(sst, x3)?;
+        }
         self.exl3(&lw.q_b, np(&a.qr), cfg.q_lora, t, np(&a.qb), true)?;
         let qrow = if decode { self.qrow / 2 } else { hl * 576 };
         let qbase = if decode { np(&a.qsend) } else { np(&a.qf) };
@@ -847,13 +901,16 @@ impl Engine {
         }
         let s_all = p0 + t; // positions [0, S) once this step's rows are written
         let dense_causal = prefill && s_all <= TOPK;
-        if full {
-            // after q_b on this stream: on a third stream beside q_b it measured the same (in-boot
-            // A/B, 1 / 4 / 8 rows -0.2 / -0.2 / +0.1%; the pair reads at ~177 GB/s either way)
+        if full && prefill {
             let ix = lw.index.as_ref().unwrap();
             self.exl3(&ix.wq_b, np(&a.qr), cfg.q_lora, t, np(&a.qi), true)?;
             ck(unsafe { glm_rope(st, np(&a.qi), 4096, 128, np(&a.qi), 4096, 128, t as i32, 32, np(&self.w.cos), np(&self.w.sin),
                                  posb) }, "rope index q")?;
+        }
+        if full && decode && !self.index_side {
+            // after q_b on this stream (wq_b alone on a third stream measured the same: in-boot A/B,
+            // 1 / 4 / 8 rows -0.2 / -0.2 / +0.1%; the pair reads at ~177 GB/s either way)
+            index_decode(&self.st, &a.x3s)?;
         }
         if decode {
             self.join()?;
@@ -862,21 +919,8 @@ impl Engine {
             self.l2_runs(lw.kvb_q.raw() as u64 + (192 * 512) as u64, (256 * 512) as u64, (448 * 512) as u64, hl)?;
         }
         let scale = (cfg.qk_dim() as f32).powf(-0.5);
-        let inv_d = (cfg.index_dim as f32).powf(-0.5);
-        let wscale = (cfg.index_heads as f32).powf(-0.5);
         if decode && split {
             // each rank scores and attends its own positions for every head
-            let lim = self.s_loc.min(self.opt.max_seq.div_ceil(self.world));
-            if full {
-                let (ix_q, ix_s) = (kv.iq.unwrap().raw(), kv.is.unwrap().raw());
-                ck(unsafe { glm_index_scores(st, np(&a.qi), np(&a.iw), wscale, ix_q, ix_s, posb, t as i32, lim as i32,
-                                             self.world as i32, self.rank as i32, 0, inv_d, np(&a.scores), lim as i64,
-                                             lanes, nl) },
-                   "index scores")?;
-                let vals = at(&a.qsend, hl * 576 * 2);
-                ck(unsafe { glm_topk(st, np(&a.scores), lim as i64, posb, self.world as i32, self.rank as i32, lim as i32,
-                                     TOPK as i32, t as i32, np(&a.idx), TOPK as i64, vals, (self.qrow / 4) as i64) }, "topk")?;
-            }
             let nbytes = t * self.qrow;
             self.gather(np(&a.qsend), nbytes, np(&a.gs), false)?;
             if full {
@@ -903,14 +947,6 @@ impl Engine {
                "mla merge")?;
         } else if decode {
             // the MTP layer (or an unsplit cache): this rank's heads over the whole cache
-            if full {
-                let (ix_q, ix_s) = (kv.iq.unwrap().raw(), kv.is.unwrap().raw());
-                let lim = self.opt.max_seq;
-                ck(unsafe { glm_index_scores(st, np(&a.qi), np(&a.iw), wscale, ix_q, ix_s, posb, t as i32, lim as i32, 1, 0, 0,
-                                             inv_d, np(&a.scores), lim as i64, lanes, nl) }, "index scores")?;
-                ck(unsafe { glm_topk(st, np(&a.scores), lim as i64, posb, 1, 0, lim as i32, TOPK as i32, t as i32, np(&a.idx),
-                                     TOPK as i64, std::ptr::null_mut(), 0) }, "topk")?;
-            }
             let (ns, chunk) = decode_split(TOPK, hl, t);
             ck(unsafe { glm_mla(st, MLA_DECODE_MT, qbase, 0, qrow as i64, 576, hl as i32, kv.cq.raw(), kv.cs.raw(), kv.cr.raw(), 0,
                                 np(&a.idx), TOPK as i64, TOPK as i32, 1, bound, t as i32, hl as i32, scale, ns as i32, chunk as i32,
@@ -1157,7 +1193,14 @@ impl Engine {
         unsafe {
             exl3m_rot_in(x, h as i32, np(&a.pick), arena.pool(3), arena.pool(4), np(&a.xh0), np(&a.xh1), n as i32, h as i32,
                          k as i32, slots, 1, st);
-            if up_tiled && mixed {
+            if up_tiled && self.fat {
+                // the fat tile with the epilogue fused: xd straight into the pair buffer
+                let suh2 = (arena.pool(5) as *mut u16).add(self.rank * il) as *const c_void;
+                exl3m_prefill_fat_gateup(np(&a.xh0), np(&a.xh1), np(&arena.t1p), np(&arena.t3p), np(&arena.k2g), np(&arena.k2u),
+                                         uids, np(&a.ucount), np(&a.members), h as i32, il as i32, p as i32, k as i32, nexp,
+                                         arena.cb, arena.max_k2.max(6), arena.pool(6), arena.pool(7), suh2, cfg.moe_inter as i32,
+                                         f32::INFINITY, np(&a.pair), st);
+            } else if up_tiled && mixed {
                 exl3m_prefill_smem_cb(np(&a.xh0), np(&a.xh1), np(&arena.t1p), np(&arena.t3p), np(&arena.k2g), np(&arena.k2u),
                                       uids, np(&a.ucount), np(&a.members), np(&a.zup), h as i32, il as i32, p as i32,
                                       k as i32, nexp, 2, arena.cb, arena.max_k2, st);
@@ -1170,9 +1213,11 @@ impl Engine {
                               np(&a.ucount), np(&a.members), np(&a.zup), h as i32, il as i32, p as i32, 1, maxm, k as i32,
                               nexp, 2, 8, 4, if decode { DECODE_PF_ROUTED } else { 2 }, 2, 10, arena.cb, st);
             }
-            let suh2 = (arena.pool(5) as *mut u16).add(self.rank * il) as *const c_void;
-            exl3m_gateup(np(&a.zup), np(&a.pick), arena.pool(6), arena.pool(7), suh2, np(&a.pair), n as i32, p as i32, il as i32,
-                         1, k as i32, slots, cfg.moe_inter as i32, f32::INFINITY, 1, st);
+            if !(up_tiled && self.fat) {
+                let suh2 = (arena.pool(5) as *mut u16).add(self.rank * il) as *const c_void;
+                exl3m_gateup(np(&a.zup), np(&a.pick), arena.pool(6), arena.pool(7), suh2, np(&a.pair), n as i32, p as i32, il as i32,
+                             1, k as i32, slots, cfg.moe_inter as i32, f32::INFINITY, 1, st);
+            }
         }
         ck(unsafe { tidelm_cuda::ffi::cudaGetLastError() }, "routed up")?;
         self.shared_join()?;
@@ -1202,7 +1247,11 @@ impl Engine {
         }
         self.exl3_on(sst, x3, sh_down, np(&a.hf), kd, n, np(&a.shout), false)?;
         unsafe {
-            if up_tiled && mixed {
+            if up_tiled && self.fat {
+                exl3m_prefill_fat(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
+                                  uids, np(&a.ucount), np(&a.members), np(&a.zd), kd as i32, dn as i32, p as i32, k as i32,
+                                  nexp, 1, arena.cb, arena.max_k2.max(6), st);
+            } else if up_tiled && mixed {
                 exl3m_prefill_smem_cb(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
                                       uids, np(&a.ucount), np(&a.members), np(&a.zd), kd as i32, dn as i32, p as i32,
                                       k as i32, nexp, 1, arena.cb, arena.max_k2, st);
@@ -2218,6 +2267,9 @@ impl Engine {
         let var = match name {
             "l2pf" => "TIDELM_L2_PREFETCH",
             "pdl" => "TIDELM_PDL",
+            "mla_half" => "TIDELM_GLM_MLA_HALF",
+            "index_side" => "TIDELM_GLM_INDEX_SIDE",
+            "fat" => "TIDELM_GLM_FAT",
             _ => "TIDELM_GLM_EVICT_FIRST",
         };
         self.bench_knob(name, std::env::var(var).as_deref() != Ok("0"))
@@ -2241,6 +2293,11 @@ impl Engine {
             4 => unsafe {
                 tidelm_kernels::ds41::ds_set_stream_weights(on as i32);
             },
+            5 => unsafe {
+                glm_set_mla_half(on as i32);
+            },
+            6 => self.index_side = on,
+            7 => self.fat = on,
             _ => return Err(format!("bench knob {code}").into()),
         }
         self.graphs_map.clear();

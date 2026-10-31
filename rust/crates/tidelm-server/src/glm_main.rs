@@ -34,7 +34,7 @@ pub fn is_glm(model_dir: &std::path::Path) -> bool {
 }
 
 pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
-    const VALUED: [&str; 48] = ["--bench-ab", "--bench-ab-rounds", "--bench-nll-skip", "--bench-nll-rows", "--bench-nll-max", "--lanes", "--lane-chunk", "--bench-nll-out", "--bench-nll", "--bench-widths", "--copy", "--hot-async", "--bench-width", "--bench-ctx", "--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
+    const VALUED: [&str; 50] = ["--bench-nll-ab", "--bench-prefill-ab", "--bench-ab", "--bench-ab-rounds", "--bench-nll-skip", "--bench-nll-rows", "--bench-nll-max", "--lanes", "--lane-chunk", "--bench-nll-out", "--bench-nll", "--bench-widths", "--copy", "--hot-async", "--bench-width", "--bench-ctx", "--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
                                 "--max-seq", "--chunk", "--hot", "--hot-keep", "--depth", "--cal", "--dyn", "--lookup",
                                 "--adapt", "--adapt-every", "--adapt-prefill", "--adapt-decode", "--bg-every", "--loop-break",
                                 "--two-pass", "--two-pass-miss", "--host", "--port", "--served-model-name", "--moe-rows",
@@ -207,7 +207,20 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         let shape = (num("--bench-nll-skip", 32.0)? as usize, rows, num("--bench-nll-max", 4096.0)? as usize);
         // with --bench-width too, the width bench follows in the same boot
         let last = arg(args, "--bench-width").is_none();
-        bench_nll(&mut srv.eng, &path, &text, keep, arg(args, "--bench-nll-out"), &shape, last)?;
+        // --bench-nll-ab KNOB: the NLL twice in this boot, the knob off then on, the dumps to
+        // --bench-nll-out's path with .off / .on appended
+        if let Some(knob) = arg(args, "--bench-nll-ab") {
+            let out = arg(args, "--bench-nll-out");
+            for on in [false, true] {
+                srv.eng.bench_knob(&knob, on)?;
+                eprintln!("bench-nll-ab: {knob} {}", if on { "on" } else { "off" });
+                let o = out.as_ref().map(|p| format!("{p}.{}", if on { "on" } else { "off" }));
+                bench_nll(&mut srv.eng, &path, &text, keep, o, &shape, last && on)?;
+            }
+            srv.eng.bench_knob_reset(&knob)?;
+        } else {
+            bench_nll(&mut srv.eng, &path, &text, keep, arg(args, "--bench-nll-out"), &shape, last)?;
+        }
         if last {
             return Ok(());
         }
@@ -225,8 +238,11 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
             Some((k, r)) => Some((k, r?)),
             None => None,
         };
+        // --bench-prefill-ab KNOB[,KNOB..]: the first context's prefill timed with each knob off and on
+        // (ABBA, --bench-ab-rounds), before its widths
+        let pab = arg(args, "--bench-prefill-ab").map(|k| (k, num("--bench-ab-rounds", 3.0).unwrap_or(3.0) as usize));
         return bench_width(&mut srv.eng, &path, &list("--bench-ctx", "2500")?, &list("--bench-widths", "1,2,4,6,8,9,12,16,17,24,32,33")?,
-                           &text, ab);
+                           &text, ab, pab);
     }
     let text = Text::load(&model_dir)?;
     let family = Family::load(&model_dir, &text)?;
@@ -313,8 +329,8 @@ fn engine_loop(mut srv: Server, rx: mpsc::Receiver<Cmd>) -> tidelm_engine::Resul
 /// then passes of --bench-widths rows of its continuation, each rolled back (20 timed after 5
 /// warm; past 16 rows the path wide_decode_from() picks), and the MTP draft pass a copy round
 /// skips.
-fn bench_width(eng: &mut Engine, path: &str, ctxs: &[usize], widths: &[usize], text: &Text, ab: Option<(String, usize)>)
-               -> tidelm_engine::Result<()> {
+fn bench_width(eng: &mut Engine, path: &str, ctxs: &[usize], widths: &[usize], text: &Text, ab: Option<(String, usize)>,
+               pab: Option<(String, usize)>) -> tidelm_engine::Result<()> {
     let ids = text.encode(&std::fs::read_to_string(path)?).map_err(|e| format!("{path}: {e:?}"))?;
     let wmax = widths.iter().copied().max().unwrap_or(1);
     eng.set_sampling(None)?;
@@ -323,7 +339,33 @@ fn bench_width(eng: &mut Engine, path: &str, ctxs: &[usize], widths: &[usize], t
         if ids.len() < ctx + wmax || ctx <= eng.pos {
             return Err(format!("{path}: {} tokens; contexts must ascend and leave {wmax}", ids.len()).into());
         }
+        if let (Some((knobs, rounds)), true) = (&pab, ctx == ctxs[0]) {
+            // the whole context prefilled from position 0 each time, lane 0's rows rewritten
+            for knob in knobs.split(',').map(str::trim) {
+                let mut by: [Vec<f64>; 2] = [vec![], vec![]];
+                for r in 0..*rounds {
+                    for on in if r % 2 == 0 { [false, true] } else { [true, false] } {
+                        eng.bench_knob(knob, on)?;
+                        eng.set_pos(0)?;
+                        let t = Instant::now();
+                        eng.forward(&ids[..ctx], false)?;
+                        let dt = t.elapsed().as_secs_f64();
+                        eprintln!("bench-prefill-ab: {knob} {}: {ctx} tokens in {dt:.3} s", if on { "on" } else { "off" });
+                        by[on as usize].push(dt);
+                    }
+                }
+                eng.bench_knob_reset(knob)?;
+                let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+                let f = |v: &[f64]| v.iter().map(|x| format!("{x:.3}")).collect::<Vec<_>>().join(" / ");
+                let (a, b) = (mean(&by[0]), mean(&by[1]));
+                eprintln!("bench-prefill-ab: {knob} context {ctx}: off {a:.3} s ({}), on {b:.3} s ({}), {:+.1}%", f(&by[0]), f(&by[1]),
+                          100.0 * (b - a) / a);
+            }
+            eng.set_pos(0)?;
+        }
+        let t = Instant::now();
         eng.forward(&ids[eng.pos..ctx], false)?;
+        eprintln!("bench-width: context to {ctx} tokens prefilled in {:.3} s", t.elapsed().as_secs_f64());
         eng.keep_hidden(eng.last_rows - 1)?;
         let Some((knobs, rounds)) = &ab else {
             bench_widths(eng, &ids, ctx, widths)?;
