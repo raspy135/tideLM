@@ -273,6 +273,8 @@ pub struct Stats {
     /// copy rounds that copied the prompt by the long rule (GLM_COPY)
     pub long_copies: usize,
     pub fallbacks: usize,
+    /// rows of a pass with no finite logit (a NaN hidden state): the request ends as an error
+    pub nan_rows: usize,
     pub loop_breaks: usize,
     pub two_pass: usize,
     /// rounds that verified beside another lane's rows (a request's)
@@ -404,7 +406,14 @@ impl Server {
         }
         let d = dist_from_logits(&z, temp, top_p);
         if d.is_empty() {
-            return Err(format!("row {row}: no finite logits to sample from").into());
+            // a whole row of NaN (seen 2026-10-29 past 162K and 2026-11-01 four times past
+            // 323K, one request in ~10 at that context, cause not found): the request ends with an
+            // error (finish), the pair stays up. The row draws a stop token so its lane's round
+            // ends; rank 1 follows the mirrored calls as for any token.
+            self.stats.nan_rows += 1;
+            st.nan_rows += 1;
+            let stop = self.eng.cfg.eos.first().copied().unwrap_or(0);
+            return Ok(vec![(stop, 1.0)]);
         }
         Ok(d)
     }
@@ -689,6 +698,12 @@ impl Server {
 
     /// A request's end: its Done event, its prompt's rows to the disk store, its line.
     fn finish(&mut self, mut run: Run, finish: Finish) -> Result<()> {
+        let finish = if run.stats.nan_rows > 0 && !matches!(finish, Finish::Error(_) | Finish::Cancelled) {
+            Finish::Error(format!("{} row(s) of a pass had no finite logits (NaN) in lane {} near position {}", run.stats.nan_rows,
+                                  run.lane, self.eng.lane_pos(run.lane)))
+        } else {
+            finish
+        };
         self.log_json(serde_json::json!({"tokens": run.g.tokens}));
         let ok = !matches!(finish, Finish::Error(_));
         // the request's own routing by phase (its rows alone, beside another lane too), DS's
@@ -706,6 +721,7 @@ impl Server {
         let rounds = s.rounds.max(1) as f64;
         let r1 = &self.eng.res.stats;
         let r0 = &run.res0;
+        let nan = if s.nan_rows > 0 { format!(", NaN rows {}", s.nan_rows) } else { String::new() };
         let beside = if s.shared_rounds > 0 {
             format!(" ({} of {} rounds beside another lane; hot reads and swaps are the lanes')", s.shared_rounds, s.rounds)
         } else {
@@ -713,7 +729,7 @@ impl Server {
         };
         let line = format!("request {}, GLM: {:.2} drafted / {:.2} accepted a round, copy rounds {} ({} long, {} accepted), \
                             miss rate {:.1}% (prompt {:.1}%, decode {:.1}%; by score {:.1}%), hot reads {} (kept {}, {:.2} s waited), \
-                            swaps {} ({:.2} s waited), fallbacks {}{beside}",
+                            swaps {} ({:.2} s waited), fallbacks {}{nan}{beside}",
                            run.job.id, s.drafted as f64 / rounds, s.accepted as f64 / rounds, s.copy_rounds, s.long_copies,
                            s.copy_accepted, pct(p[0] + d[0], p[1] + d[1]), pct(p[0], p[1]), pct(d[0], d[1]),
                            pct(p[2] + d[2], p[3] + d[3]), r1.hot_reads - r0.hot_reads, r1.hot_kept - r0.hot_kept,
@@ -767,6 +783,10 @@ impl Server {
         for mut r in runs.drain(..) {
             if r.cancelled {
                 self.finish(r, Finish::Cancelled)?;
+                continue;
+            }
+            if r.stats.nan_rows > 0 {
+                self.finish(r, Finish::Stop)?; // finish reports it as an error
                 continue;
             }
             if opt.loop_break > 0 && {
