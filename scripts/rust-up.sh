@@ -42,6 +42,15 @@
 # --rust), and the worker must hold the same image id; a mismatch is refused with the command
 # that fixes it. RUST_BIN=path runs a binary built on this box instead (cargo build --release in
 # rust/, for development): mounted over the image's on both ranks, copied to the worker first.
+# ENGINE_CPUS=5-9,15-19 (unset: any core) pins both ranks' containers to those cores, in their own
+# engine.slice so a cpuset on system.slice (the OS and GUI kept to the E cores, 0-4,10-14:
+# `systemctl set-property user.slice|system.slice|init.scope AllowedCPUs=0-4,10-14`) does not
+# bind them too. GB10's P cores (Cortex-X925, 3.9 GHz) are 5-9 and 15-19, interleaved with the
+# E cores (A725, 2.8 GHz). Measured 2026-11-02, 300-token decode with both ranks taskset to
+# each: P only equal to unpinned (the scheduler already puts the two busy threads on P cores),
+# E only +20% a step. The pin is for jitter, not placement: unpinned, the dispatcher thread was
+# preempted ~10 times a second by other tasks woken on its core, each a ~1 ms bubble between
+# launches.
 # The containers run as the calling user, with the model, its packs and ~/tidelm-rust-state
 # mounted at their own paths. Logs: `scripts/tide.sh logs -f` (one line a request: prefill and
 # decode speeds; --rank 1 the worker's).
@@ -263,6 +272,7 @@ r0vols=()   # rank 0's alone: the DS routing trace (above)
 dflags=(-d --network host --gpus all --device /dev/infiniband --cap-add IPC_LOCK --ipc host
         --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=65536
         --entrypoint /app/scripts/memguard.sh)
+[[ -n "${ENGINE_CPUS:-}" ]] && dflags+=(--cgroup-parent=engine.slice --cpuset-cpus "$ENGINE_CPUS")
 if [[ -n "${PEER:-}" ]]; then
     peer_img=$(ssh "$PEER" "docker image inspect -f '{{.Id}}' '$IMAGE'" 2>/dev/null) || peer_img="none"
     [[ "$peer_img" == "$img" ]] || err "the worker's $IMAGE ($peer_img) is not this box's ($img): \
