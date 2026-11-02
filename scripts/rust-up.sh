@@ -50,7 +50,12 @@
 # each: P only equal to unpinned (the scheduler already puts the two busy threads on P cores),
 # E only +20% a step. The pin is for jitter, not placement: unpinned, the dispatcher thread was
 # preempted ~10 times a second by other tasks woken on its core, each a ~1 ms bubble between
-# launches.
+# launches. It does not show in the step: the width bench (bench profile, 16K context, median
+# verify ms at 1 / 4 / 8 rows) gave all cores 61.9 / 118.0 / 175.1, the P cores 62.1 / 116.4 /
+# 168.4, cluster 1 alone (10-19: its own 16 MB L3 and bus, the OS held to 0-9) 61.3 / 116.3 /
+# 168.1 and 61.9 / 116.1 / 168.5 - within a boot's noise (the 8-row all-cores number is one
+# high boot: min 169.6). The two busy threads touch a few cache lines each, so neither the L3
+# nor the cores matter; set it for a quiet desktop, not for speed.
 # The containers run as the calling user, with the model, its packs and ~/tidelm-rust-state
 # mounted at their own paths. Logs: `scripts/tide.sh logs -f` (one line a request: prefill and
 # decode speeds; --rank 1 the worker's).
