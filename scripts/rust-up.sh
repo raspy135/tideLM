@@ -32,6 +32,8 @@
 #   RUST_PREFIX_DIR=~/tidelm-rust-state/prefix-cache     the prefix cache's disk tier
 #   RUST_EXPERT_TOPP         unset: off (DSV41_EXPERT_TOPP=0.90 measured slower in Rust, rust/PORT.md)
 #   RUST_COPY_DRAFT=1        the copy drafter (CPU prompt lookup in front of DSpark; 0 off)
+#   DSV41_DREAM=1            both models: log finished chats for dreaming (unset: off), to
+#                            DSV41_DREAM_DIR (host path, default ~/models/dream)/conversations
 #   RUST_KV_TOKENS           unset: every lane can reach MAX_SEQ at once. Set: the compressed
 #                            caches' page pool, in tokens over all lanes (at least MAX_SEQ: one lane
 #                            always reaches it); under RUST_LANES x MAX_SEQ a lane short of pages
@@ -279,10 +281,20 @@ rank0=("${pair[@]}")
 # by name, so the value is on no command line.
 keyf=()
 if [[ -n "${API_KEY:-}" ]]; then export TIDELM_API_KEY="$API_KEY"; keyf=(-e TIDELM_API_KEY); fi
+# DSV41_DREAM=1 (either model, opt-in): rank 0 appends every finished chat completion, with its
+# exact prompt and answer ids, to DSV41_DREAM_DIR/conversations/YYYY-MM-DD.jsonl for dreaming
+# (rust/crates/tidelm-server/src/convlog.rs). DSV41_DREAM_DIR is a host path, default
+# ~/models/dream, where dream/extract_facts.py reads. Unset: nothing is logged.
+dreamf=()
+if [[ "${DSV41_DREAM:-0}" == 1 ]]; then
+    ddir="${DSV41_DREAM_DIR:-$HOME/models/dream}"
+    mkdir -p "$ddir/conversations" && chmod 700 "$ddir/conversations"
+    dreamf=(-e DSV41_DREAM=1 -e DSV41_DREAM_DIR="$ddir" -v "$ddir:$ddir")
+fi
 docker rm -f tidelm-rank0 > /dev/null 2>&1 || true
 docker run "${dflags[@]}" --name tidelm-rank0 --user "$(id -u):$(id -g)" -e HOME="$HOME" \
     --health-cmd "curl -fsS http://127.0.0.1:${PORT:-8000}/health || exit 1" --health-interval 30s \
-    --health-start-period 10m "${vols[@]}" "${r0vols[@]}" "${envf[@]}" "${keyf[@]}" "${bin[@]}" \
+    --health-start-period 10m "${vols[@]}" "${r0vols[@]}" "${envf[@]}" "${keyf[@]}" "${dreamf[@]}" "${bin[@]}" \
     "$IMAGE" "$guard" tidelm-server "${args[@]}" "${rank0[@]}" > /dev/null
 if [[ -n "${PEER:-}" ]]; then
     ssh -n "$PEER" "docker rm -f tidelm-rank1 > /dev/null 2>&1; docker run $(printf '%q ' "${dflags[@]}") \

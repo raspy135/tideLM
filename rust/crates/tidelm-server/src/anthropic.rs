@@ -495,6 +495,8 @@ fn handle(stream: &mut TcpStream, path: &str, body: &[u8], ctx: &Ctx) -> Result<
     }
     let images = matches!(ctx.family, Family::Ds) && ctx.vision.is_some();
     let (msgs, tools) = to_chat(&req, Some(&ctx.memo), images).map_err(|e| ApiError::bad(e, Some("messages")))?;
+    // the conversation log records the translated chat messages, as Python's did
+    let logged = ctx.convlog.as_ref().map(|_| json!({"messages": msgs.clone()}));
     let prep = match &ctx.family {
         Family::Glm(g) => crate::glm::anthropic_prepare(&req, &msgs, tools, ctx, g, count)?,
         Family::Ds => crate::api::anthropic_prepare(&req, msgs, tools, ctx, count)?,
@@ -514,12 +516,17 @@ fn handle(stream: &mut TcpStream, path: &str, body: &[u8], ctx: &Ctx) -> Result<
     let tools = p.tools.clone();
     let tools = Some(&tools).filter(|t| !t.is_null());
     let mut answer = p.answer;
+    let prompt_ids = if logged.is_some() { p.request.prompt.clone() } else { Vec::new() };
+    // the answer's ids, through the stop id (the conversation log's token_ids)
+    let mut toks: Vec<u32> = Vec::new();
     let (id, rx) = submit(ctx, p.request)?;
     if !streaming {
         let (finish, gen) = loop {
             match rx.recv() {
                 Ok(Event::Tokens(t)) => {
+                    let before = answer.tokens();
                     answer.feed(&ctx.text, &t);
+                    toks.extend_from_slice(&t[..(answer.tokens() - before).min(t.len())]);
                 }
                 Ok(Event::Done(Finish::Error(e), _)) => return Err(ApiError { status: 500, message: e, param: None }.into()),
                 Ok(Event::Done(f, g)) => break (f, g),
@@ -534,6 +541,7 @@ fn handle(stream: &mut TcpStream, path: &str, body: &[u8], ctx: &Ctx) -> Result<
         ctx.memo.put(&text, &ids, answer.reasoning());
         let length = !answer.ended() && matches!(finish, Finish::Length);
         let stop = stop_reason(&uses, length);
+        log_turn(ctx, logged.as_ref(), answer.reasoning(), &text, &calls, stop, &prompt_ids, &toks);
         let usage = usage_counts(n_prompt, gen.cached, answer.tokens());
         send_json(stream, 200, &message(&mid, &ctx.model, &text, uses, stop, usage))?;
         return Ok(());
@@ -552,7 +560,10 @@ fn handle(stream: &mut TcpStream, path: &str, body: &[u8], ctx: &Ctx) -> Result<
                 return Ok(());
             }
             Ok(Event::Tokens(t)) => {
-                for (ph, d) in answer.feed(&ctx.text, &t) {
+                let before = answer.tokens();
+                let events = answer.feed(&ctx.text, &t);
+                toks.extend_from_slice(&t[..(answer.tokens() - before).min(t.len())]);
+                for (ph, d) in events {
                     if ph == Phase::Content {
                         out.text(&d).map_err(gone)?;
                     }
@@ -581,8 +592,23 @@ fn handle(stream: &mut TcpStream, path: &str, body: &[u8], ctx: &Ctx) -> Result<
     let ids: Vec<Value> = uses.iter().map(|u| u["id"].clone()).collect();
     ctx.memo.put(&text, &ids, answer.reasoning());
     let length = !answer.ended() && matches!(finish, Finish::Length);
-    out.finish(&uses, stop_reason(&uses, length), usage_counts(n_prompt, gen.cached, answer.tokens())).map_err(gone)?;
+    let stop = stop_reason(&uses, length);
+    log_turn(ctx, logged.as_ref(), answer.reasoning(), &text, &calls, stop, &prompt_ids, &toks);
+    out.finish(&uses, stop, usage_counts(n_prompt, gen.cached, answer.tokens())).map_err(gone)?;
     Ok(())
+}
+
+/// The conversation log's record of a /v1/messages answer (`logged`: its chat messages, None: off)
+#[allow(clippy::too_many_arguments)]
+fn log_turn(ctx: &Ctx, logged: Option<&Value>, reasoning: &str, text: &str, calls: &[Value], stop: &str, prompt_ids: &[u32],
+            toks: &[u32]) {
+    if let (Some(log), Some(body)) = (&ctx.convlog, logged) {
+        let family = match ctx.family { Family::Glm(_) => "glm", Family::Ds => "ds" };
+        log.record(&crate::convlog::Turn {
+            body, model: &ctx.model, family, thinking: !reasoning.is_empty(), effort: Value::Null, reasoning,
+            content: text, tool_calls: calls, finish_reason: stop, prompt_ids, token_ids: toks,
+        });
+    }
 }
 
 #[cfg(test)]

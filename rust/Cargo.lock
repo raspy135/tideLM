@@ -1168,6 +1168,8 @@ dependencies = [
 name = "tidelm-server"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "regex",
  "serde_json",
  "sha2",
  "tidelm-comm",

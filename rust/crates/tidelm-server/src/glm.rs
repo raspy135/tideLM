@@ -209,7 +209,7 @@ pub fn chat(stream: &mut TcpStream, body: &[u8], ctx: &Ctx, g: &GlmSettings) -> 
     let mut p = params(&body, g)?;
     p.max_tokens = Room::Glm.fit(ids.len(), p.max_tokens, ctx.max_seq).ok_or_else(|| exceeds(ids.len()))?;
     let tools = body.get("tools").filter(|t| !t.is_null());
-    run(stream, ctx, g, request(ids, &p, g), tools, body.get("stream").is_some_and(truthy), true, t0)
+    run(stream, ctx, g, request(ids, &p, g), tools, body.get("stream").is_some_and(truthy), Some(&body), t0)
 }
 
 /// /v1/completions: a raw prompt; `text` is the decode of every answer id, the stop id too
@@ -227,7 +227,7 @@ pub fn completions(stream: &mut TcpStream, body: &[u8], ctx: &Ctx, g: &GlmSettin
     }
     let mut p = params(&body, g)?;
     p.max_tokens = Room::Glm.fit(ids.len(), p.max_tokens, ctx.max_seq).ok_or_else(|| exceeds(ids.len()))?;
-    run(stream, ctx, g, request(ids, &p, g), None, body.get("stream").is_some_and(truthy), false, t0)
+    run(stream, ctx, g, request(ids, &p, g), None, body.get("stream").is_some_and(truthy), None, t0)
 }
 
 /// /v1/messages on GLM: the translated request rendered at the server's effort, muse_app's
@@ -317,10 +317,15 @@ impl Sse<'_> {
     }
 }
 
+/// A request through the engine: `body` is a chat request's (None: /v1/completions), which the
+/// conversation log records and whose x_debug puts the prompt and answer ids in the stats
 #[allow(clippy::too_many_arguments)]
-fn run(stream: &mut TcpStream, ctx: &Ctx, g: &GlmSettings, req: Request, tools: Option<&Value>, streaming: bool, chat: bool,
-       t0: Instant) -> Result<(), Failure> {
+fn run(stream: &mut TcpStream, ctx: &Ctx, g: &GlmSettings, req: Request, tools: Option<&Value>, streaming: bool,
+       body: Option<&Value>, t0: Instant) -> Result<(), Failure> {
+    let chat = body.is_some();
+    let debug = body.is_some_and(|b| b.get("x_debug").is_some_and(truthy));
     let n_prompt = req.prompt.len();
+    let prompt_ids = if debug || (chat && ctx.convlog.is_some()) { req.prompt.clone() } else { Vec::new() };
     let mut answer = GlmAnswer::new(&g.ids);
     // the answer's ids, through the stop id (/v1/completions' text)
     let mut ids = Vec::new();
@@ -373,10 +378,22 @@ fn run(stream: &mut TcpStream, ctx: &Ctx, g: &GlmSettings, req: Request, tools: 
     let tail = answer.finish(&ctx.text);
     let total = t0.elapsed().as_secs_f64();
     let n = answer.tokens();
-    let st = stats(n_prompt, n, &gen, first, total);
+    let mut st = stats(n_prompt, n, &gen, first, total);
+    if debug {
+        st["prompt_ids"] = json!(prompt_ids);
+        st["token_ids"] = json!(ids);
+    }
     let usage = json!({"prompt_tokens": n_prompt, "completion_tokens": n, "total_tokens": n_prompt + n, "muse": st});
     let (calls, _) = answer.tool_calls(&ctx.text, tools);
     let reason = finish_reason(&calls, &answer, &finish);
+    if let (Some(log), Some(b)) = (&ctx.convlog, body) {
+        // GLM's thinking is the template's: whether this answer reasoned
+        log.record(&crate::convlog::Turn {
+            body: b, model: &ctx.model, family: "glm", thinking: !answer.reasoning().is_empty(),
+            effort: json!(template_effort(b, g)), reasoning: answer.reasoning(), content: answer.content(),
+            tool_calls: &calls, finish_reason: reason, prompt_ids: &prompt_ids, token_ids: &ids,
+        });
+    }
     if let Some(mut s) = sse {
         for (ph, d) in &tail {
             s.send(&chunk(delta(*ph, d), Value::Null)).map_err(gone)?;

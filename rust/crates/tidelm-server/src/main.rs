@@ -20,6 +20,7 @@
 
 mod anthropic;
 mod api;
+mod convlog;
 mod glm_main;
 mod glm;
 mod http;
@@ -71,6 +72,8 @@ pub struct Ctx {
     pub memo: anthropic::ReasoningMemo,
     /// the keys a request must carry (empty: none needed), from api_keys()
     pub api_keys: Vec<String>,
+    /// DSV41_DREAM=1: every finished completion appended for dreaming (convlog.rs); None: off
+    pub convlog: Option<convlog::Log>,
 }
 
 /// TIDELM_API_KEY: the keys clients authenticate with, comma-separated (unset or empty: the
@@ -401,6 +404,7 @@ fn main() -> tidelm_engine::Result<()> {
         family: Family::Ds,
         memo: anthropic::ReasoningMemo::default(),
         api_keys: api_keys(),
+        convlog: convlog::Log::from_env(),
     });
     let addr = format!("{}:{}", arg(&args, "--host").unwrap_or_else(|| "0.0.0.0".into()),
                        arg(&args, "--port").unwrap_or_else(|| "8000".into()));

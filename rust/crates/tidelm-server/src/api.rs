@@ -605,6 +605,16 @@ pub fn chat(stream: &mut TcpStream, body: &[u8], ctx: &Ctx) -> Result<(), Failur
             _ => "stop",
         }
     };
+    if let Some(log) = &ctx.convlog {
+        // the body as the client sent it (Python's record), not the encoder's folded messages
+        if let Ok(b) = serde_json::from_slice::<Value>(body) {
+            log.record(&crate::convlog::Turn {
+                body: &b, model: &ctx.model, family: "ds", thinking: req.thinking, effort: json!(req.effort),
+                reasoning: &router.reasoning, content: &router.content, tool_calls: &calls, finish_reason,
+                prompt_ids: &ids, token_ids: &gen.tokens,
+            });
+        }
+    }
     let n = gen.tokens.len();
     let reasoning_tokens = if req.thinking {
         gen.tokens.iter().position(|&t| Some(t) == ctx.think_end).unwrap_or(n)

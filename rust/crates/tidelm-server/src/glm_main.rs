@@ -275,6 +275,7 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         family,
         memo: anthropic::ReasoningMemo::default(),
         api_keys: crate::api_keys(),
+        convlog: crate::convlog::Log::from_env(),
     });
     let addr = format!("{}:{}", arg(args, "--host").unwrap_or_else(|| "0.0.0.0".into()),
                        arg(args, "--port").unwrap_or_else(|| "8000".into()));

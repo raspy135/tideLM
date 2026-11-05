@@ -41,6 +41,12 @@ impl Engine {
 /// A server on 127.0.0.1 with `family`; the engine thread answers every job with
 /// `engine.answer`, three tokens a step, reusing 7 prompt tokens.
 fn serve(text: Text, family: Family, eos: u32, max_seq: usize, api_keys: Vec<String>) -> (String, Arc<Engine>, Arc<Ctx>) {
+    serve_with(text, family, eos, max_seq, api_keys, None)
+}
+
+/// serve, with the conversation log `convlog` (None: off, as serve)
+fn serve_with(text: Text, family: Family, eos: u32, max_seq: usize, api_keys: Vec<String>, convlog: Option<crate::convlog::Log>)
+              -> (String, Arc<Engine>, Arc<Ctx>) {
     let (tx, rx) = mpsc::channel::<Cmd>();
     let engine = Arc::new(Engine::default());
     let ctx = Arc::new(Ctx {
@@ -57,6 +63,7 @@ fn serve(text: Text, family: Family, eos: u32, max_seq: usize, api_keys: Vec<Str
         family,
         memo: ReasoningMemo::default(),
         api_keys,
+        convlog,
     });
     let e = engine.clone();
     std::thread::spawn(move || {
@@ -522,4 +529,93 @@ fn api_key_auth() {
     assert_eq!(request(&addr, "GET", "/v1/models", "X-Api-Key: k-one\r\n", "").0, 200);
     assert_eq!(request(&addr, "POST", "/v1/chat/completions", "Authorization: Bearer k-one-and-more\r\n", &chat).0, 401);
     assert_eq!(engine.jobs.lock().unwrap().len(), 3);
+}
+
+/// DSV41_DREAM's log on the GLM routes: the client's body and the parsed reply, plus the exact
+/// prompt ids the engine was given and the answer's ids through the stop id (a drafter's training
+/// sequence), the same ids x_debug returns; /v1/messages logged too; /v1/completions not.
+#[test]
+fn glm_conversation_log() {
+    let Some(d) = dir("GLM_TOKENIZER_DIR", "models/GLM-5.3-EXL3-3.0bpw") else {
+        eprintln!("GLM tokenizer not present; skipping");
+        return;
+    };
+    let tmp = std::env::temp_dir().join(format!("tidelm-convlog-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let text = Text::load(&d).unwrap();
+    let ids = GlmIds::load(&d, &text).unwrap();
+    let eos = ids.stop[0];
+    let g = GlmSettings { ids, default_effort: "low".into(), default_max_tokens: 4096, temperature: 1.0, top_p: 1.0 };
+    let (addr, engine, ctx) = serve_with(text, Family::Glm(g), eos, 65536, vec![], Some(crate::convlog::Log::new(tmp.clone())));
+    *engine.answer.lock().unwrap() = ctx.text.encode("Let me think.</think>Hello!<|user|>never seen").unwrap();
+    let body = json!({"messages": [{"role": "user", "content": "Hi"}], "x_debug": true});
+    let (status, _, out) = post(&addr, "/v1/chat/completions", &body);
+    assert_eq!(status, 200, "{out}");
+    let r: Value = serde_json::from_str(&out).unwrap();
+    let (prompt, _, _) = engine.last();
+    let answer = ctx.text.encode("Let me think.</think>Hello!<|user|>").unwrap();
+    assert_eq!(r["usage"]["muse"]["prompt_ids"], json!(prompt));
+    assert_eq!(r["usage"]["muse"]["token_ids"], json!(answer));
+    // a raw completion is not a conversation
+    post(&addr, "/v1/completions", &json!({"prompt": "Hi"}));
+    let (status, _, out) = post(&addr, "/v1/messages", &json!({"model": "m", "max_tokens": 100,
+                                                               "messages": [{"role": "user", "content": "Hey"}]}));
+    assert_eq!(status, 200, "{out}");
+    let (mprompt, _, _) = engine.last();
+    let mut rows: Vec<Value> = vec![];
+    for e in std::fs::read_dir(tmp.join("conversations")).unwrap().flatten() {
+        rows.extend(std::fs::read_to_string(e.path()).unwrap().lines().map(|l| serde_json::from_str::<Value>(l).unwrap()));
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let c = &rows[0];
+    assert_eq!((c["family"].as_str(), c["effort"].as_str(), c["thinking"].as_bool()), (Some("glm"), Some("low"), Some(true)));
+    assert_eq!(c["messages"], body["messages"]);
+    assert_eq!((c["reply"]["reasoning"].as_str(), c["reply"]["content"].as_str()), (Some("Let me think."), Some("Hello!")));
+    assert_eq!((c["prompt_ids"].clone(), c["token_ids"].clone(), c["finish_reason"].as_str()), (json!(prompt), json!(answer), Some("stop")));
+    let m = &rows[1];
+    assert_eq!(m["messages"][0]["content"], "Hey");
+    assert_eq!((m["prompt_ids"].clone(), m["token_ids"].clone()), (json!(mprompt), json!(answer)));
+}
+
+/// DSV41_DREAM's log on DeepSeek's chat route: the client's body (not the encoder's folded
+/// messages), its thinking and effort, and the ids the engine ran, as x_debug returns them; a
+/// secret in the history leaves the text redacted and the ids out.
+#[test]
+fn ds_conversation_log() {
+    let Some(d) = dir("TIDELM_MODEL_DIR", "models/DeepSeek-V4.1-Flash-1017") else {
+        eprintln!("DeepSeek tokenizer not present; skipping");
+        return;
+    };
+    let tmp = std::env::temp_dir().join(format!("tidelm-convlog-ds-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let text = Text::load(&d).unwrap();
+    let eos = text.encode(tidelm_text::chat::EOS).unwrap()[0];
+    let (addr, engine, ctx) = serve_with(text, Family::Ds, eos, 65536, vec![], Some(crate::convlog::Log::new(tmp.clone())));
+    let answer = ctx.text.encode(&format!("Let me see.</think>Hello!{}", tidelm_text::chat::EOS)).unwrap();
+    *engine.answer.lock().unwrap() = answer.clone();
+    let body = json!({"messages": [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi"}],
+                      "reasoning_effort": "high", "x_debug": true});
+    let (status, _, out) = post(&addr, "/v1/chat/completions", &body);
+    assert_eq!(status, 200, "{out}");
+    let r: Value = serde_json::from_str(&out).unwrap();
+    let (prompt, _, _) = engine.last();
+    let secret = json!({"messages": [{"role": "user", "content": "my key is hf_abcdefghijklmnopqrstuvwxyz0123"}]});
+    assert_eq!(post(&addr, "/v1/chat/completions", &secret).0, 200);
+    let mut rows: Vec<Value> = vec![];
+    for e in std::fs::read_dir(tmp.join("conversations")).unwrap().flatten() {
+        rows.extend(std::fs::read_to_string(e.path()).unwrap().lines().map(|l| serde_json::from_str::<Value>(l).unwrap()));
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let c = &rows[0];
+    assert_eq!((c["family"].as_str(), c["messages"].clone()), (Some("ds"), body["messages"].clone()));
+    assert_eq!((c["reply"]["reasoning"].as_str(), c["reply"]["content"].as_str()), (Some("Let me see."), Some("Hello!")));
+    assert_eq!((c["thinking"].as_bool(), c["effort"].as_u64()), (Some(true), Some(75)));
+    assert_eq!((c["prompt_ids"].clone(), c["token_ids"].clone()), (r["x_engine_stats"]["prompt_ids"].clone(), r["x_engine_stats"]["token_ids"].clone()));
+    assert_eq!(c["prompt_ids"], json!(prompt));
+    assert_eq!(c["token_ids"], json!(answer));
+    let s = &rows[1];
+    assert!(s["messages"][0]["content"].as_str().unwrap().contains("[REDACTED hf_]"));
+    assert!(s["prompt_ids"].is_null() && s["token_ids"].is_null());
 }

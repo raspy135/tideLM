@@ -19,5 +19,8 @@ ureq = "2.12"
 serde_json = { version = "1", features = ["preserve_order"] }
 # /v1/messages: the reasoning memo keys an answer by a digest of its text
 sha2 = "0.10"
+# the conversation log (convlog.rs): its secret patterns, and local dates for its file names
+regex = "1"
+libc = "0.2"
 
 [build-dependencies]
