@@ -113,7 +113,8 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
           --hot "${GLM_HOT:-0}" --hot-async "${GLM_HOT_ASYNC:-0}" --hot-keep "${GLM_HOT_KEEP:-0}" --depth "$depth" "${gate[@]}" --lookup "${GLM_LOOKUP:-0}"
           --adapt "${GLM_ADAPT:-1}" --adapt-every "${GLM_ADAPT_EVERY:-200}" --adapt-prefill "${GLM_ADAPT_PREFILL_SWAPS:-2048}"
           --adapt-decode "${GLM_ADAPT_DECODE_SWAPS:-256}" --bg-every "$bg" --loop-break "${GLM_LOOP_BREAK:-0}"
-          --two-pass "${GLM_PREFILL_TWO_PASS:-0}" --two-pass-miss "${GLM_PREFILL_TWO_PASS_MISS:-0}")
+          --two-pass "${GLM_PREFILL_TWO_PASS:-0}" --two-pass-miss "${GLM_PREFILL_TWO_PASS_MISS:-0}"
+          --preload "${GLM_PRELOAD:-0}")
     [[ "${GLM_GRAPHS:-1}" == 1 ]] && args+=(--graphs)
     # the long prompt copier, on unless GLM_COPY=0 (the server's default)
     [[ -n "${GLM_COPY:-}" ]] && args+=(--copy "$GLM_COPY")

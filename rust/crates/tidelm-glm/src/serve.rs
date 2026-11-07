@@ -258,6 +258,12 @@ pub struct ServeOptions {
     /// computed >= two_pass_miss of its routed weight on substitutes
     pub two_pass: usize,
     pub two_pass_miss: f64,
+    /// GLM_PRELOAD: session-demand preloading. A request that continues a conversation (a
+    /// prefix-cache hit with a fresh suffix) loads its conversation's already-voiced demand
+    /// before that suffix prefills: the loads the prefill->decode boundary pass would pay for
+    /// after the prefill, paid before it, so the suffix computes on the real experts and the
+    /// boundary pass plans less. The cap on experts a request may preload; 0 off.
+    pub preload: usize,
     /// GLM_LANE_CHUNK: a prompt admitted while other lanes decode prefills in parts of this many
     /// rows, a round of theirs between parts (a part alone would hold them up seconds a chunk)
     pub lane_chunk: usize,
@@ -283,6 +289,10 @@ pub struct Stats {
 /// (the lanes share one KV pool: tidelm_engine::kv).
 const KV_HEADROOM: usize = 4096;
 
+/// Conversations whose cumulative votes GLM_PRELOAD keeps, each an [layers x experts] f64 on
+/// the host; the least recently used beyond it are dropped.
+const CONV_KEEP: usize = 32;
+
 /// A request in its lane: generate's state between rounds.
 struct Run {
     job: Job,
@@ -293,6 +303,11 @@ struct Run {
     temp: f32,
     top_p: f32,
     depth: usize,
+    /// the conversation's key (prefix::conv_key of its opening): its votes accumulate at each
+    /// of its requests' ends, its continuations preload from them (GLM_PRELOAD)
+    conv: u64,
+    /// the prompt's phase vote, stashed for the conversation's accumulation at this request's end
+    prompt_vote: Option<Vec<f32>>,
     /// the next token, decided, not yet emitted or in the cache
     anchor: u32,
     /// the anchor's distribution, for a loop break (sampled)
@@ -356,6 +371,10 @@ pub struct Server {
     pub store: Option<crate::prefix::Store>,
     /// the DS engine's routing history beside GLM's (residency::DsHistory), when on
     pub ds_history: Option<crate::residency::DsHistory>,
+    /// conversations' cumulative routing votes (GLM_PRELOAD), keyed by prefix::conv_key:
+    /// (per-(layer, expert) accumulated shares, last-use sequence for CONV_KEEP's bound)
+    conv_votes: HashMap<u64, (Vec<f64>, u64)>,
+    conv_seq: u64,
     /// each lane's candidate temperature as last set
     sampling: Vec<Option<f32>>,
     pub log: Box<dyn Fn(&str) + Send>,
@@ -375,7 +394,7 @@ impl Server {
         let round_log = std::env::var("TIDELM_GLM_ROUND_LOG").ok()
             .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
         let lanes = eng.lanes();
-        Server { eng, opt, cal, stats: Stats::default(), store: None, ds_history: None, sampling: vec![None; lanes], log, round_log,
+        Server { eng, opt, cal, stats: Stats::default(), store: None, ds_history: None, conv_votes: HashMap::new(), conv_seq: 0, sampling: vec![None; lanes], log, round_log,
                  runs: (0..lanes).map(|_| None).collect(), queue: VecDeque::new(), lru: (0..lanes).collect(), done: vec![] }
     }
 
@@ -588,13 +607,31 @@ impl Server {
         g.cached = keep;
         let suffix = prompt[keep..].to_vec();
         self.eng.take_lane_demand(lane)?; // the lane's demand restarts with this request
+        // the conversation's key (its opening): its votes accumulate at each of its requests' ends,
+        // its continuations preload from them (GLM_PRELOAD)
+        let conv = crate::prefix::conv_key(&prompt);
         let mut run = Run {
             job, g, lane, rng: Pcg64::from_seed(0), greedy, temp, top_p, depth, anchor: 0, z_anchor: None, anchor_cands: None,
             lookup: None, copier: None, copied: 0, synced: 0, out: vec![], next_adapt: self.opt.adapt_every, rounds: 0,
-            cancelled: false, part: None, stats: Stats::default(), res0: self.eng.res.stats.clone(), lane0: self.eng.lane_miss(lane)?,
-            lane1: None,
+            cancelled: false, part: None, conv, prompt_vote: None, stats: Stats::default(), res0: self.eng.res.stats.clone(),
+            lane0: self.eng.lane_miss(lane)?, lane1: None,
         };
         run.rng = Pcg64::from_seed(run.job.seed as u128);
+        // session-demand preloading (GLM_PRELOAD): a continuation's suffix prefills against the demand its
+        // conversation already voiced -- the loads the prefill->decode boundary pass would pay for after the
+        // prefill, paid before it, so the suffix computes on the real experts and the boundary pass plans less
+        // (the preloaded experts are resident)
+        if self.opt.preload > 0 && keep > 0 && suffix.len() >= 4 {
+            if let Some((m, _)) = self.conv_votes.get(&conv) {
+                if self.eng.preload_wanted(m) {
+                    let (mb, s) = (self.eng.res.stats.preload_mb, self.eng.res.stats.preload_s);
+                    let n = self.eng.preload(m, self.opt.preload)?;
+                    let (mbytes, secs) = (self.eng.res.stats.preload_mb, self.eng.res.stats.preload_s);
+                    (self.log)(&format!("[glm] preload request {}: {} experts of its conversation's demand, \
+                                         {} MB read, {:.2} s", run.job.id, n, (mbytes - mb) / 1_000_000, secs - s));
+                }
+            }
+        }
         let beside = self.runs.iter().any(|r| r.is_some());
         if beside && suffix.len() > self.opt.lane_chunk.max(self.opt.two_pass) {
             run.part = Some((suffix, 0));
@@ -679,6 +716,8 @@ impl Server {
         if let Some(h) = self.ds_history.as_mut() {
             h.fold(&d)?;
         }
+        // stashed for the conversation's accumulation at this request's end (GLM_PRELOAD)
+        run.prompt_vote = Some(d);
         let prompt = &run.job.prompt;
         run.lookup = (self.opt.lookup > 0 && run.depth > 0).then(|| Lookup::new(prompt, self.opt.lookup));
         run.copier = self.opt.copy.clone().filter(|_| run.job.copy_draft && run.depth > 0).map(|c| CopyDraft::new(prompt, c, None));
@@ -701,6 +740,33 @@ impl Server {
         if let Some(h) = self.ds_history.as_mut() {
             h.fold(&dem)?;
         }
+        // the conversation's cumulative votes for its continuations' preloads (GLM_PRELOAD):
+        // both of this request's phases, per-layer normalized (adapt::conv_fold_mass), no decay,
+        // bounded by last use; the histories above stay the only persistence
+        if self.opt.preload > 0 {
+            let (nl, e) = (self.eng.cfg.n_layers(), self.eng.cfg.experts);
+            self.conv_seq = self.conv_seq.wrapping_add(1);
+            let seq = self.conv_seq;
+            let acc = self
+                .conv_votes
+                .entry(run.conv)
+                .or_insert_with(|| (vec![0.0; nl * e], seq));
+            acc.1 = seq;
+            if let Some(pv) = run.prompt_vote.as_deref() {
+                crate::adapt::conv_fold_mass(&mut acc.0, pv, nl, e);
+            }
+            crate::adapt::conv_fold_mass(&mut acc.0, &dem, nl, e);
+            if self.conv_votes.len() > CONV_KEEP {
+                if let Some(oldest) = self
+                    .conv_votes
+                    .iter()
+                    .min_by_key(|(_, v)| v.1)
+                    .map(|(&k, _)| k)
+                {
+                    self.conv_votes.remove(&oldest);
+                }
+            }
+        }
         let pct = |a: f64, b: f64| if b > 0.0 { a / b * 100.0 } else { 0.0 };
         let s = &run.stats;
         let rounds = s.rounds.max(1) as f64;
@@ -713,11 +779,13 @@ impl Server {
         };
         let line = format!("request {}, GLM: {:.2} drafted / {:.2} accepted a round, copy rounds {} ({} long, {} accepted), \
                             miss rate {:.1}% (prompt {:.1}%, decode {:.1}%; by score {:.1}%), hot reads {} (kept {}, {:.2} s waited), \
-                            swaps {} ({:.2} s waited), fallbacks {}{beside}",
+                            swaps {} ({:.2} s waited), preload {} ({} MB, {:.2} s), fallbacks {}{beside}",
                            run.job.id, s.drafted as f64 / rounds, s.accepted as f64 / rounds, s.copy_rounds, s.long_copies,
                            s.copy_accepted, pct(p[0] + d[0], p[1] + d[1]), pct(p[0], p[1]), pct(d[0], d[1]),
                            pct(p[2] + d[2], p[3] + d[3]), r1.hot_reads - r0.hot_reads, r1.hot_kept - r0.hot_kept,
-                           r1.hot_wait_s - r0.hot_wait_s, r1.swaps - r0.swaps, r1.adapt_wait_s - r0.adapt_wait_s, s.fallbacks);
+                           r1.hot_wait_s - r0.hot_wait_s, r1.swaps - r0.swaps, r1.adapt_wait_s - r0.adapt_wait_s,
+                           r1.preload - r0.preload, (r1.preload_mb - r0.preload_mb) / 1_000_000, r1.preload_s - r0.preload_s,
+                           s.fallbacks);
         let (id, lane, prompt) = (run.job.id, run.lane, run.job.prompt.clone());
         let mut job = run.job;
         (job.sink)(Event::Done(finish, run.g));

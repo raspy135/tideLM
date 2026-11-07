@@ -7,7 +7,7 @@
 //!                 --addr H:P] [--slots 12500] [--max-seq 262144] [--chunk 4096] [--graphs]
 //!                 [--hot 1] [--hot-async 0] [--hot-keep 32] [--depth 7] [--cal 0.36 | --dyn 0.9] [--lookup 8] [--copy 1]
 //!                 [--adapt 1] [--adapt-every 200] [--adapt-prefill 512] [--adapt-decode 256]
-//!                 [--bg-every 2] [--loop-break 12] [--two-pass 512] [--two-pass-miss 0.15]
+//!                 [--bg-every 2] [--loop-break 12] [--two-pass 512] [--two-pass-miss 0.15] [--preload 512]
 //!                 [--lanes 1] [--lane-chunk 1024]
 //!                 [--state-db FILE] [--host 0.0.0.0] [--port 8000] [--served-model-name glm-5.3]
 //!
@@ -34,12 +34,12 @@ pub fn is_glm(model_dir: &std::path::Path) -> bool {
 }
 
 pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
-    const VALUED: [&str; 50] = ["--bench-nll-ab", "--bench-prefill-ab", "--bench-ab", "--bench-ab-rounds", "--bench-nll-skip", "--bench-nll-rows", "--bench-nll-max", "--lanes", "--lane-chunk", "--bench-nll-out", "--bench-nll", "--bench-widths", "--copy", "--hot-async", "--bench-width", "--bench-ctx", "--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
+    const VALUED: [&str; 51] = ["--bench-nll-ab", "--bench-prefill-ab", "--bench-ab", "--bench-ab-rounds", "--bench-nll-skip", "--bench-nll-rows", "--bench-nll-max", "--lanes", "--lane-chunk", "--bench-nll-out", "--bench-nll", "--bench-widths", "--copy", "--hot-async", "--bench-width", "--bench-ctx", "--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
                                 "--max-seq", "--chunk", "--hot", "--hot-keep", "--depth", "--cal", "--dyn", "--lookup",
                                 "--adapt", "--adapt-every", "--adapt-prefill", "--adapt-decode", "--bg-every", "--loop-break",
                                 "--two-pass", "--two-pass-miss", "--host", "--port", "--served-model-name", "--moe-rows",
                                 "--kv-split", "--reduce", "--warmup", "--prefix-disk", "--prefix-disk-gb",
-                                "--prefix-min"];
+                                "--prefix-min", "--preload"];
     const FLAGS: [&str; 1] = ["--graphs"];
     let mut i = 1;
     while i < args.len() {
@@ -68,9 +68,10 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         moe_rows: num("--moe-rows", 2048.0)? as usize,
         pack: PathBuf::from(&pack),
         lanes: num("--lanes", 1.0)? as usize,
-        guard_extra: format!("graphs {} hot {} async {} prefix {} gb {}", args.iter().any(|a| a == "--graphs"),
+        guard_extra: format!("graphs {} hot {} async {} prefix {} gb {} preload {}", args.iter().any(|a| a == "--graphs"),
                              arg(args, "--hot").unwrap_or_else(|| "1".into()), arg(args, "--hot-async").unwrap_or_default(),
-                             arg(args, "--prefix-disk").is_some(), arg(args, "--prefix-disk-gb").unwrap_or_default()),
+                             arg(args, "--prefix-disk").is_some(), arg(args, "--prefix-disk-gb").unwrap_or_default(),
+                             arg(args, "--preload").unwrap_or_default()),
     };
     tidelm_cuda::set_device(0)?;
     let cfg = tidelm_glm::config::GlmConfig::load(&model_dir)?;
@@ -152,6 +153,7 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         loop_break: num("--loop-break", 12.0)? as usize,
         two_pass: num("--two-pass", 512.0)? as usize,
         two_pass_miss: num("--two-pass-miss", 0.15)?,
+        preload: num("--preload", 0.0)? as usize,
         lane_chunk: num("--lane-chunk", 1024.0)? as usize,
     };
     // the disk prefix store: its namespace is everything that changes what a cached row means

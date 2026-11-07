@@ -34,6 +34,16 @@ pub fn prefix_hash(tokens: &[u32]) -> String {
     format!("{:x}", h.finalize())
 }
 
+/// A conversation's stable key: the opening `KEY` tokens' prefix hash, as a u64. Every turn of
+/// an agent session resubmits the whole conversation, so the opening identifies it across turns,
+/// turn 1 included (whose demand is the largest single turn); conversations that share an
+/// opening share a key and their votes merge -- conservative: more known demand, never less.
+pub fn conv_key(tokens: &[u32]) -> u64 {
+    const KEY: usize = 256;
+    let h = prefix_hash(&tokens[..tokens.len().min(KEY)]);
+    u64::from_str_radix(&h[..16], 16).unwrap_or(0)
+}
+
 #[derive(Clone, Debug)]
 pub struct Segment {
     pub id: u64,
@@ -301,6 +311,18 @@ pub fn open_direct_read(p: &Path) -> Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_conversation_keys_by_its_opening_across_turns() {
+        let opening: Vec<u32> = (0..256).collect();
+        let mut later = opening.clone();
+        later.extend((1000..1400).map(|i| i as u32));
+        assert_eq!(conv_key(&opening), conv_key(&later));
+        let other: Vec<u32> = (1 << 30..(1 << 30) + 256).collect();
+        assert_ne!(conv_key(&opening), conv_key(&other));
+        // a short prompt keys itself whole
+        assert_ne!(conv_key(&[1, 2, 3]), conv_key(&[1, 2, 4]));
+    }
 
     #[test]
     fn chains_match_restore_and_evict_leaves() {

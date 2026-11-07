@@ -80,6 +80,52 @@ pub struct ResStats {
     pub hot_wait_s: f64,
     /// background adaptations: host seconds a decoder pass waited for their reads
     pub adapt_wait_s: f64,
+    /// session-demand preloading: experts a continuation's conversation had already voiced,
+    /// loaded before its suffix prefills, their bytes, and the host seconds their reads took
+    pub preload: usize,
+    pub preload_mb: u64,
+    pub preload_s: f64,
+}
+
+/// One conversation's cumulative votes: `vote` (a phase's routed weight per (layer, expert))
+/// normalized per layer as the DS history's fold (sum to one a layer) and accumulated into
+/// `acc` without decay -- the conversation's own total, read only by its continuations'
+/// preloads. The histories keep the only persistence; this never leaves the process.
+pub fn conv_fold_mass(acc: &mut [f64], vote: &[f32], layers: usize, experts: usize) {
+    for l in 0..layers {
+        let (lo, hi) = (l * experts, (l + 1) * experts);
+        let sm: f64 = vote[lo..hi]
+            .iter()
+            .map(|&x| x as f64)
+            .sum::<f64>()
+            .max(1e-20);
+        for (a, &x) in acc[lo..hi].iter_mut().zip(&vote[lo..hi]) {
+            *a += x as f64 / sm;
+        }
+    }
+}
+
+/// The preload candidates: a conversation's non-resident demand by accumulated share,
+/// descending (ties to the lower (layer, expert)). Pure; `resident(l, x)` marks what is
+/// routable now.
+pub fn preload_candidates(
+    conv: &[f64],
+    resident: &dyn Fn(usize, usize) -> bool,
+    swap_layers: &[usize],
+    experts: usize,
+) -> Vec<(usize, usize)> {
+    let mut cand: Vec<(usize, usize)> = swap_layers
+        .iter()
+        .flat_map(|&l| (0..experts).map(move |x| (l, x)))
+        .filter(|&(l, x)| !resident(l, x) && conv[l * experts + x] > 0.0)
+        .collect();
+    cand.sort_by(|a, b| {
+        conv[b.0 * experts + b.1]
+            .partial_cmp(&conv[a.0 * experts + a.1])
+            .unwrap()
+            .then(a.cmp(b))
+    });
+    cand
 }
 
 /// Synchronous hot reads' settings and per-step state.
@@ -259,6 +305,126 @@ impl Engine {
         self.save_db()?;
         self.res.stats.adapt_s += t0.elapsed().as_secs_f64();
         Ok(plan.len())
+    }
+
+    /// Session-demand preloading (rank 0, mirrored through OP_ADAPT as the boundary pass): the
+    /// conversation's accumulated votes planned and applied BEFORE its continuation's suffix
+    /// prefills, so the suffix computes on the experts it will demand instead of substitutes.
+    /// Nothing is folded into any history and no live demand is read here -- the request's own
+    /// votes still fold at their usual sites; this only times the loads the prefill->decode
+    /// boundary pass would otherwise pay for after the prefill. That pass then plans less:
+    /// the preloaded experts are already resident, so the reads the request pays stay about
+    /// what they were, reordered ahead of the compute they exist for.
+    pub fn preload(&mut self, conv: &[f64], max_swaps: usize) -> Result<usize> {
+        let t0 = Instant::now();
+        self.hot_install()?;
+        self.adapt_install(true)?;
+        let plan = self.plan_preload(conv, max_swaps);
+        let mb: u64 = plan
+            .iter()
+            .map(|&(l, x, _, _)| self.pack.record(l, x).map(|r| r.nbytes as u64).unwrap_or(0))
+            .sum();
+        let flat: Vec<u32> = plan
+            .iter()
+            .flat_map(|&(a, b, c, d)| [a as u32, b as u32, c as u32, d as u32])
+            .collect();
+        self.mirror_msg(|m| {
+            m.u32(OP_ADAPT).u32s(&flat);
+        })?;
+        self.adapt_apply(&plan)?;
+        self.res.stats.preload += plan.len();
+        self.res.stats.preload_mb += mb;
+        self.res.stats.preload_s += t0.elapsed().as_secs_f64();
+        Ok(plan.len())
+    }
+
+    /// Whether the conversation's votes name any expert that is not resident (rank 0; the cheap
+    /// gate before preload(): an empty plan would still mirror and reset the demand buffers, and
+    /// a conversation whose demand is all resident has nothing to time).
+    pub fn preload_wanted(&self, conv: &[f64]) -> bool {
+        let e = self.cfg.experts;
+        self.res
+            .swap_layers
+            .iter()
+            .any(|&l| (l * e..(l + 1) * e).any(|i| conv[i] > 0.0 && self.lut_h[i] < 0))
+    }
+
+    /// Rank 0: the preload plan -- candidates only this conversation's accumulated votes name
+    /// (preload_candidates), victims the globally weakest residents it did not itself name, the
+    /// per-layer floor and the width classes as plan_swaps' (a newcomer takes a slot of its own
+    /// class). No margin check: conv shares are per-layer normalized and res.score is decayed
+    /// demand, not comparable scales -- the protections are the budget, the floor, and that
+    /// every candidate is demand this conversation voiced.
+    fn plan_preload(&self, conv: &[f64], max_swaps: usize) -> Vec<(usize, usize, usize, usize)> {
+        let e = self.cfg.experts;
+        let floor = 2 * self.cfg.topk;
+        let sc = &self.res.score;
+        let layers = &self.res.swap_layers;
+        let res = |l: usize, x: usize| self.lut_h[l * e + x] >= 0;
+        let cand = preload_candidates(conv, &res, layers, e);
+        let class = |l: usize, x: usize| -> usize {
+            let b = self
+                .pack
+                .records
+                .get(&(l, x))
+                .map(|r| r.bits)
+                .unwrap_or([0; 3]);
+            self.arena
+                .classes
+                .iter()
+                .position(|c| c.bits == b)
+                .unwrap_or(usize::MAX)
+        };
+        // victims weakest first, a list a width class; a conversation's own residents stay
+        let mut vict: Vec<Vec<(usize, usize)>> = vec![vec![]; self.arena.classes.len()];
+        for (l, x) in layers
+            .iter()
+            .flat_map(|&l| (0..e).map(move |x| (l, x)))
+            .filter(|&(l, x)| res(l, x) && conv[l * e + x] <= 0.0)
+        {
+            let s = self.lut_h[l * e + x] as usize;
+            vict[self.arena.class_of[s]].push((l, x));
+        }
+        for v in vict.iter_mut() {
+            v.sort_by(|a, b| {
+                sc[a.0 * e + a.1]
+                    .partial_cmp(&sc[b.0 * e + b.1])
+                    .unwrap()
+                    .then(a.cmp(b))
+            });
+        }
+        let mut left: std::collections::HashMap<usize, usize> = layers
+            .iter()
+            .map(|&l| (l, (0..e).filter(|&x| res(l, x)).count()))
+            .collect();
+        let (mut plan, mut vi) = (vec![], vec![0usize; vict.len()]);
+        let mut done = vec![false; vict.len()];
+        for (cl, ce) in cand {
+            if plan.len() >= max_swaps || done.iter().all(|&d| d) {
+                break;
+            }
+            let c = class(cl, ce);
+            if c >= vict.len() || done[c] {
+                continue; // no slot of its width (or its class is settled)
+            }
+            let mut found = None;
+            while vi[c] < vict[c].len() {
+                let (vl, ve) = vict[c][vi[c]];
+                vi[c] += 1;
+                if left[&vl] > floor {
+                    found = Some((vl, ve));
+                    break;
+                }
+            }
+            let Some((vl, ve)) = found else {
+                done[c] = true;
+                continue;
+            };
+            *left.get_mut(&vl).unwrap() -= 1;
+            *left.get_mut(&cl).unwrap() += 1;
+            plan.push((cl, ce, vl, ve));
+        }
+        plan
     }
 
     /// Rank 0: the demand folded into the score and the history, the swaps planned toward it.
@@ -692,5 +858,36 @@ impl Engine {
         }
         self.hot = Some(h);
         ck(0, "")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conv_votes_fold_per_layer_normalized_and_accumulate() {
+        let (layers, e) = (2usize, 3usize);
+        // a vote concentrated on one expert of layer 1, none of layer 0
+        let mut vote = vec![0.0f32; layers * e];
+        vote[e + 2] = 5.0;
+        let mut acc = vec![0.0f64; layers * e];
+        conv_fold_mass(&mut acc, &vote, layers, e);
+        assert_eq!(acc[e + 2], 1.0);
+        assert!(acc[..e].iter().all(|&x| x == 0.0));
+        conv_fold_mass(&mut acc, &vote, layers, e);
+        assert_eq!(acc[e + 2], 2.0);
+    }
+
+    #[test]
+    fn preload_candidates_rank_the_conversations_non_resident_demand() {
+        // layer 0's heaviest (0, 2) and layer 1's (1, 0) are resident: neither is a candidate,
+        // whatever their mass; the rest rank by accumulated share, descending
+        let conv = vec![0.1, 0.0, 0.9, 0.2, 0.0, 0.4, 0.0, 0.3];
+        let resident = |l: usize, x: usize| (l, x) == (0, 2) || (l, x) == (1, 0);
+        assert_eq!(
+            preload_candidates(&conv, &resident, &[0, 1], 4),
+            vec![(1, 1), (1, 3), (0, 3), (0, 0)]
+        );
     }
 }
