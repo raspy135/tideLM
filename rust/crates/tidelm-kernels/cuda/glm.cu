@@ -718,6 +718,7 @@ __global__ void __launch_bounds__(kTk) split_share_kernel(const uint8_t* __restr
 // one head's 128 output columns; its threads split n in two halves. T <= 8 a launch.
 constexpr int kKvRows = 448, kNope = 192, kLat = 512, kVd = 256;
 
+template <int NOPE, int KVR>
 __global__ void __launch_bounds__(256) absorb_q_kernel(const __nv_bfloat16* __restrict__ q, int64_t ldq_t,
                                                        int64_t ldq_h, const uint8_t* __restrict__ w,
                                                        const float* __restrict__ ws, __nv_bfloat16* __restrict__ out,
@@ -727,11 +728,12 @@ __global__ void __launch_bounds__(256) absorb_q_kernel(const __nv_bfloat16* __re
     // u32 of FP8) over a 24-row slice of n, its loads unrolled to keep them in flight; the 8
     // slices summed in shared memory
     constexpr int TM = 8;
-    __shared__ float xs[TM][kNope];
+    constexpr int SL = NOPE / 8;  // a warp's slice of n (24 / 32)
+    __shared__ float xs[TM][NOPE];
     __shared__ float part[8][TM][128];
     const int h = blockIdx.x, cb = blockIdx.y, tid = threadIdx.x;
-    for (int i = tid; i < T * kNope; i += blockDim.x) {
-        const int t = i / kNope, n = i % kNope;
+    for (int i = tid; i < T * NOPE; i += blockDim.x) {
+        const int t = i / NOPE, n = i % NOPE;
         xs[t][n] = bf(q[(int64_t)t * ldq_t + (int64_t)h * ldq_h + n]);
     }
     __syncthreads();
@@ -742,17 +744,17 @@ __global__ void __launch_bounds__(256) absorb_q_kernel(const __nv_bfloat16* __re
     for (int t = 0; t < TM; ++t)
 #pragma unroll
         for (int c = 0; c < 4; ++c) acc[t][c] = 0.f;
-    uint32_t wd[24];
-    float sc[24];
+    uint32_t wd[SL];
+    float sc[SL];
 #pragma unroll
-    for (int i = 0; i < 24; ++i) {
-        const int64_t r = (int64_t)h * kKvRows + sl * 24 + i;
+    for (int i = 0; i < SL; ++i) {
+        const int64_t r = (int64_t)h * KVR + sl * SL + i;
         wd[i] = ld_once(reinterpret_cast<const uint32_t*>(w + r * kLat + col), 1);
         sc[i] = ws[r * 4 + cb];
     }
 #pragma unroll
-    for (int i = 0; i < 24; ++i) {
-        const int n = sl * 24 + i;
+    for (int i = 0; i < SL; ++i) {
+        const int n = sl * SL + i;
         float wv[4];
 #pragma unroll
         for (int c = 0; c < 4; ++c) wv[c] = rbf(e4m3((wd[i] >> (8 * c)) & 0xff) * sc[i]);
@@ -783,6 +785,7 @@ __global__ void __launch_bounds__(256) absorb_q_kernel(const __nv_bfloat16* __re
 // h * 448 + 192 + v), bf16 out. A warp per output column v, lanes over c in 16-value pieces; a
 // block kAbsV columns, so each block stages the rows' latents once for them.
 constexpr int kAbsV = 64;
+template <int NOPE, int KVR>
 __global__ void __launch_bounds__(256) absorb_o_kernel(const __nv_bfloat16* __restrict__ o, int64_t ldo_t,
                                                        int64_t ldo_h, const uint8_t* __restrict__ w,
                                                        const float* __restrict__ ws, __nv_bfloat16* __restrict__ out,
@@ -797,7 +800,7 @@ __global__ void __launch_bounds__(256) absorb_o_kernel(const __nv_bfloat16* __re
     __syncthreads();
     for (int vi = 0; vi < kAbsV / 8; ++vi) {
         const int v = blockIdx.y * kAbsV + vi * 8 + warp;
-        const int64_t r = (int64_t)h * kKvRows + kNope + v;
+        const int64_t r = (int64_t)h * KVR + NOPE + v;
         const uint4 raw = ld_once(reinterpret_cast<const uint4*>(w + r * kLat + l * 16), 1);
         const float s = ws[r * 4 + (l * 16) / 128];
         const uint32_t wd[4] = {raw.x, raw.y, raw.z, raw.w};
@@ -835,14 +838,15 @@ __global__ void kvb_dequant_kernel(const uint8_t* __restrict__ w, const float* _
 // [T][H][NS] for mla_combine_kernel. q head h is at q + (h / hg) * q_ldg + t * q_ldt + (h % hg) * q_ldh
 // (a gathered [rank][row][head] query in place); split_n: a gathered pair's keys (key_row);
 // koff (null: 0): row t's keys are its lane's cache rows, koff[t] on (positions_kernel).
-constexpr int kMD = 576, kMLD = kMD + 8, kMNT = 32, kMPS = kMNT + 4;
+constexpr int kMNT = 32, kMPS = kMNT + 4;
 
-template <int MT>
+template <int MT, int RP = 8>
 constexpr int mla_smem() {
-    return (16 * MT + kMNT) * kMLD * 2 + 16 * MT * kMPS * 4 + 3 * 16 * MT * 4 + 2 * kMNT * 4;
+    return (16 * MT + kMNT) * (kLat + 8 * RP + 8) * 2 + 16 * MT * kMPS * 4 + 3 * 16 * MT * 4 + 2 * kMNT * 4;
 }
 
-template <int MT>
+// RP: the RoPE pieces (8 bf16) a key after its 32 latent pieces of 16 FP8: 8 for GLM-5.3, 0 for GLM-5.3-Flash
+template <int MT, int RP>
 __global__ void __launch_bounds__(256) mla_kernel(
     const __nv_bfloat16* __restrict__ q, int64_t q_ldg, int64_t q_ldt, int64_t q_ldh, int hg,
     const uint8_t* __restrict__ cq, const float* __restrict__ cs, const __nv_bfloat16* __restrict__ cr, int split_n,
@@ -850,6 +854,7 @@ __global__ void __launch_bounds__(256) mla_kernel(
     int chunk, float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,
     __nv_bfloat16* __restrict__ out, int64_t o_ldt, int64_t o_ldh, const int* __restrict__ koff) {
     pdl_enter();
+    constexpr int kMD = kLat + 8 * RP, kMLD = kMD + 8, kNP = 32 + RP;
     constexpr int HB = 16 * MT;
     extern __shared__ __align__(16) unsigned char mla_smem_raw[];
     __nv_bfloat16* Qs = reinterpret_cast<__nv_bfloat16*>(mla_smem_raw);   // [HB][kMLD]
@@ -864,7 +869,7 @@ __global__ void __launch_bounds__(256) mla_kernel(
         const int64_t o = koff[t];
         cq += o * kLat;
         cs += o * 4;
-        cr += o * 64;
+        if (RP) cr += o * 64;
     }
     const int nh = min(HB, H - h0);
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, r = lane >> 2, qd = lane & 3;
@@ -905,7 +910,7 @@ __global__ void __launch_bounds__(256) mla_kernel(
     // off (--probe 31) the kernel still takes 17 / 59 us at 1 / 4 rows - the per-block skeleton of
     // one 80 KB-smem block an SM in 3 waves, its syncs, softmax and partial stores - so the next
     // lever here is two blocks an SM (FP8-staged keys), not deeper loads.
-    constexpr int kPieces = kMNT * 40 / 256;
+    constexpr int kPieces = kMNT * kNP / 256;
     constexpr int kPF = 1;
     uint4 pre_raw[kPF][kPieces];
     float pre_s[kPF][kPieces];
@@ -913,7 +918,7 @@ __global__ void __launch_bounds__(256) mla_kernel(
     auto prefetch = [&](int n0, uint4 (&raw)[kPieces], float (&sc)[kPieces], bool (&okv)[kPieces]) {
 #pragma unroll
         for (int u = 0; u < kPieces; ++u) {
-            const int i = tid + 256 * u, j = i / 40, c = i % 40;
+            const int i = tid + 256 * u, j = i / kNP, c = i % kNP;
             const int n = n0 + j;
             int key = -1;
             if (n < k_hi) key = idx ? idx[(int64_t)t * ld_idx + n] : n;
@@ -943,7 +948,7 @@ __global__ void __launch_bounds__(256) mla_kernel(
         __syncthreads();  // the previous tile's PV is done with Ks / Ps
 #pragma unroll
         for (int u = 0; u < kPieces; ++u) {
-            const int i = tid + 256 * u, j = i / 40, c = i % 40;
+            const int i = tid + 256 * u, j = i / kNP, c = i % kNP;
             if (c < 32) {
                 uint4 o[2] = {make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0)};
                 if (pre_ok[sl][u] && !(c_mla_probe & 16)) fp8x16_bf16(pre_raw[sl][u], pre_s[sl][u], true, o);
@@ -1179,12 +1184,13 @@ __global__ void mla_merge_kernel(const float* __restrict__ own_o, const float* _
 //     missed mass) for rows below live[0] (null: all rows).
 constexpr int kE = 256;
 
+template <int E>
 __device__ void route_select(const float* __restrict__ lg, const float* __restrict__ bias,
                              const uint8_t* __restrict__ allowed, int K, float* sc, int* chosen, float* chosen_s,
                              int& nvalid) {
-    __shared__ float sel[kE];
-    __shared__ float bv[8];
-    __shared__ int bi[8];
+    __shared__ float sel[E];
+    __shared__ float bv[E / 32];
+    __shared__ int bi[E / 32];
     const int e = threadIdx.x;
     const float s = 1.f / (1.f + expf(-lg[e]));
     sc[e] = s;
@@ -1209,7 +1215,7 @@ __device__ void route_select(const float* __restrict__ lg, const float* __restri
         __syncthreads();
         float b = bv[0];
         int bidx = bi[0];
-        for (int i = 1; i < kE / 32; ++i)
+        for (int i = 1; i < E / 32; ++i)
             if (bv[i] > b || (bv[i] == b && bi[i] < bidx)) {
                 b = bv[i];
                 bidx = bi[i];
@@ -1224,7 +1230,8 @@ __device__ void route_select(const float* __restrict__ lg, const float* __restri
     }
 }
 
-__global__ void __launch_bounds__(kE) router_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
+template <int E>
+__global__ void __launch_bounds__(E) router_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
                                                     const uint8_t* __restrict__ allowed, const int* __restrict__ lut,
                                                     int K, float scale, int* __restrict__ ids, float* __restrict__ w,
                                                     const uint8_t* __restrict__ resident, float* __restrict__ hot,
@@ -1234,12 +1241,12 @@ __global__ void __launch_bounds__(kE) router_kernel(const float* __restrict__ lo
                                                     float* __restrict__ lane_demand, int64_t lane_stride,
                                                     const int* __restrict__ row_lane) {
     pdl_enter();
-    __shared__ float sc[kE];
+    __shared__ float sc[E];
     const int t = blockIdx.x;
     int chosen[8];
     float cs[8];
     int nv;
-    route_select(logits + (int64_t)t * kE, bias, allowed, K, sc, chosen, cs, nv);
+    route_select<E>(logits + (int64_t)t * E, bias, allowed, K, sc, chosen, cs, nv);
     if (threadIdx.x != 0) return;
     float tot = 0.f;
     for (int k = 0; k < K; ++k) tot += cs[k];
@@ -1446,7 +1453,10 @@ __global__ void count_live_kernel(const int* __restrict__ block_slot, int nb, in
 // weights._fp8_quant for one rank's kv_b rows (fp16 [rows][512], rows a multiple of 128): per
 // 128x128 block s = max(amax, 1e-12) / 448, q = fp8(w / s); the scales expanded to a row's four
 // blocks [rows][4] (kvb_fp8.HeadFP8.from_rows). One block per (128 rows, 128 columns).
-__global__ void __launch_bounds__(256) quant_kvb_kernel(const __half* __restrict__ w, uint8_t* __restrict__ q,
+__device__ __forceinline__ float to_f32(__half v) { return __half2float(v); }
+__device__ __forceinline__ float to_f32(__nv_bfloat16 v) { return __bfloat162float(v); }
+template <typename W>
+__global__ void __launch_bounds__(256) quant_kvb_kernel(const W* __restrict__ w, uint8_t* __restrict__ q,
                                                         float* __restrict__ s_rows) {
     pdl_enter();
     __shared__ float red[32];
@@ -1454,7 +1464,7 @@ __global__ void __launch_bounds__(256) quant_kvb_kernel(const __half* __restrict
     float am = 0.f;
     for (int i = threadIdx.x; i < 128 * 128; i += blockDim.x) {
         const int r = rb * 128 + i / 128, c = cb * 128 + i % 128;
-        am = fmaxf(am, fabsf(__half2float(w[(int64_t)r * kLat + c])));
+        am = fmaxf(am, fabsf(to_f32(w[(int64_t)r * kLat + c])));
     }
     am = warp_max(am);
     if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = am;
@@ -1468,7 +1478,7 @@ __global__ void __launch_bounds__(256) quant_kvb_kernel(const __half* __restrict
     const float sc = fmaxf(red[0], 1e-12f) / 448.f;
     for (int i = threadIdx.x; i < 128 * 128; i += blockDim.x) {
         const int r = rb * 128 + i / 128, c = cb * 128 + i % 128;
-        q[(int64_t)r * kLat + c] = to_e4m3(__half2float(w[(int64_t)r * kLat + c]) / sc);
+        q[(int64_t)r * kLat + c] = to_e4m3(to_f32(w[(int64_t)r * kLat + c]) / sc);
     }
     if (threadIdx.x < 128) s_rows[(int64_t)(rb * 128 + threadIdx.x) * 4 + cb] = sc;
 }
@@ -1726,7 +1736,7 @@ int glm_absorb_q(void* stream, const void* q, int64_t ldq_t, int64_t ldq_h, cons
                  int64_t ldo_t, int64_t ldo_h, int T, int hl) {
     if (T < 1) return (int)cudaErrorInvalidValue;
     for (int t0 = 0; t0 < T; t0 += 8)
-        pdl_launch(absorb_q_kernel, dim3(hl, kLat / 128), 256, 0, GST, static_cast<const __nv_bfloat16*>(q) + t0 * ldq_t, ldq_t, ldq_h,
+        pdl_launch(absorb_q_kernel<kNope, kKvRows>, dim3(hl, kLat / 128), 256, 0, GST, static_cast<const __nv_bfloat16*>(q) + t0 * ldq_t, ldq_t, ldq_h,
                                                                static_cast<const uint8_t*>(w), static_cast<const float*>(ws),
                                                                static_cast<__nv_bfloat16*>(out) + t0 * ldo_t, ldo_t, ldo_h,
                                                                T - t0 < 8 ? T - t0 : 8);
@@ -1738,10 +1748,31 @@ int glm_absorb_o(void* stream, const void* o, int64_t ldo_t, int64_t ldo_h, cons
     if (T < 1) return (int)cudaErrorInvalidValue;
     // 16 rows a launch (the kernel stages them in shared memory); each row's sums are its own
     for (int t0 = 0; t0 < T; t0 += 16)
-        pdl_launch(absorb_o_kernel, dim3(hl, kVd / kAbsV), 256, 0, GST, static_cast<const __nv_bfloat16*>(o) + t0 * ldo_t, ldo_t,
+        pdl_launch(absorb_o_kernel<kNope, kKvRows>, dim3(hl, kVd / kAbsV), 256, 0, GST, static_cast<const __nv_bfloat16*>(o) + t0 * ldo_t, ldo_t,
                                                             ldo_h, static_cast<const uint8_t*>(w), static_cast<const float*>(ws),
                                                             static_cast<__nv_bfloat16*>(out) + t0 * ld_out, ld_out,
                                                             T - t0 < 16 ? T - t0 : 16);
+    GRET;
+}
+
+// GLM-5.3-Flash: 256 nope dims a head, kv_b 512 rows a head (256 key | 256 value)
+int glm_absorb_q_n256(void* stream, const void* q, int64_t ldq_t, int64_t ldq_h, const void* w, const void* ws, void* out,
+                      int64_t ldo_t, int64_t ldo_h, int T, int hl) {
+    if (T < 1) return (int)cudaErrorInvalidValue;
+    for (int t0 = 0; t0 < T; t0 += 8)
+        pdl_launch(absorb_q_kernel<256, 512>, dim3(hl, kLat / 128), 256, 0, GST, static_cast<const __nv_bfloat16*>(q) + t0 * ldq_t,
+                   ldq_t, ldq_h, static_cast<const uint8_t*>(w), static_cast<const float*>(ws),
+                   static_cast<__nv_bfloat16*>(out) + t0 * ldo_t, ldo_t, ldo_h, T - t0 < 8 ? T - t0 : 8);
+    GRET;
+}
+
+int glm_absorb_o_n256(void* stream, const void* o, int64_t ldo_t, int64_t ldo_h, const void* w, const void* ws, void* out,
+                      int64_t ld_out, int T, int hl) {
+    if (T < 1) return (int)cudaErrorInvalidValue;
+    for (int t0 = 0; t0 < T; t0 += 16)
+        pdl_launch(absorb_o_kernel<256, 512>, dim3(hl, kVd / kAbsV), 256, 0, GST, static_cast<const __nv_bfloat16*>(o) + t0 * ldo_t,
+                   ldo_t, ldo_h, static_cast<const uint8_t*>(w), static_cast<const float*>(ws),
+                   static_cast<__nv_bfloat16*>(out) + t0 * ld_out, ld_out, T - t0 < 16 ? T - t0 : 16);
     GRET;
 }
 
@@ -1753,9 +1784,9 @@ int glm_kvb_dequant(void* stream, const void* w, const void* ws, void* out, int6
     GRET;
 }
 
-int glm_mla_smem(int mt) { return mt == 2 ? mla_smem<2>() : mla_smem<1>(); }
-
-int glm_mla(void* stream, int mt, const void* q, int64_t q_ldg, int64_t q_ldt, int64_t q_ldh, int hg, const void* cq,
+extern "C++" {
+template <int RP>
+static int mla_launch(void* stream, int mt, const void* q, int64_t q_ldg, int64_t q_ldt, int64_t q_ldh, int hg, const void* cq,
             const void* cs, const void* cr, int split_n, const void* idx, int64_t ld_idx, int K, int ascending, const void* bound, int T,
             int H, float scale, int nsplit, int chunk, void* part_m, void* part_l, void* part_acc, void* out,
             int64_t o_ldt, int64_t o_ldh, const void* koff) {
@@ -1766,7 +1797,7 @@ int glm_mla(void* stream, int mt, const void* q, int64_t q_ldg, int64_t q_ldt, i
     dim3 grid((unsigned)((H + hb - 1) / hb), (unsigned)T, (unsigned)nsplit);
     auto args = [&](auto kernel, int smem) {
         static bool set1 = false, set2 = false;
-        bool& set = smem == mla_smem<2>() ? set2 : set1;
+        bool& set = mt == 2 ? set2 : set1;
         if (!set) {
             cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             set = true;
@@ -1779,9 +1810,29 @@ int glm_mla(void* stream, int mt, const void* q, int64_t q_ldg, int64_t q_ldt, i
                                          static_cast<float*>(part_acc), static_cast<__nv_bfloat16*>(out), o_ldt, o_ldh,
                                          static_cast<const int*>(koff));
     };
-    if (mt == 2) args(mla_kernel<2>, mla_smem<2>());
-    else args(mla_kernel<1>, mla_smem<1>());
+    if (mt == 2) args(mla_kernel<2, RP>, mla_smem<2, RP>());
+    else args(mla_kernel<1, RP>, mla_smem<1, RP>());
     GRET;
+}
+}  // extern "C++"
+
+int glm_mla_smem(int mt) { return mt == 2 ? mla_smem<2>() : mla_smem<1>(); }
+
+int glm_mla(void* stream, int mt, const void* q, int64_t q_ldg, int64_t q_ldt, int64_t q_ldh, int hg, const void* cq,
+            const void* cs, const void* cr, int split_n, const void* idx, int64_t ld_idx, int K, int ascending, const void* bound, int T,
+            int H, float scale, int nsplit, int chunk, void* part_m, void* part_l, void* part_acc, void* out,
+            int64_t o_ldt, int64_t o_ldh, const void* koff) {
+    return mla_launch<8>(stream, mt, q, q_ldg, q_ldt, q_ldh, hg, cq, cs, cr, split_n, idx, ld_idx, K, ascending, bound, T, H,
+                         scale, nsplit, chunk, part_m, part_l, part_acc, out, o_ldt, o_ldh, koff);
+}
+
+// GLM-5.3-Flash: a key is its 512-wide latent alone (no RoPE: q rows of 512 per head, cr unused)
+int glm_mla_nope(void* stream, int mt, const void* q, int64_t q_ldg, int64_t q_ldt, int64_t q_ldh, int hg, const void* cq,
+            const void* cs, const void* cr, int split_n, const void* idx, int64_t ld_idx, int K, int ascending, const void* bound, int T,
+            int H, float scale, int nsplit, int chunk, void* part_m, void* part_l, void* part_acc, void* out,
+            int64_t o_ldt, int64_t o_ldh, const void* koff) {
+    return mla_launch<0>(stream, mt, q, q_ldg, q_ldt, q_ldh, hg, cq, cs, cr, split_n, idx, ld_idx, K, ascending, bound, T, H,
+                         scale, nsplit, chunk, part_m, part_l, part_acc, out, o_ldt, o_ldh, koff);
 }
 
 int glm_mla_combine(void* stream, const void* pm, const void* pl, const void* pacc, int T, int H, int NS, void* out,
@@ -1808,7 +1859,7 @@ int glm_router(void* stream, const void* logits, const void* bias, const void* a
                void* demand, void* acc, const void* live, void* lane_acc, void* lane_demand, int64_t lane_stride,
                const void* row_lane) {
     if (K > 8) return (int)cudaErrorInvalidValue;
-    pdl_launch(router_kernel, T, kE, 0, GST, static_cast<const float*>(logits), static_cast<const float*>(bias),
+    pdl_launch(router_kernel<kE>, T, kE, 0, GST, static_cast<const float*>(logits), static_cast<const float*>(bias),
                                      static_cast<const uint8_t*>(allowed), static_cast<const int*>(lut), K, scale,
                                      static_cast<int*>(ids), static_cast<float*>(w), static_cast<const uint8_t*>(resident),
                                      static_cast<float*>(hot), static_cast<const int*>(ex_ids),
@@ -1816,6 +1867,28 @@ int glm_router(void* stream, const void* logits, const void* bias, const void* a
                                      static_cast<double*>(acc), static_cast<const int*>(live),
                                      static_cast<double*>(lane_acc), static_cast<float*>(lane_demand), lane_stride,
                                      static_cast<const int*>(row_lane));
+    GRET;
+}
+
+// the router over E experts (GLM-5.3 256, GLM-5.3-Flash 288: a thread an expert)
+int glm_router_e(void* stream, const void* logits, const void* bias, const void* allowed, const void* lut, int T, int K,
+               float scale, void* ids, void* w, const void* resident, void* hot, const void* ex_ids, const void* ex_w,
+               void* demand, void* acc, const void* live, void* lane_acc, void* lane_demand, int64_t lane_stride,
+               const void* row_lane, int E) {
+    if (K > 8) return (int)cudaErrorInvalidValue;
+    auto go = [&](auto kernel, int e) {
+    pdl_launch(kernel, T, e, 0, GST, static_cast<const float*>(logits), static_cast<const float*>(bias),
+                                     static_cast<const uint8_t*>(allowed), static_cast<const int*>(lut), K, scale,
+                                     static_cast<int*>(ids), static_cast<float*>(w), static_cast<const uint8_t*>(resident),
+                                     static_cast<float*>(hot), static_cast<const int*>(ex_ids),
+                                     static_cast<const float*>(ex_w), static_cast<float*>(demand),
+                                     static_cast<double*>(acc), static_cast<const int*>(live),
+                                     static_cast<double*>(lane_acc), static_cast<float*>(lane_demand), lane_stride,
+                                     static_cast<const int*>(row_lane));
+    };
+    if (E == 256) go(router_kernel<256>, 256);
+    else if (E == 288) go(router_kernel<288>, 288);
+    else return (int)cudaErrorInvalidValue;
     GRET;
 }
 
@@ -1868,7 +1941,14 @@ int glm_count_live(void* stream, const void* block_slot, int nb, void* out) {
 
 int glm_quant_kvb(void* stream, const void* w, int rows, void* q, void* s_rows) {
     if (rows % 128) return (int)cudaErrorInvalidValue;
-    pdl_launch(quant_kvb_kernel, dim3(rows / 128, kLat / 128), 256, 0, GST, static_cast<const __half*>(w),
+    pdl_launch(quant_kvb_kernel<__half>, dim3(rows / 128, kLat / 128), 256, 0, GST, static_cast<const __half*>(w),
+                                                                  static_cast<uint8_t*>(q), static_cast<float*>(s_rows));
+    GRET;
+}
+
+int glm_quant_kvb_bf16(void* stream, const void* w, int rows, void* q, void* s_rows) {
+    if (rows % 128) return (int)cudaErrorInvalidValue;
+    pdl_launch(quant_kvb_kernel<__nv_bfloat16>, dim3(rows / 128, kLat / 128), 256, 0, GST, static_cast<const __nv_bfloat16*>(w),
                                                                   static_cast<uint8_t*>(q), static_cast<float*>(s_rows));
     GRET;
 }

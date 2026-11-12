@@ -460,3 +460,133 @@ fn kda_bench() {
     }
     unsafe { flash_set_kda_split(2) };
 }
+
+// ------------------------------------------------------------------ glm.cu's GLM-5.3-Flash instances
+use tidelm_kernels::glm::*;
+
+#[test]
+fn mla_without_rope_is_mla_with_a_zero_rope_slot() {
+    // glm_mla_nope on 512-wide queries and keys against glm_mla with the RoPE dims zero: the extra
+    // terms are exact zeros, so the outputs agree bit for bit, direct and through split partials
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(0x0dd5);
+    let (hh, t, s, kk) = (64usize, 3usize, 300usize, 160usize);
+    let q512 = rng.bf16_vec(t * hh * 512, 1.0);
+    let mut q576 = vec![0u16; t * hh * 576];
+    for r in 0..t * hh {
+        q576[r * 576..r * 576 + 512].copy_from_slice(&q512[r * 512..(r + 1) * 512]);
+    }
+    let cq: Vec<u8> = (0..s * 512).map(|_| (rng.next() & 0x7e) as u8 | ((rng.next() & 1) << 7) as u8).collect();
+    let cs: Vec<f32> = (0..s * 4).map(|_| 0.01 + rng.unif() * 0.02).collect();
+    let cr = vec![0u16; s * 64];
+    let bound: Vec<i32> = vec![299, 250, 120];
+    let mut idx = vec![-1i32; t * kk];
+    for r in 0..t {
+        let mut n = 0;
+        for x in (0..=bound[r]).rev().step_by(2) {
+            if n < kk {
+                idx[r * kk + n] = x;
+                n += 1;
+            }
+        }
+        idx[r * kk..r * kk + n].sort();
+    }
+    let (dq5, dq6, dcq, dcs, dcr, di, db) = (dev(&q512), dev(&q576), dev(&cq), dev(&cs), dev(&cr), dev(&idx), dev(&bound));
+    let scale = 256f32.powf(-0.5);
+    for (ns, mt) in [(1usize, 2i32), (1, 1), (4, 2)] {
+        let chunk = (kk.div_ceil(ns)).div_ceil(32) * 32;
+        let outs: Vec<Vec<u16>> = [0, 1].iter().map(|&nope| {
+            let out = DeviceBuffer::<u16>::zeroed(t * hh * 512).unwrap();
+            let pm = DeviceBuffer::<f32>::zeroed(t * hh * ns).unwrap();
+            let pl = DeviceBuffer::<f32>::zeroed(t * hh * ns).unwrap();
+            let pa = DeviceBuffer::<f32>::zeroed(t * hh * ns * 512).unwrap();
+            let direct = ns == 1;
+            unsafe {
+                let (o, a, b, c) = if direct { (p(&out), null(), null(), null()) } else { (null(), p(&pm), p(&pl), p(&pa)) };
+                if nope == 1 {
+                    ok(glm_mla_nope(st.raw(), mt, p(&dq5), 0, (hh * 512) as i64, 512, hh as i32, p(&dcq), p(&dcs), null(), 0, p(&di),
+                                    kk as i64, kk as i32, 1, p(&db), t as i32, hh as i32, scale, ns as i32, chunk as i32, a, b, c, o,
+                                    (hh * 512) as i64, 512, null()));
+                } else {
+                    ok(glm_mla(st.raw(), mt, p(&dq6), 0, (hh * 576) as i64, 576, hh as i32, p(&dcq), p(&dcs), p(&dcr), 0, p(&di),
+                               kk as i64, kk as i32, 1, p(&db), t as i32, hh as i32, scale, ns as i32, chunk as i32, a, b, c, o,
+                               (hh * 512) as i64, 512, null()));
+                }
+                if !direct {
+                    ok(glm_mla_combine(st.raw(), p(&pm), p(&pl), p(&pa), t as i32, hh as i32, ns as i32, p(&out), (hh * 512) as i64,
+                                       512, null(), null(), null(), 0, 0, 0));
+                }
+            }
+            out.download().unwrap()
+        }).collect();
+        assert!(outs[0].iter().any(|&x| x != 0));
+        assert_eq!(outs[0], outs[1], "splits {ns} mt {mt}");
+    }
+}
+
+#[test]
+fn absorbs_at_256_nope_dims_match_the_reference() {
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(0xab50);
+    let (hl, t) = (8usize, 5usize);
+    let kvb = rng.bf16_vec(hl * 512 * 512, 0.05);
+    let (dk, wq, ws) = (dev(&kvb), DeviceBuffer::<u8>::zeroed(hl * 512 * 512).unwrap(), DeviceBuffer::<f32>::zeroed(hl * 512 * 4).unwrap());
+    unsafe { ok(glm_quant_kvb_bf16(st.raw(), p(&dk), (hl * 512) as i32, p(&wq), p(&ws))) };
+    let (q8, s4) = (wq.download().unwrap(), ws.download().unwrap());
+    let w = |r: usize, c: usize| bf(e4m3(q8[r * 512 + c]) * s4[r * 4 + c / 128]);
+    // the FP8 kv_b is within FP8's rounding of the bf16 one
+    let deq: Vec<f32> = (0..hl * 512 * 512).map(|i| w(i / 512, i % 512)).collect();
+    let src: Vec<f32> = kvb.iter().map(|&h| f32_from_bf16(h)).collect();
+    assert!(rel_err(&deq, &src) < 0.04);
+    let q = rng.bf16_vec(t * hl * 256, 1.0);
+    let out = DeviceBuffer::<u16>::zeroed(t * hl * 512).unwrap();
+    let dq = dev(&q);
+    unsafe { ok(glm_absorb_q_n256(st.raw(), p(&dq), (hl * 256) as i64, 256, p(&wq), p(&ws), p(&out), (hl * 512) as i64, 512, t as i32, hl as i32)) };
+    let got: Vec<f32> = out.download().unwrap().iter().map(|&h| f32_from_bf16(h)).collect();
+    let want: Vec<f32> = (0..t * hl * 512).map(|i| {
+        let (r, h, c) = (i / (hl * 512), (i / 512) % hl, i % 512);
+        (0..256).map(|n| f32_from_bf16(q[(r * hl + h) * 256 + n]) as f64 * w(h * 512 + n, c) as f64).sum::<f64>() as f32
+    }).collect();
+    let e = rel_err(&got, &want);
+    eprintln!("absorb_q n256 rel err {e:.2e}");
+    assert!(e < 4e-3);
+    let ol = rng.bf16_vec(t * hl * 512, 1.0);
+    let dol = dev(&ol);
+    let o = DeviceBuffer::<u16>::zeroed(t * hl * 256).unwrap();
+    unsafe { ok(glm_absorb_o_n256(st.raw(), p(&dol), (hl * 512) as i64, 512, p(&wq), p(&ws), p(&o), (hl * 256) as i64, t as i32, hl as i32)) };
+    let got: Vec<f32> = o.download().unwrap().iter().map(|&h| f32_from_bf16(h)).collect();
+    let want: Vec<f32> = (0..t * hl * 256).map(|i| {
+        let (r, h, v) = (i / (hl * 256), (i / 256) % hl, i % 256);
+        (0..512).map(|c| f32_from_bf16(ol[(r * hl + h) * 512 + c]) as f64 * w(h * 512 + 256 + v, c) as f64).sum::<f64>() as f32
+    }).collect();
+    let e = rel_err(&got, &want);
+    eprintln!("absorb_o n256 rel err {e:.2e}");
+    assert!(e < 4e-3);
+}
+
+#[test]
+fn router_over_288_experts() {
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(0x288);
+    let (e, t, k) = (288usize, 4usize, 8usize);
+    let logits: Vec<f32> = (0..t * e).map(|_| rng.normal() * 2.0).collect();
+    let bias: Vec<f32> = (0..e).map(|_| rng.normal() * 0.1).collect();
+    let (dl, dbias) = (dev(&logits), dev(&bias));
+    let (ids, w) = (DeviceBuffer::<i32>::zeroed(t * k).unwrap(), DeviceBuffer::<f32>::zeroed(t * k).unwrap());
+    unsafe {
+        ok(glm_router_e(st.raw(), p(&dl), p(&dbias), null(), null(), t as i32, k as i32, 2.5, p(&ids), p(&w), null(), null(),
+                        null(), null(), null(), null(), null(), null(), null(), 0, null(), e as i32));
+    }
+    let (gi, gw) = (ids.download().unwrap(), w.download().unwrap());
+    for r in 0..t {
+        let s: Vec<f32> = (0..e).map(|x| sigmoid(logits[r * e + x])).collect();
+        let mut order: Vec<usize> = (0..e).collect();
+        order.sort_by(|&a, &b| (s[b] + bias[b]).partial_cmp(&(s[a] + bias[a])).unwrap().then(a.cmp(&b)));
+        let pick = &order[..k];
+        let tot: f32 = pick.iter().map(|&x| s[x]).sum();
+        for (j, &x) in pick.iter().enumerate() {
+            assert_eq!(gi[r * k + j], x as i32, "row {r} pick {j}");
+            assert!((gw[r * k + j] - s[x] / (tot + 1e-20) * 2.5).abs() < 1e-5);
+        }
+    }
+}

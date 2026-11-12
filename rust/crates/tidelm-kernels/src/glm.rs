@@ -68,6 +68,23 @@ extern "C" {
     pub fn glm_member_codes(stream: CudaStream, pair: *const c_void, n: c_int, k: c_int, out: *mut c_void) -> c_int;
     pub fn glm_count_live(stream: CudaStream, block_slot: *const c_void, nb: c_int, out: *mut c_void) -> c_int;
     pub fn glm_quant_kvb(stream: CudaStream, w: *const c_void, rows: c_int, q: *mut c_void, s_rows: *mut c_void) -> c_int;
+    // GLM-5.3-Flash instances of the kernels above: 256 nope dims and 512 kv_b rows a head, a
+    // 512-wide key (no RoPE: q rows [heads][512], cr unused), 288 experts, a BF16 kv_b
+    pub fn glm_absorb_q_n256(stream: CudaStream, q: *const c_void, ldq_t: i64, ldq_h: i64, w: *const c_void, ws: *const c_void,
+                             out: *mut c_void, ldo_t: i64, ldo_h: i64, t: c_int, hl: c_int) -> c_int;
+    pub fn glm_absorb_o_n256(stream: CudaStream, o: *const c_void, ldo_t: i64, ldo_h: i64, w: *const c_void, ws: *const c_void,
+                             out: *mut c_void, ld_out: i64, t: c_int, hl: c_int) -> c_int;
+    pub fn glm_mla_nope(stream: CudaStream, mt: c_int, q: *const c_void, q_ldg: i64, q_ldt: i64, q_ldh: i64, hg: c_int,
+                        cq: *const c_void, cs: *const c_void, cr: *const c_void, split_n: c_int, idx: *const c_void,
+                        ld_idx: i64, k: c_int, ascending: c_int, bound: *const c_void, t: c_int, h: c_int, scale: f32,
+                        nsplit: c_int, chunk: c_int, part_m: *mut c_void, part_l: *mut c_void, part_acc: *mut c_void,
+                        out: *mut c_void, o_ldt: i64, o_ldh: i64, koff: *const c_void) -> c_int;
+    pub fn glm_router_e(stream: CudaStream, logits: *const c_void, bias: *const c_void, allowed: *const c_void,
+                        lut: *const c_void, t: c_int, k: c_int, scale: f32, ids: *mut c_void, w: *mut c_void,
+                        resident: *const c_void, hot: *mut c_void, ex_ids: *const c_void, ex_w: *const c_void,
+                        demand: *mut c_void, acc: *mut c_void, live: *const c_void, lane_acc: *mut c_void,
+                        lane_demand: *mut c_void, lane_stride: i64, row_lane: *const c_void, e: c_int) -> c_int;
+    pub fn glm_quant_kvb_bf16(stream: CudaStream, w: *const c_void, rows: c_int, q: *mut c_void, s_rows: *mut c_void) -> c_int;
     pub fn glm_quant_int8_rows(stream: CudaStream, x: *const c_void, rows: c_int, h: c_int, q: *mut c_void,
                                s: *mut c_void) -> c_int;
     pub fn glm_dup_rows(stream: CudaStream, x: *const c_void, ldx: i64, out: *mut c_void, t: c_int, k: c_int,
