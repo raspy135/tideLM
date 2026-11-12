@@ -11,18 +11,16 @@ tide — so the engine gets better the more you use it.
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,000 / 15,360 (65.1%) | 1M (2 lanes, 1.5M shared) | **33.5 tok/s** | **51.8 tok/s** | 4.3 s |
 | `glm53-exlr8` | GLM-5.3 | exlr8 `bit260` (2.6 bpw: 2-3 bits a projection) | 14,124 / 19,200 (73.6%) | 320K (2 lanes) | **22.3 tok/s** | **28.2 tok/s** | 17.9 s |
-| `glm53-exl3` | GLM-5.3 | EXL3 2.75 bpw (2-4 bits an expert) | 12,968 / 19,200 (67.5%) | 320K (2 lanes) | 20.5 tok/s | 26.2 tok/s | 17.3 s |
 
 *Medians of three `bench/bench.py` runs after a warmup, 1,024 tokens at temperature 0.6 (raw runs:
-[DeepSeek](results/rust-ds41-20261028-pdl/README.md), [GLM-5.3](results/rust-glm53-exlr8-20261111/README.md):
-both GLM rows from one binary on one afternoon, the same expert memory).*
+[DeepSeek](results/rust-ds41-20261028-pdl/README.md), [GLM-5.3](results/rust-glm53-exlr8-20261111/README.md)).*
 
-GLM-5.3's default profile is `glm53-exlr8`: the `bit260` profile of
+GLM-5.3 is served from the `bit260` profile of
 [kindlingai/glm-5.3-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4). Against
-the EXL3 profile it decodes about 8% faster (prose +8.9%, code +7.6%), scores 0.024 nats better on
-held-out text and keeps 1,150 more experts resident in the same memory; its 8K-token first token
-is 3% slower
-([what it took](docs/exlr8.md)).
+the EXL3 2.75 bpw profile it replaced (20.5 / 26.2 tok/s, 17.3 s on the same binary and afternoon) it
+decodes about 8% faster, scores 0.024 nats better on held-out text and keeps 1,150 more experts
+resident in the same memory; its 8K-token first token is 3% slower ([what it took](docs/exlr8.md)).
+The EXL3 profile is still served: its setup is in the [install guide](docs/install.md).
 
 Adaptive expert loading also allows flexible memory configuration.
 Memory for expert resident and context length are the big levers. You can run other services
@@ -82,7 +80,6 @@ nodes, the GLM packs.
 ```bash
 cp configs/ds41-mxfp4.env.example  .env.ds41-mxfp4     # DeepSeek-V4.1-Flash(-1017), MXFP4
 cp configs/glm53-exlr8.env.example .env.glm53-exlr8    # GLM-5.3, exlr8 bit260 (needs the packs below)
-cp configs/glm53-exl3.env.example  .env.glm53-exl3     # GLM-5.3, EXL3 2.75 bpw (the profile before it)
 ```
 
 **2. Get the weights** onto both nodes:
@@ -91,13 +88,12 @@ cp configs/glm53-exl3.env.example  .env.glm53-exl3     # GLM-5.3, EXL3 2.75 bpw 
 | --- | --- | ---: |
 | `ds41-mxfp4` | [`deepseek-ai/DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) (or the original `DeepSeek-V4.1-Flash`) | 510 GB |
 | `glm53-exlr8` | the `bit260` profile of [`kindlingai/glm-5.3-exlr8-k2-k3-k4`](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4): its routed experts repacked into one file per node, its 4-bit dense matrices, and the other non-expert weights of [`bertholomus/GLM-5.3-EXL3-3.0bpw`](https://huggingface.co/bertholomus/GLM-5.3-EXL3-3.0bpw) (below) | 246 GB of the 838 GB release, on the head, needed only to pack; a 120 GB pack and 22 GB of weights a node |
-| `glm53-exl3` | [`Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold`](https://huggingface.co/Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold)'s routed experts, repacked into one file per node, and the non-expert weights of [`bertholomus/GLM-5.3-EXL3-3.0bpw`](https://huggingface.co/bertholomus/GLM-5.3-EXL3-3.0bpw) (below) | 293 GB checkpoint, needed only to pack; 128 GB pack and 15 GB of weights a node |
 
 `MODEL_REPO=deepseek-ai/DeepSeek-V4.1-Flash-1017 MODEL_DIR=<dir> bash scripts/download-model.sh`
 fetches the DeepSeek checkpoint and resumes if interrupted (`HF_TOKEN` is optional; it only
 raises rate limits).
 
-For GLM (`glm53-exlr8`), the release stores every routed expert at 2, 3 and 4 bits and a profile
+For GLM, the exlr8 release stores every routed expert at 2, 3 and 4 bits and a profile
 names one width a unit, so only the profile's part is fetched, by HTTP range requests (stdlib
 Python; resumable; it holds tens of MB and is safe beside a serving engine):
 
@@ -112,14 +108,6 @@ exlr8 keeps its largest non-expert matrices at 4 bits and the rest at 8; the pro
 fewer bytes a decode pass than exlr8's 8), which is what `glm_fetch_dense.py` fetches. The packs
 and the combined weights are made after step 3.
 
-For the EXL3 profile (`glm53-exl3`), download Mia's AI Lab's checkpoint on the head with
-`hf download Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold --local-dir <ckpt dir>`. It keeps its
-non-expert weights in BF16, ~19 GB a rank, so the profile takes those from bertholomus's EXL3
-checkpoint of the same GLM-5.3 instead (~5-6 bits, 7.3 GB a rank): on each node,
-`python3 tools/glm_fetch_dense.py --out <dense dir>` fetches just those 15 GB by range requests
-(stdlib Python; re-run to resume). That directory is `GLM_MODEL_DIR`; the experts are packed
-after step 3.
-
 **3. Build the image** on the head; it is copied to the worker, and both models run from it:
 
 ```bash
@@ -131,7 +119,7 @@ refuses to start from an image built from other sources than the checkout: after
 run the same command again. The Rust engine serves DeepSeek's native scales; the lossless scale
 pack ([details](docs/lossless-scales.md)) is the Python engine's.
 
-For `glm53-exlr8`, pack each node's half of the routed experts and write the combined dense
+For GLM, pack each node's half of the routed experts and write the combined dense
 weights once, on the head (numpy and xxhash: `pip install numpy xxhash`, or `uv run --with numpy
 --with xxhash python ...`; every unit read is checked against the release's checksums; with
 `--follow 3600` a pack runs behind the fetch and both are done when it is, 57 minutes here):
@@ -152,21 +140,6 @@ rsync -a <dense dir>/exlr8-overlay-*.safetensors <dense dir>/model.safetensors.i
 both nodes; once they are in place `<exlr8 dir>` is no longer read. Another profile of the release
 (`bit243`, `home`, ...) is the same three commands with its `--manifest`: the fetch adds only the
 units it lacks.
-
-For `glm53-exl3`, pack each node's half of the routed experts once, from this image and as your own user
-(~10 minutes a rank). The packer reads the checkpoint, so run both ranks on the head and copy
-rank 1's 128 GB file to the worker (or copy the checkpoint across and pack there); once both packs
-are in place, at the same path, the checkpoint is no longer read:
-
-```bash
-# rank 0, and the same with r1of2 / --rank 1; then GLM_EXL3_DIR=<packs dir> in the profile
-docker run --rm --user "$(id -u):$(id -g)" -v <ckpt dir>:/src:ro -v <packs dir>:/packs \
-  -v "$PWD":/w -w /w --entrypoint python tidelm:local tools/glm_pack_exl3.py \
-  --source /src --out /packs/glm-exl3-experts-r0of2.bin --rank 0
-```
-
-bertholomus's whole 3.0bpw checkpoint works the same way (its experts at 3 bits for 12,500
-residents in the same memory, its own directory as `GLM_MODEL_DIR`).
 
 **4. Start and stop:**
 
@@ -239,7 +212,7 @@ python3 tools/glm_ablit_fit.py --alpha 3 --out ~/models/glm53-ablit/glm53-derisk
 ```
 
 Copy the file to **both nodes** at the same path and set it in the GLM profile, then start it
-(`scripts/tide.sh start .env.glm53-exl3`); the log shows
+(`scripts/tide.sh start .env.glm53-exlr8`); the log shows
 `[glm] ablit: 48 layers (2-49), alpha 3.000-3.000, from ... (sha256 ...)`:
 
 ```bash
