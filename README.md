@@ -85,44 +85,38 @@ path on both nodes. Clone this repository to the same absolute path on both node
 [install guide](docs/install.md) has each step in full: disk per profile, copying between the
 nodes, the GLM packs.
 
-**1. Pick a profile** and fill in your paths, the worker's address and network interfaces:
+There are three profiles, and each is set up on its own below. One image runs all three, one
+profile serves at a time (each fills both boxes), and switching between profiles that are set up
+is one `scripts/tide.sh start`.
+
+| Profile | Model | Disk, each node | Head only, while setting up |
+| --- | --- | ---: | ---: |
+| [`ds41-mxfp4`](#deepseek-v41-flash-ds41-mxfp4) | DeepSeek-V4.1-Flash-1017 | 510 GB | |
+| [`glm53-exlr8`](#glm-53-exlr8-bit260-glm53-exlr8) | GLM-5.3, exlr8 `bit260` | 142 GB | 246 GB |
+| [`glm53-exlr8-home`](#glm-53-exlr8-home-glm53-exlr8-home) | GLM-5.3, exlr8 `home` | 172 GB | 308 GB |
+
+### DeepSeek-V4.1-Flash (`ds41-mxfp4`)
+
+**1. Profile.** Copy the example and fill in your paths, the worker's address and the network
+interfaces:
 
 ```bash
-cp configs/ds41-mxfp4.env.example  .env.ds41-mxfp4     # DeepSeek-V4.1-Flash(-1017), MXFP4
-cp configs/glm53-exlr8.env.example .env.glm53-exlr8    # GLM-5.3, exlr8 bit260 (needs the packs below)
-cp configs/glm53-exlr8-home.env.example .env.glm53-exlr8-home    # or exlr8 home: its own packs, the rest shared
+cp configs/ds41-mxfp4.env.example .env.ds41-mxfp4
 ```
 
-**2. Get the weights** onto both nodes:
-
-| Profile | Checkpoint | Size |
-| --- | --- | ---: |
-| `ds41-mxfp4` | [`deepseek-ai/DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) (or the original `DeepSeek-V4.1-Flash`) | 510 GB |
-| `glm53-exlr8` | the `bit260` profile of [`kindlingai/glm-5.3-exlr8-k2-k3-k4`](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4): its routed experts repacked into one file per node, its 4-bit dense matrices, and the other non-expert weights of [`bertholomus/GLM-5.3-EXL3-3.0bpw`](https://huggingface.co/bertholomus/GLM-5.3-EXL3-3.0bpw) (below) | 246 GB of the 838 GB release, on the head, needed only to pack; a 120 GB pack and 22 GB of weights a node |
-
-`MODEL_REPO=deepseek-ai/DeepSeek-V4.1-Flash-1017 MODEL_DIR=<dir> bash scripts/download-model.sh`
-fetches the DeepSeek checkpoint and resumes if interrupted (`HF_TOKEN` is optional; it only
-raises rate limits).
-
-For GLM, the exlr8 release stores every routed expert at 2, 3 and 4 bits and a profile
-names one width a unit, so only the profile's part is fetched, by HTTP range requests (stdlib
-Python; resumable; it holds tens of MB and is safe beside a serving engine):
+**2. Weights**, on both nodes: 510 GB of
+[`deepseek-ai/DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
+(or the original `DeepSeek-V4.1-Flash`). The script resumes if interrupted; `HF_TOKEN` is
+optional and only raises rate limits. Set `MODEL_DIR=<dir>` in the profile.
 
 ```bash
-python3 tools/exlr8_fetch.py --manifest bit260 --out <exlr8 dir>     # head: 237 GB of experts
-python3 tools/exlr8_fetch.py --dense --out <exlr8 dir>               # head: 8.8 GB of dense layers
-python3 tools/glm_fetch_dense.py --out <base dense dir>              # each node: 15 GB (below)
+MODEL_REPO=deepseek-ai/DeepSeek-V4.1-Flash-1017 MODEL_DIR=<dir> bash scripts/download-model.sh
 ```
 
-exlr8 keeps its largest non-expert matrices at 4 bits and the rest at 8; the profile takes the
-4-bit ones and leaves the rest to bertholomus's EXL3 checkpoint of the same GLM-5.3 (5-6 bits:
-fewer bytes a decode pass than exlr8's 8), which is what `glm_fetch_dense.py` fetches. The packs
-and the combined weights are made after step 3.
-
-**3. Build the image** on the head; it is copied to the worker, and both models run from it:
+**3. Image**, on the head; it is copied to the worker:
 
 ```bash
-scripts/tide.sh build .env.ds41-mxfp4    # any of your profiles: the image, shipped to its PEER
+scripts/tide.sh build .env.ds41-mxfp4
 ```
 
 It compiles the Rust engine inside the build, so the boxes need nothing but Docker. The engine
@@ -130,10 +124,53 @@ refuses to start from an image built from other sources than the checkout: after
 run the same command again. The Rust engine serves DeepSeek's native scales; the lossless scale
 pack ([details](docs/lossless-scales.md)) is the Python engine's.
 
-For GLM, pack each node's half of the routed experts and write the combined dense
-weights once, on the head (numpy and xxhash: `pip install numpy xxhash`, or `uv run --with numpy
---with xxhash python ...`; every unit read is checked against the release's checksums; with
-`--follow 3600` a pack runs behind the fetch and both are done when it is, 57 minutes here):
+**4. Start:**
+
+```bash
+scripts/tide.sh start .env.ds41-mxfp4
+```
+
+### GLM-5.3, exlr8 `bit260` (`glm53-exlr8`)
+
+The default GLM-5.3 profile: the `bit260` profile (2.6 bpw) of
+[`kindlingai/glm-5.3-exlr8-k2-k3-k4`](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4).
+The release stores every routed expert at 2, 3 and 4 bits and a profile names one width a unit,
+so only the profile's part is fetched (246 GB of 838 GB, on the head, needed only to pack). What
+serves is a 120 GB pack of routed experts and 22 GB of other weights on each node.
+
+**1. Profile.** Copy the example and fill in your paths and the worker's address:
+
+```bash
+cp configs/glm53-exlr8.env.example .env.glm53-exlr8
+```
+
+**2. Fetch**, by HTTP range requests (stdlib Python; resumable; it holds tens of MB and is safe
+beside a serving engine):
+
+```bash
+python3 tools/exlr8_fetch.py --manifest bit260 --out <exlr8 dir>     # head: 237 GB of experts
+python3 tools/exlr8_fetch.py --dense --out <exlr8 dir>               # head: 8.8 GB of dense layers
+python3 tools/glm_fetch_dense.py --out <base dense dir>              # each node: 15 GB
+```
+
+exlr8 keeps its largest non-expert matrices at 4 bits and the rest at 8; the profile takes the
+4-bit ones and leaves the rest to
+[`bertholomus/GLM-5.3-EXL3-3.0bpw`](https://huggingface.co/bertholomus/GLM-5.3-EXL3-3.0bpw), an
+EXL3 checkpoint of the same GLM-5.3 (5-6 bits: fewer bytes a decode pass than exlr8's 8), which
+is what `glm_fetch_dense.py` fetches.
+
+**3. Image**, on the head; it is copied to the worker. Skip this if you built it for another
+profile, and run it again after every `git pull`:
+
+```bash
+scripts/tide.sh build .env.glm53-exlr8
+```
+
+**4. Packs and weights**, once, on the head: each node's half of the routed experts, and the
+combined non-expert weights. The tools need numpy and xxhash (`pip install numpy xxhash`, or
+`uv run --with numpy --with xxhash python ...`); every unit read is checked against the release's
+checksums. With `--follow 3600` a pack runs behind the fetch and both are done when it is, 57
+minutes here.
 
 ```bash
 python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest bit260 --rank 0 \
@@ -147,27 +184,70 @@ ssh <worker> 'cp -al <base dense dir> <dense dir>'
 rsync -a <dense dir>/exlr8-overlay-*.safetensors <dense dir>/model.safetensors.index.json <worker>:<dense dir>/
 ```
 
-`GLM_EXL3_DIR=<packs dir>` and `GLM_MODEL_DIR=<dense dir>` in the profile, at the same paths on
-both nodes; once they are in place `<exlr8 dir>` is no longer read. Another profile of the release
-(`bit243`, `home`, ...) is the same three commands with its `--manifest`: the fetch adds only the
-bytes the mirror lacks.
+Set `GLM_EXL3_DIR=<packs dir>` and `GLM_MODEL_DIR=<dense dir>` in the profile, at the same paths
+on both nodes. Once the packs and weights are in place `<exlr8 dir>` is no longer read.
 
-For `home` that is the fetch and the two packs, and no dense step - its shared experts have
-`bit260`'s widths, so `<dense dir>` is the one above (without `bit260`, the dense command takes
-`--manifest home`):
+**5. Start:**
 
 ```bash
-python3 tools/exlr8_fetch.py --manifest home --out <exlr8 dir>       # 300 GB of experts; 172 GB beside bit260's
-python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest home --rank 0 \
-    --out <packs dir>/glm-exlr8-home-r0of2.bin                        # 150 GB a node
-python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest home --rank 1 --out - | \
-    ssh <worker> 'cat > <packs dir>/glm-exlr8-home-r1of2.bin'
+scripts/tide.sh start .env.glm53-exlr8
 ```
 
-The two profiles then differ in one key (`GLM_EXL3_PACK`) and switch with
-`scripts/tide.sh start .env.glm53-exlr8-home`.
+### GLM-5.3, exlr8 `home` (`glm53-exlr8-home`)
 
-**4. Start and stop:**
+The same release's `home` profile (3.25 bpw: 192 of a layer's routed experts at 3 bits, 64 at
+4): wider experts, fewer of them resident, slower (the table at the top). The steps are
+`bit260`'s with `--manifest home` and a 150 GB pack on each node. **With `bit260` already set
+up**, only the experts' fetch (172 GB more) and the two packs are new: skip the lines marked
+*shared*, and use the same `<exlr8 dir>`, `<packs dir>` and `<dense dir>`.
+
+**1. Profile.** Copy the example and fill in your paths and the worker's address:
+
+```bash
+cp configs/glm53-exlr8-home.env.example .env.glm53-exlr8-home
+```
+
+**2. Fetch** (as above: resumable, safe beside a serving engine):
+
+```bash
+python3 tools/exlr8_fetch.py --manifest home --out <exlr8 dir>       # head: 300 GB of experts
+python3 tools/exlr8_fetch.py --dense --out <exlr8 dir>               # shared - head: 8.8 GB of dense layers
+python3 tools/glm_fetch_dense.py --out <base dense dir>              # shared - each node: 15 GB
+```
+
+**3. Image**, on the head (*shared*: skip it if you built it for another profile):
+
+```bash
+scripts/tide.sh build .env.glm53-exlr8-home
+```
+
+**4. Packs and weights**, once, on the head (numpy and xxhash, as above):
+
+```bash
+python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest home --rank 0 \
+    --out <packs dir>/glm-exlr8-home-r0of2.bin
+python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest home --rank 1 --out - | \
+    ssh <worker> 'cat > <packs dir>/glm-exlr8-home-r1of2.bin'
+# shared from here - home's shared experts have bit260's widths, so <dense dir> is the same directory
+python3 tools/glm_exlr8_dense.py --base <base dense dir> --exlr8 <exlr8 dir> --manifest home \
+    --out <dense dir>
+ssh <worker> 'cp -al <base dense dir> <dense dir>'
+rsync -a <dense dir>/exlr8-overlay-*.safetensors <dense dir>/model.safetensors.index.json <worker>:<dense dir>/
+```
+
+Set `GLM_EXL3_DIR=<packs dir>` and `GLM_MODEL_DIR=<dense dir>` in the profile, at the same paths
+on both nodes. The two GLM profiles then differ in one key, `GLM_EXL3_PACK`.
+
+**5. Start:**
+
+```bash
+scripts/tide.sh start .env.glm53-exlr8-home
+```
+
+Another profile of the release (`bit243`, ...) is the same steps with its `--manifest`: the fetch
+adds only the bytes the mirror lacks.
+
+### Running it
 
 ```bash
 scripts/tide.sh start .env.glm53-exlr8   # stops whatever is serving, starts this profile
