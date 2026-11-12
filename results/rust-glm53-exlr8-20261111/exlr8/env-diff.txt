@@ -1,0 +1,22 @@
+2c2
+< GLM_MODEL_DIR=/home/ryan/models/GLM-5.3-dense-from-3.0bpw
+---
+> GLM_MODEL_DIR=/home/ryan/models/GLM-5.3-dense-exlr8
+10,11c10,11
+< GLM_EXL3_DIR=/home/ryan/models/glm275-packs
+< GLM_EXL3_PACK=/packs/glm-exl3-experts-r{rank}of2.bin
+---
+> GLM_EXL3_DIR=/home/ryan/models/glm-exlr8-packs
+> GLM_EXL3_PACK=/packs/glm-exlr8-bit260-r{rank}of2.bin
+34d33
+< GLM_HOT_RESCUE=0.4
+37,38c36,37
+< RUST_GLM_STATE_DB=/home/ryan/tidelm-rust-state/glm-stats-rust.npz
+< RUST_GLM_PREFIX_DIR=/home/ryan/tidelm-rust-state/glm-prefix
+---
+> RUST_GLM_STATE_DB=/home/ryan/tidelm-rust-state/exlr8/bench/exlr8/state.npz
+> RUST_GLM_PREFIX_DIR=/home/ryan/tidelm-rust-state/exlr8/bench/exlr8/prefix
+43c42
+< DSV41_DREAM=1
+---
+> DSV41_DREAM=0

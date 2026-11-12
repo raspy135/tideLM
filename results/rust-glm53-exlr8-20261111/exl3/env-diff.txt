@@ -1,0 +1,12 @@
+34d33
+< GLM_HOT_RESCUE=0.4
+37,38c36,37
+< RUST_GLM_STATE_DB=/home/ryan/tidelm-rust-state/glm-stats-rust.npz
+< RUST_GLM_PREFIX_DIR=/home/ryan/tidelm-rust-state/glm-prefix
+---
+> RUST_GLM_STATE_DB=/home/ryan/tidelm-rust-state/exlr8/bench/exl3/state.npz
+> RUST_GLM_PREFIX_DIR=/home/ryan/tidelm-rust-state/exlr8/bench/exl3/prefix
+43c42
+< DSV41_DREAM=1
+---
+> DSV41_DREAM=0

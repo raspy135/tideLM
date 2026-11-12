@@ -1,0 +1,12 @@
+== p2-code: workload=code isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=68 ttft=   1141.9 ms  tpot=  39.04 ms  decode= 25.62 tok/s  out=1024 (length)
+          accept_len=3.035608308605341  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=68 ttft=    515.5 ms  tpot=  37.91 ms  decode= 26.38 tok/s  out=1024 (length)
+          accept_len=3.062874251497006  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=68 ttft=    512.0 ms  tpot=  39.41 ms  decode= 25.38 tok/s  out=1024 (length)
+          accept_len=2.857541899441341  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=68 ttft=    498.9 ms  tpot=  38.16 ms  decode= 26.21 tok/s  out=1024 (length)
+          accept_len=2.9566473988439306  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=511.9504 ms  tpot=38.1575 ms  decode=26.2072 tok/s
+  -> ENGINE  accept_len=2.9566  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /home/ryan/git/tidelm-exlr8/results/rust-glm53-exlr8-20261111/exl3/code.json

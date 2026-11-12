@@ -10,10 +10,19 @@ tide — so the engine gets better the more you use it.
 | Profile | Model | Routed experts | Resident | Context | Prose | Code | 8K-token prompt, first token |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,000 / 15,360 (65.1%) | 1M (2 lanes, 1.5M shared) | **33.5 tok/s** | **51.8 tok/s** | 4.3 s |
-| `glm53-exl3` | GLM-5.3 | EXL3 2.75 bpw (2-4 bits an expert) | 12,968 / 19,200 (67.5%) | 320K (2 lanes) | **21.0 tok/s** | **25.7 tok/s** | 17.5 s |
+| `glm53-exlr8` | GLM-5.3 | exlr8 `bit260` (2.6 bpw: 2-3 bits a projection) | 14,124 / 19,200 (73.6%) | 320K (2 lanes) | **22.3 tok/s** | **28.2 tok/s** | 17.9 s |
+| `glm53-exl3` | GLM-5.3 | EXL3 2.75 bpw (2-4 bits an expert) | 12,968 / 19,200 (67.5%) | 320K (2 lanes) | 20.5 tok/s | 26.2 tok/s | 17.3 s |
 
 *Medians of three `bench/bench.py` runs after a warmup, 1,024 tokens at temperature 0.6 (raw runs:
-[DeepSeek](results/rust-ds41-20261028-pdl/README.md), [GLM-5.3](results/rust-glm53-20261030/README.md)).*
+[DeepSeek](results/rust-ds41-20261028-pdl/README.md), [GLM-5.3](results/rust-glm53-exlr8-20261111/README.md):
+both GLM rows from one binary on one afternoon, the same expert memory).*
+
+GLM-5.3's default profile is `glm53-exlr8`: the `bit260` profile of
+[kindlingai/glm-5.3-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4). Against
+the EXL3 profile it decodes about 8% faster (prose +8.9%, code +7.6%), scores 0.024 nats better on
+held-out text and keeps 1,150 more experts resident in the same memory; its 8K-token first token
+is 3% slower
+([what it took](docs/exlr8.md)).
 
 Adaptive expert loading also allows flexible memory configuration.
 Memory for expert resident and context length are the big levers. You can run other services
@@ -72,7 +81,8 @@ nodes, the GLM packs.
 
 ```bash
 cp configs/ds41-mxfp4.env.example  .env.ds41-mxfp4     # DeepSeek-V4.1-Flash(-1017), MXFP4
-cp configs/glm53-exl3.env.example  .env.glm53-exl3     # GLM-5.3, EXL3 (needs the packs below)
+cp configs/glm53-exlr8.env.example .env.glm53-exlr8    # GLM-5.3, exlr8 bit260 (needs the packs below)
+cp configs/glm53-exl3.env.example  .env.glm53-exl3     # GLM-5.3, EXL3 2.75 bpw (the profile before it)
 ```
 
 **2. Get the weights** onto both nodes:
@@ -80,11 +90,29 @@ cp configs/glm53-exl3.env.example  .env.glm53-exl3     # GLM-5.3, EXL3 (needs th
 | Profile | Checkpoint | Size |
 | --- | --- | ---: |
 | `ds41-mxfp4` | [`deepseek-ai/DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) (or the original `DeepSeek-V4.1-Flash`) | 510 GB |
+| `glm53-exlr8` | the `bit260` profile of [`kindlingai/glm-5.3-exlr8-k2-k3-k4`](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4): its routed experts repacked into one file per node, its 4-bit dense matrices, and the other non-expert weights of [`bertholomus/GLM-5.3-EXL3-3.0bpw`](https://huggingface.co/bertholomus/GLM-5.3-EXL3-3.0bpw) (below) | 246 GB of the 838 GB release, on the head, needed only to pack; a 120 GB pack and 22 GB of weights a node |
 | `glm53-exl3` | [`Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold`](https://huggingface.co/Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold)'s routed experts, repacked into one file per node, and the non-expert weights of [`bertholomus/GLM-5.3-EXL3-3.0bpw`](https://huggingface.co/bertholomus/GLM-5.3-EXL3-3.0bpw) (below) | 293 GB checkpoint, needed only to pack; 128 GB pack and 15 GB of weights a node |
 
 `MODEL_REPO=deepseek-ai/DeepSeek-V4.1-Flash-1017 MODEL_DIR=<dir> bash scripts/download-model.sh`
 fetches the DeepSeek checkpoint and resumes if interrupted (`HF_TOKEN` is optional; it only
-raises rate limits). For GLM, download Mia's AI Lab's checkpoint on the head with
+raises rate limits).
+
+For GLM (`glm53-exlr8`), the release stores every routed expert at 2, 3 and 4 bits and a profile
+names one width a unit, so only the profile's part is fetched, by HTTP range requests (stdlib
+Python; resumable; it holds tens of MB and is safe beside a serving engine):
+
+```bash
+python3 tools/exlr8_fetch.py --manifest bit260 --out <exlr8 dir>     # head: 237 GB of experts
+python3 tools/exlr8_fetch.py --dense --out <exlr8 dir>               # head: 8.8 GB of dense layers
+python3 tools/glm_fetch_dense.py --out <base dense dir>              # each node: 15 GB (below)
+```
+
+exlr8 keeps its largest non-expert matrices at 4 bits and the rest at 8; the profile takes the
+4-bit ones and leaves the rest to bertholomus's EXL3 checkpoint of the same GLM-5.3 (5-6 bits:
+fewer bytes a decode pass than exlr8's 8), which is what `glm_fetch_dense.py` fetches. The packs
+and the combined weights are made after step 3.
+
+For the EXL3 profile (`glm53-exl3`), download Mia's AI Lab's checkpoint on the head with
 `hf download Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold --local-dir <ckpt dir>`. It keeps its
 non-expert weights in BF16, ~19 GB a rank, so the profile takes those from bertholomus's EXL3
 checkpoint of the same GLM-5.3 instead (~5-6 bits, 7.3 GB a rank): on each node,
@@ -103,7 +131,29 @@ refuses to start from an image built from other sources than the checkout: after
 run the same command again. The Rust engine serves DeepSeek's native scales; the lossless scale
 pack ([details](docs/lossless-scales.md)) is the Python engine's.
 
-For GLM, pack each node's half of the routed experts once, from this image and as your own user
+For `glm53-exlr8`, pack each node's half of the routed experts and write the combined dense
+weights once, on the head (numpy and xxhash: `pip install numpy xxhash`, or `uv run --with numpy
+--with xxhash python ...`; every unit read is checked against the release's checksums; with
+`--follow 3600` a pack runs behind the fetch and both are done when it is, 57 minutes here):
+
+```bash
+python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest bit260 --rank 0 \
+    --out <packs dir>/glm-exlr8-bit260-r0of2.bin
+python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest bit260 --rank 1 --out - | \
+    ssh <worker> 'cat > <packs dir>/glm-exlr8-bit260-r1of2.bin'
+python3 tools/glm_exlr8_dense.py --base <base dense dir> --exlr8 <exlr8 dir> --manifest bit260 \
+    --out <dense dir>             # the base's shards hard-linked, 6.9 GB of exlr8 matrices beside them
+# the worker's <dense dir>: its own copy of the base by hard links, then the new shards and the index
+ssh <worker> 'cp -al <base dense dir> <dense dir>'
+rsync -a <dense dir>/exlr8-overlay-*.safetensors <dense dir>/model.safetensors.index.json <worker>:<dense dir>/
+```
+
+`GLM_EXL3_DIR=<packs dir>` and `GLM_MODEL_DIR=<dense dir>` in the profile, at the same paths on
+both nodes; once they are in place `<exlr8 dir>` is no longer read. Another profile of the release
+(`bit243`, `home`, ...) is the same three commands with its `--manifest`: the fetch adds only the
+units it lacks.
+
+For `glm53-exl3`, pack each node's half of the routed experts once, from this image and as your own user
 (~10 minutes a rank). The packer reads the checkpoint, so run both ranks on the head and copy
 rank 1's 128 GB file to the worker (or copy the checkpoint across and pack there); once both packs
 are in place, at the same path, the checkpoint is no longer read:
@@ -121,7 +171,7 @@ residents in the same memory, its own directory as `GLM_MODEL_DIR`).
 **4. Start and stop:**
 
 ```bash
-scripts/tide.sh start .env.glm53-exl3    # stops whatever is serving, starts this profile
+scripts/tide.sh start .env.glm53-exlr8   # stops whatever is serving, starts this profile
 scripts/tide.sh logs -f                  # its log (--rank 1: the worker's)
 scripts/tide.sh stop
 ```
@@ -179,7 +229,7 @@ DSV41_ABLIT_WOB=/models/dsv41-1017-wo-b-ablit/wo_b_l10_35_1017.safetensors
 The Rust engine serves GLM-5.3 abliterated with the edit of
 [`Blackfrost-Research/GLM-5.3-DERISKED-BF16`](https://huggingface.co/Blackfrost-Research/GLM-5.3-DERISKED-BF16):
 one direction a layer, projected out of layers 2-49's attention and MLP outputs at run time (alpha
-3). That is the same model as its edited weights, the routed experts included, so the EXL3 packs
+3). That is the same model as its edited weights, the routed experts included, so the expert packs
 stay the stock ones. The directions are a 1.2 MB file, recovered from that checkpoint and the BF16
 base (`zai-org/GLM-5.3-BF16`) by HTTP range requests: both repos are public, ~5 GB is fetched a
 tensor at a time, and nothing but the file is kept. It needs numpy:
@@ -200,7 +250,7 @@ As with the DeepSeek overlay, both ranks refuse to pair over different files (th
 boot guard), and the disk prefix store keeps the abliterated model's prompts apart from the stock
 model's: the first request of a conversation after switching prefills its whole prompt again. On
 held-out text (`corpus/heldout_quick.jsonl`, 10,151 tokens) it costs NLL +0.018 +- 0.005 (+1.0%)
-and top-1 60.22 -> 59.95%.
+and top-1 60.22 -> 59.95% (measured on the EXL3 profile; not yet on `glm53-exlr8`).
 
 ## Use
 
@@ -225,7 +275,7 @@ with what each setting measured.
 
 | DeepSeek | GLM-5.3 | What it controls |
 | --- | --- | --- |
-| `RUST_BUDGET=9950` | `GLM_SLOTS=12500` | How many experts stay resident (GLM: expert memory a rank, in 3-bit experts' worth: ~13,300 of the 2.75bpw pack's). Fewer, more memory for context. |
+| `RUST_BUDGET=9950` | `GLM_SLOTS=12400` | How many experts stay resident (GLM: expert memory a rank, in 3-bit experts' worth, 7.1 MB each - a budget, not a count: 14,361 of `bit260`'s, whose records are smaller). Fewer, more memory for context. |
 | `MAX_SEQ=1048576`, `RUST_KV_TOKENS=1572864` | `GLM_MAX_SEQ=262144` | Context, generated tokens included (DeepSeek: the most one lane reaches, out of a pool of `RUST_KV_TOKENS` the lanes share). Less context, more experts. |
 | `DSV41_ADAPT_SENSITIVITY=high` | `GLM_ADAPT=1`, `GLM_ADAPT_EVERY=200` | How fast the resident set follows new traffic. |
 | `RUST_ADAPT_DB` | `RUST_GLM_STATE_DB` | The learned history, under `~/tidelm-rust-state`. With none yet, the first boot starts from the bundled one in `profiles/`. |
@@ -234,13 +284,15 @@ with what each setting measured.
 | `SPEC=1`, `RUST_DEPTH=confidence` | `GLM_MTP=1`, `GLM_MTP_DEPTH=7`, `GLM_MTP_CAL=0.36` | Speculative decoding and its depth policy. |
 | `DSV41_PREFIX_CACHE=1`, `DSV41_PREFIX_DISK=1` | `GLM_PREFIX_DISK=1`, `GLM_KV_SPLIT=1` | Prompt caching; GLM's KV cache split across the ranks. |
 | — | `GLM_KV=fp8` | GLM's KV cache format, the one the Rust engine serves. The Python engine's 4-bit latent with the first and last ten layers in FP8 fits 320K in less memory and measured KL +0.004 against FP8 on the long eval, but in use the model's recall of its context was visibly worse. |
+| — | `GLM_EXLR8_ROUND=exact` | exlr8's codebook rounded to FP8 exactly as the format defines it, instead of in two instructions (the default: a decode pass ~2% shorter, held-out NLL unchanged). |
 | — | `GLM_LOOP_BREAK=12` | Stops a short cycle of tokens from repeating a 12th time (repetition loops start where experts are substituted). |
 
 ## Documentation
 
 - [Install guide](docs/install.md): each setup step in full
 - [Hot reads: design and measurements](docs/hot-reads.md)
-- [Adaptive expert loading](docs/adaptive-experts.md), [GLM-5.3 engine plan](docs/glm53-plan.md)
+- [Adaptive expert loading](docs/adaptive-experts.md), [GLM-5.3 engine plan](docs/glm53-plan.md),
+  [exlr8 on the pair](docs/exlr8.md)
 - [Results](RESULTS.md), [TP memory](docs/tp-memory.md), [packed KV](docs/packed-kv.md),
   [speculative decoding](docs/decode-dynamic-depth.md), [decode dashboard](docs/decode-probe.md)
 
@@ -261,6 +313,6 @@ reuses its runtime, kernels and server.
 The RoCE all-gather is ported from [TensorFold](https://github.com/ashhart/TensorFold), which
 adapted b12x's; the EXL3 expert kernels port TensorFold's ExLlamaV3-derived device code. Models:
 DeepSeek-V4.1-Flash by DeepSeek, GLM-5.3 by Z.ai, the MXFP4 GLM checkpoint by AMD (Quark), the
-EXL3 GLM checkpoint by bertholomus. Full attributions and licences: [CREDITS.md](CREDITS.md).
+EXL3 GLM checkpoints by bertholomus and Mia's AI Lab, the exlr8 GLM release by KindlingAI. Full attributions and licences: [CREDITS.md](CREDITS.md).
 
 Repository code is [MIT-licensed](LICENSE). Model use is governed by each checkpoint's own license.

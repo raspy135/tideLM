@@ -1,0 +1,12 @@
+== p2-prose: workload=prose isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=53 ttft=   1392.5 ms  tpot=  51.09 ms  decode= 19.57 tok/s  out=1024 (length)
+          accept_len=2.109278350515464  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=53 ttft=    750.5 ms  tpot=  46.50 ms  decode= 21.51 tok/s  out=1024 (length)
+          accept_len=2.253303964757709  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=53 ttft=    466.4 ms  tpot=  48.77 ms  decode= 20.50 tok/s  out=1024 (length)
+          accept_len=2.167372881355932  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=53 ttft=    459.8 ms  tpot=  50.37 ms  decode= 19.85 tok/s  out=1024 (length)
+          accept_len=2.0542168674698793  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=466.387 ms  tpot=48.7738 ms  decode=20.5028 tok/s
+  -> ENGINE  accept_len=2.1674  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /home/ryan/git/tidelm-exlr8/results/rust-glm53-exlr8-20261111/exl3/prose.json
