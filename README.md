@@ -11,9 +11,11 @@ tide — so the engine gets better the more you use it.
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,000 / 15,360 (65.1%) | 1M (2 lanes, 1.5M shared) | **33.5 tok/s** | **51.8 tok/s** | 4.3 s |
 | `glm53-exlr8` | GLM-5.3 | exlr8 `bit260` (2.6 bpw: 2-3 bits a projection) | 14,124 / 19,200 (73.6%) | 320K (2 lanes) | **22.3 tok/s** | **28.2 tok/s** | 17.9 s |
+| `glm53-exlr8-home` | GLM-5.3 | exlr8 `home` (3.25 bpw: 3 or 4 bits an expert) | 11,430 / 19,200 (59.5%) | 320K (2 lanes) | **20.4 tok/s** | **23.9 tok/s** | 17.2 s |
 
 *Medians of three `bench/bench.py` runs after a warmup, 1,024 tokens at temperature 0.6 (raw runs:
-[DeepSeek](results/rust-ds41-20261028-pdl/README.md), [GLM-5.3](results/rust-glm53-exlr8-20261111/README.md)).*
+[DeepSeek](results/rust-ds41-20261028-pdl/README.md), [GLM-5.3](results/rust-glm53-exlr8-20261111/README.md),
+[GLM-5.3 `home`](results/rust-glm53-exlr8-home-20261112/README.md), a day later on another build).*
 
 GLM-5.3 is served from the `bit260` profile of
 [kindlingai/glm-5.3-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4). Against
@@ -21,6 +23,14 @@ the EXL3 2.75 bpw profile it replaced (20.5 / 26.2 tok/s, 17.3 s on the same bin
 decodes about 8% faster, scores 0.024 nats better on held-out text and keeps 1,150 more experts
 resident in the same memory; its 8K-token first token is 3% slower ([what it took](docs/exlr8.md)).
 The EXL3 profile is still served: its setup is in the [install guide](docs/install.md).
+
+`home` is the same release's 3.25 bpw profile, for when the wider experts matter more than the
+speed: the release measures it closer to the unquantized model than `bit260` (KL 0.149 against
+0.192 on its held-out set, with every expert loaded), and on this pair its larger records leave
+2,900 fewer experts resident in the same memory (11,430 against 14,361) and decode about 9%
+(prose) to 15% (code) slower. What it gives in answers with 59.5% of the experts resident is not
+measured here
+([`home` on the pair](docs/exlr8.md#home-325-bpw-2026-11-12)).
 
 Adaptive expert loading also allows flexible memory configuration.
 Memory for expert resident and context length are the big levers. You can run other services
@@ -80,6 +90,7 @@ nodes, the GLM packs.
 ```bash
 cp configs/ds41-mxfp4.env.example  .env.ds41-mxfp4     # DeepSeek-V4.1-Flash(-1017), MXFP4
 cp configs/glm53-exlr8.env.example .env.glm53-exlr8    # GLM-5.3, exlr8 bit260 (needs the packs below)
+cp configs/glm53-exlr8-home.env.example .env.glm53-exlr8-home    # or exlr8 home: its own packs, the rest shared
 ```
 
 **2. Get the weights** onto both nodes:
@@ -139,7 +150,22 @@ rsync -a <dense dir>/exlr8-overlay-*.safetensors <dense dir>/model.safetensors.i
 `GLM_EXL3_DIR=<packs dir>` and `GLM_MODEL_DIR=<dense dir>` in the profile, at the same paths on
 both nodes; once they are in place `<exlr8 dir>` is no longer read. Another profile of the release
 (`bit243`, `home`, ...) is the same three commands with its `--manifest`: the fetch adds only the
-units it lacks.
+bytes the mirror lacks.
+
+For `home` that is the fetch and the two packs, and no dense step - its shared experts have
+`bit260`'s widths, so `<dense dir>` is the one above (without `bit260`, the dense command takes
+`--manifest home`):
+
+```bash
+python3 tools/exlr8_fetch.py --manifest home --out <exlr8 dir>       # 300 GB of experts; 172 GB beside bit260's
+python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest home --rank 0 \
+    --out <packs dir>/glm-exlr8-home-r0of2.bin                        # 150 GB a node
+python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest home --rank 1 --out - | \
+    ssh <worker> 'cat > <packs dir>/glm-exlr8-home-r1of2.bin'
+```
+
+The two profiles then differ in one key (`GLM_EXL3_PACK`) and switch with
+`scripts/tide.sh start .env.glm53-exlr8-home`.
 
 **4. Start and stop:**
 

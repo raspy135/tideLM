@@ -1,0 +1,12 @@
+== p2-code: workload=code isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=68 ttft=   1061.8 ms  tpot=  42.66 ms  decode= 23.44 tok/s  out=1024 (length)
+          accept_len=2.84958217270195  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=68 ttft=   1059.9 ms  tpot=  41.57 ms  decode= 24.06 tok/s  out=1024 (length)
+          accept_len=2.9481268011527377  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=68 ttft=    557.6 ms  tpot=  41.82 ms  decode= 23.91 tok/s  out=1024 (length)
+          accept_len=3.053731343283582  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=68 ttft=    547.3 ms  tpot=  43.75 ms  decode= 22.86 tok/s  out=1024 (length)
+          accept_len=2.9145299145299144  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=557.6272 ms  tpot=41.817 ms  decode=23.9137 tok/s
+  -> ENGINE  accept_len=2.9481  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /home/ryan/tidelm-rust-state/exlr8-home/bench/rescue0/code.json

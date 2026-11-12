@@ -143,3 +143,62 @@ are free of both.
 The mirror is 237 GB of experts and 8.8 GB of dense files (the head; not read once the packs
 exist), a rank's pack 120.4 GB (each node), the dense checkpoint 6.9 GB beside the base's 15 GB
 (each node; the base's shards are hard links).
+
+## `home` (3.25 bpw, 2026-11-12)
+
+The release's `home` manifest: each routed expert whole at one width - in every decoder layer 192
+at K3 and 64 at K4 (the widths of GLM-5.3-EXL3-TR3-3.25bpw's tier bitmap), the MTP layer's 256 at
+K3 - and the shared experts as `bit260` has them (K4; K3 in the MTP layer). Profile:
+`configs/glm53-exlr8-home.env.example`, which differs from `bit260`'s in `GLM_EXL3_PACK`.
+
+Nothing in the engine changed for it. A pack's records carry their widths and the arena makes a
+pool of slots a width triple (`class_arena`), so 4/4/4 records are a class beside 3/3/3 as 2/2/3
+is in `bit260`; the kernels read a slot's widths from its tables. It is the first 4-bit routed
+record served from an exlr8 pack. Checked: the pack against the reference decode
+(`tools/test_glm_pack_exlr8.py`, ten records of layer 10 on rank 0, three of them 4/4/4: max
+|pack - reference| 6.7e-8), every unit against the release's xxhash64 as the packer read it, and
+in serving that it boots, answers six prompts of a graded set correctly and has carried a
+morning of agent traffic with hot reads, swaps and preloads. Not checked: the GPU kernels' decode
+of a 4-bit record with this codebook against the reference (the fixture test above ran on
+`bit260`'s widths).
+
+The dense checkpoint is `bit260`'s: the two manifests name the same shared-expert widths in all
+76 layers, and nothing else of the manifest reaches `glm_exlr8_dense.py`.
+
+The fetch needed one fix. `home` cuts the release's K3 files at other offsets than `bit260` did
+(192 of a layer's experts where `bit260` took every down), and the journal was compared piece by
+piece, so a `home` fetch into
+`bit260`'s mirror planned 292.9 of its 299.5 GB again. The plan now subtracts the byte ranges
+the journal holds (`missing`): 172.1 GB, fetched in 54 minutes beside the serving engine.
+
+| | `bit260` | `home` |
+| --- | ---: | ---: |
+| a rank's pack | 120.4 GB | 149.8 GB |
+| records | 5.5 MB (2/2/3), 7.1 MB (3/3/3) | 7.1 MB (3/3/3), 9.5 MB (4/4/4) |
+| resident at `GLM_SLOTS=12400` (88.3 GB a rank), bundled history | 14,361 (74.8%) | 11,430 (59.5%): 8,505 3-bit, 2,925 4-bit |
+| the release's KL to BF16, held-out, every expert loaded: mean / median | 0.192 / 0.0222 | 0.149 / 0.0125 |
+| bench/bench.py prose / code, tok/s | 22.34 / 28.20 | 20.38 / 23.91 |
+| random 8K: first token, its 256 tokens | 17.88 s, 20.49 tok/s | 17.18 s, 19.69 tok/s |
+| decode picks missed in those runs: prose, code, 8K | 2.1-2.6%, 6.3-8.2%, 13.0-15.3% | 6.3-7.9%, 13.1-16.8%, 21.7-23.3% |
+
+The speed rows are a day and a build apart (`results/rust-glm53-exlr8-home-20261112`: `home` ran
+the image of main plus uncommitted hot-read work with its knobs unset, at 12,400; `bit260` a host
+build of this branch at 12,200), so the gap - prose -8.8%, code -15.2% - is an estimate, not an
+A/B. Its direction has two causes that are not in doubt: more bytes a pick, and 2,900 fewer
+residents, which here shows as two to three times the missed picks on prose and code.
+
+Residency is the cost that matters. The routing history (the served one, the bundled seed
+included) has no dead experts to give up - none of the 19,456 has zero mass, the least used holds
+a tenth of an even share of its layer, and half of all picks need 7,125 experts, 90% need 16,076
+- so the 2,900 that `home` leaves on disk are
+experts traffic asks for. Whether 3.25 bpw at 59.5% resident answers better than 2.6 bpw at
+74.8% is the open question, and it is not measured: no held-out NLL, no verify pass, no graded
+comparison was run for `home`.
+
+One property of mixed widths to know: the two pools are sized at boot from the history (8,505 /
+2,925 from the bundled one; 8,413 / 2,994 and 8,408 / 2,998 from a used one) and a swap, a
+preload or a kept hot read replaces a resident of its own width (`plan_swaps`), so memory does
+not move between the widths until a restart re-plans them.
+
+Disk for `home`: 299.5 GB of the release's experts (172.1 GB more in a mirror that holds
+`bit260`), a rank's pack 149.8 GB (each node).

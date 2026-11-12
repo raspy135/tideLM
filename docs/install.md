@@ -21,6 +21,7 @@ Disk, per node:
 |---|---|---|
 | `ds41-mxfp4` | 510 GB checkpoint | |
 | `glm53-exlr8` | 22 GB of non-expert weights + a 120 GB expert pack | 246 GB of the exlr8 release (the `bit260` profile's part of 838 GB), read only to pack, then deletable; the worker's pack is streamed to it |
+| `glm53-exlr8-home` | the same 22 GB of non-expert weights + a 150 GB expert pack | 308 GB of the release (the `home` profile's part; 172 GB more where `bit260`'s is already there), read only to pack, then deletable |
 | `glm53-exl3` | 15 GB of non-expert weights + a 128 GB expert pack | the 293 GB checkpoint, read only to pack, then deletable (+128 GB for the worker's pack if you pack both on the head) |
 
 ## 1. Profile
@@ -28,6 +29,7 @@ Disk, per node:
 ```bash
 cp configs/ds41-mxfp4.env.example  .env.ds41-mxfp4     # DeepSeek-V4.1-Flash-1017
 cp configs/glm53-exlr8.env.example .env.glm53-exlr8    # GLM-5.3 (exlr8 bit260: the default)
+cp configs/glm53-exlr8-home.env.example .env.glm53-exlr8-home    # GLM-5.3 (exlr8 home, 3.25 bpw: wider experts, fewer resident)
 cp configs/glm53-exl3.env.example  .env.glm53-exl3     # GLM-5.3 (EXL3 2.75 bpw: the profile before it)
 ```
 
@@ -147,6 +149,22 @@ against the release (docs/exlr8.md). To serve another profile of the release, re
 the three commands with its `--manifest` and point the profile's keys at the new files; switching
 between profiles already packed is those keys and a restart. `GLM_SLOTS` is a memory budget, so it
 stays as it is: a profile of smaller records holds more experts in it.
+
+`glm53-exlr8-home` is that for the release's `home` profile (3.25 bpw: 192 of a layer's routed
+experts at 3 bits and 64 at 4), with its own example, `configs/glm53-exlr8-home.env.example`:
+
+```bash
+python3 tools/exlr8_fetch.py --manifest home --out <exlr8 dir>       # 300 GB of experts; 172 GB into bit260's mirror (54 minutes at 53 MB/s)
+python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest home --rank 0 \
+    --out <packs dir>/glm-exlr8-home-r0of2.bin                        # 149.8 GB
+python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest home --rank 1 --out - | \
+    ssh <worker> 'cat > <packs dir>/glm-exlr8-home-r1of2.bin'
+```
+
+Its shared experts have `bit260`'s widths, so `<dense dir>` is the same directory and the dense
+command is not run again (without `bit260`'s: run it with `--manifest home`). In the same
+`GLM_SLOTS` it holds fewer experts than `bit260` - 11,430 for 14,361 at 12,400 - because its
+records are larger.
 
 `glm53-exl3`: pack each node's half of the routed experts once, as your own user (the packer reads
 the checkpoint and writes one file per rank; ~10 minutes each):
