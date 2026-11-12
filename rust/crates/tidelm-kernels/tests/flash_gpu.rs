@@ -590,3 +590,67 @@ fn router_over_288_experts() {
         }
     }
 }
+
+#[test]
+#[ignore]
+fn fp8_gemv_bench() {
+    // ds41.cu's FP8 GEMV (e4m3, 32 x 32 UE8M0 scales) at GLM-5.3-Flash's dense shapes, cold (64 MB
+    // written between calls), the decode row counts
+    use tidelm_kernels::ds41::{ds_linear_fp8, ds_splits_reduce};
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(3);
+    let shapes: [(&str, usize, usize); 9] = [
+        ("kda q|k|v|fa|ga|b", 3 * 8192 + 128 + 128 + 64, 4096),
+        ("kda o_proj", 4096, 8192),
+        ("mla q_a|kv_a|ix", 1536 + 512 + 128 + 32 + 128, 4096),
+        ("mla q_b|wq_b", 16384 + 4096, 1536),
+        ("mla o_proj", 4096, 16384),
+        ("shared gate|up", 4096, 4096),
+        ("shared down", 4096, 2048),
+        ("dense gate|up", 24576, 4096),
+        ("head", 154880, 4096),
+    ];
+    let flush = DeviceBuffer::<u8>::zeroed(64 << 20).unwrap();
+    let part = DeviceBuffer::<f32>::zeroed(8 * 8 * 154880).unwrap();
+    for (name, n, k) in shapes {
+        let w: Vec<u8> = (0..n * k).map(|_| (rng.next() & 0x77) as u8).collect();
+        let s: Vec<u8> = (0..(n / 32) * (k / 32)).map(|_| 120u8).collect();
+        let (dw, ds) = (dev(&w), dev(&s));
+        let x = dev(&rng.bf16_vec(8 * k, 1.0));
+        let y = DeviceBuffer::<u16>::zeroed(8 * n).unwrap();
+        let mut line = format!("{name:18} {n:6} x {k:5} ({:6.1} MB):", (n * k) as f64 / 1e6);
+        for &m in &[1usize, 4, 8] {
+            let mut best = (f64::INFINITY, 0);
+            for &sp in &[1usize, 2, 4, 8] {
+                if sp > 1 && n > 8192 {
+                    continue;
+                }
+                let (e0, e1) = (Event::timing().unwrap(), Event::timing().unwrap());
+                let mut tot = 0.0;
+                for rep in 0..6 {
+                    unsafe { tidelm_cuda::ffi::cudaMemsetAsync(flush.raw(), rep as i32, 64 << 20, st.raw()) };
+                    e0.record(&st).unwrap();
+                    unsafe {
+                        let pp = if sp > 1 { p(&part) } else { null() };
+                        ds_linear_fp8(st.raw(), p(&x), k as i64, p(&dw), p(&ds), (k / 32) as i64, m as i32, n as i32, k as i32,
+                                      sp as i32, if sp > 1 { pp } else { p(&y) }, null(), n as i64, pp);
+                        if sp > 1 {
+                            ds_splits_reduce(st.raw(), pp, sp as i32, m as i32, n as i32, p(&y), null(), n as i64);
+                        }
+                    }
+                    e1.record(&st).unwrap();
+                    e1.synchronize().unwrap();
+                    if rep > 0 {
+                        tot += e1.elapsed_ms(&e0).unwrap() as f64;
+                    }
+                }
+                let us = 1e3 * tot / 5.0;
+                if us < best.0 {
+                    best = (us, sp);
+                }
+            }
+            line += &format!("  {m}r {:7.1} us {:4.0} GB/s (split {})", best.0, (n * k) as f64 / best.0 / 1e3, best.1);
+        }
+        eprintln!("{line}");
+    }
+}
