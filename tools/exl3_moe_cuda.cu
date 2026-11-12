@@ -99,7 +99,28 @@ __device__ __forceinline__ uint32_t fetch(const uint32_t (&w)[LW], int idx) {
     }
 }
 
-// Two codebook values (0 3inst, 1 mcg, 2 mul1) as half2, bit-identical to ExLlamaV3's decode.
+// A half2 rounded to FP8 E4M3, nearest even (exlr8: the encoder searched over the rounded values, so
+// the rounding is the format). E4M3 keeps 3 mantissa bits from 2^-6 up and steps by 2^-9 below it:
+// its spacing at a value of fp16 exponent field E is the fp16 spacing of the binade 2^7 above
+// (E >= 9), or of [2, 4) (below). Adding the middle of that binade, c = 1.5 x 2^(E + 7), and
+// subtracting it again rounds v to the spacing in one fp16 add: |v| is under 1 / 64 of c, so v + c
+// stays in c's binade whatever v's sign, and c is an even multiple of the spacing, so the add's own
+// ties-to-even are E4M3's. c per half: the exponent field plus 7 and a mantissa of one half (no
+// carry: a codebook value is at most 4, two addends under 2 - which is also why nothing saturates),
+// floored at 3.0 by one half2 max. Five instructions a pair; a zero comes out +0.
+// (Measured on the way: taking each half's exponent apart with shifts and integer max, 14
+// instructions, read 2-bit gate+up 20-25% slower than plain mcg at split 1; the low end of the binade
+// as c needs v's sign on it, 7 instructions. The decode kernels are bound by this arithmetic wherever
+// their bytes come from L2 or their warps are few.)
+__device__ __forceinline__ uint32_t e4m3_round2(uint32_t v) {
+    const uint32_t c0 = (v & 0x7C007C00u) + 0x1E001E00u;
+    const half2 c = __hmax2(*reinterpret_cast<const half2*>(&c0), __half2half2(__ushort_as_half(0x4200)));
+    const half2 r = __hsub2(__hadd2(*reinterpret_cast<const half2*>(&v), c), c);
+    return *reinterpret_cast<const uint32_t*>(&r);
+}
+
+// Two codebook values (0 3inst, 1 mcg, 2 mul1, 3 mcg rounded to E4M3: exlr8) as half2, bit-identical
+// to ExLlamaV3's decode (3: to kindlingai/exlr8's, tools/exlr8_ref.py).
 template <int CB>
 __device__ __forceinline__ uint32_t cb_pair(uint32_t s0, uint32_t s1) {
     if constexpr (CB == 2) {
@@ -112,7 +133,7 @@ __device__ __forceinline__ uint32_t cb_pair(uint32_t s0, uint32_t s1) {
         return *reinterpret_cast<uint32_t*>(&r);
     } else {
         uint32_t x0, x1;
-        if constexpr (CB == 1) {
+        if constexpr (CB == 1 || CB == 3 || CB == 4) {
             x0 = s0 * 0xCBAC1FEDu;
             x1 = s1 * 0xCBAC1FEDu;
         } else {
@@ -124,6 +145,12 @@ __device__ __forceinline__ uint32_t cb_pair(uint32_t s0, uint32_t s1) {
         uint32_t lo = __byte_perm(x0, x1, 0x5410);
         uint32_t hi = __byte_perm(x0, x1, 0x7632);
         half2 r = __hadd2(*reinterpret_cast<half2*>(&lo), *reinterpret_cast<half2*>(&hi));
+        if constexpr (CB == 3) return e4m3_round2(*reinterpret_cast<uint32_t*>(&r));
+        // 4: exlr8's rounding in two instructions - half an E4M3 step added to the fp16 bits, the seven low
+        // mantissa bits cleared. Not the format's: ties go away from zero and a value under 2^-6 keeps
+        // three mantissa bits instead of the 2^-9 grid, so 1,078 of the 65,536 states decode to a
+        // neighbouring value (rms 0.8% of the codebook's; no rounding at all: 2.7%).
+        if constexpr (CB == 4) return (*reinterpret_cast<uint32_t*>(&r) + 0x00400040u) & 0xFF80FF80u;
         return *reinterpret_cast<uint32_t*>(&r);
     }
 }
@@ -1442,6 +1469,50 @@ __global__ void rot_in_kernel(const TIN* __restrict__ x, int x_stride, const int
     for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
 }
 
+// rot_in_kernel for an exlr8 pack, one rotation a row instead of one a pick and matrix. exlr8's gate
+// and up share their input side: suh = signs.in (the layer's) x one scale a 128-block (the expert's,
+// either sign), so within a block every pick's suh is the first pick's times a constant c, and
+// (x * suh) @ H = c ((x * sign(suh of the first pick)) @ H). Program (row, 128-block of K): the block
+// rotated once, then scaled into each pick's gate and up rows. Against rot_in_kernel a pick reads one
+// suh value a block instead of 128 (12 KB of each matrix's scales a pick, from DRAM), and the row runs
+// one butterfly instead of 2 x slots; the outputs differ from it by the order of two fp32 products.
+template <typename TIN>
+__global__ void rot_in_shared_kernel(const TIN* __restrict__ x, int x_stride, const int* __restrict__ pick,
+                                     const half* __restrict__ suh0, const half* __restrict__ suh1, half* __restrict__ out0,
+                                     half* __restrict__ out1, int K, int slots, int E) {
+    pdl_enter();
+    const int row = blockIdx.x, blk = blockIdx.y, lane = threadIdx.x;
+    int e0 = -1;
+    for (int k = 0; k < slots && e0 < 0; ++k) e0 = pick[row * slots + k];
+    if (e0 < 0) return;
+    const half* sg = suh0 + (size_t)e0 * K + blk * 128;
+    const TIN* xr = x + (size_t)row * x_stride + blk * 128 + 4 * lane;
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float xv = to_f<TIN>(xr[j]);
+        v[j] = (__half_as_ushort(sg[4 * lane + j]) & 0x8000u) ? -xv : xv;
+    }
+    fwht128(v, lane);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] = __fmul_rn(v[j], HAD_SCALE);
+    const float s0 = (__half_as_ushort(sg[0]) & 0x8000u) ? -1.f : 1.f;
+    for (int k = 0; k < slots; ++k) {
+        const int p = row * slots + k;
+        const int e = pick[p];
+        if (e < 0) continue;
+        const float cg = __half2float(suh0[(size_t)e * K + blk * 128]) * s0;
+        const float cu = __half2float(suh1[(size_t)e * K + blk * 128]) * s0;
+        half* og = out0 + (size_t)p * K + blk * 128 + 4 * lane;
+        half* ou = out1 + (size_t)p * K + blk * 128 + 4 * lane;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            og[j] = __float2half_rn(__fmul_rn(v[j], cg));
+            ou[j] = __float2half_rn(__fmul_rn(v[j], cu));
+        }
+    }
+}
+
 // Program (member row, 128-block of the width): splits summed in order, rotated, * svh, SwiGLU (act_mode 1 =
 // fp32, 0 = TensorFold's bf16 rounding points), then Xd = fp16((act * suh_d) @ H).
 __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
@@ -1580,6 +1651,45 @@ __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __re
     for (int j = 0; j < 4; ++j) out[(size_t)r * D + n + j] = acc[j];
 }
 
+// down_combine_kernel for an exlr8 pack, one rotation a row instead of one a pick. exlr8's down has
+// svh = signs.out (the layer's) x one scale a 128-block (the expert's, either sign), so
+// sum_k w_k ((z_k @ H) * svh_k) = ((sum_k w_k c_k z_k) @ H) * sign(svh of the first pick), c_k the pick's
+// block constant against the first pick's sign. Program (row, 128-block of the width): one warp.
+__global__ void down_combine_shared_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
+                                           const half* __restrict__ svh_d, const float* __restrict__ wts,
+                                           float* __restrict__ out, int P, int D, int SK, int E, int slots) {
+    pdl_enter();
+    const int r = blockIdx.x, blk = blockIdx.y, lane = threadIdx.x;
+    const int n = blk * 128 + 4 * lane;
+    int e0 = -1;
+    for (int k = 0; k < slots && e0 < 0; ++k) e0 = pick[r * slots + k];
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    if (e0 >= 0) {
+        const half* sv = svh_d + (size_t)e0 * D + blk * 128;
+        const float s0 = (__half_as_ushort(sv[0]) & 0x8000u) ? -1.f : 1.f;
+        for (int k = 0; k < slots; ++k) {
+            const int p = r * slots + k;
+            const int e = pick[p];
+            if (e < 0) continue;
+            const float c = wts[p] * (__half2float(svh_d[(size_t)e * D + blk * 128]) * s0);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float sum = 0.f;
+                for (int q = 0; q < SK; ++q) sum += Z[((size_t)q * P + p) * D + n + j];
+                acc[j] = fmaf(c, sum, acc[j]);
+            }
+        }
+        fwht128(acc, lane);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float y = acc[j] * HAD_SCALE;
+            acc[j] = (__half_as_ushort(sv[4 * lane + j]) & 0x8000u) ? -y : y;
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) out[(size_t)r * D + n + j] = acc[j];
+}
+
 // Grouping in one block: distinct arena slots (< E) in id order, members = row * 32 + k, -1 after the last.
 // Only used for small E; the decode path uses group_small_kernel below.
 constexpr int GROUP_THREADS = 1024;
@@ -1712,7 +1822,11 @@ void exl3m_grouped(const void* X0, const void* X1, const int64_t* tp0, const int
                    const int* k2_1, const int* uids, const int* ucount, const int* members, float* Z, int K, int N,
                    int P, int SK, int maxm, int slots, int nexp_max, int mats, int nt, int warps, int pf, int lo,
                    int hi, int cb, cudaStream_t s) {
-    if (cb == 2) exl3::grouped_launch<2>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, SK,
+    if (cb == 4) exl3::grouped_launch<4>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, SK,
+                                         maxm, slots, nexp_max, mats, nt, warps, pf, lo, hi, s);
+    else if (cb == 3) exl3::grouped_launch<3>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, SK,
+                                         maxm, slots, nexp_max, mats, nt, warps, pf, lo, hi, s);
+    else if (cb == 2) exl3::grouped_launch<2>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, SK,
                                          maxm, slots, nexp_max, mats, nt, warps, pf, lo, hi, s);
     else if (cb == 1) exl3::grouped_launch<1>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, SK,
                                               maxm, slots, nexp_max, mats, nt, warps, pf, lo, hi, s);
@@ -1758,7 +1872,13 @@ void exl3m_prefill_smem_cb(const void* X0, const void* X1, const int64_t* tp0, c
     else if (cb == 2 && hi <= 8)
         exl3::prefill_smem_cb_launch<2, 8>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots,
                                            nblocks, mats, s);
-    else EXL3_CHECK(false, "smem prefill (mixed widths): codebook mul1 or mcg, widths up to 4 bits");
+    else if (cb == 3 && hi <= 8)
+        exl3::prefill_smem_cb_launch<3, 8>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots,
+                                           nblocks, mats, s);
+    else if (cb == 4 && hi <= 8)
+        exl3::prefill_smem_cb_launch<4, 8>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots,
+                                           nblocks, mats, s);
+    else EXL3_CHECK(false, "smem prefill (mixed widths): codebook mul1, mcg or exlr8's, widths up to 4 bits");
 }
 
 // The fat tile (prefill_fat_kernel) for a mixed-width arena: codebook cb (2 mul1, 1 mcg), widths up to
@@ -1775,7 +1895,15 @@ void exl3m_prefill_fat(const void* X0, const void* X1, const int64_t* tp0, const
         exl3::prefill_fat_launch<2, 6>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots, nblocks, mats, s);
     else if (cb == 2 && hi <= 8)
         exl3::prefill_fat_launch<2, 8>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots, nblocks, mats, s);
-    else EXL3_CHECK(false, "fat prefill: codebook mul1 or mcg, widths up to 4 bits");
+    else if (cb == 3 && hi <= 6)
+        exl3::prefill_fat_launch<3, 6>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots, nblocks, mats, s);
+    else if (cb == 3 && hi <= 8)
+        exl3::prefill_fat_launch<3, 8>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots, nblocks, mats, s);
+    else if (cb == 4 && hi <= 6)
+        exl3::prefill_fat_launch<4, 6>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots, nblocks, mats, s);
+    else if (cb == 4 && hi <= 8)
+        exl3::prefill_fat_launch<4, 8>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots, nblocks, mats, s);
+    else EXL3_CHECK(false, "fat prefill: codebook mul1, mcg or exlr8's, widths up to 4 bits");
 }
 
 // exl3m_prefill_fat (mats 2) and exl3m_gateup in one launch: the rotated, activated down input xd
@@ -1790,7 +1918,11 @@ void exl3m_prefill_fat_gateup(const void* X0, const void* X1, const int64_t* tp0
     else if (cb == 1 && hi <= 8) EXL3_FG(1, 8);
     else if (cb == 2 && hi <= 6) EXL3_FG(2, 6);
     else if (cb == 2 && hi <= 8) EXL3_FG(2, 8);
-    else EXL3_CHECK(false, "fat prefill: codebook mul1 or mcg, widths up to 4 bits");
+    else if (cb == 3 && hi <= 6) EXL3_FG(3, 6);
+    else if (cb == 3 && hi <= 8) EXL3_FG(3, 8);
+    else if (cb == 4 && hi <= 6) EXL3_FG(4, 6);
+    else if (cb == 4 && hi <= 8) EXL3_FG(4, 8);
+    else EXL3_CHECK(false, "fat prefill: codebook mul1, mcg or exlr8's, widths up to 4 bits");
 #undef EXL3_FG
 }
 
@@ -1814,6 +1946,19 @@ void exl3m_dense_rot(const void* x, int x_stride, const void* suh, void* out, in
                                                          K, G);
 }
 
+// exl3m_rot_in for an exlr8 pack (rot_in_shared_kernel): the same arguments and outputs
+void exl3m_rot_in_shared(const void* x, int x_stride, const int* pick, const void* suh0, const void* suh1, void* out0,
+                         void* out1, int rows, int K, int slots, int E, int x_bf16, cudaStream_t s) {
+    dim3 grid((unsigned)rows, (unsigned)(K / 128));
+    if (x_bf16)
+        pdl_launch(exl3::rot_in_shared_kernel<__nv_bfloat16>, grid, 32, 0, s, (const __nv_bfloat16*)x, x_stride, pick,
+                                                                      (const half*)suh0, (const half*)suh1, (half*)out0,
+                                                                      (half*)out1, K, slots, E);
+    else
+        pdl_launch(exl3::rot_in_shared_kernel<half>, grid, 32, 0, s, (const half*)x, x_stride, pick, (const half*)suh0,
+                                                             (const half*)suh1, (half*)out0, (half*)out1, K, slots, E);
+}
+
 void exl3m_dense_out(const float* Z, const void* svh, void* out, int rows, int N, int SK, int G, int out_bf16,
                      cudaStream_t s) {
     dim3 grid((unsigned)rows, (unsigned)(N / 128));
@@ -1826,6 +1971,13 @@ void exl3m_down_combine(const float* Z, const int* pick, const void* svh_d, cons
     dim3 grid((unsigned)rows, (unsigned)(D / 128));
     pdl_launch(exl3::down_combine_kernel, grid, (unsigned)(32 * slots), 0, s, Z, pick, (const half*)svh_d, wts, out, P, D,
                                                                       SK, E, slots);
+}
+
+// exl3m_down_combine for an exlr8 pack (down_combine_shared_kernel): the same arguments and output
+void exl3m_down_combine_shared(const float* Z, const int* pick, const void* svh_d, const float* wts, float* out,
+                               int rows, int P, int D, int SK, int slots, int E, cudaStream_t s) {
+    dim3 grid((unsigned)rows, (unsigned)(D / 128));
+    pdl_launch(exl3::down_combine_shared_kernel, grid, 32, 0, s, Z, pick, (const half*)svh_d, wts, out, P, D, SK, E, slots);
 }
 
 }  // extern "C"

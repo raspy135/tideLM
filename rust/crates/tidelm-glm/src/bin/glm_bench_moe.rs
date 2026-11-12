@@ -50,13 +50,15 @@ fn main() -> Result<()> {
     if std::env::args().any(|a| a == "--prefill") {
         return prefill(&st, &t1p, &t3p, &t2p, &k2, (h, il, kd, dn), (wgu, wdn), &e0, &e1);
     }
+    // CB=1 mcg, 2 mul1 (default), 3 exlr8's mcg rounded to E4M3: what the codebook's arithmetic costs a call
+    let cb: i32 = std::env::var("CB").ok().and_then(|v| v.parse().ok()).unwrap_or(CB_MUL1);
     let mut call = 0usize;
     println!("GB/s of trellis bytes read (median of 12 calls); nt x warps x pf, then split-K");
     for &(r, u) in &[(1usize, 8usize), (2, 12), (4, 21), (8, 40)] {
         let p = r * TOPK;
         for (name, mats, k, n, wq, tp0, tp1) in [("gate+up", 2, h, il, wgu, &t1p, &t3p), ("down", 1, kd, dn, wdn, &t2p, &t2p)] {
             let mut line = format!("R{r} U{u:>2} {name:>7}:");
-            for &(nt, pf) in &[(8usize, 1i32), (8, -2), (8, -3)] {
+            for &(nt, pf) in &[(8usize, -3i32), (8, -2), (4, -2)] {
                 line += &format!("  nt{nt}pf{pf}");
                 for sk in [1usize, 2, 4, 8] {
                     if (k / 16) % (sk * 4) != 0 {
@@ -78,7 +80,7 @@ fn main() -> Result<()> {
                             exl3m_grouped(x0.raw(), x1.raw(), tp0.raw(), tp1.raw(), k2.raw(), k2.raw(), uids.raw(),
                                           ucount.raw(), members.raw(), z.raw(), k as i32, n as i32, p as i32, sk as i32,
                                           MAX_MEMBERS, TOPK as i32, p as i32, mats, nt as i32, 4, pf, 2, 10,
-                                          CB_MUL1, st.raw());
+                                          cb, st.raw());
                         }
                         e1.record(&st)?;
                         e1.synchronize()?;

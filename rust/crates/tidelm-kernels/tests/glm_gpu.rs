@@ -948,3 +948,140 @@ fn absorb_and_router() {
         assert!((ldem[i] as f64 - lane_dem[i]).abs() < 1e-5, "lane demand {i}");
     }
 }
+
+/// exlr8's codebook (CB_MCG_E4M3: mcg, every value rounded to FP8 E4M3) through the decode path, on a
+/// real record of an exlr8 pack: tools/exlr8_fixture.py's gate and down matrices with y = x W from the
+/// reference decode of the published units (tools/exlr8_ref.py). The same words read as plain mcg are
+/// other weights - the rounding is the format - and must miss the reference by far more.
+/// EXLR8_FIXTURE names the file; without it the test is skipped.
+#[test]
+fn exlr8_codebook_matches_the_reference() {
+    let Ok(path) = std::env::var("EXLR8_FIXTURE") else {
+        eprintln!("no EXLR8_FIXTURE; skipping");
+        return;
+    };
+    let Some(st) = setup() else { return };
+    let f = std::fs::read(&path).unwrap();
+    let u16s = |b: &[u8]| -> Vec<u16> { b.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect() };
+    let mut at = 0usize;
+    let mut seen = 0;
+    while at < f.len() {
+        let hd: Vec<usize> = f[at..at + 16].chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize).collect();
+        let (k, n, bits, t) = (hd[0], hd[1], hd[2], hd[3]);
+        at += 16;
+        let mut take = |len: usize| {
+            let s = &f[at..at + len];
+            at += len;
+            s
+        };
+        let tr = take((k / 16) * (n / 16) * 32 * bits).to_vec();
+        let (suh, svh, xb) = (u16s(take(2 * k)), u16s(take(2 * n)), u16s(take(2 * t * k)));
+        let want: Vec<f64> = take(4 * t * n).chunks(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64).collect();
+        let (d_tr, d_x, d_suh, d_svh) = (dev(&tr), dev(&xb), dev(&suh), dev(&svh));
+        let d_xh = DeviceBuffer::<u16>::new(t * k).unwrap();
+        unsafe { exl3m_dense_rot(p(&d_x), k as i32, p(&d_suh), p(&d_xh), t as i32, k as i32, 1, 1, st.raw()) };
+        last_ok();
+        let sk = 8usize;
+        let d_z = DeviceBuffer::<f32>::new(sk * t * n).unwrap();
+        let (d_ptr, d_k2, d_uids, d_cnt) = (dev(&[d_tr.raw() as i64]), dev(&[2 * bits as i32]), dev(&[0i32]), dev(&[1i32]));
+        let mut members = vec![-1i32; 16];
+        for (r, m) in members.iter_mut().enumerate().take(t) {
+            *m = r as i32 * 32;
+        }
+        let d_mem = dev(&members);
+        let d_y = DeviceBuffer::<f32>::new(t * n).unwrap();
+        let mut errs = vec![];
+        for cb in [CB_MCG_E4M3, CB_MCG] {
+            unsafe {
+                exl3m_grouped(p(&d_xh), p(&d_xh), p(&d_ptr), p(&d_ptr), p(&d_k2), p(&d_k2), p(&d_uids), p(&d_cnt), p(&d_mem),
+                              p(&d_z), k as i32, n as i32, t as i32, sk as i32, 16, 1, 1, 1, 8, 4, 1, 2, 10, cb, st.raw());
+                exl3m_dense_out(p(&d_z), p(&d_svh), p(&d_y), t as i32, n as i32, sk as i32, 1, 0, st.raw());
+            }
+            last_ok();
+            errs.push(rel_err(&d_y.download().unwrap(), &want));
+        }
+        eprintln!("exlr8 {k} x {n}, {bits}-bit: decode rel {:.2e} against the reference; read as plain mcg {:.2e}", errs[0], errs[1]);
+        assert!(errs[0] < 2e-3, "exlr8 decode {}", errs[0]);
+        assert!(errs[1] > 5.0 * errs[0], "plain mcg {} should miss the reference (exlr8 {})", errs[1], errs[0]);
+        seen += 1;
+    }
+    assert_eq!(seen, 2);
+}
+
+/// An exlr8 pack's sides are the layer's signs times one scale a 128-block (either sign), so the
+/// routed experts take one input rotation and one output rotation a row (exl3m_rot_in_shared,
+/// exl3m_down_combine_shared). Both against the per-pick kernels they stand in for, over sides of
+/// that shape, a pruned pick (-1) and split-K partials: the rotated inputs to an fp16 ulp, the
+/// combined outputs to fp32 rounding.
+#[test]
+fn exlr8_shared_rotations_match_the_per_pick_kernels() {
+    let Some(st) = setup() else { return };
+    let (k, d, slots, rows, e) = (6144usize, 3072usize, 8usize, 3usize, 12usize);
+    let mut rng = Rng(11);
+    let f16 = |v: f32| -> u16 {
+        // fp16 bits of a value that is exact in fp16 here (signs and scales of few mantissa bits)
+        let b = v.to_bits();
+        let (s, ex, m) = ((b >> 16) & 0x8000, ((b >> 23) & 0xff) as i32 - 127 + 15, (b >> 13) & 0x3ff);
+        if v == 0.0 { s as u16 } else { (s | ((ex as u32) << 10) | m) as u16 }
+    };
+    // gate and up share the layer's input signs; down has the output's
+    let sign_vec = |rng: &mut Rng, len: usize| -> Vec<f32> { (0..len).map(|_| if rng.next() & 1 == 0 { 1.0 } else { -1.0 }).collect() };
+    let (sin, sout) = (sign_vec(&mut rng, k), sign_vec(&mut rng, d));
+    let sides = |rng: &mut Rng, signs: &[f32]| -> Vec<u16> {
+        let len = signs.len();
+        let mut out = Vec::with_capacity(e * len);
+        for _ in 0..e {
+            for b in 0..len / 128 {
+                // one scale a block, a few of them negative, quantized to 6 mantissa bits
+                let sc = ((0.25 + rng.unif()) * 64.0).round() / 64.0 * if rng.next() % 5 == 0 { -1.0 } else { 1.0 };
+                out.extend((0..128).map(|i| f16(signs[b * 128 + i] * sc)));
+            }
+        }
+        out
+    };
+    let (suh0, suh1, svh) = (sides(&mut rng, &sin), sides(&mut rng, &sin), sides(&mut rng, &sout));
+    let mut pick: Vec<i32> = (0..rows * slots).map(|i| ((i * 5 + 3) % e) as i32).collect();
+    pick[slots + 2] = -1;
+    let x = rng.bf16_vec(rows * k, 1.0);
+    let (d_x, d_pick, d_s0, d_s1, d_sv) = (dev(&x), dev(&pick), dev(&suh0), dev(&suh1), dev(&svh));
+    let pn = rows * slots;
+    let outs: Vec<DeviceBuffer<u16>> = (0..4).map(|_| DeviceBuffer::<u16>::zeroed(pn * k).unwrap()).collect();
+    unsafe {
+        exl3m_rot_in(p(&d_x), k as i32, p(&d_pick), p(&d_s0), p(&d_s1), p(&outs[0]), p(&outs[1]), rows as i32, k as i32,
+                     slots as i32, e as i32, 1, st.raw());
+        exl3m_rot_in_shared(p(&d_x), k as i32, p(&d_pick), p(&d_s0), p(&d_s1), p(&outs[2]), p(&outs[3]), rows as i32,
+                            k as i32, slots as i32, e as i32, 1, st.raw());
+    }
+    last_ok();
+    for m in 0..2 {
+        let (a, b) = (outs[m].download().unwrap(), outs[m + 2].download().unwrap());
+        let (mut worst, mut differ) = (0f32, 0usize);
+        for (i, (&u, &v)) in a.iter().zip(&b).enumerate() {
+            if pick[i / k] < 0 {
+                continue;
+            }
+            let (fu, fv) = (f16_to_f32(u), f16_to_f32(v));
+            differ += (u != v) as usize;
+            worst = worst.max((fu - fv).abs() / fu.abs().max(1e-3));
+        }
+        eprintln!("exlr8 rot_in matrix {m}: {differ} of {} fp16 values differ, worst relative {worst:.1e}", a.len());
+        assert!(worst < 2e-3, "rot_in matrix {m}: {worst}");
+    }
+    // the down side: Z [SK][P][D] partials, weights a pick
+    let sk = 2usize;
+    let z: Vec<f32> = (0..sk * pn * d).map(|_| rng.normal()).collect();
+    let wts: Vec<f32> = (0..pn).map(|_| rng.unif()).collect();
+    let (d_z, d_w) = (dev(&z), dev(&wts));
+    let (o0, o1) = (DeviceBuffer::<f32>::zeroed(rows * d).unwrap(), DeviceBuffer::<f32>::zeroed(rows * d).unwrap());
+    unsafe {
+        exl3m_down_combine(p(&d_z), p(&d_pick), p(&d_sv), p(&d_w), p(&o0), rows as i32, pn as i32, d as i32, sk as i32,
+                           slots as i32, e as i32, st.raw());
+        exl3m_down_combine_shared(p(&d_z), p(&d_pick), p(&d_sv), p(&d_w), p(&o1), rows as i32, pn as i32, d as i32,
+                                  sk as i32, slots as i32, e as i32, st.raw());
+    }
+    last_ok();
+    let want: Vec<f64> = o0.download().unwrap().iter().map(|&v| v as f64).collect();
+    let err = rel_err(&o1.download().unwrap(), &want);
+    eprintln!("exlr8 down_combine: relative {err:.1e}");
+    assert!(err < 1e-5, "down_combine {err}");
+}

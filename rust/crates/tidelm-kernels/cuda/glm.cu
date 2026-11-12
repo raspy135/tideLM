@@ -1379,7 +1379,11 @@ __global__ void argmax_combine_kernel(const int* __restrict__ pairs, int world, 
 // u32 words) -> W_q fp16 [K][N] in output order: each element's stream position, its 16-bit
 // window state and the mul1 codebook value (1024 + the four bytes of state * 0x83DCD12D) times
 // scale plus bias, exact in fp32, rounded once to fp16. One block per (k tile, 128 columns).
-__global__ void exl3_unpack_kernel(const uint32_t* __restrict__ tr, int NT, int N, int bits, __half* __restrict__ W) {
+// cb 3 (exlr8, exl3_moe_cuda.cu's cb_pair<3>): mcg - the two fp16 halves of
+// (state * 0xCBAC1FED & 0x8FFF8FFF) ^ 0x3B603B60 added in fp16 - rounded to FP8 E4M3 (nearest even):
+// v plus and minus the middle of the fp16 binade whose spacing is E4M3's at v (the exponent field
+// + 7 with a mantissa of one half, floored at 3.0).
+__global__ void exl3_unpack_kernel(const uint32_t* __restrict__ tr, int NT, int N, int bits, int cb, __half* __restrict__ W) {
     pdl_enter();
     const int kt = blockIdx.x, c0 = blockIdx.y * 128;
     const int nw = 8 * bits;
@@ -1397,6 +1401,17 @@ __global__ void exl3_unpack_kernel(const uint32_t* __restrict__ tr, int NT, int 
         const uint32_t hi = off >= 16 ? w0 << (off - 16) : w0 >> (16 - off);
         const uint32_t lo = off > 16 ? w1 >> (48 - off) : 0u;
         const uint32_t state = (hi | lo) & 0xffffu;
+        if (cb == 3 || cb == 4) {
+            const uint32_t x = ((state * 0xCBAC1FEDu) & 0x8FFF8FFFu) ^ 0x3B603B60u;
+            const __half v = __hadd(__ushort_as_half((unsigned short)(x & 0xffffu)), __ushort_as_half((unsigned short)(x >> 16)));
+            if (cb == 4) {      // the two-instruction rounding (exl3_moe_cuda.cu cb_pair<4>)
+                W[((int64_t)kt * 16 + r) * N + c] = __ushort_as_half((unsigned short)((__half_as_ushort(v) + 0x40u) & 0xFF80u));
+                continue;
+            }
+            const __half cm = __hmax(__ushort_as_half((unsigned short)((__half_as_ushort(v) & 0x7C00u) + 0x1E00u)), __ushort_as_half(0x4200));
+            W[((int64_t)kt * 16 + r) * N + c] = __hsub(__hadd(v, cm), cm);
+            continue;
+        }
         const uint32_t x = state * 0x83DCD12Du;
         const uint32_t h = 1024u + (x & 255u) + ((x >> 8) & 255u) + ((x >> 16) & 255u) + (x >> 24);
         const float v = (float)h * 0.00676727294921875f + -10.3828125f;
@@ -1829,11 +1844,16 @@ int glm_argmax_combine(void* stream, const void* pairs, int world, int M, void* 
     GRET;
 }
 
-int glm_exl3_unpack(void* stream, const void* trellis, int K, int N, int bits, void* w) {
-    if (K % 16 || N % 128) return (int)cudaErrorInvalidValue;
+// cb: 2 mul1, 3 exlr8's mcg rounded to E4M3 (tidelm_kernels::exl3::CB_*)
+int glm_exl3_unpack_cb(void* stream, const void* trellis, int K, int N, int bits, int cb, void* w) {
+    if (K % 16 || N % 128 || cb < 2 || cb > 4) return (int)cudaErrorInvalidValue;
     pdl_launch(exl3_unpack_kernel, dim3(K / 16, N / 128), 256, 0, GST, static_cast<const uint32_t*>(trellis), N / 16, N, bits,
-                                                               static_cast<__half*>(w));
+                                                               cb, static_cast<__half*>(w));
     GRET;
+}
+
+int glm_exl3_unpack(void* stream, const void* trellis, int K, int N, int bits, void* w) {
+    return glm_exl3_unpack_cb(stream, trellis, K, N, bits, 2, w);
 }
 
 int glm_member_codes(void* stream, const void* pair, int n, int K, void* out) {

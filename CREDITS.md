@@ -89,6 +89,20 @@ pack (`scripts/exl3-packs.sh`) from the base checkpoint
 [`Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw`](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw),
 quantized with ExLlamaV3 from `deepseek-ai/DeepSeek-V4.1-Flash`.
 
+## exlr8 routed experts and dense matrices
+
+The default GLM-5.3 profile serves the `bit260` profile of **KindlingAI**'s
+[`kindlingai/glm-5.3-exlr8-k2-k3-k4`](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4), a
+quantization of Z.ai's GLM-5.3 in their exlr8 v2 format (the weights under the GLM-5.3 License, the
+packing and manifests also CC BY 4.0). The format is ExLlamaV3's trellis (MIT, Copyright (c) 2025
+Turboderp) with the codebook rounded to FP8 E4M3 and the weights stored in units that decode on
+their own. `tools/exlr8_ref.py`, the fetcher, the packers and the kernels' codebook
+(`tools/exl3_moe_cuda.cu` `e4m3_round2`) are this repo's, written from the release's model card and
+[`kindlingai/exlr8`](https://github.com/kindlingai/exlr8)'s `FORMAT.md`; no code of theirs is
+vendored, and their reference loader is not run by anything here. The engine's own choices - the
+EXL3 record layout the units are regrouped into, the two-instruction rounding it defaults to, the
+EXL3 checkpoint's weights where exlr8 stores 8 bits - are not the format's (docs/exlr8.md).
+
 ## The platform and the tools
 
 **NVIDIA** — the DGX Spark / GB10, the CUDA 13 container images, and PyTorch's cu130

@@ -62,6 +62,9 @@ extern "C" {
     pub fn glm_argmax_combine(stream: CudaStream, pairs: *const c_void, world: c_int, m: c_int, out: *mut c_void) -> c_int;
     pub fn glm_exl3_unpack(stream: CudaStream, trellis: *const c_void, k: c_int, n: c_int, bits: c_int,
                            w: *mut c_void) -> c_int;
+    /// `glm_exl3_unpack` for codebook `cb`: 2 mul1, 3 exlr8's (exl3::CB_MCG_E4M3)
+    pub fn glm_exl3_unpack_cb(stream: CudaStream, trellis: *const c_void, k: c_int, n: c_int, bits: c_int, cb: c_int,
+                              w: *mut c_void) -> c_int;
     pub fn glm_member_codes(stream: CudaStream, pair: *const c_void, n: c_int, k: c_int, out: *mut c_void) -> c_int;
     pub fn glm_count_live(stream: CudaStream, block_slot: *const c_void, nb: c_int, out: *mut c_void) -> c_int;
     pub fn glm_quant_kvb(stream: CudaStream, w: *const c_void, rows: c_int, q: *mut c_void, s_rows: *mut c_void) -> c_int;

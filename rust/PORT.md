@@ -568,6 +568,30 @@ shared-memory work; Triton's 64-key tiles were ~1.8x faster per pick).
   is the next lever there. The levers left are quality trades (4-bit dense, async hot reads) or
   1-2% fusions.
 
+## GLM-5.3 on exlr8 (`bit260`, 2026-11-11)
+
+The default GLM profile (`configs/glm53-exlr8.env.example`; docs/exlr8.md has every number).
+kindlingai/glm-5.3-exlr8-k2-k3-k4 stores each routed expert at 2, 3 and 4 bits in 128-channel
+units, a profile naming one width a unit; its trellis is EXL3's with the codebook rounded to FP8
+E4M3. The engine's structure did not change: `tools/glm_pack_exlr8.py` regroups a profile's units
+into the EXL3 pack's records and `tools/glm_exlr8_dense.py` its 4-bit o_proj, q_b, dense MLPs and
+shared experts into the EXL3 checkpoint's layout; the codebook is new (`exl3::CB_MCG_E4M3` exact,
+`CB_MCG_E4M3_FAST` the two-instruction rounding served by default; `--exlr8-round`, in the guard
+and the disk prefix store's namespace). What exlr8 keeps at 8 bits stays the EXL3 checkpoint's.
+
+- **Measured** against the EXL3 2.75 bpw profile, one binary, the same `GLM_SLOTS` (12,968 against
+  14,124 residents): bench.py prose 20.50 -> 22.34 tok/s, code 26.21 -> 28.20, the 8K prompt's
+  first token 17.28 -> 17.88 s (results/rust-glm53-exlr8-20261111); a verify pass 60.61 -> 56.16
+  ms at one row and 110.67 -> 103.75 at four; held-out NLL 1.8793 -> 1.8549.
+- **Fewer bytes were not enough**: the first build was +0.7% at one row. Decode is bound by the
+  kernels' arithmetic, and mcg plus the rounding is the heavier codebook. What paid: split-K for
+  the routed experts' decode GEMVs on an exlr8 pack (`routed_splits`), o_proj at split 8
+  (`SPLIT_O_E4M3`), the rounding in 5 and then 2 instructions.
+- **Left off or not built**: one input and one output rotation a row (the reference's order;
+  `rot1`: +0.5% at one row), the format's one-exchange split (the gather it removes already
+  covers the down rows' L2 prefetch), a codebook table.
+- **Prefill is 2-3% slower** (its tile is bound by the decode arithmetic): the open item.
+
 ## Rules carried over from the Python engine
 
 - **The pair fails silently.** Anything that changes numerics or control flow per rank

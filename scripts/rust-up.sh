@@ -118,6 +118,10 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
           --two-pass "${GLM_PREFILL_TWO_PASS:-0}" --two-pass-miss "${GLM_PREFILL_TWO_PASS_MISS:-0}"
           --preload "${GLM_PRELOAD:-0}")
     [[ "${GLM_GRAPHS:-1}" == 1 ]] && args+=(--graphs)
+    # GLM_EXLR8_ROUND=exact|fast: an exlr8 pack's (tools/glm_pack_exlr8.py) and exlr8 dense matrices'
+    # (tools/glm_exlr8_dense.py) codebook rounded to E4M3 as the format defines it, or in two
+    # instructions (the server's default: docs/exlr8.md); nothing to an EXL3 pack
+    [[ -n "${GLM_EXLR8_ROUND:-}" ]] && args+=(--exlr8-round "$GLM_EXLR8_ROUND")
     # the long prompt copier, on unless GLM_COPY=0 (the server's default)
     [[ -n "${GLM_COPY:-}" ]] && args+=(--copy "$GLM_COPY")
     # lanes: requests served at once, sharing the KV pool (1 unless set)

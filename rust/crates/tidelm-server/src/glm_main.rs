@@ -34,7 +34,7 @@ pub fn is_glm(model_dir: &std::path::Path) -> bool {
 }
 
 pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
-    const VALUED: [&str; 51] = ["--bench-nll-ab", "--bench-prefill-ab", "--bench-ab", "--bench-ab-rounds", "--bench-nll-skip", "--bench-nll-rows", "--bench-nll-max", "--lanes", "--lane-chunk", "--bench-nll-out", "--bench-nll", "--bench-widths", "--copy", "--hot-async", "--bench-width", "--bench-ctx", "--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
+    const VALUED: [&str; 53] = ["--exlr8-round", "--bench-nll-ab", "--bench-nll-adapt", "--bench-prefill-ab", "--bench-ab", "--bench-ab-rounds", "--bench-nll-skip", "--bench-nll-rows", "--bench-nll-max", "--lanes", "--lane-chunk", "--bench-nll-out", "--bench-nll", "--bench-widths", "--copy", "--hot-async", "--bench-width", "--bench-ctx", "--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
                                 "--max-seq", "--chunk", "--hot", "--hot-keep", "--depth", "--cal", "--dyn", "--lookup",
                                 "--adapt", "--adapt-every", "--adapt-prefill", "--adapt-decode", "--bg-every", "--loop-break",
                                 "--two-pass", "--two-pass-miss", "--host", "--port", "--served-model-name", "--moe-rows",
@@ -59,6 +59,14 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
     let world = num("--world", 1.0)? as usize;
     let rank = num("--rank", 0.0)? as usize;
     let pack = arg(args, "--pack").ok_or("--pack PACK_r{rank}of2.bin")?.replace("{rank}", &rank.to_string());
+    // --exlr8-round fast|exact (GLM_EXLR8_ROUND; an exlr8 pack or matrix only): its codebook's E4M3
+    // rounding in two instructions (default: 1,078 of 65,536 states decode to a neighbouring value; a
+    // pass 1.7-2.0% shorter, held-out NLL -0.0002 +- 0.0042) or the format's own. In the boot guard.
+    let exlr8_exact = match arg(args, "--exlr8-round").as_deref() {
+        None | Some("fast") => false,
+        Some("exact") => true,
+        Some(v) => return Err(format!("--exlr8-round {v}: fast or exact").into()),
+    };
     let opt = Options {
         max_seq: num("--max-seq", 262144.0)? as usize,
         chunk: num("--chunk", 4096.0)? as usize,
@@ -68,10 +76,10 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         moe_rows: num("--moe-rows", 2048.0)? as usize,
         pack: PathBuf::from(&pack),
         lanes: num("--lanes", 1.0)? as usize,
-        guard_extra: format!("graphs {} hot {} async {} prefix {} gb {} preload {}", args.iter().any(|a| a == "--graphs"),
+        guard_extra: format!("graphs {} hot {} async {} prefix {} gb {} preload {} exlr8-round {}", args.iter().any(|a| a == "--graphs"),
                              arg(args, "--hot").unwrap_or_else(|| "1".into()), arg(args, "--hot-async").unwrap_or_default(),
                              arg(args, "--prefix-disk").is_some(), arg(args, "--prefix-disk-gb").unwrap_or_default(),
-                             arg(args, "--preload").unwrap_or_default()),
+                             arg(args, "--preload").unwrap_or_default(), if exlr8_exact { "exact" } else { "fast" }),
     };
     tidelm_cuda::set_device(0)?;
     let cfg = tidelm_glm::config::GlmConfig::load(&model_dir)?;
@@ -120,6 +128,7 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         }
     };
     let mut eng = Engine::load(&model_dir, opt, rank, world, pair, &residents, &log)?;
+    eng.set_exlr8_boot_round(exlr8_exact);
     eng.graphs = arg(args, "--graphs").is_some() || args.iter().any(|a| a == "--graphs");
     // async hot reads (GLM_HOT_ASYNC) go into the background period's victims, and have none
     // without it (tp.py's rule)
@@ -163,6 +172,15 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         let cfg_bytes = std::fs::read(model_dir.join("config.json"))?;
         let key = format!("glm-rust-kv v1 {:x} {} {} {} {}", sha2::Sha256::digest(&cfg_bytes), eng.pack.source_sha256,
                           eng.opt.max_seq, eng.opt.kv_split, world);
+        // an exlr8 pack is served with one of several dense checkpoints (the EXL3 one, or exlr8's trellis
+        // matrices in it: tools/glm_exlr8_dense.py - the same config.json) and one of two roundings: each
+        // changes the rows. (An EXL3 pack's key stays as it was: its stores keep their namespaces.)
+        let key = if eng.pack.is_exlr8() {
+            let index = std::fs::read(model_dir.join("model.safetensors.index.json"))?;
+            format!("{key} dense {:x} round {}", sha2::Sha256::digest(&index), if exlr8_exact { "exact" } else { "fast" })
+        } else {
+            key
+        };
         // GLM_ABLIT changes every row past its first edited layer: its own namespace (stock: unchanged)
         let ablit = tidelm_glm::ablit::digest()?;
         let key = if ablit.is_empty() { key } else { format!("{key} ablit {ablit}") };
@@ -228,7 +246,10 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
                 srv.eng.bench_knob_reset(knob)?;
             }
         } else {
-            bench_nll(&mut srv.eng, &path, &text, keep, arg(args, "--bench-nll-out"), &shape, last, true)?;
+            // --bench-nll-adapt 0: no adaptation in the bench (with GLM_HOT=0 the residents are the
+            // boot's: two packs of one history are then scored over the same experts)
+            let adapt = num("--bench-nll-adapt", 1.0)? > 0.0;
+            bench_nll(&mut srv.eng, &path, &text, keep, arg(args, "--bench-nll-out"), &shape, last, adapt)?;
         }
         if last {
             return Ok(());

@@ -1,0 +1,145 @@
+# exlr8 on the pair: GLM-5.3 `bit260` (2026-11-11)
+
+[kindlingai/glm-5.3-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4):
+every routed expert stored at 2, 3 and 4 bits in independent 128-channel units, a profile
+(manifest) naming one width a unit; the trellis is EXL3's with one change - every codebook value
+is rounded to FP8 E4M3, and the encoder searched over the rounded values. `bit260` is the profile
+served here: gate / up at K2 in 45 layers and K3 in 30, every down at K3, the shared expert K4.
+
+## What runs
+
+Nothing in the engine's structure changed. The units regroup, tile for tile, into the records
+and matrices the EXL3 kernels already read; what is new is the codebook.
+
+| piece | where |
+| --- | --- |
+| the codebook: mcg, then the E4M3 rounding - exact in 5 instructions a pair (`CB_MCG_E4M3`, 3) or in 2 (`CB_MCG_E4M3_FAST`, 4) | `tools/exl3_moe_cuda.cu` `cb_pair`, `e4m3_round2`; the prefill unpack `glm_exl3_unpack_cb` |
+| fetch a profile by HTTP Range into a sparse mirror (bit260: 237 of 838 GB) | `tools/exlr8_fetch.py` |
+| the routed experts as an EXL3-layout pack, a rank (120.4 GB) | `tools/glm_pack_exlr8.py`; `arena.rs` takes codebook `mcg-e4m3` |
+| exlr8's 4-bit o_proj, q_b, dense MLPs and shared experts as an EXL3-layout checkpoint | `tools/glm_exlr8_dense.py`; `weights.rs` takes the codebook from a `.mcg_e4m3` marker |
+| reference decode, checks | `tools/exlr8_ref.py`, `exlr8_check.py`, `test_glm_pack_exlr8.py`, `exlr8_fixture.py`, `glm_gpu.rs` `exlr8_codebook_matches_the_reference` |
+
+Left as the EXL3 checkpoint's (bertholomus 3.0bpw): what exlr8 keeps at 8 bits - q_a, kv_a, the
+indexer's wq_b (MXFP8), kv_b, the embedding and the head (FP8) - and five int4 matrices. At 5-6
+bits they are fewer bytes a pass than exlr8's; a pure-exlr8 engine would be slower there.
+
+A profile is a boot-time choice: one pack a profile, from the same mirror. `GLM_SLOTS` is a memory
+budget (3-bit records), so a profile of smaller records holds more experts in it.
+
+## Checks
+
+- 36 units' xxhash64 against the index; the tiles against `tools/exl3_ref.py` plus torch's
+  `float8_e4m3fn` cast for all 65,536 states; the three widths against each other (K3 / K4
+  correlation 0.987, K2 / K4 0.955).
+- The kernel's rounding against the reference on every fp16 value in [-4, 4] (CPU emulation), and
+  the decode GEMV on a real record: relative error 2.1e-4 (the same bytes as plain mcg: 2.7e-2).
+- Pack records and converted dense matrices decode to the reference; the dense ones correlate
+  0.99 with the EXL3 checkpoint's decode of the same weights.
+
+## Serving it
+
+`configs/glm53-exlr8.env.example` is the profile, and the README's quick start the setup: fetch
+(`tools/exlr8_fetch.py`), pack a rank (`tools/glm_pack_exlr8.py`), write the dense checkpoint
+(`tools/glm_exlr8_dense.py`). Against the EXL3 profile three keys differ - `GLM_EXL3_DIR`,
+`GLM_EXL3_PACK`, `GLM_MODEL_DIR` - and `GLM_EXLR8_ROUND=exact` asks for the format's own rounding
+instead of the two-instruction one (below).
+
+Carried over and exercised on it: adaptive residency (396 replayed requests: 7,226 async hot
+reads, 46,237 swaps, session preloads), MTP speculation, copy rounds, the disk prefix store across
+a restart (a 6,792-token prompt saved, then restored in 0.09 s) and a second lane beside it. The
+store's namespace now carries the dense checkpoint and the rounding for an exlr8 pack - one pack
+is served with either - and an EXL3 pack's is as it was. Not exercised: the abliteration overlay,
+contexts past 14K tokens, two lanes under sustained load.
+
+## Measured against the served EXL3 (Mia's 2.75 bpw experts + bertholomus dense)
+
+Same binary, same memory budget (`GLM_SLOTS=12200`: 86.8 GB of experts a rank - 12,980 EXL3
+experts, 14,133 exlr8), one boot an arm, the arms alternating.
+
+**bench/bench.py** (the README's protocol; `results/rust-glm53-exlr8-20261111`; medians of three):
+
+| | EXL3 2.75 bpw | exlr8 bit260 | |
+| --- | ---: | ---: | ---: |
+| prose, 1,024 tokens | 20.50 tok/s (21.51 / 20.50 / 19.85) | 22.34 (22.34 / 22.40 / 22.07) | +8.9% |
+| code, 1,024 tokens | 26.21 (26.38 / 25.38 / 26.21) | 28.20 (28.20 / 28.34 / 27.44) | +7.6% |
+| random 8K, first token | 17.28 s | 17.88 s | +3.5% |
+| random 8K, its 256 tokens | 20.19 tok/s (24.02 / 20.19 / 18.96) | 20.49 (19.45 / 20.49 / 20.88) | inside the spread |
+| tokens a step: prose / code / 8K | 2.17 / 2.96 / 1.98 | 2.03 / 3.05 / 1.98 | |
+
+**Verify pass** (`--bench-width`, 2,500 tokens of context, fixed residents, ms):
+
+| rows | EXL3 | exlr8 bit260 | |
+| ---: | ---: | ---: | ---: |
+| 1 | 60.61 (60.86 / 60.36) | 56.16 (56.07 / 56.25) | -7.3% |
+| 4 | 110.67 (110.76 / 110.57) | 103.75 (103.79 / 103.71) | -6.3% |
+
+and with the format's exact rounding (`GLM_EXLR8_ROUND=exact`), three boots each:
+
+| rows | EXL3 | exlr8 bit260, exact | |
+| ---: | ---: | ---: | ---: |
+| 1 | 59.88 (59.71 / 59.83 / 60.09) | 57.49 (57.64 / 57.33 / 57.50) | -4.0% |
+| 2 | 79.04 | 75.59 | -4.4% |
+| 4 | 110.29 | 103.79 | -5.9% |
+| 8 | 163.65 | 156.90 | -4.1% |
+
+The MTP draft pass is the same (2.44 ms). A 2,500-token prefill is 2% slower (4.68 -> 4.79 s):
+the prefill tile is bound by the decode arithmetic and exlr8's codebook is the heavier one.
+
+**Held-out NLL** (`--bench-nll`, heldout_quick, 10,151 tokens, no adaptation, no hot reads, paired
+by token): EXL3 1.8793; exlr8 experts 1.8534 (-0.026 +- 0.006); with exlr8's dense 1.8549
+(-0.024 +- 0.005). At equal memory: the 1,153 more residents are part of it.
+
+**Serving** (the logged-turn replay of `docs/residency-speed.md`; hot reads, adaptation, two
+lanes): paired rounds, tokens a round +0.8 +- 1.1% and +1.3 +- 1.2% (two runs): not different.
+Six runs of up to 768 tokens from the logged prompts, one boot each: 23.29 -> 25.21 tok/s (115.6 ->
+110.3 ms a step); the texts part ways, so that is one sample, not the size of the gain. Two boots
+of one arm replay token for token (25.56 / 25.66 tok/s).
+
+## Where the time went, and what it took
+
+Fewer bytes alone bought nothing at one row. The pack's residents are 8% fewer bytes a pick
+(6.14 against 6.69 MB) and the 4-bit dense 0.83 GB less a pass, and the first build measured
+1 row +0.7%, 2 rows -1.6%, 4 rows -2.8%, 8 rows -2.6% (five and four alternating boots). The
+decode kernels are bound by their arithmetic wherever their bytes come from L2 or their warps are
+few (the notes' "EXL3 decode is not DRAM-bound"), and exlr8's codebook is the heavier one: mcg's
+9 instructions a pair plus the rounding.
+
+| change | measured |
+| --- | --- |
+| the exact rounding, 14 -> 7 -> 5 instructions a pair | cold 2-bit gate+up, 1 row, split 1: 174 -> 147 -> 137 us (plain mcg 133) |
+| split-K for the routed experts' decode GEMVs on an exlr8 pack (gate+up 4 at one row, 2 above; down 2 at one row) | in-boot `--bench-ab split`: 1 / 2 / 4 / 8 rows -1.5 / -0.9 / -0.6 / -0.3% (an EXL3 pack: -0.4 / -0.4 / -0.8 / -0.4%, left at split 1 - its sums' order) |
+| o_proj (exlr8, 4-bit) at split 8 instead of 2 | in-boot `--bench-ab osplit`, two boots: 1 row -2.2 / -2.3%, 4 rows -1.4 / -1.7% |
+| the rounding in two instructions (`GLM_EXLR8_ROUND=fast`, the default): half an E4M3 step added to the fp16 bits, the low mantissa bits cleared | in-boot `--bench-ab round`: 1 row 60.25 -> 59.06 ms (-2.0%), 4 rows 111.11 -> 109.25 (-1.7%); NLL in the same boot 2.3197 -> 2.3196 on 3,477 tokens (-0.0002 +- 0.0042) |
+| q_b at split 4 | +0.4 / -0.6%: left |
+| 4-bit dense, timed alone (`glm_bench_chain`) | o_proj 149.5 -> 128 us a layer, q_b 55.4 -> 47.3; the shared expert's gate+up 51.4 -> 53.2 and down 29.8 -> 28.8 (latency-bound: no gain) |
+
+The two-instruction rounding is not the format's: ties go away from zero and a value under 2^-6
+keeps three mantissa bits instead of the 2^-9 grid, so 1,078 of the 65,536 states decode to a
+neighbouring E4M3 value - an rms of 0.8% of the codebook's, against the 16-29% by which two widths
+of one unit differ. (No rounding at all is 2.7%, and 98% of the states.)
+
+Built and left off, or not built, with the reason:
+
+- **One input rotation and one output rotation a row** (the reference's order of operations:
+  exlr8's sides are the layer's signs times one scale a 128-block; `exl3m_rot_in_shared`,
+  `exl3m_down_combine_shared`, knob `rot1`): equal to the per-pick kernels to fp32 rounding (NLL
+  2.3197 -> 2.3183, -0.0014 +- 0.0040) and no faster - 1 row 59.62 -> 59.90 ms, 4 rows 108.93 ->
+  108.87. The per-pick kernels are 768 short blocks side by side; a warp a block looping over the
+  row's picks does less work in the same time.
+- **The format's own split** (a rank owns a unit's gate, up and down; one MoE exchange a layer
+  instead of two): not built. The gather it removes is 17 us at one row, and the engine already
+  reads the down rows into L2 during it - the bytes move into the down kernel.
+- **A codebook table** (65,536 states -> an E4M3 byte): not built. A warp's 32 lookups land in 32
+  cache lines; the arithmetic is 11-14 instructions a pair.
+
+Measurement traps met: a boot that runs `--bench-nll` before `--bench-width` times its passes
+~3 ms (1 row) to ~7 ms (4 rows) slower than one that does not; and for a quarter of an hour
+(14:45-15:00) boots of either pack timed passes over an 8 ms spread (1 row: min 55.4, max 64.1)
+where the alternating sets before and after hold within 1.5 ms. The in-boot A/Bs (ABBA rounds)
+are free of both.
+
+## Disk
+
+The mirror is 237 GB of experts and 8.8 GB of dense files (the head; not read once the packs
+exist), a rank's pack 120.4 GB (each node), the dense checkpoint 6.9 GB beside the base's 15 GB
+(each node; the base's shards are hard links).

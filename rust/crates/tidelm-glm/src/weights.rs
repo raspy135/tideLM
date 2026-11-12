@@ -118,6 +118,9 @@ pub struct Exl3Mat {
     ptr: DeviceBuffer<i64>,
     k2: DeviceBuffer<i32>,
     hi: i32,
+    /// the trellis codebook: exl3::CB_MUL1 (the EXL3 checkpoint's) or CB_MCG_E4M3 (an exlr8 matrix
+    /// rewritten in EXL3's layout, tools/glm_exlr8_dense.py)
+    pub cb: i32,
 }
 
 impl Exl3Mat {
@@ -146,7 +149,7 @@ impl Exl3Mat {
             let (uids, count, members) = m.get(g, rows);
             exl3m_grouped(s.xh.raw(), s.xh.raw(), self.ptr.raw(), self.ptr.raw(), self.k2.raw(), self.k2.raw(), uids,
                           count, members, s.z.raw(), k as i32, n as i32, r as i32, split as i32, MAX_MEMBERS,
-                          g as i32, g as i32, 1, self.nt as i32, 4, self.pf, 2, self.hi, CB_MUL1, st.raw());
+                          g as i32, g as i32, 1, self.nt as i32, 4, self.pf, 2, self.hi, self.cb, st.raw());
             exl3m_dense_out(s.z.raw(), self.svh.raw(), out, r as i32, n as i32, split as i32, g as i32,
                             out_bf16 as i32, st.raw());
         }
@@ -176,7 +179,7 @@ impl Exl3Mat {
             exl3m_dense_rot(x, ldx as i32, self.suh.ptr_at(grp * k), s.xh.raw(), rows as i32, k as i32, 1, 1, st.raw());
         }
         let tr = unsafe { (self.tr.raw() as *const u8).add(grp * self.tr_bytes) } as *const c_void;
-        ck(unsafe { glm_exl3_unpack(st.raw(), tr, k as i32, n as i32, self.bits[grp] as i32, s.wq.raw()) }, "exl3 unpack")?;
+        ck(unsafe { glm_exl3_unpack_cb(st.raw(), tr, k as i32, n as i32, self.bits[grp] as i32, self.cb, s.wq.raw()) }, "exl3 unpack")?;
         blas.gemm_rm(rows, n, k, Mat { ptr: s.xh.raw(), ty: R_16F, ld: k as i64 }, Mat { ptr: s.wq.raw(), ty: R_16F, ld: n as i64 },
                      false, s.z.raw(), R_32F, n as i64)?;
         unsafe { exl3m_dense_out(s.z.raw(), self.svh.ptr_at(grp * n), out, rows as i32, n as i32, 1, 1, out_bf16 as i32, st.raw()) };
@@ -270,11 +273,23 @@ impl<'a> Loader<'a> {
         let mut tr_all = vec![];
         let (mut suh_all, mut svh_all, mut bits) = (vec![], vec![], vec![]);
         let (mut k, mut n, mut tr_bytes) = (0, 0, 0);
+        let mut cb = 0;
         for (gi, pre) in prefixes.iter().enumerate() {
-            let mul1 = self.bytes(&format!("{pre}.mul1"))?;
-            if mul1.len() != 4 || u32::from_le_bytes([mul1[0], mul1[1], mul1[2], mul1[3]]) != 0x83DC_D12D {
-                return Err(format!("{pre}: not the mul1 codebook").into());
+            // the codebook's marker tensor: `.mul1` (EXL3), or `.mcg_e4m3` (an exlr8 matrix in EXL3's
+            // layout: mcg, every value rounded to FP8 E4M3)
+            let (marker, want, c) = if self.ck.meta(&format!("{pre}.mcg_e4m3")).is_ok() {
+                ("mcg_e4m3", 0xCBAC_1FEDu32, CB_MCG_E4M3)
+            } else {
+                ("mul1", 0x83DC_D12D, CB_MUL1)
+            };
+            let m = self.bytes(&format!("{pre}.{marker}"))?;
+            if m.len() != 4 || u32::from_le_bytes([m[0], m[1], m[2], m[3]]) != want {
+                return Err(format!("{pre}: not the {marker} codebook").into());
             }
+            if gi > 0 && c != cb {
+                return Err(format!("{pre}: groups differ in codebook").into());
+            }
+            cb = c;
             let meta = self.ck.meta(&format!("{pre}.trellis")).map_err(|e| format!("{pre}: {e}"))?;
             if meta.dtype != "I16" || meta.shape.len() != 3 || meta.shape[2] % 16 != 0 {
                 return Err(format!("{pre}.trellis: {:?} {:?}", meta.dtype, meta.shape).into());
@@ -331,7 +346,7 @@ impl<'a> Loader<'a> {
         let hi = if bits.iter().all(|&b| b <= 5) { 10 } else { 16 };
         Ok(Exl3Mat { k, n, n_out: n_out.unwrap_or(n), g, bits, split, wide_rows: 0, split_wide: split, pf: DECODE_PF, nt: 8, tr, tr_bytes,
                      suh: DeviceBuffer::from_slice(&suh_all)?,
-                     svh: DeviceBuffer::from_slice(&svh_all)?, ptr, k2, hi })
+                     svh: DeviceBuffer::from_slice(&svh_all)?, ptr, k2, hi, cb })
     }
 
     /// kv_b (F16 [heads * 448, 512]) for this rank's heads, quantized to FP8 128x128 blocks with
@@ -432,12 +447,46 @@ pub struct Weights {
     pub bytes: usize,
 }
 
+impl Weights {
+    /// Every EXL3-layout matrix this rank holds.
+    pub fn for_each_mat(&mut self, f: &mut dyn FnMut(&mut Exl3Mat)) {
+        for l in self.layers.iter_mut() {
+            for m in [&mut l.q_a, &mut l.kv_a, &mut l.q_b, &mut l.o] {
+                f(m);
+            }
+            if let Some(ix) = l.index.as_mut() {
+                f(&mut ix.wq_b);
+            }
+            match &mut l.mlp {
+                Mlp::Dense { gate_up, down } => {
+                    f(gate_up);
+                    f(down);
+                }
+                Mlp::Moe { sh_gate_up, sh_down, .. } => {
+                    f(sh_gate_up);
+                    f(sh_down);
+                }
+            }
+            if let Some(x) = l.mtp.as_mut() {
+                f(&mut x.eh);
+            }
+        }
+        f(&mut self.head);
+    }
+}
+
 /// The decode split-K counts per projection (exl3_model.py; other splits move the outputs'
 /// bits).
 pub const SPLIT_QA: usize = 8;
 pub const SPLIT_KVA: usize = 8;
 pub const SPLIT_QB: usize = 1;
 pub const SPLIT_O: usize = 2;
+/// o_proj in exlr8's codebook (4-bit, mcg rounded to E4M3: tools/glm_exlr8_dense.py): its arithmetic,
+/// not its bytes, bounds the call at split 2 - in a pass 12 MB of the matrix are already in L2. In-boot
+/// A/B on the pair (`--bench-ab osplit`, two boots, 2,500 tokens of context): 1 row 61.72 -> 60.36 and
+/// 61.80 -> 60.40 ms, 4 rows 112.85 -> 111.28 and 112.84 -> 110.91. q_b at 4 instead of 1: +0.4 / -0.6%,
+/// left. (The 5-bit mul1 o_proj reads the same at 2 and 4: 149.5 / 150.5 us a layer, glm_bench_chain.)
+pub const SPLIT_O_E4M3: usize = 8;
 pub const SPLIT_IQ: usize = 1;
 pub const SPLIT_EH: usize = 4;
 pub const SPLIT_HEAD: usize = 1;
@@ -524,7 +573,14 @@ impl Weights {
                 q_b: ld.exl3(&[&format!("{a}q_b_proj")], SPLIT_QB, Cut::N, None)?,
                 kvb_q,
                 kvb_s,
-                o: ld.exl3(&[&format!("{a}o_proj")], SPLIT_O, Cut::K, None)?,
+                o: {
+                    let mut o = ld.exl3(&[&format!("{a}o_proj")], SPLIT_O, Cut::K, None)?;
+                    if is_exlr8(o.cb) {
+                        o.split = SPLIT_O_E4M3;
+                        o.split_wide = SPLIT_O_E4M3;
+                    }
+                    o
+                },
                 index,
                 mlp,
                 mtp,

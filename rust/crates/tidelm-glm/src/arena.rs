@@ -67,7 +67,7 @@ pub struct Pack {
     pub source_sha256: String,
     pub header_sha256: String,
     pub max_record: usize,
-    /// the trellis codebook, as the kernels take it (exl3::CB_MUL1 / CB_MCG)
+    /// the trellis codebook, as the kernels take it (exl3::CB_MUL1 / CB_MCG / CB_MCG_E4M3)
     pub cb: i32,
 }
 
@@ -85,7 +85,10 @@ impl Pack {
         let cb = match (field("format")?.as_str(), field("codebook")?.as_str()) {
             (Some("exl3-experts"), Some("mul1")) => tidelm_kernels::exl3::CB_MUL1,
             (Some("exl3-experts"), Some("mcg")) => tidelm_kernels::exl3::CB_MCG,
-            _ => return Err(format!("{}: not a mul1 / mcg EXL3 expert pack", path.display()).into()),
+            // an exlr8 profile's units regrouped into EXL3 records (tools/glm_pack_exlr8.py): mcg, every
+            // value rounded to FP8 E4M3
+            (Some("exl3-experts"), Some("mcg-e4m3")) => tidelm_kernels::exl3::CB_MCG_E4M3,
+            _ => return Err(format!("{}: not a mul1 / mcg / mcg-e4m3 EXL3 expert pack", path.display()).into()),
         };
         let dims: Vec<u64> = field("dims")?.as_array().map(|a| a.iter().filter_map(|v| v.as_u64()).collect()).unwrap_or_default();
         if dims != [hidden as u64, inter as u64] {
@@ -143,6 +146,11 @@ impl Pack {
             max_record,
             cb,
         })
+    }
+
+    /// An exlr8 profile's pack (tools/glm_pack_exlr8.py): the engine's exlr8 settings go with it.
+    pub fn is_exlr8(&self) -> bool {
+        tidelm_kernels::exl3::is_exlr8(self.cb)
     }
 
     pub fn record(&self, l: usize, e: usize) -> Result<Record> {

@@ -16,6 +16,16 @@ use std::os::raw::{c_int, c_void};
 pub const CB_MUL1: c_int = 2;
 /// The mcg codebook: Mia's AI Lab's mixed-width GLM-5.3 checkpoint.
 pub const CB_MCG: c_int = 1;
+/// exlr8's codebook: mcg with every value rounded to FP8 E4M3 (kindlingai/glm-5.3-exlr8).
+pub const CB_MCG_E4M3: c_int = 3;
+/// exlr8's codebook with the rounding in two instructions (ties away from zero, no grid under 2^-6):
+/// 1,078 of the 65,536 states decode to a neighbouring E4M3 value. Not the format's; the engine takes
+/// it only when asked (GLM_EXLR8_ROUND=fast).
+pub const CB_MCG_E4M3_FAST: c_int = 4;
+/// An exlr8 codebook (either rounding): the pack's sides and the engine's exlr8 settings go with it.
+pub fn is_exlr8(cb: c_int) -> bool {
+    cb == CB_MCG_E4M3 || cb == CB_MCG_E4M3_FAST
+}
 /// Decode grouping: at most this many members a slot (`exl3m_group`'s maxm).
 pub const MAX_MEMBERS: c_int = 16;
 
@@ -27,6 +37,14 @@ extern "C" {
     pub fn exl3m_rot_in(x: *const c_void, x_stride: c_int, pick: *const c_void, suh0: *const c_void,
                         suh1: *const c_void, out0: *mut c_void, out1: *mut c_void, rows: c_int, k: c_int,
                         slots: c_int, e: c_int, x_bf16: c_int, s: CudaStream);
+    /// `exl3m_rot_in` for an exlr8 pack: one rotation a row, each pick's block scales applied after it
+    pub fn exl3m_rot_in_shared(x: *const c_void, x_stride: c_int, pick: *const c_void, suh0: *const c_void,
+                               suh1: *const c_void, out0: *mut c_void, out1: *mut c_void, rows: c_int, k: c_int,
+                               slots: c_int, e: c_int, x_bf16: c_int, s: CudaStream);
+    /// `exl3m_down_combine` for an exlr8 pack: the picks combined before one rotation a row
+    pub fn exl3m_down_combine_shared(z: *const c_void, pick: *const c_void, svh_d: *const c_void, wts: *const c_void,
+                                     out: *mut c_void, rows: c_int, p: c_int, d: c_int, sk: c_int, slots: c_int,
+                                     e: c_int, s: CudaStream);
     pub fn exl3m_grouped(x0: *const c_void, x1: *const c_void, tp0: *const c_void, tp1: *const c_void,
                          k2_0: *const c_void, k2_1: *const c_void, uids: *const c_void, ucount: *const c_void,
                          members: *const c_void, z: *mut c_void, k: c_int, n: c_int, p: c_int, sk: c_int,

@@ -76,7 +76,8 @@ const OP_BENCH_KNOB: u32 = 12;
 
 /// Schedule knobs a benchmark can switch on both ranks inside one boot (Engine::bench_knob): each
 /// moves no value, only when and where kernels run.
-pub const BENCH_KNOBS: [&str; 8] = ["l2pf", "pdl", "evict_first", "evict_kvb", "evict_skinny", "mla_half", "index_side", "fat"];
+pub const BENCH_KNOBS: [&str; 13] = ["l2pf", "pdl", "evict_first", "evict_kvb", "evict_skinny", "mla_half", "index_side", "fat",
+                                      "split", "osplit", "qsplit", "rot1", "round"];
 
 /// Lanes a pass may carry (glm.cu kMaxLanes).
 pub const MAX_LANES: usize = 4;
@@ -304,6 +305,21 @@ pub struct Engine {
     /// TIDELM_L2_PREFETCH=0 off): its stream, fork / join events and whether a branch is open. It
     /// moves no value.
     l2pf: bool,
+    /// the routed experts' decode GEMVs at split-K (routed_splits); None: by the pack's codebook - an
+    /// exlr8 pack's are split, an EXL3 pack's keep split 1 and the sums' order they shipped with. The
+    /// bench knob `split` sets it on both ranks.
+    routed_split: Option<bool>,
+    /// an exlr8 pack's routed experts through one input rotation and one output rotation a row
+    /// (exl3m_rot_in_shared, exl3m_down_combine_shared: the reference's order of operations, exact to
+    /// fp32 rounding; held-out NLL 2.3197 -> 2.3183 on 3,477 tokens, -0.0014 +- 0.0040). Off: it is no
+    /// faster. In-boot `--bench-ab rot1`, three rounds: 1 row 59.62 -> 59.90 ms (+0.5%), 4 rows 108.93 ->
+    /// 108.87 (-0.1%). The per-pick kernels are 768 short blocks side by side (9.4 us a layer at one
+    /// row); one warp a block looping over the row's picks does less work and takes as long. The bench
+    /// knob `rot1` switches it.
+    rot1: bool,
+    /// the exlr8 codebooks' rounding now (set_exlr8_round) and as the boot set it
+    exlr8_exact: bool,
+    exlr8_boot_exact: bool,
     pf_side: Stream,
     pf_fork: tidelm_cuda::Event,
     pf_join: tidelm_cuda::Event,
@@ -566,6 +582,10 @@ impl Engine {
             ev_fork: tidelm_cuda::Event::new()?,
             ev_join: tidelm_cuda::Event::new()?,
             l2pf: std::env::var("TIDELM_L2_PREFETCH").as_deref() != Ok("0"),
+            routed_split: None,
+            rot1: false,
+            exlr8_exact: true,
+            exlr8_boot_exact: true,
             pf_side: Stream::new()?,
             pf_fork: tidelm_cuda::Event::new()?,
             pf_join: tidelm_cuda::Event::new()?,
@@ -774,14 +794,15 @@ impl Engine {
 
     /// The routed experts' down GEMV (picks `pick`, `p` of them, in `arena`) into L2 from the prefetch
     /// branch: `budget` bytes over the picks' warp ranges (the grouped kernel at split 1: 4 a matrix).
-    fn l2_experts(&self, pick: *mut c_void, p: usize, arena: &Arena, k: usize, n: usize, budget: usize) -> Result<()> {
+    fn l2_experts(&self, pick: *mut c_void, p: usize, arena: &Arena, k: usize, n: usize, budget: usize, split: usize) -> Result<()> {
         if !self.l2pf || p == 0 {
             return Ok(());
         }
         self.pf_fork.record(&self.st)?;
         self.pf_side.wait_event(&self.pf_fork)?;
-        ck(unsafe { glm_l2_experts(self.pf_side.raw(), pick, p as i32, np(&arena.t2p), np(&arena.k2d), k as i32, n as i32, 4,
-                                   (budget / (4 * p)) as u64, 8) }, "l2 experts")?;
+        let ranges = 4 * split;
+        ck(unsafe { glm_l2_experts(self.pf_side.raw(), pick, p as i32, np(&arena.t2p), np(&arena.k2d), k as i32, n as i32, ranges as i32,
+                                   (budget / (ranges * p)) as u64, 8) }, "l2 experts")?;
         self.pf_join.record(&self.pf_side)?;
         self.pf_open.set(true);
         Ok(())
@@ -1151,6 +1172,22 @@ impl Engine {
         self.ablit_rows(l, at(&a.a, r0 * h), n)
     }
 
+    /// Split-K of the routed experts' decode GEMVs (gate + up, down) for a block of `n` rows. A decode
+    /// call gives each (expert, 128 columns) one block of four warps over the whole K range: 128 blocks
+    /// for a row's gate + up, 192 for its down - too few warps for the codebook's arithmetic to keep up
+    /// with the bytes, and exlr8's codebook (mcg plus the E4M3 rounding) is the heavier one. Split-K
+    /// multiplies the blocks. glm_bench_moe, cold exlr8 experts, split 1 -> the split here: gate + up
+    /// 2-bit 1 row 147 -> 133 us (4), 2 rows 230 -> 191 (2), 4 rows 362 -> 340, 8 rows 620 -> 606;
+    /// 3-bit 184 -> 182, 323 -> 272, 514 -> 473, 912 -> 863; down 3-bit 1 row 116 -> 97 (2), flat or
+    /// worse from 2 rows up (142 -> 147), so 1 there. (EXL3's mcg gains too - 3-bit gate + up 2 rows
+    /// 296 -> 263 - but its packs keep split 1: the sums' order they have always had.)
+    fn routed_splits(&self, arena: &Arena, decode: bool, n: usize) -> (i32, i32) {
+        if !decode || !self.routed_split.unwrap_or(is_exlr8(arena.cb)) {
+            return (1, 1);
+        }
+        if n == 1 { (4, 2) } else { (2, 1) }
+    }
+
     /// One block of MoE rows (routing done: pick / wts): the shared expert and the routed picks,
     /// their intermediates in one gather, the summed hidden columns in another -> out bf16 [n][H].
     #[allow(clippy::too_many_arguments)]
@@ -1190,9 +1227,17 @@ impl Engine {
         // mixed-width one), the grouped GEMV for the MTP layer's
         let up_tiled = !decode && arena.prefill_tiled;
         let mixed = arena.cb != CB_MUL1 || arena.max_k2 > 6;
+        let (sk_up, sk_dn) = self.routed_splits(arena, decode, n);
+        // an exlr8 pack's sides are the layer's signs times one scale a 128-block: one rotation a row
+        let shared = self.rot1 && is_exlr8(arena.cb);
         unsafe {
-            exl3m_rot_in(x, h as i32, np(&a.pick), arena.pool(3), arena.pool(4), np(&a.xh0), np(&a.xh1), n as i32, h as i32,
-                         k as i32, slots, 1, st);
+            if shared {
+                exl3m_rot_in_shared(x, h as i32, np(&a.pick), arena.pool(3), arena.pool(4), np(&a.xh0), np(&a.xh1), n as i32,
+                                    h as i32, k as i32, slots, 1, st);
+            } else {
+                exl3m_rot_in(x, h as i32, np(&a.pick), arena.pool(3), arena.pool(4), np(&a.xh0), np(&a.xh1), n as i32, h as i32,
+                             k as i32, slots, 1, st);
+            }
             if up_tiled && self.fat {
                 // the fat tile with the epilogue fused: xd straight into the pair buffer
                 let suh2 = (arena.pool(5) as *mut u16).add(self.rank * il) as *const c_void;
@@ -1210,13 +1255,13 @@ impl Engine {
                                         k as i32, nexp, 2, 4, 1, 8, -4, st);
             } else {
                 exl3m_grouped(np(&a.xh0), np(&a.xh1), np(&arena.t1p), np(&arena.t3p), np(&arena.k2g), np(&arena.k2u), uids,
-                              np(&a.ucount), np(&a.members), np(&a.zup), h as i32, il as i32, p as i32, 1, maxm, k as i32,
+                              np(&a.ucount), np(&a.members), np(&a.zup), h as i32, il as i32, p as i32, sk_up, maxm, k as i32,
                               nexp, 2, 8, 4, if decode { DECODE_PF_ROUTED } else { 2 }, 2, 10, arena.cb, st);
             }
             if !(up_tiled && self.fat) {
                 let suh2 = (arena.pool(5) as *mut u16).add(self.rank * il) as *const c_void;
                 exl3m_gateup(np(&a.zup), np(&a.pick), arena.pool(6), arena.pool(7), suh2, np(&a.pair), n as i32, p as i32, il as i32,
-                             1, k as i32, slots, cfg.moe_inter as i32, f32::INFINITY, 1, st);
+                             if up_tiled { 1 } else { sk_up }, k as i32, slots, cfg.moe_inter as i32, f32::INFINITY, 1, st);
             }
         }
         ck(unsafe { tidelm_cuda::ffi::cudaGetLastError() }, "routed up")?;
@@ -1224,7 +1269,7 @@ impl Engine {
         if decode {
             // during the gather: the routed experts' down rows (the critical path), then the shared
             // down's, which then reads L2 beside them
-            self.l2_experts(np(&a.pick), p, arena, il * w, dn, PF_DOWN)?;
+            self.l2_experts(np(&a.pick), p, arena, il * w, dn, PF_DOWN, sk_dn as usize)?;
             self.l2_mat(sh_down, n, PF_SH_DOWN)?;
         }
         // one gather: both ranks' [routed xd | shared act]
@@ -1261,11 +1306,16 @@ impl Engine {
                                         k as i32, nexp, 1, 4, 1, 8, -4, st);
             } else {
                 exl3m_grouped(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d), uids,
-                              np(&a.ucount), np(&a.members), np(&a.zd), kd as i32, dn as i32, p as i32, 1, maxm, k as i32,
+                              np(&a.ucount), np(&a.members), np(&a.zd), kd as i32, dn as i32, p as i32, sk_dn, maxm, k as i32,
                               nexp, 1, 8, 4, if decode { DECODE_PF_ROUTED } else { 2 }, 2, 10, arena.cb, st);
             }
-            exl3m_down_combine(np(&a.zd), np(&a.pick), arena.pool(8), np(&a.wts), np(&a.local), n as i32, p as i32, dn as i32, 1,
-                               k as i32, slots, st);
+            if shared {
+                exl3m_down_combine_shared(np(&a.zd), np(&a.pick), arena.pool(8), np(&a.wts), np(&a.local), n as i32, p as i32,
+                                          dn as i32, if up_tiled { 1 } else { sk_dn }, k as i32, slots, st);
+            } else {
+                exl3m_down_combine(np(&a.zd), np(&a.pick), arena.pool(8), np(&a.wts), np(&a.local), n as i32, p as i32, dn as i32,
+                                   if up_tiled { 1 } else { sk_dn }, k as i32, slots, st);
+            }
         }
         ck(unsafe { tidelm_cuda::ffi::cudaGetLastError() }, "routed down")?;
         if decode {
@@ -2261,9 +2311,48 @@ impl Engine {
         self.bench_knob_local(code, on)
     }
 
+    /// Every exlr8 codebook this rank decodes with - the routed arenas, the dense matrices - at the
+    /// format's rounding (`exact`) or the two-instruction one. A boot's choice (GLM_EXLR8_ROUND, in the
+    /// guard) or the bench knob `round`; an EXL3 pack or matrix is not touched.
+    pub fn set_exlr8_round(&mut self, exact: bool) {
+        let cb = if exact { CB_MCG_E4M3 } else { CB_MCG_E4M3_FAST };
+        for a in std::iter::once(&mut self.arena).chain(self.mtp_arena.iter_mut()) {
+            if is_exlr8(a.cb) {
+                a.cb = cb;
+            }
+        }
+        self.w.for_each_mat(&mut |m| {
+            if is_exlr8(m.cb) {
+                m.cb = cb;
+            }
+        });
+        self.exlr8_exact = exact;
+    }
+
+    /// The boot's rounding (--exlr8-round), each rank from its own arguments: they are in the guard.
+    pub fn set_exlr8_boot_round(&mut self, exact: bool) {
+        self.set_exlr8_round(exact);
+        self.exlr8_boot_exact = exact;
+    }
+
     /// Rank 0: BENCH_KNOBS[name] back to what the boot set (on, unless its environment switch
     /// turned it off).
     pub fn bench_knob_reset(&mut self, name: &str) -> Result<()> {
+        if name == "split" {
+            // back to the pack's default on both ranks (the knob's code, then the Option cleared here
+            // and by the next toggle there: a reset is the last thing a bench does with it)
+            let on = is_exlr8(self.arena_of(self.moe_layers()[0]).cb);
+            self.bench_knob(name, on)?;
+            self.routed_split = None;
+            return Ok(());
+        }
+        if name == "round" {
+            let boot = self.exlr8_boot_exact;
+            return self.bench_knob(name, boot);
+        }
+        if name == "osplit" || name == "qsplit" || name == "rot1" {
+            return self.bench_knob(name, name == "osplit");     // the boot's: o_proj wide; q_b and one rotation not
+        }
         let var = match name {
             "l2pf" => "TIDELM_L2_PREFETCH",
             "pdl" => "TIDELM_PDL",
@@ -2298,6 +2387,14 @@ impl Engine {
             },
             6 => self.index_side = on,
             7 => self.fat = on,
+            8 => self.routed_split = Some(on),
+            11 => self.rot1 = on,
+            // on: the format's E4M3 rounding; off: the two-instruction one (exl3::CB_MCG_E4M3_FAST)
+            12 => self.set_exlr8_round(on),
+            // an exlr8 o_proj / q_b (CB_MCG_E4M3) at a wider split-K: measurement only
+            9 => self.w.layers.iter_mut().filter(|l| is_exlr8(l.o.cb))
+                .for_each(|l| l.o.split = if on { crate::weights::SPLIT_O_E4M3 } else { crate::weights::SPLIT_O }),
+            10 => self.w.layers.iter_mut().filter(|l| is_exlr8(l.q_b.cb)).for_each(|l| l.q_b.split = if on { 4 } else { crate::weights::SPLIT_QB }),
             _ => return Err(format!("bench knob {code}").into()),
         }
         self.graphs_map.clear();
