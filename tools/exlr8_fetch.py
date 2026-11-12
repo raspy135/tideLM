@@ -145,6 +145,34 @@ def runs(units: list[int], stride: int, base: int):
     return out
 
 
+def missing(pieces, done):
+    """The parts of the pieces that no journalled range holds, as pieces of their own.
+
+    Another profile's fetch cut the same files at other offsets (bit260 took every down at K3, home
+    takes 192 of a layer's 256), so a piece is compared with the bytes already here, not with the
+    journal's entries: without this home after bit260 planned 292.9 GB to fetch where 172.1 GB were new."""
+    have = []
+    for o, n in sorted(done):
+        if have and o <= have[-1][1]:
+            have[-1][1] = max(have[-1][1], o + n)
+        else:
+            have.append([o, o + n])
+    out = []
+    for o, n in pieces:
+        a, b = o, o + n
+        for s, e in have:
+            if e <= a:
+                continue
+            if s >= b:
+                break
+            if s > a:
+                out.append((a, s - a))
+            a = max(a, e)
+        if a < b:
+            out.append((a, b - a))
+    return out
+
+
 def plan_layer(out: str, layer: int, lay: dict, hidden: int = 6144):
     """(Mirror, [(off, n)]) a trellis file the manifest's layer reads: the units at each width."""
     need: dict[int, dict[str, list[int]]] = {}
@@ -203,7 +231,7 @@ def main():
         fetch_small(f"experts/exlr8-layer-{L:03d}.index.safetensors", out)
         for m, pieces in plan_layer(out, L, man["layers"][str(L)]):
             total += sum(n for _, n in pieces)
-            left = [(m, o, n) for o, n in pieces if (o, n) not in m.done]
+            left = [(m, o, n) for o, n in missing(pieces, m.done)]
             todo += sum(n for _, _, n in left)
             work += left
     free = os.statvfs(out).f_bavail * os.statvfs(out).f_frsize
