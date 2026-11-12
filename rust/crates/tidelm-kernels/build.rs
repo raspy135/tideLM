@@ -31,10 +31,12 @@ fn main() {
     let ds41_src = manifest.join("cuda/ds41.cu");
     let vision_src = manifest.join("cuda/vision.cu");
     let glm_src = manifest.join("cuda/glm.cu");
+    let flash_src = manifest.join("cuda/flash.cu");
     let exl3_src = repo.join("tools/exl3_moe_cuda.cu");
     println!("cargo:rerun-if-changed={}", ds41_src.display());
     println!("cargo:rerun-if-changed={}", vision_src.display());
     println!("cargo:rerun-if-changed={}", glm_src.display());
+    println!("cargo:rerun-if-changed={}", flash_src.display());
     println!("cargo:rerun-if-changed={}", exl3_src.display());
     // TIDELM_EXL3_STREAM=1: the EXL3 kernels' trellis loads evict-first (a benchmark switch)
     println!("cargo:rerun-if-env-changed=TIDELM_EXL3_STREAM");
@@ -101,7 +103,8 @@ fn main() {
     // tools/exl3_moe_cuda.py::_library builds them (no tuning defines)
     let mut objs = vec![];
     let stream = std::env::var("TIDELM_EXL3_STREAM").as_deref() == Ok("1");
-    for (src, name) in [(&glm_src, "glm.o"), (&exl3_src, "exl3_moe_cuda.o")] {
+    // GLM-5.3-Flash (glm5_next): KDA, the indexer's key pools; flash.o is objs[2]
+    for (src, name) in [(&glm_src, "glm.o"), (&exl3_src, "exl3_moe_cuda.o"), (&flash_src, "flash.o")] {
         let obj = out.join(name);
         run(Command::new(&nvcc).args(if stream { &["-DEXL3_STREAM=1"][..] } else { &[][..] }).args([
             "-std=c++17",
@@ -142,6 +145,7 @@ fn main() {
         engram_obj.to_str().unwrap(),
         objs[0].to_str().unwrap(),
         objs[1].to_str().unwrap(),
+        objs[2].to_str().unwrap(),
     ]));
 
     println!("cargo:rustc-link-search=native={}", out.display());

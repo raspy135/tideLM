@@ -19,6 +19,7 @@
 pub mod blas;
 pub mod ds41;
 pub mod exl3;
+pub mod flash;
 pub mod glm;
 pub mod vision;
 
