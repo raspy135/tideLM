@@ -21,7 +21,11 @@ import struct
 from functools import lru_cache
 
 import numpy as np
-import torch
+
+try:
+    import torch
+except ImportError:  # the pack writer and reader need only numpy (glm_pack_exl3.py on a host without torch)
+    torch = None
 
 MUL1_MUL = 0x83DCD12D
 MCG_MUL = 0xCBAC1FED
@@ -297,15 +301,25 @@ def build_header(bits_map: dict[int, float], rank: int, world: int, codebook: st
 
 
 def write_pack(path: str, bits_map: dict[int, float], rank: int, world: int, codebook: str,
-               source_sha256: str, records_iter, n_experts: int = 384, expert_bits=None):
+               source_sha256: str, records_iter, n_experts: int = 384, expert_bits=None, resume: bool = False):
     """Stream a pack.  ``records_iter`` yields ``((layer, expert), {tensor_name: ndarray})`` in any order;
-    the header offsets are already fixed, so each record is written with ``pwrite`` at its own offset."""
+    the header offsets are already fixed, so each record is written with ``pwrite`` at its own offset.
+    ``resume`` keeps an existing file whose header is this one (the caller leaves out the records
+    ``written_records`` finds); any other file is rewritten from scratch."""
 
     header, data0, records = build_header(bits_map, rank, world, codebook, source_sha256, n_experts, expert_bits)
     end = data0
-    with open(path, "wb") as f:
-        f.write(struct.pack("<Q", len(header)) + header)
-        f.truncate(data0)                                # zero-fill the header padding
+    head = struct.pack("<Q", len(header)) + header
+    keep = False
+    if resume and os.path.exists(path):
+        with open(path, "rb") as f:
+            keep = f.read(len(head)) == head
+    with open(path, "r+b" if keep else "wb") as f:
+        if keep:
+            end = os.path.getsize(path)
+        else:
+            f.write(head)
+            f.truncate(data0)                            # zero-fill the header padding
         for (key, tensors), meta in _ordered(records_iter, records):
             parts = []
             shapes = record_shapes(meta["bits"], rank, world)
@@ -321,6 +335,29 @@ def write_pack(path: str, bits_map: dict[int, float], rank: int, world: int, cod
             end = max(end, data0 + meta["off"] + meta["nbytes"])
         f.truncate(_align_up(end))
     return path
+
+
+def written_records(path: str) -> set[tuple[int, int]]:
+    """The records of a partly written pack that hold data: a record's suh1 (EXL3's input sign
+    and scale vector) is never all zero, and an unwritten record is the file's zero fill."""
+
+    if not os.path.exists(path):
+        return set()
+    r = PackReader(path)
+    done = set()
+    size = os.path.getsize(path)
+    n_suh = K13 * 2
+    with open(path, "rb") as f:
+        for key, meta in r.records.items():
+            bits = meta["bits"] if isinstance(meta["bits"], list) else float(meta["bits"])
+            sh = record_shapes(bits, r.rank, r.world)
+            off = r.data0 + meta["off"] + sum(int(np.prod(sh[n])) * 2 for n in ("t1", "t3", "t2"))
+            if off + n_suh > size:
+                continue
+            f.seek(off)
+            if any(f.read(n_suh)):
+                done.add(key)
+    return done
 
 
 def _ordered(records_iter, records):
