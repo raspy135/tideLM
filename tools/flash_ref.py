@@ -36,10 +36,10 @@ P = "model.language_model."
 class PackExperts(torch.nn.Module):
     """Glm5NextTextExperts' forward on experts dequantized from a --world 1 pack when first hit."""
 
-    def __init__(self, reader, layer, n_experts, limit, dev):
+    def __init__(self, reader, layer, n_experts, limit, dev, keep=True):
         super().__init__()
         self.reader, self.layer, self.num_experts, self.swiglu_limit, self.dev = reader, layer, n_experts, limit, dev
-        self.cache = {}
+        self.cache, self.keep = {}, keep
 
     def weights(self, e):
         if e not in self.cache:
@@ -66,6 +66,8 @@ class PackExperts(torch.nn.Module):
             u = u.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
             cur = F.linear(F.silu(g) * u, down) * top_k_weights[tok, pos, None]
             final.index_add_(0, tok, cur.to(final.dtype))
+        if not self.keep:
+            self.cache.clear()
         return final
 
 
@@ -75,6 +77,8 @@ def main(argv=None) -> int:
     ap.add_argument("--pack", required=True)
     ap.add_argument("--dump", required=True, help="the engine's TIDELM_FLASH_DUMP prefix")
     ap.add_argument("--layers", type=int, default=6)
+    ap.add_argument("--residents", action="store_true",
+                    help="route over the engine's residents only (PREFIX.residents.json), as the engine does, and compare the head")
     a = ap.parse_args(argv)
     from safetensors import safe_open
     from transformers.models.glm5_next import configuration_glm5_next as C
@@ -84,6 +88,7 @@ def main(argv=None) -> int:
     top = json.load(open(os.path.join(a.dense, "config.json")))
     tc = dict(top["text_config"])
     K = a.layers
+    cfg_layers_full = top["text_config"]["num_hidden_layers"]
     for k in ("layer_types", "mlp_layer_types", "indexer_types"):
         tc[k] = tc[k][:K]
     tc["num_hidden_layers"] = K
@@ -95,7 +100,7 @@ def main(argv=None) -> int:
     reader = R.PackReader(a.pack)
     for l, layer in enumerate(model.layers):
         if hasattr(layer.mlp, "experts"):
-            layer.mlp.experts = PackExperts(reader, l, cfg.n_routed_experts, cfg.swiglu_limit, dev)
+            layer.mlp.experts = PackExperts(reader, l, cfg.n_routed_experts, cfg.swiglu_limit, dev, keep=K <= 8)
     model = model.to_empty(device=dev).to(torch.bfloat16)
     # the checkpoint's tensors for the kept layers (names without the model prefix)
     idx = json.load(open(os.path.join(a.dense, "model.safetensors.index.json")))["weight_map"]
@@ -147,26 +152,59 @@ def main(argv=None) -> int:
         print("missing:", missing[:10], "unexpected:", unexpected[:10])
     # buffers HF initialises in post_init that to_empty left uninitialised (none expected beyond weights)
     model.eval()
-    tok = np.fromfile(a.dump + ".tok.bin", dtype=np.int32)
+    if a.residents:
+        res = json.load(open(a.dump + ".residents.json"))
+        allowed = torch.zeros(K, cfg.n_routed_experts, dtype=torch.bool, device=dev)
+        for l, x in res:
+            if l < K:
+                allowed[l, x] = True
+        for l, layer in enumerate(model.layers):
+            if not hasattr(layer.mlp, "gate"):
+                continue
+            g = layer.mlp.gate
+            # the engine's router: a non-resident expert is never chosen; the chosen ones' weights
+            # are normalised among themselves (glm.cu route_select with `allowed`)
+            g.e_score_correction_bias.data = torch.where(allowed[l], g.e_score_correction_bias.data, torch.full_like(g.e_score_correction_bias.data, -1e30))
+        head_w = None
+        hn = os.path.join(a.dense, "model.safetensors.index.json")
+        name = "lm_head.weight"
+        shard = json.load(open(hn))["weight_map"][name]
+        head_w = safe_open(os.path.join(a.dense, shard), framework="pt", device=dev).get_tensor(name)
+    # every pass the engine dumped, in position order: its tokens make the sequence
+    import glob, re
+    passes = sorted(int(re.search(r"\.p(\d+)\.tok\.bin$", f).group(1)) for f in glob.glob(a.dump + ".p*.tok.bin"))
+    toks = [np.fromfile(f"{a.dump}.p{p}.tok.bin", dtype=np.int32) for p in passes]
+    if [p for p in passes] != list(np.cumsum([0] + [len(t) for t in toks])[:-1]):
+        raise SystemExit(f"passes at {passes} do not tile the sequence")
+    tok = np.concatenate(toks)
     T = len(tok)
     outs = {}
     for l, layer in enumerate(model.layers):
         layer.register_forward_hook(lambda m, i, o, l=l: outs.__setitem__(l, o[0].detach()))
     with torch.no_grad():
-        model(input_ids=torch.from_numpy(tok.astype(np.int64))[None].to(dev), use_cache=False)
-    print(f"{T} tokens, {K} layers ({', '.join(t[:3] for t in cfg.layer_types)})")
-    for l in range(K):
-        path = f"{a.dump}.x{l}.bin"
-        if not os.path.exists(path):
-            print(f"layer {l}: no engine dump")
-            continue
-        eng = torch.from_numpy(np.fromfile(path, dtype=np.uint16).view(np.int16).astype(np.int32) << 16).view(torch.float32)
-        eng = eng.reshape(T, 4, -1).to(dev)
-        ref = outs[l][0].float()                     # [T, 4, H]
-        rel = ((eng - ref).norm() / ref.norm()).item()
-        cos = F.cosine_similarity(eng.reshape(T, -1), ref.reshape(T, -1), dim=-1)
-        print(f"layer {l:2d} ({cfg.layer_types[l][:6]}, {cfg.mlp_layer_types[l]}): rel err {rel:.3e}, "
-              f"row cosine min {cos.min().item():.5f} mean {cos.mean().item():.5f}")
+        fin = model(input_ids=torch.from_numpy(tok.astype(np.int64))[None].to(dev), use_cache=False).last_hidden_state
+    print(f"{T} tokens in {len(passes)} passes, {K} layers ({', '.join(t[:3] for t in cfg.layer_types)})")
+    for p, tk in zip(passes, toks):
+        n = len(tk)
+        line = []
+        for l in range(K):
+            path = f"{a.dump}.p{p}.x{l}.bin"
+            if not os.path.exists(path):
+                continue
+            eng = torch.from_numpy(np.fromfile(path, dtype=np.uint16).view(np.int16).astype(np.int32) << 16).view(torch.float32)
+            eng = eng.reshape(n, 4, -1).to(dev)
+            ref = outs[l][0, p:p + n].float()
+            rel = ((eng - ref).norm() / ref.norm()).item()
+            cos = F.cosine_similarity(eng.reshape(n, -1), ref.reshape(n, -1), dim=-1).min().item()
+            line.append(f"L{l} {rel:.1e}/{cos:.4f}")
+        print(f"pass at {p:5d} ({n:4d} rows): " + "  ".join(line))
+    if a.residents and K == cfg_layers_full:
+        logits = F.linear(fin[0], head_w).float()
+        top = logits.topk(5, dim=-1)
+        from transformers import AutoTokenizer
+        tk = AutoTokenizer.from_pretrained(a.dense)
+        for r in range(max(0, T - 3), T):
+            print(f"row {r}: transformers' top-5 {[tk.decode([i]) for i in top.indices[r].tolist()]}")
     return 0
 
 

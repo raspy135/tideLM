@@ -47,10 +47,36 @@ Done (commits on `glm-flash`):
 Fetch (2026-11-12): `~/tidelm-rust-state/flash/fetch.sh` -> `~/models/GLM-5.3-Flash-3.5bpw-dense`
 (non-expert tensors, glm_fetch_dense.py) and `~/models/glm-flash-packs/glm-flash-35-r0of1.bin`.
 
-Next: the engine (config `glm5_next`, weights with a Lin type - EXL3 / FP8 / BF16 - in the shared
-MoE path, mHC through ds41.cu, KDA layer + state + rollback in set_pos, nope-DSA with pools, the
-MTP layer without mHC), glm_main.rs for one box, a layer-level check against HF's modules, then the
-serving profile.
+- The engine (677c822): one GLM-family Engine, a layer kind each, Lin (EXL3 / FP8 / BF16), mHC via
+  ds41.cu, KDA with rollback, nope-DSA with pools, Flash's MTP layer on GLM's MTP path.
+- tools/flash_ref.py against transformers' glm5_next (4af5c62 and after), engine at BF16:
+  - 24-token prompt, layers 0-5 (MoE layers wholly resident): rel. err. 0.6-0.9%, row cosine >= 0.99984;
+  - a 3,259-token prompt (two prefill chunks, pool selection active, 815 pools) and 8 decode steps:
+    prefill 0.6-1.2%, decode 0.7-1.8% (one decode row's sparse layer 5.3% / cosine 0.9986, as the worst
+    prefill rows: the FP8 pooled keys moving a pick near the cutoff);
+  - all 45 layers with transformers routing over the engine's residents: 0.4-2% through the stack, the
+    same next tokens (top-5 agree; one near-tie).
+- Greedy MTP (depth 3) and plain decode agree token for token over the 48 tokens compared.
+
+Next: glm_main.rs / rust-up.sh for one box and a profile, GLM-5.3's byte-for-byte check on the pair,
+held-out NLL BF16 vs FP8, then tuning.
+
+## Residency needs a history
+
+The first runs placed residents uniformly (no routing history): 42% of each token's picks masked,
+and the output degraded from the first token on - transformers' glm5_next routing over the same
+residents degraded identically, so it is the placement, not the engine. A history from prefills of
+150K tokens of the repo's calibration sources (`glm_run --history-out`, 188 s; the exact router's
+weight per expert, whatever is resident): half a layer's routed weight is in 56 of its 288 experts,
+the top 58% hold 85% of it, the top 67% 90%. With it the same prompt reads right; with synchronous
+hot reads the first tokens too (a short reasoning, then the answer).
+
+| run (one box, FP8, graphs, 26-token prompt) | residents | tok/s | MTP accepted a round |
+|---|---:|---:|---:|
+| plain, uniform placement | 7,040 (58%) | 16.8 | - |
+| MTP 3, uniform placement | 7,040 | 26.2 | 1.58 |
+| MTP 3, history v0 | 6,895 | 23.9 | 1.68 |
+| MTP 3, history v0, sync hot reads (1,018 reads, 1.33 s) | 6,895 | 20.5 | 1.70 |
 
 ## Measurements
 

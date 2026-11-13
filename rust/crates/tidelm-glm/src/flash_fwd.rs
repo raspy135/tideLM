@@ -238,20 +238,21 @@ impl Engine {
         Ok(())
     }
 
-    /// TIDELM_FLASH_DUMP=PREFIX (checks only: eager passes, never under graph capture): a prompt's
-    /// first pass of more than one row writes `bytes` at `ptr` to PREFIX.NAME.bin - the mHC streams
-    /// after each layer, the tokens - for tools/flash_ref.py to compare with transformers' glm5_next.
-    fn dump(&self, name: &str, ptr: *mut c_void, bytes: usize, t: usize) -> Result<()> {
+    /// TIDELM_FLASH_DUMP=PREFIX (checks only: eager passes, never under graph capture): each decoder
+    /// pass writes `bytes` at `ptr` to PREFIX.p{first position}.NAME.bin - the tokens and the mHC
+    /// streams after each layer below TIDELM_FLASH_DUMP_MAX (default all) - for tools/flash_ref.py
+    /// to compare with transformers' glm5_next.
+    fn dump(&self, name: &str, ptr: *mut c_void, bytes: usize, layer: Option<usize>) -> Result<()> {
         let Ok(prefix) = std::env::var("TIDELM_FLASH_DUMP") else { return Ok(()) };
-        let path = format!("{prefix}.{name}.bin");
-        if t < 2 || std::path::Path::new(&path).exists() {
+        let max = std::env::var("TIDELM_FLASH_DUMP_MAX").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(usize::MAX);
+        if layer.is_some_and(|l| l >= max) {
             return Ok(());
         }
         self.st.synchronize()?;
         let mut v = vec![0u8; bytes];
         ck(unsafe { tidelm_cuda::ffi::cudaMemcpy(v.as_mut_ptr() as *mut c_void, ptr, bytes, tidelm_cuda::ffi::MEMCPY_DEVICE_TO_HOST) },
            "dump")?;
-        std::fs::write(&path, &v)?;
+        std::fs::write(format!("{prefix}.p{}.{name}.bin", self.pos), &v)?;
         Ok(())
     }
 
@@ -299,9 +300,9 @@ impl Engine {
     pub(crate) fn flash_layer_pre(&self, l: usize, t: usize, prefill: bool) -> Result<()> {
         if l > 0 {
             self.hc_post(1, t)?;
-            self.dump(&format!("x{}", l - 1), np(&self.act.h), t * 4 * self.cfg.hidden * 2, t)?;
+            self.dump(&format!("x{}", l - 1), np(&self.act.h), t * 4 * self.cfg.hidden * 2, Some(l - 1))?;
         } else {
-            self.dump("tok", np(&self.act.tok), t * 4, t)?;
+            self.dump("tok", np(&self.act.tok), t * 4, None)?;
         }
         self.hc_pre(l, 0, t)?;
         self.attention(l, t, prefill)?;
@@ -313,7 +314,7 @@ impl Engine {
     /// hyper head), the final norm into hn.
     pub(crate) fn flash_final(&self, t: usize) -> Result<()> {
         self.hc_post(1, t)?;
-        self.dump(&format!("x{}", self.cfg.layers - 1), np(&self.act.h), t * 4 * self.cfg.hidden * 2, t)?;
+        self.dump(&format!("x{}", self.cfg.layers - 1), np(&self.act.h), t * 4 * self.cfg.hidden * 2, Some(self.cfg.layers - 1))?;
         let (a, fa) = (&self.act, &self.fl().act);
         let h = self.cfg.hidden;
         ck(unsafe { tidelm_kernels::ds41::ds_hc_mean(self.st.raw(), np(&a.h), np(&fa.hy), h as i64, t as i32, h as i32, 4) }, "hc mean")?;

@@ -70,6 +70,11 @@ fn main() -> Result<()> {
         let msg = pair.as_mut().ok_or("rank 1 needs the pair")?.ctl.recv()?;
         tidelm_comm::Reader::new(&msg).u32s()?.into_iter().map(|v| (v as usize / e, v as usize % e)).collect()
     };
+    if let Ok(prefix) = std::env::var("TIDELM_FLASH_DUMP") {
+        // the residents, for tools/flash_ref.py to route over the same experts
+        let v: Vec<[usize; 2]> = residents.iter().map(|&(l, x)| [l, x]).collect();
+        std::fs::write(format!("{prefix}.residents.json"), serde_json::to_string(&v)?)?;
+    }
     let t0 = Instant::now();
     let mut eng = Engine::load(&model_dir, opt, rank, world, pair, &residents, &log)?;
     log(&format!("[glm] engine up in {:.0} s", t0.elapsed().as_secs_f64()));
@@ -81,6 +86,29 @@ fn main() -> Result<()> {
         return eng.follow();
     }
     let text = tidelm_text::Text::load(&model_dir)?;
+    if let Some(out) = arg(&args, "--history-out") {
+        // a routing history from prefills of --history-files (comma-separated, raw text in 4,096-token
+        // documents): the exact router's weight per (layer, expert), whatever is resident
+        let files = arg(&args, "--history-files").ok_or("--history-files")?;
+        let max: usize = arg(&args, "--history-tokens").map(|s| s.parse()).transpose()?.unwrap_or(usize::MAX);
+        let (mut n, t0) = (0usize, Instant::now());
+        'files: for f in files.split(',') {
+            let ids = text.encode(&std::fs::read_to_string(f)?)?;
+            for doc in ids.chunks(4096) {
+                if n >= max {
+                    break 'files;
+                }
+                eng.set_pos(0)?;
+                eng.forward(doc, false)?;
+                n += doc.len();
+            }
+            log(&format!("[history] {f}: {n} tokens so far, {:.0} s", t0.elapsed().as_secs_f64()));
+        }
+        let mass: Vec<f64> = eng.demand.download()?.into_iter().map(|x| x as f64).collect();
+        tidelm_glm::residency::write_mass(std::path::Path::new(&out), &mass, cfg.n_layers(), e, n as u64)?;
+        log(&format!("[history] {n} tokens -> {out}"));
+        return Ok(());
+    }
     let prompt = arg(&args, "--prompt").unwrap_or_else(|| "Write a short poem about the sea.".into());
     let msgs = vec![serde_json::json!({"role": "user", "content": prompt})];
     let rendered = tidelm_text::glm::render(&msgs, None, Some("low"))?;
