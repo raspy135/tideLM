@@ -256,8 +256,8 @@ bundled seed; v0 (150K tokens of the repo's sources, prefill only) placed a 69% 
 - Seed v1 (profiles/glm53-flash-history-v1.npz): the development box's state file after a day of
   serving - 2.9M routed rows (chat, bench.py, 438K prompt tokens of long-prompt tests, v0). Read only
   while RUST_GLM_STATE_DB's file does not exist.
-- GLM_HOT_RESCUE=0.4 on the TP=1 profile (docs/hot-predict.md: built for GLM-5.3 and never qualified
-  there). Flash runs it through the shared decode_segment path (layer_pre and final_norm dispatch to
+- GLM_HOT_RESCUE=0.4 on the TP=1 profile, then off again (below; docs/hot-predict.md: built for
+  GLM-5.3 and never qualified there). Flash runs it through the shared decode_segment path (layer_pre and final_norm dispatch to
   Flash's own); the transient slot is its own class, last in the arena.
 
 Rescue, two boots from one frozen state file, `--bench-nll` over heldout_quick + heldout_eval (57,315
@@ -276,5 +276,12 @@ second boot (the knob switches between the boot's threshold and off):
 
 The segment structure costs nothing measurable here (DS's sync arm lost 6-16% to it). The NLL moved
 the wrong way for a change that computes misses exactly; the two boots' hot reads diverge from the
-first rescued token on, which the paired error does not see. Shipped at the author's call; the
-noise-floor arm (a numerics-neutral perturbation, the same two-boot harness) decides whether it stays.
+first rescued token on, which the paired error does not see - so a noise-floor arm: the off boot
+again with TIDELM_GLM_MLA_HALF=0 (decode attention's split partials in fp32: numerics-neutral, and
+the hot reads diverge from it the same way). NLL 1.7127, +0.0006 +- 0.0012 paired (coding +0.0012,
+general -0.0001, median window +0.0005), miss 11.46% (7.16%), 1,038 s. Rescue's +0.0048 (coding
++0.0120) is 8x that: the loss is its own. Shipped at 0.4 for the hour this took (2c7df05), then
+back to off. Cause not found; next to look at: the same harness with GLM_HOT_RESCUE=1.0 (the
+segment path with no rescue read - whether the per-segment graphs alone differ from the whole
+pass on Flash), then whether keeping rescued experts over the queued victims costs the code
+texts their residents.

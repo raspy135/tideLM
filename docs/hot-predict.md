@@ -131,6 +131,12 @@ DS measurements: -6% to -16% tok/s). Prediction's real margins at this budget ar
    NLL at <= +1% round time; the `0.3` arm carries 3.7x the stalls for +2.6 points of cube
    and is expected to lose on time. The alternative that needs no stall stays Stage 1.
 
+   **On GLM-5.3-Flash TP=1 (2026-11-13) 0.4 failed the NLL half and passed the time half**:
+   heldout_quick + heldout_eval, two boots from one state file, NLL +0.0048 +- 0.0015 paired
+   (coding +0.0120), against a noise floor of +0.0006 +- 0.0012 (TIDELM_GLM_MLA_HALF=0 through the
+   same harness); passes +0.0 to +0.2%, 0.10 rescues a pass. Off there; docs/glm-flash.md has the
+   table. GLM-5.3 itself is still unmeasured.
+
    `RUST_ARGS="--bench-nll corpus/heldout_quick.jsonl ..."` runs one arm (RUST_ARGS is the
    launcher's passthrough for both ranks).
 
