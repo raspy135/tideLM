@@ -325,6 +325,18 @@ impl Arena {
         Ok(())
     }
 
+    /// The device memory of slots [s0, s0 + n) of class `c`: its gate, up and down trellis pools'
+    /// ranges for them, each contiguous (a class's slots are consecutive in each pool). Lent out
+    /// while those slots hold no expert (Engine::lend_slots).
+    pub fn class_ranges(&self, c: usize, s0: usize, n: usize) -> Result<[(*mut c_void, usize); 3]> {
+        let cl = self.classes.get(c).ok_or("arena: no such class")?;
+        if s0 < cl.first || s0 + n > cl.first + cl.n {
+            return Err(format!("arena: slots {s0}..{} outside class {c} ({}..{})", s0 + n, cl.first, cl.first + cl.n).into());
+        }
+        let k = s0 - cl.first;
+        Ok([0, 1, 2].map(|i| (unsafe { (cl.trellis[i].raw() as *mut u8).add(k * cl.sizes[i]) } as *mut c_void, n * cl.sizes[i])))
+    }
+
     /// A scale pool (record tensors 3..9: suh1, suh3, suh2, svh1, svh3, svh2).
     pub fn pool(&self, i: usize) -> *mut c_void {
         self.scales[i - 3].raw()

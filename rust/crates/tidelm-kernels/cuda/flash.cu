@@ -467,6 +467,60 @@ __global__ void widen_kernel(const bf16* __restrict__ x, int64_t ldx, float* __r
     if (c < n) y[(int64_t)t * ldy + c] = bf(x[(int64_t)t * ldx + c]);
 }
 
+// ------------------------------------------------------------------ the vision tower (glm5_next)
+// Glm5NextVisionAttention's q_norm / k_norm: a 64-wide RMSNorm of every q and k head of qkv
+// [N][3][H][64] in place, Glm5NextRMSNorm's two roundings: bf16(w * bf16(x * rsqrt(mean(x^2) + eps))).
+// A warp a (row, q|k, head), two values a lane.
+__global__ void vit_qknorm_kernel(bf16* qkv, int N, int H, const bf16* __restrict__ wq, const bf16* __restrict__ wk, float eps) {
+    pdl_enter();
+    const int64_t wid = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int l = threadIdx.x & 31;
+    if (wid >= (int64_t)N * 2 * H) return;
+    const int hh = wid % (2 * H);
+    const int64_t n = wid / (2 * H);
+    bf16* x = qkv + n * (3 * H * 64) + (int64_t)hh * 64;
+    const bf16* w = hh < H ? wq : wk;
+    const float a = bf(x[2 * l]), b = bf(x[2 * l + 1]);
+    const float r = rsqrtf(warp_sum(a * a + b * b) * (1.f / 64.f) + eps);
+    x[2 * l] = to_bf(bf(w[2 * l]) * rbf(a * r));
+    x[2 * l + 1] = to_bf(bf(w[2 * l + 1]) * rbf(b * r));
+}
+
+// The patch merger's post_projection_norm then its GELU: z = bf16(LayerNorm(x; w, b, eps)) (fp32
+// statistics, biased variance, one rounding), out = bf16(z * 0.5 * (1 + erf(z / sqrt 2))) (nn.GELU).
+// A block of 256 a row of `n` (a multiple of 256).
+__global__ void __launch_bounds__(256) vit_ln_gelu_kernel(const bf16* __restrict__ x, const bf16* __restrict__ w,
+                                                          const bf16* __restrict__ b, bf16* __restrict__ out, int n, float eps) {
+    pdl_enter();
+    __shared__ float red[8];
+    const int64_t r = blockIdx.x;
+    const bf16* xr = x + r * n;
+    float s = 0.f;
+    for (int i = threadIdx.x; i < n; i += 256) s += bf(xr[i]);
+    s = warp_sum(s);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = s;
+    __syncthreads();
+    float tot = 0.f;
+    for (int i = 0; i < 8; ++i) tot += red[i];
+    const float mean = tot / n;
+    __syncthreads();
+    float d2 = 0.f;
+    for (int i = threadIdx.x; i < n; i += 256) {
+        const float d = bf(xr[i]) - mean;
+        d2 += d * d;
+    }
+    d2 = warp_sum(d2);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = d2;
+    __syncthreads();
+    float var = 0.f;
+    for (int i = 0; i < 8; ++i) var += red[i];
+    const float rstd = rsqrtf(var / n + eps);
+    for (int i = threadIdx.x; i < n; i += 256) {
+        const float z = rbf((bf(xr[i]) - mean) * rstd * bf(w[i]) + bf(b[i]));
+        out[r * n + i] = to_bf(z * 0.5f * (1.f + erff(z * 0.70710678118654752f)));
+    }
+}
+
 }  // namespace
 
 extern "C" {
@@ -572,6 +626,20 @@ int flash_embed(void* stream, const void* ids, int T, const void* table, int H, 
 
 int flash_widen(void* stream, const void* x, int64_t ldx, void* y, int64_t ldy, int T, int n) {
     pdl_launch(widen_kernel, dim3((n + 127) / 128, T), 128, 0, GST, static_cast<const bf16*>(x), ldx, static_cast<float*>(y), ldy, n);
+    GRET;
+}
+
+int flash_vit_qknorm(void* stream, void* qkv, int N, int H, const void* wq, const void* wk, float eps) {
+    const int64_t warps = (int64_t)N * 2 * H;
+    pdl_launch(vit_qknorm_kernel, (unsigned)((warps * 32 + 255) / 256), 256, 0, GST, static_cast<bf16*>(qkv), N, H,
+               static_cast<const bf16*>(wq), static_cast<const bf16*>(wk), eps);
+    GRET;
+}
+
+int flash_vit_ln_gelu(void* stream, const void* x, const void* w, const void* b, void* out, int M, int n, float eps) {
+    if (n % 256) return (int)cudaErrorInvalidValue;
+    pdl_launch(vit_ln_gelu_kernel, M, 256, 0, GST, static_cast<const bf16*>(x), static_cast<const bf16*>(w), static_cast<const bf16*>(b),
+               static_cast<bf16*>(out), n, eps);
     GRET;
 }
 

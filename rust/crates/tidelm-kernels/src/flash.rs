@@ -42,6 +42,12 @@ extern "C" {
     pub fn flash_embed(stream: CudaStream, ids: *const c_void, t: c_int, table: *const c_void, h: c_int, copies: c_int,
                        pos: *const c_void, out: *mut c_void) -> c_int;
     pub fn flash_widen(stream: CudaStream, x: *const c_void, ldx: i64, y: *mut c_void, ldy: i64, t: c_int, n: c_int) -> c_int;
+    /// the vision tower's per-head q / k RMSNorm of qkv [n][3][h][64] in place (two roundings)
+    pub fn flash_vit_qknorm(stream: CudaStream, qkv: *mut c_void, n: c_int, h: c_int, wq: *const c_void, wk: *const c_void,
+                            eps: f32) -> c_int;
+    /// out [m][n] = gelu(bf16(LayerNorm(x; w, b, eps))), exact gelu, n % 256 == 0
+    pub fn flash_vit_ln_gelu(stream: CudaStream, x: *const c_void, w: *const c_void, b: *const c_void, out: *mut c_void, m: c_int,
+                             n: c_int, eps: f32) -> c_int;
     pub fn flash_expand(stream: CudaStream, pools: *const c_void, ldp: i64, kp: c_int, pos: *const c_void, out: *mut c_void,
                         ldo: i64, t: c_int) -> c_int;
 }
