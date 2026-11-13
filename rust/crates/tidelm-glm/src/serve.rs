@@ -583,8 +583,9 @@ impl Server {
         let depth = if self.eng.cfg.mtp { self.opt.depth } else { 0 };
         // the lane's sequence's prefix, one token back so the reprefilled row refills its MTP row
         let mut common = prompt.iter().zip(&self.eng.tokens).take_while(|(a, b)| a == b).count().min(prompt.len() - 1);
-        // the disk store's deepest saved prefix, when it gains enough over the lane's
-        if let Some(store) = self.store.as_mut() {
+        // the disk store's deepest saved prefix, when it gains enough over the lane's (not with KDA:
+        // the store holds KV rows, not the linear-attention state)
+        if let Some(store) = self.store.as_mut().filter(|_| !self.eng.cfg.is_flash()) {
             if let Some((chain, end)) = store.plan_restore(&prompt, common) {
                 let c: Vec<(u64, usize, usize, String)> = chain.iter().map(|s| (s.id, s.start, s.end, s.hash.clone())).collect();
                 let ids: Vec<u64> = chain.iter().map(|s| s.id).collect();
@@ -611,6 +612,8 @@ impl Server {
             }
         }
         let keep = common.saturating_sub(1);
+        // KDA's state goes back only within its last pass: a prefix further back is prefilled again
+        let keep = if self.eng.can_rewind(keep) { keep } else { 0 };
         self.eng.set_pos(keep)?;
         let mut g = g;
         g.cached = keep;
@@ -651,7 +654,7 @@ impl Server {
         let m0 = self.eng.miss_totals()?;
         let mut first = self.eng.forward(&suffix, depth > 0)?;
         let mut adapted = false;
-        if opt.adapt && suffix.len() >= 4 && suffix.len() <= opt.two_pass {
+        if opt.adapt && suffix.len() >= 4 && suffix.len() <= opt.two_pass && self.eng.can_rewind(keep) {
             let m1 = self.eng.miss_totals()?;
             let mass = m1[2] - m0[2];
             let miss = if mass > 0.0 { (m1[3] - m0[3]) / mass } else { 0.0 };

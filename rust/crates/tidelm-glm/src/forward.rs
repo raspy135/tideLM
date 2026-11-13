@@ -2388,6 +2388,12 @@ impl Engine {
         Ok(())
     }
 
+    /// Whether set_pos(n) can take the selected lane back to `n` positions: always for GLM-5.3's KV
+    /// caches; GLM-5.3-Flash's KDA state only to 0, to where it is, or into its last saved pass.
+    pub fn can_rewind(&self, n: usize) -> bool {
+        self.fl.is_none() || self.flash_can_rewind(self.lane, self.pos, n)
+    }
+
     /// Truncate the selected lane's sequence to `n` positions (rejected drafts; a new prompt's reuse).
     pub fn set_pos(&mut self, n: usize) -> Result<()> {
         let lane = self.lane;

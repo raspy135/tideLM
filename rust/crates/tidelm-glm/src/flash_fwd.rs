@@ -195,6 +195,10 @@ impl Engine {
         }
     }
 
+    pub(crate) fn flash_can_rewind(&self, lane: usize, pos: usize, n: usize) -> bool {
+        n == pos || n == 0 || self.fl().last[lane].is_some_and(|(p0, rows, saved)| saved && n >= p0 && n < p0 + rows)
+    }
+
     /// set_pos on a GLM-5.3-Flash lane at `pos`: to 0 a fresh state, inside the lane's last pass a
     /// replay of its kept rows, anything else is out of KDA's reach (no saved state).
     pub(crate) fn flash_set_pos(&mut self, lane: usize, pos: usize, n: usize) -> Result<()> {

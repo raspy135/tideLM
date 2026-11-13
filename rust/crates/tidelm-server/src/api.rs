@@ -35,7 +35,7 @@ impl Family {
     /// test), else DeepSeek.
     pub fn load(model_dir: &Path, text: &Text) -> Result<Family, tidelm_text::Error> {
         let cfg: Value = serde_json::from_slice(&std::fs::read(model_dir.join("config.json"))?)?;
-        Ok(if cfg["model_type"].as_str() == Some("glm_moe_dsa") {
+        Ok(if matches!(cfg["model_type"].as_str(), Some("glm_moe_dsa") | Some("glm5_next")) {
             Family::Glm(crate::glm::GlmSettings::load(model_dir, text)?)
         } else {
             Family::Ds

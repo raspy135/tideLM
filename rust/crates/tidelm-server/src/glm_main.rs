@@ -30,7 +30,7 @@ use crate::{anthropic, arg, http, Cmd, Ctx, Family};
 pub fn is_glm(model_dir: &std::path::Path) -> bool {
     std::fs::read(model_dir.join("config.json")).ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .is_some_and(|c| c["model_type"].as_str() == Some("glm_moe_dsa"))
+        .is_some_and(|c| matches!(c["model_type"].as_str(), Some("glm_moe_dsa") | Some("glm5_next")))
 }
 
 pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
