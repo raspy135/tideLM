@@ -238,6 +238,23 @@ impl Engine {
         Ok(())
     }
 
+    /// TIDELM_FLASH_DUMP=PREFIX (checks only: eager passes, never under graph capture): a prompt's
+    /// first pass of more than one row writes `bytes` at `ptr` to PREFIX.NAME.bin - the mHC streams
+    /// after each layer, the tokens - for tools/flash_ref.py to compare with transformers' glm5_next.
+    fn dump(&self, name: &str, ptr: *mut c_void, bytes: usize, t: usize) -> Result<()> {
+        let Ok(prefix) = std::env::var("TIDELM_FLASH_DUMP") else { return Ok(()) };
+        let path = format!("{prefix}.{name}.bin");
+        if t < 2 || std::path::Path::new(&path).exists() {
+            return Ok(());
+        }
+        self.st.synchronize()?;
+        let mut v = vec![0u8; bytes];
+        ck(unsafe { tidelm_cuda::ffi::cudaMemcpy(v.as_mut_ptr() as *mut c_void, ptr, bytes, tidelm_cuda::ffi::MEMCPY_DEVICE_TO_HOST) },
+           "dump")?;
+        std::fs::write(&path, &v)?;
+        Ok(())
+    }
+
     // ------------------------------------------------------------------ mHC
     /// A site's mixes of the stream (act.h [t][4][H]): pre, post, comb into `site` (0 attention, 1 MLP).
     fn hc_mixes(&self, l: usize, site: usize, t: usize) -> Result<()> {
@@ -282,6 +299,9 @@ impl Engine {
     pub(crate) fn flash_layer_pre(&self, l: usize, t: usize, prefill: bool) -> Result<()> {
         if l > 0 {
             self.hc_post(1, t)?;
+            self.dump(&format!("x{}", l - 1), np(&self.act.h), t * 4 * self.cfg.hidden * 2, t)?;
+        } else {
+            self.dump("tok", np(&self.act.tok), t * 4, t)?;
         }
         self.hc_pre(l, 0, t)?;
         self.attention(l, t, prefill)?;
@@ -293,6 +313,7 @@ impl Engine {
     /// hyper head), the final norm into hn.
     pub(crate) fn flash_final(&self, t: usize) -> Result<()> {
         self.hc_post(1, t)?;
+        self.dump(&format!("x{}", self.cfg.layers - 1), np(&self.act.h), t * 4 * self.cfg.hidden * 2, t)?;
         let (a, fa) = (&self.act, &self.fl().act);
         let h = self.cfg.hidden;
         ck(unsafe { tidelm_kernels::ds41::ds_hc_mean(self.st.raw(), np(&a.h), np(&fa.hy), h as i64, t as i32, h as i32, 4) }, "hc mean")?;
