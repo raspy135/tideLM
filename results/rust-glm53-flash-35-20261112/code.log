@@ -1,0 +1,12 @@
+== p2-code: workload=code isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=68 ttft=    421.1 ms  tpot=  49.71 ms  decode= 20.12 tok/s  out=1024 (length)
+          accept_len=2.643410852713178  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=68 ttft=    422.8 ms  tpot=  40.19 ms  decode= 24.88 tok/s  out=1024 (length)
+          accept_len=3.1770186335403725  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=68 ttft=    410.8 ms  tpot=  37.79 ms  decode= 26.46 tok/s  out=1024 (length)
+          accept_len=3.1770186335403725  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=68 ttft=    411.7 ms  tpot=  38.57 ms  decode= 25.93 tok/s  out=1024 (length)
+          accept_len=3.090634441087613  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=411.7049 ms  tpot=38.5669 ms  decode=25.929 tok/s
+  -> ENGINE  accept_len=3.177  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote results/rust-glm53-flash-35-20261112/code.json

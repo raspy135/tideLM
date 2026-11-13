@@ -1,0 +1,12 @@
+== p2-random: workload=random isl=8192 osl=256 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=8219 ttft=  12067.2 ms  tpot=  54.74 ms  decode= 18.27 tok/s  out=256 (length)
+          accept_len=2.451923076923077  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=8211 ttft=  11868.2 ms  tpot=  56.26 ms  decode= 17.78 tok/s  out=256 (length)
+          accept_len=2.361111111111111  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=8225 ttft=  11749.9 ms  tpot=  53.39 ms  decode= 18.73 tok/s  out=256 (length)
+          accept_len=2.383177570093458  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=8205 ttft=  11613.9 ms  tpot=  48.65 ms  decode= 20.56 tok/s  out=256 (length)
+          accept_len=2.6842105263157894  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=11749.9017 ms  tpot=53.3886 ms  decode=18.7306 tok/s
+  -> ENGINE  accept_len=2.3832  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote results/rust-glm53-flash-35-20261112/random8k.json
