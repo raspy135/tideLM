@@ -209,3 +209,20 @@ Found with it: the DS-rule routing history (residency::DsHistory, written at eac
 by nothing in serving) had a fixed name beside the state db, glm-ds-history.npz - GLM-5.3's. Flash
 opened it, found another shape, started empty and saved its own over GLM-5.3's (unrecoverable;
 GLM-5.3's next boot starts it anew). Flash's is now its state db's own (<state db>.ds-history.npz).
+
+### TP=2 at 1M a lane (2026-11-12)
+
+The model's own context (max_position_embeddings 1,048,576; no RoPE) for each of two lanes at once:
+GLM_MAX_SEQ=1048576 and GLM_KV_TOKENS=2097152, a new key (the KV pool in positions over all lanes;
+unset, one lane's max_seq shared as before). KV 14.42 GB a rank, device 86.9 GiB, MemAvailable
+26-28 GiB a box. One box keeps 327,680: there the same memory is ~1,300 expert slots. bench.py was
+not rerun (its rows were measured at 327,680, short prompts); no prompt past 327,680 positions has run
+yet.
+
+Found with it: the pass's decoder lane offsets took the split cache's lane stride (dec_rows, padded
+from s_loc + 1) where the caches are whole (mtp_rows, padded from max_seq). Rows pad to 524,288, so
+the two agree at 262,144 and 327,680 and differ at 1,048,576 (1,572,864 against 1,048,576): lane 1
+read and wrote the wrong rows and served garbage ("## ## ##" from the first token), lane 0 was right
+(glm_run's one lane gave the 327,680 tokens exactly). The offset is now the caches' own stride; the
+configurations served before get the same value. Checked: two concurrent requests and a third, at 1M
+on the pair, all answer right.

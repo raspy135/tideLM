@@ -34,7 +34,7 @@ pub fn is_glm(model_dir: &std::path::Path) -> bool {
 }
 
 pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
-    const VALUED: [&str; 53] = ["--exlr8-round", "--bench-nll-ab", "--bench-nll-adapt", "--bench-prefill-ab", "--bench-ab", "--bench-ab-rounds", "--bench-nll-skip", "--bench-nll-rows", "--bench-nll-max", "--lanes", "--lane-chunk", "--bench-nll-out", "--bench-nll", "--bench-widths", "--copy", "--hot-async", "--bench-width", "--bench-ctx", "--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
+    const VALUED: [&str; 54] = ["--exlr8-round", "--kv-tokens", "--bench-nll-ab", "--bench-nll-adapt", "--bench-prefill-ab", "--bench-ab", "--bench-ab-rounds", "--bench-nll-skip", "--bench-nll-rows", "--bench-nll-max", "--lanes", "--lane-chunk", "--bench-nll-out", "--bench-nll", "--bench-widths", "--copy", "--hot-async", "--bench-width", "--bench-ctx", "--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
                                 "--max-seq", "--chunk", "--hot", "--hot-keep", "--depth", "--cal", "--dyn", "--lookup",
                                 "--adapt", "--adapt-every", "--adapt-prefill", "--adapt-decode", "--bg-every", "--loop-break",
                                 "--two-pass", "--two-pass-miss", "--host", "--port", "--served-model-name", "--moe-rows",
@@ -72,6 +72,7 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         chunk: num("--chunk", 4096.0)? as usize,
         slots: num("--slots", 12500.0)? as usize,
         kv_split: world > 1 && arg(args, "--kv-split").as_deref() != Some("0"),
+        kv_tokens: num("--kv-tokens", 0.0)? as usize,
         prefill_reduce_bf16: arg(args, "--reduce").as_deref() != Some("fp32"),
         moe_rows: num("--moe-rows", 2048.0)? as usize,
         pack: PathBuf::from(&pack),

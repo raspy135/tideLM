@@ -13,7 +13,7 @@ tide — so the engine gets better the more you use it.
 | `glm53-exlr8` | GLM-5.3 | 2 | exlr8 `bit260` (2.6 bpw: 2-3 bits a projection) | 14,124 / 19,200 (73.6%) | 320K (2 lanes) | **22.3 tok/s** | **28.2 tok/s** | 17.9 s |
 | `glm53-exlr8-home` | GLM-5.3 | 2 | exlr8 `home` (3.25 bpw: 3 or 4 bits an expert) | 11,430 / 19,200 (59.5%) | 320K (2 lanes) | **20.4 tok/s** | **23.9 tok/s** | 17.2 s |
 | `glm53-flash-35-tp1` | GLM-5.3-Flash | **1** | EXL3 3.5 bpw (3 or 4 bits a projection) | 8,345 / 12,096 (69.0%) | 320K (2 lanes) | **22.6 tok/s** | **27.6 tok/s** | 12.0 s |
-| `glm53-flash-35-tp2` | GLM-5.3-Flash | 2 | EXL3 3.5 bpw (3 or 4 bits a projection) | 12,096 / 12,096 (100%) | 320K (2 lanes) | **37.3 tok/s** | **49.1 tok/s** | 7.5 s |
+| `glm53-flash-35-tp2` | GLM-5.3-Flash | 2 | EXL3 3.5 bpw (3 or 4 bits a projection) | 12,096 / 12,096 (100%) | 1M (2 lanes, 2M shared) | **37.3 tok/s** | **49.1 tok/s** | 7.5 s |
 
 *Medians of three `bench/bench.py` runs after a warmup, 1,024 tokens at temperature 0.6 (raw runs:
 [DeepSeek](results/rust-ds41-20261028-pdl/README.md), [GLM-5.3](results/rust-glm53-exlr8-20261111/README.md),

@@ -27,6 +27,7 @@ fn main() -> Result<()> {
         chunk: arg(&args, "--chunk").map(|s| s.parse()).transpose()?.unwrap_or(4096),
         slots: arg(&args, "--slots").map(|s| s.parse()).transpose()?.unwrap_or(12500),
         kv_split: world > 1 && arg(&args, "--kv-split").as_deref() != Some("0"),
+        kv_tokens: 0,
         prefill_reduce_bf16: arg(&args, "--reduce").as_deref() != Some("fp32"),
         moe_rows: arg(&args, "--moe-rows").map(|s| s.parse()).transpose()?.unwrap_or(2048),
         pack: PathBuf::from(&pack),

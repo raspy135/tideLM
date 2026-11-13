@@ -111,6 +111,9 @@ pub struct Options {
     pub pack: std::path::PathBuf,
     /// sequences served at once (GLM_LANES), sharing the KV pool max_seq positions fill
     pub lanes: usize,
+    /// the KV pool in positions over all lanes (GLM_KV_TOKENS): 0 is one lane's max_seq (the lanes
+    /// share what one lane at max_seq fills); 2 x max_seq lets two lanes reach max_seq at once
+    pub kv_tokens: usize,
     /// the serving flags both ranks act on (hot reads split the pass on both, graphs, the disk
     /// store's mirrored calls): compared at boot with the rest
     pub guard_extra: String,
@@ -124,9 +127,9 @@ impl Options {
         let exe = std::fs::read(std::env::current_exe()?)?;
         let s = format!(
             "glm-boot v1\nconfig {:x}\nexe {:x}\nmax_seq {}\nchunk {}\nslots {}\nkv_split {}\nreduce_bf16 {}\nmoe_rows {}\n\
-             lanes {}\npack_source {}\nablit {}\nenv {}\nflags {}\n",
+             lanes {}\nkv_tokens {}\npack_source {}\nablit {}\nenv {}\nflags {}\n",
             sha2::Sha256::digest(&cfg), sha2::Sha256::digest(&exe), self.max_seq, self.chunk, self.slots, self.kv_split,
-            self.prefill_reduce_bf16, self.moe_rows, self.lanes, pack.source_sha256, crate::ablit::digest()?,
+            self.prefill_reduce_bf16, self.moe_rows, self.lanes, self.kv_tokens, pack.source_sha256, crate::ablit::digest()?,
             ["TIDELM_GLM_HOT", "TIDELM_GLM_WIDE_DECODE_FROM", "NCCL_PROTO", "TIDELM_GLM_MLA_HALF", "TIDELM_GLM_FAT", "GLM_FLASH_DENSE"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
                 .collect::<Vec<_>>().join(" "), self.guard_extra);
         Ok(s.into_bytes())
@@ -545,6 +548,7 @@ impl Engine {
         let gran = PagedKv::gran()?;
         let dec_rows = PagedKv::padded_rows(gran, s_loc + 1, &KV_ROW_BYTES);
         let mtp_rows = PagedKv::padded_rows(gran, opt.max_seq, &KV_ROW_BYTES);
+        let dec_lane_rows = if opt.kv_split && world > 1 { dec_rows } else { mtp_rows };
         let mut specs = vec![];
         let mut pool = 0usize;
         let layer_rows = |l: usize| -> Vec<(usize, usize)> {
@@ -559,7 +563,12 @@ impl Engine {
             let rows = if split { dec_rows } else { mtp_rows };
             for (rb, per) in layer_rows(l) {
                 let spec = Spec { ratio: if split { world } else { per }, row_bytes: rb };
-                pool += PagedKv::chunks_for(gran, spec, rows, opt.max_seq - 1);
+                pool += if opt.kv_tokens > opt.max_seq {
+                    // GLM_KV_TOKENS over all lanes: their rows, plus a partial chunk and a row each lane
+                    ((opt.kv_tokens / spec.ratio + lanes) * rb).div_ceil(gran) + lanes
+                } else {
+                    PagedKv::chunks_for(gran, spec, rows, opt.max_seq - 1)
+                };
                 specs.push((spec, rows));
             }
         }
@@ -591,9 +600,9 @@ impl Engine {
             i += rows.len();
             kv.push(lk);
         }
-        log(&format!("[glm] KV cache {:.2} GB a rank ({} positions{}, {lanes} lane{} sharing them)",
+        log(&format!("[glm] KV cache {:.2} GB a rank ({} positions a lane{}, {} over {lanes} lane{})",
                      (pool * gran) as f64 / 1e9, opt.max_seq, if opt.kv_split { ", split" } else { "" },
-                     if lanes > 1 { "s" } else { "" }));
+                     opt.kv_tokens.max(opt.max_seq), if lanes > 1 { "s" } else { "" }));
         let act = Act::new(&cfg, &opt, hl, vl, s_loc, n_slots, lanes)?;
         let fl = if cfg.is_flash() {
             let f = flash_fwd::FlashState::new(&cfg, &opt, world, lanes)?;
@@ -645,7 +654,12 @@ impl Engine {
             arena,
             mtp_arena,
             kv,
-            dec_lane_rows: dec_rows,
+            // the decoder layers' lane stride is their caches': dec_rows split across the pair (its
+            // spare row), else the MTP layer's whole-cache rows. dec_rows (padded from s_loc + 1) was used
+            // either way: the same where max_seq is not a multiple of the padding (262,144, 327,680), a
+            // lane past its own at 1,048,576 (one padding unit more) - lane 1 read and wrote the wrong
+            // rows and served garbage, lane 0 (glm_run, one lane) was right
+            dec_lane_rows,
             mtp_lane_rows: mtp_rows,
             paged,
             lane: 0,

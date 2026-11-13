@@ -126,6 +126,8 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
     [[ -n "${GLM_COPY:-}" ]] && args+=(--copy "$GLM_COPY")
     # lanes: requests served at once, sharing the KV pool (1 unless set)
     [[ -n "${GLM_LANES:-}" ]] && args+=(--lanes "$GLM_LANES" --lane-chunk "${GLM_LANE_CHUNK:-1024}")
+    # GLM_KV_TOKENS: the KV pool in positions over all lanes (unset: one lane at GLM_MAX_SEQ, shared)
+    [[ -n "${GLM_KV_TOKENS:-}" ]] && args+=(--kv-tokens "$GLM_KV_TOKENS")
     if [[ "${GLM_PREFIX_DISK:-0}" == 1 ]]; then
         args+=(--prefix-disk "${RUST_GLM_PREFIX_DIR:-$STATE/glm-prefix}"
                --prefix-disk-gb "${GLM_PREFIX_DISK_GB:-20}" --prefix-min "${GLM_PREFIX_DISK_MIN:-256}")
