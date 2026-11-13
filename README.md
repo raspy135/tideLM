@@ -287,7 +287,9 @@ uv run --no-project --with numpy python tools/glm_pack_exl3.py --world 1 --resum
 ```
 
 Set `GLM_MODEL_DIR=<dense dir>` and `GLM_EXL3_DIR=<packs dir>` in the profile. Residency starts from
-the bundled routing history (`profiles/glm53-flash-history-v0.npz`) and learns from your traffic.
+the bundled routing history (`profiles/glm53-flash-history-v1.npz`, a day of the author's serving) and
+learns from your traffic into `RUST_GLM_STATE_DB`; the seed is read only while that file does not exist,
+so an install from before 2026-11-13 picks up v1 by moving its state file aside.
 
 **3. Image and start** (`--local-only`: there is no worker to ship it to):
 

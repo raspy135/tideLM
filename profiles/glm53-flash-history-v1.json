@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "captured_at": "2026-11-13T09:02:47-08:00",
+  "model": "GLM-5.3-Flash (glm5_next), Mia-AiLab/GLM-5.3-Flash-EXL3-3.5bpw rev 6f0cbf4a",
+  "layers": 46,
+  "experts_per_layer": 288,
+  "tokens": 470608,
+  "source": "the development box's TP=1 state file (RUST_GLM_STATE_DB) after a day of serving, 2026-11-12/13: seed v0 (150K tokens of corpus/sources prefilled), then everything the engine routed - the author's chat traffic (Open WebUI, Pi harness), bench/bench.py runs (prose, code, random 8K), and 438K prompt tokens of long-prompt tests over this repository's text (23K-305K-token prompts, about 15% of the rows). routed_rows is the mass / 2.5 (the router's scale: one routed row adds 2.5): every prompt token and every decode verify row, rejected drafts included. tokens is the engine's counter since its last boot (it restarts at 0 each boot), not the history's size.",
+  "contents": "Aggregate router mass per (layer, expert) and a token count only; no prompts, responses, KV, or model weights.",
+  "sha256": "91c844b5cae2d00601e06ea676e775d482738fd28d9a695cac76ab2deb948511",
+  "routed_rows": 2923621
+}
