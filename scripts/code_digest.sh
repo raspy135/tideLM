@@ -23,7 +23,7 @@ if [[ $rust == 1 ]]; then
     { find rust -path rust/target -prune -o -type f \( -name '*.rs' -o -name '*.cu' -o -name '*.cuh' \
            -o -name '*.cpp' -o -name '*.h' -o -name '*.toml' -o -name Cargo.lock \) -print0
       printf '%s\0' tools/roce/roce.cu tools/roce/roce_common.h tools/fp4_moe_cuda.cu tools/exl3_moe_cuda.cu \
-             engine/engram_gather.cpp engine/draft_vocab_ranking_v1.txt; } \
+             engine/engram_gather.cpp engine/draft_vocab_ranking_v1.txt engine/glm_draft_vocab_ranking_v1.txt; } \
         | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16
     exit 0
 fi

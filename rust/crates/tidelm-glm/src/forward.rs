@@ -82,8 +82,8 @@ const OP_SNAP_COMMIT: u32 = 14;
 
 /// Schedule knobs a benchmark can switch on both ranks inside one boot (Engine::bench_knob): each
 /// moves no value, only when and where kernels run.
-pub const BENCH_KNOBS: [&str; 18] = ["l2pf", "pdl", "evict_first", "evict_kvb", "evict_skinny", "mla_half", "index_side", "fat",
-                                      "split", "osplit", "qsplit", "rot1", "round", "hot_plan", "rescue", "hc_fused", "flash_pf", "flash_both"];
+pub const BENCH_KNOBS: [&str; 19] = ["l2pf", "pdl", "evict_first", "evict_kvb", "evict_skinny", "mla_half", "index_side", "fat",
+                                      "split", "osplit", "qsplit", "rot1", "round", "hot_plan", "rescue", "hc_fused", "flash_pf", "flash_both", "draft_vocab"];
 
 /// Lanes a pass may carry (glm.cu kMaxLanes).
 pub const MAX_LANES: usize = 4;
@@ -474,6 +474,14 @@ pub struct Engine {
     /// both ranks' candidates of the last sampled pass [world][rows][CROW]
     h_cand: tidelm_cuda::PinnedBuffer<f32>,
     cand_rows: usize,
+    /// the last pass read back (read_tokens) was an MTP draft pass over the listed vocabulary: its
+    /// candidates' and its full row's columns are the draft head's, mapped to ids on the host
+    cand_listed: bool,
+    /// the draft head in use (when the weights hold one): the bench knob `draft_vocab`
+    pub(crate) draft_on: bool,
+    /// the MTP passes that follow draft over the listed vocabulary (set_draft_pass: serve's choice a
+    /// round, by how much of its lanes' recent text the list holds); off, they score every id
+    draft_pass: bool,
     /// GLM-5.3-Flash: KDA's state, the indexer's rings, the pass's lane slots (flash_fwd)
     fl: Option<flash_fwd::FlashState>,
     /// GLM-5.3-Flash's image input (flash_image; None: off)
@@ -736,6 +744,9 @@ impl Engine {
             cand: DeviceBuffer::new(HEAD_ROWS * CROW)?,
             h_cand: tidelm_cuda::PinnedBuffer::zeroed(world * HEAD_ROWS * CROW)?,
             cand_rows: 0,
+            cand_listed: false,
+            draft_on: true,
+            draft_pass: true,
             fl,
             vis: None,
         };
@@ -1713,18 +1724,22 @@ impl Engine {
     fn head_dev(&self, x: *const c_void, t: usize, mtp: bool) -> Result<()> {
         let a = &self.act;
         let st = self.st.raw();
-        self.lin(&self.w.head, x, self.cfg.hidden, t, np(&a.head), false)?;
-        ck(unsafe { glm_argmax(st, np(&a.head), self.vl as i64, t as i32, self.vl as i32, (self.rank * self.vl) as i32,
-                               np(&a.pairs)) }, "argmax")?;
+        // an MTP pass's drafts over the listed vocabulary: the draft head's columns (ids on the host)
+        let (head, vl, off) = match self.draft_head(mtp) {
+            Some(d) => (&d.head, d.ids.len(), 0),
+            None => (&self.w.head, self.vl, self.rank * self.vl),
+        };
+        self.lin(head, x, self.cfg.hidden, t, np(&a.head), false)?;
+        ck(unsafe { glm_argmax(st, np(&a.head), vl as i64, t as i32, vl as i32, off as i32, np(&a.pairs)) }, "argmax")?;
         self.gather(np(&a.pairs), t * 8, at(&a.pairs, 2 * HEAD_ROWS * 2), false)?;
         ck(unsafe { glm_argmax_combine(st, at(&a.pairs, 2 * HEAD_ROWS * 2), self.world as i32, t as i32, np(&a.out_tok)) },
            "argmax combine")?;
         if self.sampled {
             let c = np(&self.cand);
-            ck(unsafe { glm_row_lse(st, np(&a.head), self.vl as i64, t as i32, self.vl as i32,
+            ck(unsafe { glm_row_lse(st, np(&a.head), vl as i64, t as i32, vl as i32,
                                     at(&self.temp, if mtp { HEAD_ROWS } else { 0 }), 1, c, CROW as i64) },
                "row lse")?;
-            ck(unsafe { glm_topk(st, np(&a.head), self.vl as i64, std::ptr::null(), 1, 0, self.vl as i32, CAND as i32, t as i32,
+            ck(unsafe { glm_topk(st, np(&a.head), vl as i64, std::ptr::null(), 1, 0, vl as i32, CAND as i32, t as i32,
                                  at(&self.cand, 2 + CAND), CROW as i64, at(&self.cand, 2), CROW as i64) }, "candidates")?;
             let nbytes = t * CROW * 4;
             self.gather(c, nbytes, np(&a.gs), false)?;
@@ -1734,6 +1749,27 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// The draft head an MTP pass's logits go through, if this engine holds one and it is on.
+    fn draft_head(&self, mtp: bool) -> Option<&crate::weights::DraftHead> {
+        self.w.draft.as_ref().filter(|_| mtp && self.draft_on && self.draft_pass)
+    }
+
+    /// Whether this engine drafts over a listed vocabulary at all.
+    pub fn has_draft_list(&self) -> bool {
+        self.w.draft.is_some() && self.draft_on
+    }
+
+    /// Whether the draft head can propose `id` (true without one).
+    pub fn draft_lists(&self, id: u32) -> bool {
+        self.w.draft.as_ref().is_none_or(|d| d.listed.get(id as usize).copied().unwrap_or(false))
+    }
+
+    /// The MTP passes from here on: over the listed vocabulary (`listed`) or over every id. One
+    /// box's choice (a pair holds no draft head), so nothing is mirrored.
+    pub fn set_draft_pass(&mut self, listed: bool) {
+        self.draft_pass = listed;
     }
 
     /// Row `row` of the last sampled pass: its candidates over the pair's vocabulary.
@@ -1748,7 +1784,10 @@ impl Engine {
                 let id = r[2 + CAND + i].to_bits() as i32;
                 if id >= 0 {
                     rc.vals.push(r[2 + i]);
-                    rc.ids.push((id as usize + w * self.vl) as u32);
+                    rc.ids.push(match self.w.draft.as_ref().filter(|_| self.cand_listed) {
+                        Some(d) => d.ids.get(id as usize).copied().unwrap_or(id as u32),
+                        None => (id as usize + w * self.vl) as u32,
+                    });
                 }
             }
             rc.min.push(r[2..2 + CAND].iter().cloned().fold(f32::INFINITY, f32::min));
@@ -1783,6 +1822,18 @@ impl Engine {
     }
 
     fn full_row_local(&mut self, row: usize) -> Result<Vec<f32>> {
+        if let Some(d) = self.w.draft.as_ref().filter(|_| self.cand_listed) {
+            // a draft pass's row: its listed columns, every other id at -inf (q = 0 there)
+            let n = d.ids.len();
+            let mut cols = vec![0f32; n];
+            self.act.head.download_async(row * n, &mut cols, &self.st)?;
+            self.st.synchronize()?;
+            let mut out = vec![f32::NEG_INFINITY; self.cfg.vocab];
+            for (&i, &z) in d.ids.iter().zip(&cols) {
+                out[i as usize] = z;
+            }
+            return Ok(out);
+        }
         let vl = self.vl;
         self.gather(at(&self.act.head, row * vl), vl * 4, np(&self.act.gs), false)?;
         let mut out = vec![0f32; vl * self.world];
@@ -1800,6 +1851,7 @@ impl Engine {
         }
         self.st.synchronize()?;
         self.cand_rows = t;
+        self.cand_listed = false;
         Ok(self.h_tok[..t].iter().map(|&x| x as u32).collect())
     }
 
@@ -1878,7 +1930,8 @@ impl Engine {
             (np(&self.act.hprev), u16::MAX)
         };
         if t <= MAX_ROWS && self.graphs {
-            let key = GraphKey::Mtp { t, nl: groups.len(), logits, hidden: code, sampled: self.sampled };
+            let key = GraphKey::Mtp { t, nl: groups.len(), logits, hidden: code, sampled: self.sampled,
+                                      listed: logits && self.draft_head(true).is_some() };
             self.replay(key, |e| e.mtp_dev(t, hp, logits))?;
         } else {
             self.mtp_dev(t, hp, logits)?;
@@ -1886,7 +1939,15 @@ impl Engine {
         if !logits {
             return Ok(None);
         }
-        Ok(Some(self.read_tokens(t)?))
+        let mut toks = self.read_tokens(t)?;
+        if let Some(d) = self.draft_head(true) {
+            // a row with no finite logit keeps argmax's "none" (0x7fffffff), as over the whole head
+            for x in toks.iter_mut() {
+                *x = d.ids.get(*x as usize).copied().unwrap_or(*x);
+            }
+            self.cand_listed = true;
+        }
+        Ok(Some(toks))
     }
 
     /// Replay the graph for `key`, capturing it on first use: that first call runs `work`
@@ -1923,7 +1984,7 @@ enum GraphKey {
     Target { t: usize, nl: usize, sampled: bool },
     /// decoder rows t, one segment between hot-read points
     Segment { t: usize, nl: usize, seg: usize, sampled: bool },
-    Mtp { t: usize, nl: usize, logits: bool, hidden: u16, sampled: bool },
+    Mtp { t: usize, nl: usize, logits: bool, hidden: u16, sampled: bool, listed: bool },
 }
 
 /// An MTP pass's hidden source in its graph key (u16::MAX: gathered into hprev).
@@ -2702,6 +2763,9 @@ impl Engine {
             self.bench_knob("hc_fused", std::env::var("TIDELM_FLASH_HC_FUSED").as_deref() != Ok("0"))?;
             return self.bench_knob("flash_pf", std::env::var("TIDELM_FLASH_PF").as_deref() != Ok("0"));
         }
+        if name == "draft_vocab" {
+            return self.bench_knob(name, true);
+        }
         if name == "flash_pf" {
             return self.bench_knob(name, std::env::var("TIDELM_FLASH_PF").as_deref() != Ok("0"));
         }
@@ -2762,6 +2826,12 @@ impl Engine {
             },
             15 => self.hc_fused = on,
             16 => self.flash_pf = on,
+            // the listed draft head on or off; a serving warm-up before the bench may have left the
+            // passes on the whole head (its random prompts are mostly unlisted)
+            18 => {
+                self.draft_on = on;
+                self.draft_pass = true;
+            }
             // the two together (they share a KDA layer's idle windows: their gains do not add)
             17 => {
                 self.hc_fused = on;

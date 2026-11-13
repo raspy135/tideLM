@@ -519,11 +519,22 @@ pub enum Embed {
     Bf16(DeviceBuffer<u16>),
 }
 
+/// The draft head: the rows of lm_head for the listed token ids (ascending), in the dense weights'
+/// format; column c scores token ids[c].
+pub struct DraftHead {
+    pub head: Lin,
+    pub ids: Vec<u32>,
+    /// by token id: whether it is listed
+    pub listed: Vec<bool>,
+}
+
 pub struct Weights {
     pub layers: Vec<Layer>,
     pub embed: Embed,
     pub norm: DeviceBuffer<u16>,
     pub head: Lin,
+    /// GLM-5.3-Flash on one box: the MTP draft passes' head over a listed vocabulary (flash.rs)
+    pub draft: Option<DraftHead>,
     /// RoPE tables [max_seq][32] BF16 (cos, sin of p * theta^(-2i/64)); empty without RoPE
     pub cos: DeviceBuffer<u16>,
     pub sin: DeviceBuffer<u16>,
@@ -703,7 +714,7 @@ impl Weights {
             }
         }
         let (cs, sn) = rope_tables(cfg, max_seq);
-        Ok(Weights { layers, embed: Embed::Int8 { q: embed_q, s: embed_s }, norm, head: Lin::Exl3(head),
+        Ok(Weights { layers, embed: Embed::Int8 { q: embed_q, s: embed_s }, norm, head: Lin::Exl3(head), draft: None,
                      cos: DeviceBuffer::from_slice(&cs)?, sin: DeviceBuffer::from_slice(&sn)?, bytes })
     }
 }

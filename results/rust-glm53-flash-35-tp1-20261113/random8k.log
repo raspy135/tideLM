@@ -1,0 +1,13 @@
+note: server serves 'glm-5.3-flash', using that
+== tp1-random: workload=random isl=8192 osl=256 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=8206 ttft=  12085.3 ms  tpot=  44.23 ms  decode= 22.61 tok/s  out=256 (length)
+          accept_len=1.9029850746268657  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=8216 ttft=  12810.7 ms  tpot=  39.78 ms  decode= 25.14 tok/s  out=142 (stop)
+          accept_len=2.35  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=8211 ttft=  12253.0 ms  tpot=  41.64 ms  decode= 24.01 tok/s  out=256 (stop)
+          accept_len=2.217391304347826  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=8220 ttft=  11819.6 ms  tpot=  47.20 ms  decode= 21.19 tok/s  out=256 (length)
+          accept_len=1.7346938775510203  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=12252.9734 ms  tpot=41.6435 ms  decode=24.0134 tok/s
+  -> ENGINE  accept_len=2.2174  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote results/rust-glm53-flash-35-tp1-20261113/random8k.json

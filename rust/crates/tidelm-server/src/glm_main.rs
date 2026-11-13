@@ -488,15 +488,16 @@ fn bench_widths(eng: &mut Engine, ids: &[u32], ctx: usize, widths: &[usize]) -> 
         out.push(m);
     }
     let mut ts = Vec::new();
+    let mut draft = None;
     for i in 0..25 {
         let t = Instant::now();
-        eng.mtp(&[ids[ctx]], tidelm_glm::forward::Hidden::Last, base - 1, true)?;
+        draft = eng.mtp(&[ids[ctx]], tidelm_glm::forward::Hidden::Last, base - 1, true)?;
         if i >= 5 {
             ts.push(t.elapsed().as_secs_f64() * 1e3);
         }
     }
     let (m, lo, hi) = median(ts);
-    eprintln!("bench-width: MTP draft pass {m:.2} ms (min {lo:.2}, max {hi:.2})");
+    eprintln!("bench-width: MTP draft pass {m:.2} ms (min {lo:.2}, max {hi:.2}), its draft {:?}", draft.unwrap_or_default());
     out.push(m);
     Ok(out)
 }

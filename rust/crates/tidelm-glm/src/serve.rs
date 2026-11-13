@@ -285,7 +285,19 @@ pub struct Stats {
     pub two_pass: usize,
     /// rounds that verified beside another lane's rows (a request's)
     pub shared_rounds: usize,
+    /// MTP rounds drafted over the listed vocabulary (of `mtp_rounds`; the rest scored every id)
+    pub listed_rounds: usize,
+    pub mtp_rounds: usize,
 }
+
+/// GLM-5.3-Flash's listed draft vocabulary: a lane drafts over it while the share of its recent
+/// tokens outside the list (an average over ~64 tokens, started from its prompt's last 256) is at
+/// most this. An unlisted token cannot be drafted and ends its round's chain, so past a few percent
+/// the smaller head costs more rounds than it saves milliseconds (break-even ~7% for prose, ~4.5% for
+/// code, from the README runs' rounds); text in a language the list leaves out is 20-70% unlisted and
+/// goes back to the whole head within a few tokens.
+const DRAFT_UNLISTED_MAX: f32 = 0.04;
+const DRAFT_UNLISTED_EMA: f32 = 1.0 / 64.0;
 
 /// Positions a lane must be able to grow past its prompt before it is admitted beside another
 /// (the lanes share one KV pool: tidelm_engine::kv).
@@ -347,6 +359,10 @@ struct Run {
     copied: usize,
     synced: usize,
     out: Vec<u32>,
+    /// the share of the lane's recent tokens the draft head does not list, and how many of `out`
+    /// it has seen (DRAFT_UNLISTED_MAX)
+    unlisted: f32,
+    folded: usize,
     next_adapt: usize,
     rounds: usize,
     cancelled: bool,
@@ -734,11 +750,15 @@ impl Server {
         let conv = crate::prefix::conv_key(&prompt);
         let mut run = Run {
             job, g, lane, rng: Pcg64::from_seed(0), greedy, temp, top_p, depth, anchor: 0, z_anchor: None, anchor_cands: None,
-            lookup: None, copier: None, copied: 0, synced: 0, out: vec![], next_adapt: self.opt.adapt_every, rounds: 0,
+            lookup: None, copier: None, copied: 0, synced: 0, out: vec![], unlisted: 0.0, folded: 0, next_adapt: self.opt.adapt_every, rounds: 0,
             cancelled: false, part: None, conv, prompt_vote: None, stats: Stats::default(), res0: self.eng.res.stats.clone(),
             lane0: self.eng.lane_miss(lane)?, lane1: None,
         };
         run.rng = Pcg64::from_seed(run.job.seed as u128);
+        if self.eng.has_draft_list() {
+            let tail = &run.job.prompt[run.job.prompt.len().saturating_sub(256)..];
+            run.unlisted = tail.iter().filter(|&&t| !self.eng.draft_lists(t)).count() as f32 / tail.len().max(1) as f32;
+        }
         // session-demand preloading (GLM_PRELOAD): a continuation's suffix prefills against the demand its
         // conversation already voiced -- the loads the prefill->decode boundary pass would pay for after the
         // prefill, paid before it, so the suffix computes on the real experts and the boundary pass plans less
@@ -914,9 +934,14 @@ impl Server {
         } else {
             String::new()
         };
+        let listed = if self.eng.has_draft_list() && s.mtp_rounds > 0 {
+            format!(", drafts over the listed vocabulary in {} of {} rounds", s.listed_rounds, s.mtp_rounds)
+        } else {
+            String::new()
+        };
         let line = format!("request {}, GLM: {:.2} drafted / {:.2} accepted a round, copy rounds {} ({} long, {} accepted), \
                             miss rate {:.1}% (prompt {:.1}%, decode {:.1}%; by score {:.1}%), hot reads {} (kept {}, {} inline, {:.2} s waited), \
-                            swaps {} ({:.2} s waited), preload {} ({} MB, {:.2} s), fallbacks {}{nan}{beside}",
+                            swaps {} ({:.2} s waited), preload {} ({} MB, {:.2} s), fallbacks {}{nan}{beside}{listed}",
                            run.job.id, s.drafted as f64 / rounds, s.accepted as f64 / rounds, s.copy_rounds, s.long_copies,
                            s.copy_accepted, pct(p[0] + d[0], p[1] + d[1]), pct(p[0], p[1]), pct(d[0], d[1]),
                            pct(p[2] + d[2], p[3] + d[3]), r1.hot_reads - r0.hot_reads, r1.hot_kept - r0.hot_kept,
@@ -1106,6 +1131,26 @@ impl Server {
         let mtp_lanes: Vec<usize> = (0..blocks.len()).filter(|&k| !blocks[k].plain).collect();
         if !mtp_lanes.is_empty() {
             let logits = mtp_lanes.iter().any(|&k| !blocks[k].copy);
+            if self.eng.has_draft_list() {
+                // the round's drafts over the listed vocabulary while every drafting lane's recent text
+                // is in it (one head a pass)
+                let mut listed = true;
+                for &k in &mtp_lanes {
+                    let r = &mut runs[blocks[k].i];
+                    for &t in &r.out[r.folded..] {
+                        let miss = if self.eng.draft_lists(t) { 0.0 } else { 1.0 };
+                        r.unlisted += (miss - r.unlisted) * DRAFT_UNLISTED_EMA;
+                    }
+                    r.folded = r.out.len();
+                    listed &= blocks[k].copy || r.unlisted <= DRAFT_UNLISTED_MAX;
+                }
+                self.eng.set_draft_pass(listed);
+                for &k in mtp_lanes.iter().filter(|&&k| !blocks[k].copy) {
+                    let r = &mut runs[blocks[k].i];
+                    r.stats.mtp_rounds += 1;
+                    r.stats.listed_rounds += listed as usize;
+                }
+            }
             let anchors: Vec<[u32; 1]> = mtp_lanes.iter().map(|&k| [runs[blocks[k].i].anchor]).collect();
             let groups: Vec<MtpRows> = mtp_lanes.iter().zip(&anchors).map(|(&k, a)| {
                 MtpRows { lane: runs[blocks[k].i].lane, ids: a, hidden: Hidden::Last, pos0: blocks[k].p - 1 }

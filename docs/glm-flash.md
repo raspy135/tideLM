@@ -347,13 +347,7 @@ o_proj's f32 -> bf16); reading each source in place removes 177 launches a pass 
 +0.1 / +0.2 / +0.4 / -0.2% at 1 / 2 / 4 / 8 rows. They are 2-3 us each and the prefetch branch uses
 the memory meanwhile.
 
-The larger lever, not built: a listed draft vocabulary for the MTP head (the DS engine's
-docs/draft-vocab.md). At ~32K listed ids the head is ~0.6 of its 2.7 ms; with 1.5-2.4 drafts a round
-(the README runs) that is ~4-6 ms of a 90-105 ms round. It needs a ranking for this tokenizer that
-the public sequences on this box cannot give: by id order the lowest 32,768 ids miss 9-43% of
-held-out tokens, and ranked by counts over 1.4M tokens (agent traces, chat, Japanese) they miss 0.1-0.3%
-of the agent traces but 5.8% of general chat and 3.8-6.9% of Japanese - each miss ends a draft
-chain, which costs about what the smaller head saves. With a ranking at the DS list's 0.3%: ~+4%.
+The larger lever, the MTP head (2.71 of a 3.66 ms draft pass), is the next section's.
 
 ### Fixed
 
@@ -413,3 +407,78 @@ was rerun at TP=2, and the pair-only items below stay as notes.
 - GLM_MTP_DEPTH is not checked against GLM_LANES (a shared verify past 33 rows exits).
 - GLM_FLASH_DENSE=bf16 still quantizes kv_b, the latent cache and the pooled keys to FP8: a BF16 /
   FP8 NLL pair isolates the linear layers only.
+
+## A listed draft vocabulary (2026-11-13)
+
+An MTP draft pass is its head: 634 MB over 154,880 ids, 2.71 of 3.66 ms, and a round runs 2-3 of
+them. The draft only proposes - the verify pass scores every id - so the draft passes now score a
+list of the tokenizer's common ids through their own head (the listed rows of lm_head, in the dense
+weights' format), the DS engine's idea (docs/draft-vocab.md) on one box. A token outside the list
+cannot be drafted: that round's chain ends there, and no output token changes (greedy: the same ids
+with the list on and off, checked in glm_run and in the served runs below; sampled: an unlisted
+token has q = 0 and the rejection sampling stays exact).
+
+`GLM_DRAFT_VOCAB` (unset: the built-in ranking, engine/glm_draft_vocab_ranking_v1.txt; `all`: no
+list; a path: another ranking) and `GLM_DRAFT_VOCAB_ROWS` (57,344). One box only; a pair loads no
+draft head. Its cost is memory: 235 MB of FP8 beside the weights (the box idled at 7.6 GiB
+MemAvailable; no expert slot was given up for it).
+
+### The list
+
+This tokenizer spreads text over far more ids than the DS one, and by language: the lowest 32,768
+ids miss 9-43% of held-out tokens, and a ranking over 18 language groups still leaves 5.9% of
+English chat and 8.9% of Chinese unlisted at 40,960 ids (1.3% and 2.1% at 81,920). So v1 ranks
+English chat (x3), agent traces and code (x2 each), English Wikipedia and Japanese (x1 each) -
+69M tokens of public text and of GLM-5.3's own answers to public prompts, every 10th text held
+out - and leaves the rest to the fallback below (tools/build_glm_draft_vocab.py; the file's header
+has the sources). Held-out tokens unlisted, and the draft pass:
+
+| listed ids | chat | agent | code | en wiki | ja | zh | ko | es | de | draft pass |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 40,960 | 2.10% | 0.74% | 1.44% | 2.80% | 1.39% | 33.9% | 70.3% | 25.2% | 31.1% | 1.65 ms |
+| 49,152 | 1.36% | 0.41% | 0.85% | 1.55% | 0.93% | 32.4% | 70.2% | 22.5% | 27.4% | 1.81 ms |
+| **57,344** | 0.82% | 0.21% | 0.51% | 0.76% | 0.58% | 30.2% | 67.7% | 19.5% | 23.7% | **1.94 ms** |
+| 65,536 | 0.48% | 0.06% | 0.29% | 0.34% | 0.35% | 28.7% | 64.1% | 16.8% | 19.7% | 2.10 ms |
+| all 154,880 | | | | | | | | | | 3.64 ms |
+
+(`--bench-ab draft_vocab`, three rounds a size.) A list by 32-id blocks of the head, which would
+keep the full head's scale blocks and its bits, was ruled out on the counts: 7.5% of chat unlisted
+at 32,768 ids against 2.7% by id.
+
+### A lane's language decides
+
+Text the list leaves out is 20-70% unlisted, and a drafter that cannot propose a fifth of the
+tokens loses most rounds. Each lane therefore keeps the share of its recent tokens outside the list
+(an average over ~64 tokens, started from its prompt's last 256), and a round drafts over the list
+only while every drafting lane's share is at most 4% (serve.rs DRAFT_UNLISTED_MAX; the break-even
+is ~7% for prose and ~4.5% for code, from the README runs' rounds). Past it the round's draft
+passes score every id, as before. The request's log line counts both.
+
+### Measured
+
+Served on the second Spark, greedy, residency fixed (no hot reads, no adaptation: the two boots
+decode the same tokens), eight prompts of 320 tokens, each twice:
+
+| | list off | list on | | rounds over the list |
+|---|---:|---:|---:|---|
+| prose (two prompts) | 23.94, 20.36 tok/s | 24.96, 21.59 | +4.3%, +6.0% | all but 1 |
+| code (two) | 31.76, 29.28 | 34.26, 30.92 | +7.9%, +5.6% | all |
+| an agent's turn | 25.82 | 26.58 | +2.9% | 236 of 265 |
+| Japanese | 27.57 | 27.54 | 0.0% | all |
+| Chinese | 22.85 | 22.78 | -0.3% | none |
+| Spanish | 23.61 | 24.44 | +3.5% | 180 of 288 |
+| all 5,067 tokens | 25.20 | 26.12 | +3.7% | |
+
+Two runs of one prompt in one boot differ by up to 10% (the calibrated gate learns between them:
+Japanese with the list off ran at 29.00 and 26.14), so a single row here resolves a few percent.
+Chinese is the fallback working: no round over the list, the speed it had.
+
+bench.py, the README's protocol (sampled at 0.6, three runs after a warm-up): on the second Spark,
+two boots from one state file, prose 22.28 -> 24.08 tok/s (+8.1%) and code 27.15 -> 28.63 (+5.5%)
+with the list; then on the serving box, the profile as shipped, prose 23.29 and code 28.91 against
+the 20261112 run's 22.58 and 27.56 (results/rust-glm53-flash-35-tp1-20261113: the README's row). The
+8K first token is prefill and did not move (12.25 s against 12.00, inside the runs' spread).
+
+Found with it: `--bench-width`'s MTP draft pass scores a row with no finite logit (its kept hidden is
+not a decode's) - its draft is argmax's "none", list or no list. It times the pass; the id mapping
+now passes that value through instead of indexing with it.

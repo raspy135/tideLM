@@ -36,6 +36,42 @@ pub fn dense_fp8() -> Result<bool> {
     }
 }
 
+/// Listed ids of the built-in ranking (GLM_DRAFT_VOCAB_ROWS' default): docs/glm-flash.md has the
+/// miss rates and pass times that chose it.
+pub const DRAFT_ROWS: usize = 57344;
+/// The tokenizer's ranking, most frequent first (tools/build_draft_vocab.py; GLM-5.3's tokenizer is
+/// the same one).
+const DRAFT_RANKING_V1: &str = include_str!("../../../../engine/glm_draft_vocab_ranking_v1.txt");
+
+/// The MTP draft passes' vocabulary: GLM_DRAFT_VOCAB (unset: the built-in ranking; `all`: every id,
+/// no draft head; otherwise a ranking file) and GLM_DRAFT_VOCAB_ROWS (how many of its ids, a
+/// multiple of 32: the FP8 head's scale blocks). None: the whole vocabulary.
+///
+/// A draft pass is its head (2.71 of 3.66 ms: 634 MB over 154,880 ids), and the draft only proposes:
+/// the verify pass scores every id, so a token outside the list is a rejected draft, never a wrong
+/// token (sampled: the draft's q is 0 there and the rejection sampling stays exact). The DS engine's
+/// tidelm_engine::draft_vocab, one box only here.
+pub fn draft_ids(vocab: usize) -> Result<Option<Vec<u32>>> {
+    let path = std::env::var("GLM_DRAFT_VOCAB").unwrap_or_default();
+    if path.trim() == "all" {
+        return Ok(None);
+    }
+    let rows = match std::env::var("GLM_DRAFT_VOCAB_ROWS") {
+        Ok(v) if !v.trim().is_empty() => v.trim().parse::<usize>().map_err(|_| format!("GLM_DRAFT_VOCAB_ROWS={v}: not a number"))?,
+        _ => DRAFT_ROWS,
+    };
+    if rows == 0 || rows % 32 != 0 || rows > vocab {
+        return Err(format!("GLM_DRAFT_VOCAB_ROWS must be a multiple of 32 in 32..={vocab}, got {rows}").into());
+    }
+    let text = if path.trim().is_empty() {
+        DRAFT_RANKING_V1.to_string()
+    } else {
+        std::fs::read_to_string(path.trim()).map_err(|e| format!("GLM_DRAFT_VOCAB {path}: {e}"))?
+    };
+    let order = tidelm_engine::draft_vocab::ranking(&text, vocab)?;
+    Ok(Some(tidelm_engine::draft_vocab::select(&order, rows, vocab)?))
+}
+
 fn u16s(b: &[u8]) -> Vec<u16> {
     b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
 }
@@ -69,6 +105,21 @@ impl Ld<'_> {
     fn all(&self, name: &str) -> Result<(Vec<u16>, usize, usize)> {
         let (n, k) = self.dims(name)?;
         Ok((self.rows(name, 0..n)?.0, n, k))
+    }
+
+    /// Rows `ids` of a BF16 tensor [n][k], in that order.
+    fn gather(&self, name: &str, ids: &[u32]) -> Result<(Vec<u16>, usize)> {
+        let (n, k) = self.dims(name)?;
+        let b = self.ld.bytes(name)?;
+        let mut o = Vec::with_capacity(ids.len() * k);
+        for &i in ids {
+            let i = i as usize;
+            if i >= n {
+                return Err(format!("{name}: row {i} of {n}").into());
+            }
+            o.extend(b[i * k * 2..(i + 1) * k * 2].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])));
+        }
+        Ok((o, k))
     }
 
     /// Columns `c` of every row of a BF16 [n][k].
@@ -148,6 +199,20 @@ pub fn load_weights(model_dir: &Path, cfg: &GlmConfig, rank: usize, world: usize
     let head = d.fused(&[("lm_head.weight".into(), hcut(vl))], 1)?;
     let norm = d.bf16_dev(&format!("{P}norm.weight"))?;
     let mut bytes = 2 * cfg.vocab * h + head.bytes();
+    // one box, MTP: the draft passes' head over the listed ids
+    let draft = match draft_ids(cfg.vocab)?.filter(|_| world == 1 && cfg.mtp) {
+        Some(ids) => {
+            let (w, k) = d.gather("lm_head.weight", &ids)?;
+            let head = d.lin(w, ids.len(), k, 1)?;
+            log(&format!("[flash] draft head: {} of {} ids listed ({:.0} MB; GLM_DRAFT_VOCAB=all for none)", ids.len(), cfg.vocab,
+                         head.bytes() as f64 / 1e6));
+            bytes += head.bytes();
+            let mut listed = vec![false; cfg.vocab];
+            ids.iter().for_each(|&i| listed[i as usize] = true);
+            Some(crate::weights::DraftHead { head, ids, listed })
+        }
+        None => None,
+    };
     let mut layers = Vec::with_capacity(cfg.n_layers());
     for l in 0..cfg.n_layers() {
         let p = format!("{P}layers.{l}.");
@@ -271,7 +336,7 @@ pub fn load_weights(model_dir: &Path, cfg: &GlmConfig, rank: usize, world: usize
                          bytes as f64 / 1e9, t0.elapsed().as_secs_f64()));
         }
     }
-    Ok(Weights { layers, embed, norm, head, cos: DeviceBuffer::from_slice(&[0u16])?, sin: DeviceBuffer::from_slice(&[0u16])?, bytes })
+    Ok(Weights { layers, embed, norm, head, draft, cos: DeviceBuffer::from_slice(&[0u16])?, sin: DeviceBuffer::from_slice(&[0u16])?, bytes })
 }
 
 fn layer_bytes(l: &Layer) -> usize {
@@ -291,4 +356,23 @@ fn layer_bytes(l: &Layer) -> usize {
         b += m.eh.bytes();
     }
     b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_built_in_ranking_lists_whole_blocks_of_this_vocabulary() {
+        // glm5_next's vocabulary (config.json vocab_size): an id outside it fails the parse
+        let vocab = 154880;
+        let order = tidelm_engine::draft_vocab::ranking(DRAFT_RANKING_V1, vocab).unwrap();
+        assert!(order.len() >= DRAFT_ROWS, "{} ranked ids for {DRAFT_ROWS} rows", order.len());
+        let ids = tidelm_engine::draft_vocab::select(&order, DRAFT_ROWS, vocab).unwrap();
+        assert_eq!(ids.len(), DRAFT_ROWS);
+        assert_eq!(DRAFT_ROWS % 32, 0);
+        assert!(ids.windows(2).all(|w| w[0] < w[1]));
+        // the template's and the tool calls' tokens are the vocabulary's last ids: all listed
+        assert!((154820..154856u32).all(|i| ids.binary_search(&i).is_ok()));
+    }
 }

@@ -12,13 +12,15 @@ tide — so the engine gets better the more you use it.
 | `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | 2 | native MXFP4 | 10,000 / 15,360 (65.1%) | 1M (2 lanes, 1.5M shared) | **33.5 tok/s** | **51.8 tok/s** | 4.3 s |
 | `glm53-exlr8` | GLM-5.3 | 2 | exlr8 `bit260` (2.6 bpw: 2-3 bits a projection) | 14,124 / 19,200 (73.6%) | 320K (2 lanes) | **22.3 tok/s** | **28.2 tok/s** | 17.9 s |
 | `glm53-exlr8-home` | GLM-5.3 | 2 | exlr8 `home` (3.25 bpw: 3 or 4 bits an expert) | 11,430 / 19,200 (59.5%) | 320K (2 lanes) | **20.4 tok/s** | **23.9 tok/s** | 17.2 s |
-| `glm53-flash-35-tp1` | GLM-5.3-Flash | **1** | EXL3 3.5 bpw (3 or 4 bits a projection) | 8,345 / 12,096 (69.0%) | 320K (2 lanes) | **22.6 tok/s** | **27.6 tok/s** | 12.0 s |
+| `glm53-flash-35-tp1` | GLM-5.3-Flash | **1** | EXL3 3.5 bpw (3 or 4 bits a projection) | 8,345 / 12,096 (69.0%) | 320K (2 lanes) | **23.3 tok/s** | **28.9 tok/s** | 12.0 s |
 | `glm53-flash-35-tp2` | GLM-5.3-Flash | 2 | EXL3 3.5 bpw (3 or 4 bits a projection) | 12,096 / 12,096 (100%) | 1M (2 lanes, 2M shared) | **37.3 tok/s** | **49.1 tok/s** | 7.5 s |
 
 *Medians of three `bench/bench.py` runs after a warmup, 1,024 tokens at temperature 0.6 (raw runs:
 [DeepSeek](results/rust-ds41-20261028-pdl/README.md), [GLM-5.3](results/rust-glm53-exlr8-20261111/README.md),
 [GLM-5.3 `home`](results/rust-glm53-exlr8-home-20261112/README.md), a day later on another build;
-GLM-5.3-Flash [on one Spark](results/rust-glm53-flash-35-tp1-20261112/README.md) and
+GLM-5.3-Flash [on one Spark](results/rust-glm53-flash-35-tp1-20261113/README.md), with its listed
+draft vocabulary, a day after `home` - its 8K first token, which that run does not move, from
+[the day before](results/rust-glm53-flash-35-tp1-20261112/README.md) - and
 [on two](results/rust-glm53-flash-35-tp2-20261112/README.md), the same day as `home`).*
 
 GLM-5.3 is served from the `bit260` profile of
@@ -299,6 +301,12 @@ scripts/tide.sh start .env.glm53-flash-35
 ```
 
 Images in chat requests (`image_url` parts) are on (`GLM_VISION=1`).
+
+Speculative drafts are scored over a listed vocabulary of 57,344 common ids (English, code and
+Japanese) rather than all 154,880 - 3-8% more tokens a second on English prose and code, the output
+the same either way. Text in another language drafts over every id as before - to give
+it a list of its own, `tools/build_glm_draft_vocab.py` ranks your text and `GLM_DRAFT_VOCAB=<file>`
+loads it ([GLM-5.3-Flash](docs/glm-flash.md#a-listed-draft-vocabulary-2026-11-13)).
 
 ### GLM-5.3-Flash on two Sparks (`glm53-flash-35-tp2`)
 

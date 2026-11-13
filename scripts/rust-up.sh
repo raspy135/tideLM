@@ -147,6 +147,16 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
     # GLM-5.3-Flash's non-expert weights: fp8 (32 x 32 block scales, the default) or bf16 (the
     # checkpoint's); it moves values, so the boot guard hashes it
     [[ -n "${GLM_FLASH_DENSE:-}" ]] && envs+=(GLM_FLASH_DENSE="$GLM_FLASH_DENSE")
+    # GLM-5.3-Flash on one box: the MTP draft passes score a listed vocabulary (unset: the built-in
+    # ranking's first GLM_DRAFT_VOCAB_ROWS ids; all: every id; a host path: another ranking file)
+    if [[ -n "${GLM_DRAFT_VOCAB:-}" ]]; then
+        if [[ "$GLM_DRAFT_VOCAB" != all ]]; then
+            [[ -f "$GLM_DRAFT_VOCAB" ]] || err "GLM_DRAFT_VOCAB=$GLM_DRAFT_VOCAB is not a file on this box (or: all)"
+            ro+=("$(dirname "$GLM_DRAFT_VOCAB")")
+        fi
+        envs+=(GLM_DRAFT_VOCAB="$GLM_DRAFT_VOCAB")
+    fi
+    [[ -n "${GLM_DRAFT_VOCAB_ROWS:-}" ]] && envs+=(GLM_DRAFT_VOCAB_ROWS="$GLM_DRAFT_VOCAB_ROWS")
     # GLM-5.3-Flash's image input: the tower is loaded on demand into lent expert slots
     [[ "${GLM_VISION:-0}" == 1 ]] && envs+=(GLM_VISION=1 GLM_VISION_MAX_TOKENS="${GLM_VISION_MAX_TOKENS:-8000}")
     # GLM_ABLIT: the abliteration's directions (rust/crates/tidelm-glm/src/ablit.rs), a host path
