@@ -357,7 +357,13 @@ pub unsafe fn memcpy_async(dst: *mut c_void, src: *const c_void, bytes: usize, k
     if bytes == 0 {
         return Ok(());
     }
-    check(unsafe { ffi::cudaMemcpyAsync(dst, src, bytes, kind, stream.raw()) }, "cudaMemcpyAsync")
+    let r = check(unsafe { ffi::cudaMemcpyAsync(dst, src, bytes, kind, stream.raw()) }, "cudaMemcpyAsync");
+    if r.is_err() {
+        // the call site: a failed copy's arguments name no caller of their own
+        eprintln!("cudaMemcpyAsync failed: dst {dst:?} src {src:?} bytes {bytes} kind {kind}\n{}",
+                  std::backtrace::Backtrace::force_capture());
+    }
+    r
 }
 
 pub use ffi::{MEMCPY_DEVICE_TO_DEVICE, MEMCPY_DEVICE_TO_HOST, MEMCPY_HOST_TO_DEVICE};

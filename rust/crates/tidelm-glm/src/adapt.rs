@@ -849,7 +849,10 @@ impl Engine {
     /// Hot reads on: synchronous between a decode pass's segments, or `asynch` (both need the
     /// background period's victims to keep a read).
     pub fn enable_hot(&mut self, asynch: bool) -> Result<()> {
-        let rows = crate::forward::VERIFY_ROWS;
+        // a decode pass's rows, as many as act.hot's region a layer holds: a pass of 9-16 rows (a short
+        // prompt prefilled on the decode path, two lanes' verify rows) copied past a table of
+        // VERIFY_ROWS (cudaMemcpyAsync: invalid argument, the engine down)
+        let rows = crate::weights::MAX_ROWS;
         // the decoder arena's last slot is the transient one (forward.rs class_arena)
         let mut h = Hot::new(self.arena.slots - 1, self.pack.max_record, rows, self.cfg.topk)?;
         if asynch {
