@@ -1129,6 +1129,7 @@ dependencies = [
  "tidelm-core",
  "tidelm-cuda",
  "tidelm-engine",
+ "tidelm-image",
  "tidelm-kernels",
  "tidelm-model",
  "tidelm-text",

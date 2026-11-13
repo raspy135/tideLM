@@ -17,6 +17,17 @@ fn arg(args: &[String], name: &str) -> Option<String> {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(img) = arg(&args, "--image") {
+        // the Rust preprocessing only: its patches and grid, for tools/flash_vision_ref.py --prep
+        let p = tidelm_image::glm5next::prepare(&std::fs::read(&img)?, 16, arg(&args, "--max-tokens").map(|s| s.parse()).transpose()?.unwrap_or(8000))?;
+        let mut b = Vec::with_capacity(p.patches.len() * 2);
+        for x in &p.patches {
+            b.extend_from_slice(&x.to_le_bytes());
+        }
+        std::fs::write(arg(&args, "--out").ok_or("--out")?, b)?;
+        println!("{} {}", p.gh, p.gw);
+        return Ok(());
+    }
     let dir = PathBuf::from(arg(&args, "--model-dir").ok_or("--model-dir")?);
     let max: usize = arg(&args, "--max").map(|s| s.parse()).transpose()?.unwrap_or(16384);
     let grids: Vec<(usize, usize)> = arg(&args, "--grids").ok_or("--grids")?.split(';')

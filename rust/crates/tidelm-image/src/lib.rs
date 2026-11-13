@@ -403,3 +403,229 @@ mod tests {
         assert_eq!(s.len(), 256);
     }
 }
+
+// ------------------------------------------------------------------ GLM-5.3-Flash (glm5_next)
+/// GLM-5.3-Flash's image input as transformers' Glm5NextImageProcessor makes it (torchvision
+/// backend, CPU): convert("RGB") (alpha dropped), smart_resize onto a canvas of 28-pixel cells
+/// holding 16..max_tokens merged tokens, the content resized by torch's antialiased uint8
+/// bicubic only when its size changes, padded at the bottom and right with 0, normalized
+/// (x - 255 mean) / (255 std) in fp32 and rounded to bf16 (the model's cast), and cut into
+/// patches of 3 channels x 2 frames (the still frame twice) x 14 x 14, a 2 x 2 merge window's four
+/// in row order, the windows row-major.
+pub mod glm5next {
+    use super::{decode_rgb, Rgb};
+    use sha2::{Digest, Sha256};
+
+    pub const PATCH: usize = 14;
+    pub const MERGE: usize = 2;
+    pub const FACTOR: usize = PATCH * MERGE;
+    pub const PATCH_K: usize = 3 * 2 * PATCH * PATCH;
+    const MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
+    const STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
+
+    pub struct Prepared {
+        /// patch rows and columns (both even)
+        pub gh: usize,
+        pub gw: usize,
+        /// bf16 [gh * gw][1176]
+        pub patches: Vec<u16>,
+        /// sha256 of the patches (cache keys)
+        pub digest: [u8; 32],
+    }
+
+    impl Prepared {
+        /// the image's `<|image|>` tokens: one a 2 x 2 window
+        pub fn tokens(&self) -> usize {
+            self.gh * self.gw / 4
+        }
+    }
+
+    fn al(v: f64) -> usize {
+        ((v / FACTOR as f64).ceil() as usize) * FACTOR
+    }
+
+    /// smart_resize (image_processing_glm5_next.py) with two frames: the canvas (height, width).
+    pub fn smart_resize(h: usize, w: usize, min_tokens: usize, max_tokens: usize) -> (usize, usize) {
+        let ppt = 2 * FACTOR * FACTOR;
+        let (minpx, maxpx) = (min_tokens * ppt, max_tokens * ppt);
+        let (mut ah, mut aw) = (al(h as f64), al(w as f64));
+        if 2 * ah * aw < minpx {
+            let s = (minpx as f64 / (2.0 * h as f64 * w as f64)).sqrt();
+            ah = al(((h as f64 * s).ceil()).max(1.0));
+            aw = al(((w as f64 * s).ceil()).max(1.0));
+        }
+        if 2 * ah * aw > maxpx {
+            let (mut lo, mut hi) = (1usize, h);
+            let mut best = (FACTOR, FACTOR);
+            while lo <= hi {
+                let ch = (lo + hi) / 2;
+                let cw = ((w as f64 * ch as f64 / h as f64).floor() as usize).max(1);
+                let c = (al(ch as f64), al(cw as f64));
+                if 2 * c.0 * c.1 <= maxpx {
+                    best = c;
+                    lo = ch + 1;
+                } else {
+                    if ch == 0 {
+                        break;
+                    }
+                    hi = ch - 1;
+                }
+            }
+            (ah, aw) = best;
+        }
+        (ah, aw)
+    }
+
+    /// The content's size on a (th, tw) canvas: scaled to fit, never up past the minimum.
+    pub fn content_size(h: usize, w: usize, th: usize, tw: usize) -> (usize, usize) {
+        let mut scale = (th as f64 / h as f64).min(tw as f64 / w as f64);
+        if 2 * h * w >= 2 * FACTOR * FACTOR * 16 {
+            scale = scale.min(1.0);
+        }
+        let ch = ((h as f64 * scale).floor() as usize).clamp(1, th);
+        let cw = ((w as f64 * scale).floor() as usize).clamp(1, tw);
+        (ch, cw)
+    }
+
+    fn cubic(x: f64) -> f64 {
+        const A: f64 = -0.5;
+        let x = x.abs();
+        if x < 1.0 {
+            ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0
+        } else if x < 2.0 {
+            ((A * x - 5.0 * A) * x + 8.0 * A) * x - 4.0 * A
+        } else {
+            0.0
+        }
+    }
+
+    /// torch's antialiased bicubic weights for in -> out (UpSampleKernel's
+    /// _compute_index_ranges_int16_weights): per output its first input and int16 weights, and the
+    /// pass's precision (the most bits below 22 whose largest weight still fits int16).
+    fn coeffs(inp: usize, out: usize) -> (u32, Vec<(usize, Vec<i16>)>) {
+        let scale = inp as f64 / out as f64;
+        let support = if scale >= 1.0 { 2.0 * scale } else { 2.0 };
+        let invscale = if scale >= 1.0 { 1.0 / scale } else { 1.0 };
+        let mut all = vec![];
+        let mut wmax = 0f64;
+        for i in 0..out {
+            let center = scale * (i as f64 + 0.5);
+            let xmin = ((center - support + 0.5) as i64).max(0) as usize;
+            let xsize = ((center + support + 0.5) as i64).min(inp as i64) as usize - xmin;
+            let mut w: Vec<f64> = (0..xsize).map(|j| cubic((j as f64 + xmin as f64 - center + 0.5) * invscale)).collect();
+            let tot: f64 = w.iter().sum();
+            if tot != 0.0 {
+                w.iter_mut().for_each(|v| *v /= tot);
+            }
+            wmax = w.iter().cloned().fold(wmax, f64::max);
+            all.push((xmin, w));
+        }
+        let mut p = 0u32;
+        while p < 22 {
+            if (0.5 + wmax * (1u64 << (p + 1)) as f64) as i64 >= (1 << 15) {
+                break;
+            }
+            p += 1;
+        }
+        let one = (1u64 << p) as f64;
+        let k = all.into_iter().map(|(x, w)| {
+            (x, w.iter().map(|&v| if v < 0.0 { (-0.5 + v * one) as i16 } else { (0.5 + v * one) as i16 }).collect())
+        }).collect();
+        (p, k)
+    }
+
+    fn pass(src: &[u8], sw: usize, sh: usize, out: usize, horizontal: bool) -> Vec<u8> {
+        let (p, k) = coeffs(if horizontal { sw } else { sh }, out);
+        let (ow, oh) = if horizontal { (out, sh) } else { (sw, out) };
+        let mut px = vec![0u8; ow * oh * 3];
+        for y in 0..oh {
+            for x in 0..ow {
+                let (xmin, ref w) = k[if horizontal { x } else { y }];
+                for c in 0..3 {
+                    let mut s: i64 = 1 << (p.max(1) - 1);
+                    for (j, &wj) in w.iter().enumerate() {
+                        let v = if horizontal { src[(y * sw + xmin + j) * 3 + c] } else { src[((xmin + j) * sw + x) * 3 + c] };
+                        s += v as i64 * wj as i64;
+                    }
+                    px[(y * ow + x) * 3 + c] = (s >> p).clamp(0, 255) as u8;
+                }
+            }
+        }
+        px
+    }
+
+    /// torchvision's resize(..., BICUBIC, antialias=True) of a uint8 image on CPU: the horizontal
+    /// pass into uint8, then the vertical; an unchanged side's pass skipped.
+    pub fn resize(img: &Rgb, ow: usize, oh: usize) -> Rgb {
+        let mut cur = Rgb { w: img.w, h: img.h, px: img.px.clone() };
+        if ow != cur.w {
+            cur = Rgb { w: ow, h: cur.h, px: pass(&cur.px, cur.w, cur.h, ow, true) };
+        }
+        if oh != cur.h {
+            cur = Rgb { w: cur.w, h: oh, px: pass(&cur.px, cur.w, cur.h, oh, false) };
+        }
+        cur
+    }
+
+    fn bf16(f: f32) -> u16 {
+        let b = f.to_bits();
+        if f.is_nan() {
+            return 0x7fc0;
+        }
+        ((b + 0x7fff + ((b >> 16) & 1)) >> 16) as u16
+    }
+
+    pub fn prepare(bytes: &[u8], min_tokens: usize, max_tokens: usize) -> Result<Prepared, String> {
+        let img = decode_rgb(bytes)?;
+        prepare_rgb(&img, min_tokens, max_tokens)
+    }
+
+    pub fn prepare_rgb(img: &Rgb, min_tokens: usize, max_tokens: usize) -> Result<Prepared, String> {
+        if img.w == 0 || img.h == 0 {
+            return Err("an empty image".into());
+        }
+        let (th, tw) = smart_resize(img.h, img.w, min_tokens, max_tokens);
+        let (ch, cw) = content_size(img.h, img.w, th, tw);
+        let r = if (ch, cw) != (img.h, img.w) { resize(img, cw, ch) } else { Rgb { w: img.w, h: img.h, px: img.px.clone() } };
+        // the per-channel LUT of (v - 255 mean) / (255 std) in fp32, as bf16; the canvas' zeros pad
+        let mut lut = [[0u16; 256]; 3];
+        for c in 0..3 {
+            let (m, s) = (MEAN[c] * 255.0, STD[c] * 255.0);
+            for v in 0..256 {
+                lut[c][v] = bf16((v as f32 - m) / s);
+            }
+        }
+        let (gh, gw) = (th / PATCH, tw / PATCH);
+        let mut patches = vec![0u16; gh * gw * PATCH_K];
+        let mut row = 0;
+        for bh in 0..gh / MERGE {
+            for bw in 0..gw / MERGE {
+                for mh in 0..MERGE {
+                    for mw in 0..MERGE {
+                        let o = row * PATCH_K;
+                        for c in 0..3 {
+                            for py in 0..PATCH {
+                                let y = (2 * bh + mh) * PATCH + py;
+                                for px in 0..PATCH {
+                                    let x = (2 * bw + mw) * PATCH + px;
+                                    let v = if y < r.h && x < r.w { r.px[(y * r.w + x) * 3 + c] } else { 0 };
+                                    let b = lut[c][v as usize];
+                                    patches[o + c * 392 + py * PATCH + px] = b;
+                                    patches[o + c * 392 + 196 + py * PATCH + px] = b;
+                                }
+                            }
+                        }
+                        row += 1;
+                    }
+                }
+            }
+        }
+        let mut h = Sha256::new();
+        h.update((gh as u32).to_le_bytes());
+        h.update((gw as u32).to_le_bytes());
+        for v in &patches {
+            h.update(v.to_le_bytes());
+        }
+        Ok(Prepared { gh, gw, patches, digest: h.finalize().into() })
+    }
+}
