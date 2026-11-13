@@ -1,0 +1,12 @@
+== tp2-code: workload=code isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=67 ttft=    319.1 ms  tpot=  20.76 ms  decode= 48.17 tok/s  out=1024 (length)
+          accept_len=3.138036809815951  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=67 ttft=    318.9 ms  tpot=  20.37 ms  decode= 49.08 tok/s  out=1024 (length)
+          accept_len=3.3106796116504853  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=67 ttft=    316.5 ms  tpot=  20.37 ms  decode= 49.09 tok/s  out=1024 (length)
+          accept_len=3.2476190476190476  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=67 ttft=    315.9 ms  tpot=  20.72 ms  decode= 48.26 tok/s  out=1024 (length)
+          accept_len=3.1770186335403725  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=316.4974 ms  tpot=20.3741 ms  decode=49.0818 tok/s
+  -> ENGINE  accept_len=3.2476  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /home/you/git/tidelm-flash/results/rust-glm53-flash-35-tp2-20261112/code.json

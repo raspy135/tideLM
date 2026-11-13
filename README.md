@@ -1,21 +1,25 @@
 # TideLM
 
-**Adaptive expert loading enables running higher quant models on two DGX Sparks.** 
+**Adaptive expert loading enables running higher quant models on one or two DGX Sparks.** 
 
-TideLM keeps the experts your traffic actually uses resident in the two boxes' unified memory, learns which
+TideLM keeps the experts your traffic actually uses resident in the boxes' unified memory, learns which
 ones those are from the router's own demand while it serves, and reads the misses that matter
 most from NVMe as decoding goes on. The resident set rises and falls with what you ask it — the
 tide — so the engine gets better the more you use it.
 
-| Profile | Model | Routed experts | Resident | Context | Prose | Code | 8K-token prompt, first token |
-| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | native MXFP4 | 10,000 / 15,360 (65.1%) | 1M (2 lanes, 1.5M shared) | **33.5 tok/s** | **51.8 tok/s** | 4.3 s |
-| `glm53-exlr8` | GLM-5.3 | exlr8 `bit260` (2.6 bpw: 2-3 bits a projection) | 14,124 / 19,200 (73.6%) | 320K (2 lanes) | **22.3 tok/s** | **28.2 tok/s** | 17.9 s |
-| `glm53-exlr8-home` | GLM-5.3 | exlr8 `home` (3.25 bpw: 3 or 4 bits an expert) | 11,430 / 19,200 (59.5%) | 320K (2 lanes) | **20.4 tok/s** | **23.9 tok/s** | 17.2 s |
+| Profile | Model | Sparks | Routed experts | Resident | Context | Prose | Code | 8K-token prompt, first token |
+| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | 2 | native MXFP4 | 10,000 / 15,360 (65.1%) | 1M (2 lanes, 1.5M shared) | **33.5 tok/s** | **51.8 tok/s** | 4.3 s |
+| `glm53-exlr8` | GLM-5.3 | 2 | exlr8 `bit260` (2.6 bpw: 2-3 bits a projection) | 14,124 / 19,200 (73.6%) | 320K (2 lanes) | **22.3 tok/s** | **28.2 tok/s** | 17.9 s |
+| `glm53-exlr8-home` | GLM-5.3 | 2 | exlr8 `home` (3.25 bpw: 3 or 4 bits an expert) | 11,430 / 19,200 (59.5%) | 320K (2 lanes) | **20.4 tok/s** | **23.9 tok/s** | 17.2 s |
+| `glm53-flash-35-tp1` | GLM-5.3-Flash | **1** | EXL3 3.5 bpw (3 or 4 bits a projection) | 8,345 / 12,096 (69.0%) | 320K (2 lanes) | **22.6 tok/s** | **27.6 tok/s** | 12.0 s |
+| `glm53-flash-35-tp2` | GLM-5.3-Flash | 2 | EXL3 3.5 bpw (3 or 4 bits a projection) | 12,096 / 12,096 (100%) | 320K (2 lanes) | **37.3 tok/s** | **49.1 tok/s** | 7.5 s |
 
 *Medians of three `bench/bench.py` runs after a warmup, 1,024 tokens at temperature 0.6 (raw runs:
 [DeepSeek](results/rust-ds41-20261028-pdl/README.md), [GLM-5.3](results/rust-glm53-exlr8-20261111/README.md),
-[GLM-5.3 `home`](results/rust-glm53-exlr8-home-20261112/README.md), a day later on another build).*
+[GLM-5.3 `home`](results/rust-glm53-exlr8-home-20261112/README.md), a day later on another build;
+GLM-5.3-Flash [on one Spark](results/rust-glm53-flash-35-tp1-20261112/README.md) and
+[on two](results/rust-glm53-flash-35-tp2-20261112/README.md), the same day as `home`).*
 
 GLM-5.3 is served from the `bit260` profile of
 [kindlingai/glm-5.3-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4). Against
@@ -31,6 +35,16 @@ speed: the release measures it closer to the unquantized model than `bit260` (KL
 (prose) to 15% (code) slower. What it gives in answers with 59.5% of the experts resident is not
 measured here
 ([`home` on the pair](docs/exlr8.md#home-325-bpw-2026-11-12)).
+
+GLM-5.3-Flash is served from Mia's AI Lab's
+[EXL3 3.5 bpw](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-3.5bpw) on **one Spark**: its
+non-expert weights in FP8, 69% of its routed experts resident and the rest read from the pack as
+decoding needs them, a follow-up turn resumed from the state its last prompt left (34 of its 45
+layers are linear attention, whose state cannot be rewound), and image input with the vision tower
+loaded into lent expert slots for the request. The two-Spark profile holds every expert and decodes
+about 1.7 times as fast; it is the option, not tuned - at two boxes the model fits whole, and engines
+built for that case serve it. What the one-box profile's substituted experts cost in answers against
+a fully resident 3.5 bpw is not measured here ([GLM-5.3-Flash](docs/glm-flash.md)).
 
 Adaptive expert loading also allows flexible memory configuration.
 Memory for expert resident and context length are the big levers. You can run other services
@@ -81,19 +95,21 @@ thinking and reasoning-effort control through an OpenAI-compatible API.
 
 You need two DGX Sparks connected by a working RoCE link, Docker with NVIDIA GPU support,
 passwordless SSH from the head (rank 0) to the worker, and the weights on local NVMe at the same
-path on both nodes. Clone this repository to the same absolute path on both nodes. The
+path on both nodes - or, for `glm53-flash-35-tp1`, one Spark with Docker. Clone this repository to the same absolute path on both nodes. The
 [install guide](docs/install.md) has each step in full: disk per profile, copying between the
 nodes, the GLM packs.
 
-There are three profiles, and each is set up on its own below. One image runs all three, one
-profile serves at a time (each fills both boxes), and switching between profiles that are set up
-is one `scripts/tide.sh start`.
+There are five profiles, and each is set up on its own below. One image runs them all, one
+profile serves at a time (each fills both boxes, or the head), and switching between profiles that
+are set up is one `scripts/tide.sh start`.
 
 | Profile | Model | Disk, each node | Head only, while setting up |
 | --- | --- | ---: | ---: |
 | [`ds41-mxfp4`](#deepseek-v41-flash-ds41-mxfp4) | DeepSeek-V4.1-Flash-1017 | 510 GB | |
 | [`glm53-exlr8`](#glm-53-exlr8-bit260-glm53-exlr8) | GLM-5.3, exlr8 `bit260` | 142 GB | 246 GB |
 | [`glm53-exlr8-home`](#glm-53-exlr8-home-glm53-exlr8-home) | GLM-5.3, exlr8 `home` | 172 GB | 308 GB |
+| [`glm53-flash-35-tp1`](#glm-53-flash-on-one-spark-glm53-flash-35-tp1) | GLM-5.3-Flash, EXL3 3.5 bpw, one Spark | 157 GB (one node) | |
+| [`glm53-flash-35-tp2`](#glm-53-flash-on-two-sparks-glm53-flash-35-tp2) | GLM-5.3-Flash, EXL3 3.5 bpw | 88 GB | 137 GB |
 
 ### DeepSeek-V4.1-Flash (`ds41-mxfp4`)
 
@@ -247,6 +263,73 @@ scripts/tide.sh start .env.glm53-exlr8-home
 Another profile of the release (`bit243`, ...) is the same steps with its `--manifest`: the fetch
 adds only the bytes the mirror lacks.
 
+### GLM-5.3-Flash on one Spark (`glm53-flash-35-tp1`)
+
+Mia's AI Lab's EXL3 3.5 bpw (down 4-bit, gate / up 3- or 4-bit a layer), its non-expert weights
+converted to FP8 at load. One box: no worker, no RoCE link.
+
+**1. Profile.** Copy the example and fill in your paths:
+
+```bash
+cp configs/glm53-flash-35-tp1.env.example .env.glm53-flash-35
+```
+
+**2. Weights**, both straight from the Hub: the non-expert tensors, and the routed experts packed
+by range requests, so the 156 GB checkpoint never lands on disk (numpy; `--resume` continues an
+interrupted run):
+
+```bash
+python3 tools/glm_fetch_dense.py --repo Mia-AiLab/GLM-5.3-Flash-EXL3-3.5bpw \
+    --revision 6f0cbf4a4f1b226a20f90d715e9040a7359937f9 --out <dense dir>       # 19 GB
+uv run --no-project --with numpy python tools/glm_pack_exl3.py --world 1 --resume --verify 64 \
+    --repo Mia-AiLab/GLM-5.3-Flash-EXL3-3.5bpw --revision 6f0cbf4a4f1b226a20f90d715e9040a7359937f9 \
+    --out <packs dir>/glm-flash-35-r0of1.bin                                      # 137 GB
+```
+
+Set `GLM_MODEL_DIR=<dense dir>` and `GLM_EXL3_DIR=<packs dir>` in the profile. Residency starts from
+the bundled routing history (`profiles/glm53-flash-history-v0.npz`) and learns from your traffic.
+
+**3. Image and start** (`--local-only`: there is no worker to ship it to):
+
+```bash
+scripts/tide.sh build --local-only .env.glm53-flash-35
+scripts/tide.sh start .env.glm53-flash-35
+```
+
+Images in chat requests (`image_url` parts) are on (`GLM_VISION=1`).
+
+### GLM-5.3-Flash on two Sparks (`glm53-flash-35-tp2`)
+
+The same model with every routed expert resident (each rank holds its half of all 12,096), no
+image input. It starts from the one-Spark setup's weights on the head.
+
+**1. Profile.** Copy the example and fill in your paths and the worker's address:
+
+```bash
+cp configs/glm53-flash-35-tp2.env.example .env.glm53-flash-35-tp2
+```
+
+**2. Weights.** Step 2 above on the head, then the dense dir to the worker and each rank's pack
+re-sliced from the one-box pack (~1 min a rank, 69 GB each):
+
+```bash
+rsync -a <dense dir>/ <worker>:<dense dir>/
+uv run --no-project --with numpy python tools/glm_pack_exl3.py --from-pack <packs dir>/glm-flash-35-r0of1.bin \
+    --world 2 --rank 1 --out <packs dir>/glm-flash-35-r1of2.bin --verify 32
+rsync -a <packs dir>/glm-flash-35-r1of2.bin <worker>:<packs dir>/ && rm <packs dir>/glm-flash-35-r1of2.bin
+uv run --no-project --with numpy python tools/glm_pack_exl3.py --from-pack <packs dir>/glm-flash-35-r0of1.bin \
+    --world 2 --rank 0 --out <packs dir>/glm-flash-35-r0of2.bin --verify 32
+```
+
+The one-box pack can go afterwards, unless the one-Spark profile stays set up.
+
+**3. Image and start:**
+
+```bash
+scripts/tide.sh build .env.glm53-flash-35-tp2     # builds the image and ships it to the worker
+scripts/tide.sh start .env.glm53-flash-35-tp2
+```
+
 ### Running it
 
 ```bash
@@ -255,12 +338,13 @@ scripts/tide.sh logs -f                  # its log (--rank 1: the worker's)
 scripts/tide.sh stop
 ```
 
-The model follows from the profile (`GLM_MODEL_DIR` → GLM-5.3, `MODEL_DIR` → DeepSeek), and
-the Rust engine serves both; the profiles carry only the settings it reads. It serves the OpenAI
-API with tool calls (and images, DeepSeek) and the Anthropic route for Claude Code. It is up 15 s
-(DeepSeek) to 40 s (GLM-5.3) after the previous pair has stopped; the first requests after a boot
-are slower while adaptation catches up with your traffic. One profile serves at a time: each
-fills both boxes. `TIDE_ENGINE=python` still starts the Python containers, from a profile with
+The model follows from the profile (`GLM_MODEL_DIR` → GLM-5.3 or GLM-5.3-Flash, by its config;
+`MODEL_DIR` → DeepSeek), and the Rust engine serves all three; the profiles carry only the settings
+it reads. It serves the OpenAI API with tool calls (and images: DeepSeek, GLM-5.3-Flash on one
+Spark) and the Anthropic route for Claude Code. It is up 15 s (DeepSeek) to 40-60 s (GLM-5.3,
+GLM-5.3-Flash) after the previous one has stopped; the first requests after a boot are slower while
+adaptation catches up with your traffic. One profile serves at a time: each fills both boxes, or
+the head. `TIDE_ENGINE=python` still starts the Python containers, from a profile with
 their settings (the examples as of `a6ec917`), and a profile the Rust engine does not serve
 (MXFP4 GLM experts, FP4 KV) goes to them with a note.
 

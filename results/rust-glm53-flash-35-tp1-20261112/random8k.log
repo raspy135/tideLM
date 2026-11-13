@@ -1,0 +1,12 @@
+== tp1-random: workload=random isl=8192 osl=256 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=8206 ttft=  12040.7 ms  tpot=  41.14 ms  decode= 24.31 tok/s  out=187 (stop)
+          accept_len=2.2962962962962963  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=8216 ttft=  12065.6 ms  tpot=  47.21 ms  decode= 21.18 tok/s  out=256 (length)
+          accept_len=1.8478260869565217  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=8211 ttft=  12001.8 ms  tpot=  40.05 ms  decode= 24.97 tok/s  out=197 (stop)
+          accept_len=2.45  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=8220 ttft=  11714.7 ms  tpot=  46.60 ms  decode= 21.46 tok/s  out=256 (length)
+          accept_len=1.8345323741007193  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=12001.765 ms  tpot=46.5962 ms  decode=21.461 tok/s
+  -> ENGINE  accept_len=1.8478  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /home/you/git/tidelm-flash/results/rust-glm53-flash-35-tp1-20261112/random8k.json

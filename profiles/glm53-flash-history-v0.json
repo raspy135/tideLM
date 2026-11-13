@@ -1,0 +1,11 @@
+{
+  "version": 0,
+  "captured_at": "2026-11-12T16:35:00-08:00",
+  "model": "GLM-5.3-Flash (glm5_next), Mia-AiLab/GLM-5.3-Flash-EXL3-3.5bpw rev 6f0cbf4a",
+  "layers": 46,
+  "experts_per_layer": 288,
+  "tokens": 150000,
+  "source": "glm_run --history-out: prefills of 150K tokens of this repository's corpus/sources (code, prose, web), README.md, docs/install.md and two engine sources, in 4,096-token documents; the exact router's weight per (layer, expert) whatever was resident (uniform placement, 8,000 slots)",
+  "contents": "Aggregate router mass per (layer, expert) and a token count only; no prompts, responses, KV, or model weights.",
+  "sha256": "0d829f68cd04c698c72bc384a22920c35f49c22fd8095f2844a3dadde680d054"
+}

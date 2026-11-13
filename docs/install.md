@@ -2,6 +2,8 @@
 
 The README's quick start in full: two DGX Sparks serving DeepSeek-V4.1-Flash-1017 or GLM-5.3
 with the Rust engine, in Docker. One profile serves at a time, using both boxes.
+GLM-5.3-Flash (one Spark or two) is set up in the README itself, its profiles' headers and
+[docs/glm-flash.md](glm-flash.md).
 
 ## What you need
 
