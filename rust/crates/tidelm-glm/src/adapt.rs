@@ -20,6 +20,15 @@
 //!   heaviest of those up to the same step cap, each into the next queued victim's slot on the
 //!   reader threads while the next round drafts; routable from the next decoder pass. The token
 //!   that missed the expert keeps its substitute (KL 0.086 -> 0.137 in Python).
+//!   GLM_HOT_PREDICT ranks candidates by missed share accumulated over the pass's rows and
+//!   decayed over passes (HotPredict), alone or after the heaviest-miss ones (REACT=1);
+//!   GLM_HOT_VICTIM=slow ranks the cold victims by slowly decayed demand (BG_SLOW).
+//!   GLM_HOT_RESCUE=TH (with GLM_HOT_ASYNC): a pass run as its segments, and a missed pick with
+//!   share >= TH read into the transient slot before its layer's MoE, computed exactly, kept
+//!   over a victim as hot reads are - the catastrophic first occurrence covered inline, the
+//!   async plan unchanged after the pass (a kept rescue expert is resident, so the plan skips
+//!   it). The pass pays the segment structure (a host point a MoE layer) to know a first
+//!   occurrence before its MoE runs; that structure is the arm's cost and the A/B measures it.
 //! - adapt_background(max_swaps), the decode-time adaptation: the same plan, but the victims
 //!   leave routing at once and the newcomers' records load on reader threads while the pair
 //!   decodes, routable from the ADAPT_BG_PASSES-th decoder pass after (a pass waits for reads not
@@ -42,10 +51,20 @@ pub const ADAPT_MARGIN: f64 = 1.5;
 const BG_DECAY: f64 = 0.7;
 const BG_COLD: f64 = 0.01;
 const BG_PROTECT: u64 = 8;
+/// GLM_HOT_VICTIM=slow: bg_slow's decay a background period (two passes): ~0.99 a pass, a
+/// half-life of ~70 passes, where BG_DECAY's is ~4. On heldout_quick (no adaptation) the engine's
+/// victims - cold by bg_score, then the lowest long-run score - were picked again within 50 passes
+/// half the time, and 37% of the run's missed picks >= 0.3 were experts it had evicted itself.
+const BG_SLOW: f64 = 0.98;
 /// decoder passes between a background adaptation's start and its newcomers becoming routable
 pub const ADAPT_BG_PASSES: u64 = 6;
 /// the background adaptation's reader threads
 const ADAPT_READERS: usize = 8;
+/// GLM_HOT_RESCUE's reads a pass. On heldout_quick (A.trace, skip 16) missed picks >= 0.4 were
+/// 0.06 a pass over 4.5% of passes (>= 0.3: 0.25 over 18.6%), so 2 leaves the cap unfelt; the
+/// damage band >= 0.4 is 5.1% of the per-(layer,row) heaviest-miss share^3 (78.2% sits below
+/// 0.2) - the rescue is insurance for the blown-window class, not a miss-rate lever.
+const RESCUE_STEP: usize = 2;
 
 /// The residency bookkeeping both ranks keep identical (rank 0's plans are mirrored).
 pub struct Res {
@@ -55,6 +74,10 @@ pub struct Res {
     /// rank 0's planning state: decayed demand (adapt), recent mass (bg), protection
     pub score: Vec<f64>,
     pub bg_score: Vec<f64>,
+    /// the same demand decayed slowly (BG_SLOW a period): GLM_HOT_VICTIM=slow's ranking
+    pub bg_slow: Vec<f64>,
+    /// GLM_HOT_VICTIM=slow: cold victims ranked by bg_slow first (then the score), not by the score
+    pub victim_slow: bool,
     pub bg_last: Vec<f64>,
     pub bg_until: Vec<u64>,
     pub bg_period: u64,
@@ -78,6 +101,8 @@ pub struct ResStats {
     pub hot_s: f64,
     /// async: host seconds waiting for a round's reads before the next decoder pass
     pub hot_wait_s: f64,
+    /// GLM_HOT_RESCUE: reads the segments made inline (in hot_reads too)
+    pub hot_rescue: usize,
     /// background adaptations: host seconds a decoder pass waited for their reads
     pub adapt_wait_s: f64,
     /// session-demand preloading: experts a continuation's conversation had already voiced,
@@ -132,6 +157,11 @@ pub fn preload_candidates(
 pub struct Hot {
     pub min_share: f32,
     pub per_step: usize,
+    /// GLM_HOT_RESCUE's threshold (a missed pick's share to read inline before its layer's MoE;
+    /// needs the async plan, whose table and victims it shares)
+    pub rescue: Option<f32>,
+    /// the boot's GLM_HOT_RESCUE (bench knob `rescue` switches `rescue` between it and off)
+    pub rescue_boot: Option<f32>,
     /// the transient slot a read goes into
     pub slot: usize,
     /// candidates of the current pass, from the device: [rows * topk][2] (share, expert)
@@ -146,18 +176,207 @@ pub struct Hot {
 
 impl Hot {
     pub fn new(slot: usize, max_record: usize, rows: usize, topk: usize) -> Result<Self> {
-        Ok(Hot { min_share: 0.2, per_step: 16, slot, host: PinnedBuffer::zeroed(rows * topk * 2)?,
+        Ok(Hot { min_share: 0.2, per_step: 16, rescue: None, rescue_boot: None, slot, host: PinnedBuffer::zeroed(rows * topk * 2)?,
                  buf: PinnedBuffer::uninit(align_up(max_record))?, reads: 0, live: None, asynch: None })
     }
 }
 
 /// Async hot reads: the last decode pass's candidates, the reads in flight, the reader threads.
 pub struct HotAsync {
-    /// [MoE layer][MAX_ROWS * topk][2] (share, expert), copied behind the head of every decode pass
+    /// [MoE layer][MAX_ROWS * topk][2] (share, expert), copied behind the head of every decode
+    /// pass: a missed pick's share positive, a resident's negated
     pub table: PinnedBuffer<f32>,
     jobs: mpsc::Sender<ReadJob>,
     /// planned reads: (slot, layer, expert, done)
     pending: Vec<(usize, usize, usize, mpsc::Receiver<std::result::Result<(), String>>)>,
+    /// GLM_HOT_PREDICT: the reads chosen by recent missed demand (None: one pass's heaviest pick)
+    pub predict: Option<HotPredict>,
+    /// TIDELM_GLM_HOT_TRACE (logging only; rank 1 to PATH.r1): every pass's table and reads,
+    /// for tools/glm_hot_sim.py
+    pub trace: Option<std::fs::File>,
+    /// plans made (the trace's pass index of the next one)
+    pub plans: usize,
+    /// TIDELM_GLM_HOT_ORACLE (debug): an earlier run's next-pass heavy misses, read first
+    pub oracle: Option<HotOracle>,
+}
+
+/// TIDELM_GLM_HOT_ORACLE=PATH,MIN (debug, --bench-nll only): a perfect predictor of the heavy
+/// misses at async speed - the most a synchronous read (or a re-run pass) of the misses >= MIN
+/// could buy, measured before building one. PATH is an earlier run's TIDELM_GLM_HOT_TRACE of the
+/// same bench (corpus, rows, boot: its passes line up with this run's, checked by their rows);
+/// the plan after pass p puts first every pick that run missed at >= MIN in pass p + 1 and that
+/// is not resident here, read async and so routable for pass p + 1. Rank r > 0 reads PATH.r{r},
+/// its own trace of that run (the same bytes; the boot guard compares the files' sums).
+pub struct HotOracle {
+    /// [recorded pass]: its rows, and its misses >= MIN as (share, layer, expert), one a (layer, expert)
+    rows: Vec<u32>,
+    misses: Vec<Vec<(f32, usize, usize)>>,
+}
+
+impl HotOracle {
+    /// (this rank's file, MIN) from TIDELM_GLM_HOT_ORACLE's value
+    pub fn spec(v: &str, rank: usize) -> Result<(String, f32)> {
+        let bad = || format!("TIDELM_GLM_HOT_ORACLE={v}: PATH,MIN (an earlier run's TIDELM_GLM_HOT_TRACE, MIN > 0)");
+        let (path, min) = v.rsplit_once(',').ok_or_else(bad)?;
+        let min: f32 = min.trim().parse().map_err(|_| bad())?;
+        if min <= 0.0 || path.is_empty() {
+            return Err(bad().into());
+        }
+        Ok((if rank == 0 { path.to_string() } else { format!("{path}.r{rank}") }, min))
+    }
+
+    /// The boot guard's word: the setting and this rank's file's FNV-1a sum ("" when unset)
+    pub fn guard(rank: usize) -> Result<String> {
+        let v = std::env::var("TIDELM_GLM_HOT_ORACLE").unwrap_or_default();
+        if v.is_empty() {
+            return Ok(String::new());
+        }
+        let (path, _) = Self::spec(&v, rank)?;
+        let b = std::fs::read(&path).map_err(|err| format!("TIDELM_GLM_HOT_ORACLE: {path}: {err}"))?;
+        let sum = b.iter().fold(0xcbf29ce484222325u64, |h, &c| (h ^ c as u64).wrapping_mul(0x100000001b3));
+        Ok(format!("{v} {sum:016x}"))
+    }
+
+    pub fn load(path: &str, min: f32, moe: &[usize], experts: usize, topk: usize) -> Result<Self> {
+        let b = std::fs::read(path).map_err(|err| format!("TIDELM_GLM_HOT_ORACLE: {path}: {err}"))?;
+        let short = || format!("TIDELM_GLM_HOT_ORACLE: {path}: not a whole hot trace");
+        let u32at = |o: usize| b.get(o..o + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap())).ok_or_else(short);
+        let f32at = |o: usize| b.get(o..o + 4).map(|s| f32::from_le_bytes(s.try_into().unwrap())).ok_or_else(short);
+        let ids = match b.get(..4) {
+            Some(b"GHT1") => false,
+            Some(b"GHT2") => true,
+            _ => return Err(short().into()),
+        };
+        let (n, e, k) = (u32at(4)? as usize, u32at(8)? as usize, u32at(12)? as usize);
+        let mut off = 16;
+        if (n, e, k) != (moe.len(), experts, topk) || (0..n).any(|i| u32at(off + 4 * i).ok() != Some(moe[i] as u32)) {
+            return Err(format!("TIDELM_GLM_HOT_ORACLE: {path}: another model's trace").into());
+        }
+        off += 4 * n + n * e;
+        let (mut rows, mut misses) = (Vec::new(), Vec::new());
+        while off < b.len() {
+            let t = u32at(off)? as usize;
+            off += 4 + if ids { 4 + 4 * t } else { 0 };
+            let mut m: Vec<(f32, usize, usize)> = Vec::new();
+            for (i, &l) in moe.iter().enumerate() {
+                for j in 0..t * k {
+                    let o = off + (i * t * k + j) * 8;
+                    let (v, x) = (f32at(o)?, f32at(o + 4)? as usize);
+                    if v >= min {
+                        match m.iter_mut().find(|c| (c.1, c.2) == (l, x)) {
+                            Some(c) => c.0 = c.0.max(v),
+                            None => m.push((v, l, x)),
+                        }
+                    }
+                }
+            }
+            off += n * t * k * 8;
+            off += 4 + 8 * u32at(off)? as usize;
+            rows.push(t as u32);
+            misses.push(m);
+        }
+        if off != b.len() {
+            return Err(short().into());
+        }
+        Ok(HotOracle { rows, misses })
+    }
+
+    /// The plan after pass `p` of `t` rows: the recorded run's misses >= MIN in pass p + 1.
+    pub fn next(&self, p: usize, t: usize) -> Result<&[(f32, usize, usize)]> {
+        if self.rows.get(p).copied() != Some(t as u32) {
+            return Err(format!("TIDELM_GLM_HOT_ORACLE: pass {p} has {t} rows, the recorded run's {:?}: not the same bench",
+                               self.rows.get(p)).into());
+        }
+        Ok(self.misses.get(p + 1).map(Vec::as_slice).unwrap_or(&[]))
+    }
+
+    pub fn summary(&self) -> (usize, usize) {
+        (self.rows.len(), self.misses.iter().map(Vec::len).sum())
+    }
+}
+
+/// GLM_HOT_PREDICT=DECAY,MIN,PER_LAYER[,REACT]: the async plan's candidates ranked by each
+/// (layer, expert)'s missed share accumulated over the pass's rows and decayed over passes
+/// (acc <- DECAY * acc + this pass's missed shares). Up to PER_LAYER a layer with acc >= MIN,
+/// the same per-step cap and victims; REACT=1 keeps the one heaviest missed pick of the pass
+/// (the plan without a predictor) first in every layer and adds these after it.
+/// Its guess: an expert missed in several rows, or in several recent passes, is the next
+/// pass's demand more surely than one row's single heavy miss. Both ranks update it from the
+/// same replicated table in the same order, so they plan the same reads without a message.
+pub struct HotPredict {
+    pub decay: f32,
+    pub min: f32,
+    pub per_layer: usize,
+    /// REACT=1: the engine's own candidate (each layer's heaviest missed pick >= 0.2) first,
+    /// the tally's after it; 0 (the 3-field form): the tally's alone - measured worse (+0.024 +-
+    /// 0.005 NLL on heldout_quick at 0.48 reads a token against 0.57): a one-off heavy miss never
+    /// reaches MIN, and heavy misses cost more than their share. REACT=1 (0.9,1.0,1,1) measured
+    /// worse too: +0.122 NLL, a collapse in one text (its next token 16.5 nats through the prefill
+    /// path, 16.6 as decode passes: the residency, not the path), and +0.005 +- 0.003 where nothing
+    /// collapses (16-token prefills), at 0.73 reads a token. Its own reads are good predictions (70%
+    /// picked the next pass, the rule's 34%) of light picks (0.008 picks >= 0.3 each in 16 passes,
+    /// the rule's 0.15); the extra reads cut a rule read's life 1098 -> 438 passes, and the heavy
+    /// misses left are first heavy picks (0.5% had one in the 16 passes before):
+    /// tools/glm_hot_eval.py
+    pub react: bool,
+    /// [MoE layer index][expert]
+    acc: Vec<f32>,
+}
+
+impl HotPredict {
+    pub fn parse(v: &str, layers: usize, experts: usize) -> Result<Option<Self>> {
+        let v = v.trim();
+        if v.is_empty() || v == "0" {
+            return Ok(None);
+        }
+        let f: Vec<&str> = v.split(',').map(str::trim).collect();
+        let bad = || format!("GLM_HOT_PREDICT={v}: DECAY,MIN,PER_LAYER[,REACT] (0 <= DECAY < 1, MIN > 0, PER_LAYER >= 1, REACT 0/1)");
+        if f.len() != 3 && f.len() != 4 {
+            return Err(bad().into());
+        }
+        let react = match f.get(3) {
+            None | Some(&"0") => false,
+            Some(&"1") => true,
+            _ => return Err(bad().into()),
+        };
+        let decay: f32 = f[0].parse().map_err(|_| bad())?;
+        let min: f32 = f[1].parse().map_err(|_| bad())?;
+        let per_layer: usize = f[2].parse().map_err(|_| bad())?;
+        if !(0.0..1.0).contains(&decay) || min <= 0.0 || per_layer == 0 {
+            return Err(bad().into());
+        }
+        Ok(Some(HotPredict { decay, min, per_layer, react, acc: vec![0.0; layers * experts] }))
+    }
+
+    /// One pass's table for MoE layer index `i` (its `t * topk` (share, expert) pairs) into the
+    /// accumulators: decay, then add every missed pick's share.
+    pub fn fold(&mut self, i: usize, experts: usize, row: &[f32]) {
+        let acc = &mut self.acc[i * experts..(i + 1) * experts];
+        for a in acc.iter_mut() {
+            *a *= self.decay;
+        }
+        for p in row.chunks_exact(2) {
+            if p[0] > 0.0 {
+                acc[p[1] as usize] += p[0];
+            }
+        }
+    }
+
+    /// Layer index `i`'s candidates (acc, expert), at most per_layer of them, heaviest first
+    /// (ties to the lower expert), among the experts `ok` allows.
+    pub fn candidates(&self, i: usize, experts: usize, ok: impl Fn(usize) -> bool) -> Vec<(f32, usize)> {
+        let acc = &self.acc[i * experts..(i + 1) * experts];
+        let mut c: Vec<(f32, usize)> = (0..experts).filter(|&x| acc[x] >= self.min && ok(x)).map(|x| (acc[x], x)).collect();
+        c.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1)));
+        c.truncate(self.per_layer);
+        c
+    }
+
+    /// A read was planned: its accumulator starts over (resident now, it is no candidate; if it
+    /// is evicted later, only its demand from then on counts).
+    pub fn taken(&mut self, i: usize, experts: usize, x: usize) {
+        self.acc[i * experts + x] = 0.0;
+    }
 }
 
 /// A background adaptation in flight: its reads (slot, layer, expert, done), the decoder pass
@@ -180,7 +399,8 @@ struct ReadJob {
 
 impl HotAsync {
     fn new(pack: &Pack, threads: usize, table_len: usize) -> Result<Self> {
-        Ok(HotAsync { table: PinnedBuffer::zeroed(table_len)?, jobs: readers(pack, threads)?, pending: vec![] })
+        Ok(HotAsync { table: PinnedBuffer::zeroed(table_len)?, jobs: readers(pack, threads)?, pending: vec![],
+                      predict: None, trace: None, plans: 0, oracle: None })
     }
 }
 
@@ -228,7 +448,8 @@ impl Res {
         for &(s, l, x) in placed {
             owner[s] = Some((l, x));
         }
-        Res { owner, swap_layers, score: vec![0.0; nl * e], bg_score: vec![0.0; nl * e], bg_last: vec![0.0; nl * e],
+        Res { owner, swap_layers, score: vec![0.0; nl * e], bg_score: vec![0.0; nl * e], bg_slow: vec![0.0; nl * e],
+              victim_slow: false, bg_last: vec![0.0; nl * e],
               bg_until: vec![0; nl * e], bg_period: 0, hot_q: vec![], db_mass: None, db_tokens: 0, db_path: None,
               demand_tokens: 0, stats: ResStats::default() }
     }
@@ -620,23 +841,26 @@ impl Engine {
             let w = demand[i] - self.res.bg_last[i];
             self.res.bg_last[i] = demand[i];
             self.res.bg_score[i] = self.res.bg_score[i] * BG_DECAY + w;
+            self.res.bg_slow[i] = self.res.bg_slow[i] * BG_SLOW + w;
         }
         let period = self.res.bg_period + 1;
         let floor = 2 * self.cfg.topk;
         let layers = self.res.swap_layers.clone();
         let mut left: std::collections::HashMap<usize, usize> =
             layers.iter().map(|&l| (l, (0..e).filter(|&x| self.lut_h[l * e + x] >= 0).count())).collect();
-        let mut cold: Vec<(f64, usize, usize)> = layers.iter().flat_map(|&l| (0..e).map(move |x| (l, x)))
+        let slow = self.res.victim_slow;
+        let mut cold: Vec<(f64, f64, usize, usize)> = layers.iter().flat_map(|&l| (0..e).map(move |x| (l, x)))
             .filter(|&(l, x)| {
                 let i = l * e + x;
                 self.lut_h[i] >= 0 && self.res.bg_score[i] < BG_COLD && self.res.bg_until[i] <= period
             })
-            .map(|(l, x)| (self.res.score[l * e + x] + demand[l * e + x], l, x)).collect();
-        cold.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then((a.1, a.2).cmp(&(b.1, b.2))));
+            .map(|(l, x)| (if slow { self.res.bg_slow[l * e + x] } else { 0.0 }, self.res.score[l * e + x] + demand[l * e + x], l, x))
+            .collect();
+        cold.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.partial_cmp(&b.1).unwrap()).then((a.2, a.3).cmp(&(b.2, b.3))));
         // up to `keep` victims a width class (a hot read keeps its expert only in its own class)
         let mut q = vec![];
         let mut per = vec![0usize; self.arena.classes.len()];
-        for (_, l, x) in cold {
+        for (_, _, l, x) in cold {
             let s = self.lut_h[l * e + x] as usize;
             let c = self.arena.class_of[s];
             if per[c] < keep && left[&l] > floor {
@@ -669,13 +893,24 @@ impl Engine {
         self.hot_release()?;
         let k = self.cfg.topk;
         let e = self.cfg.experts;
-        let (min_share, per_step, slot) = match self.hot.as_ref() {
-            Some(h) => (h.min_share, h.per_step, h.slot),
+        let (min_share, per_step, slot, rescue) = match self.hot.as_ref() {
+            // GLM_HOT_RESCUE (beside the async plan): the rescue threshold, RESCUE_STEP a pass
+            // with no linear pacing - a first occurrence can be any layer - and the heaviest
+            // *missed* pick (the sync path below takes the heaviest pick and gives up when it
+            // is resident; measured behavior, untouched)
+            Some(h) => match h.rescue {
+                Some(th) => (th, RESCUE_STEP, h.slot, true),
+                None => (h.min_share, h.per_step, h.slot, false),
+            },
             None => return Ok(()),
         };
         let reads = self.hot.as_ref().unwrap().reads;
         // linear pacing: the i-th of n MoE layers may bring the step's reads to ceil(cap * (i+1)/n)
-        let room = per_step.saturating_sub(reads).min((per_step * (idx + 1)).div_ceil(n_layers).saturating_sub(reads));
+        let room = if rescue {
+            per_step.saturating_sub(reads)
+        } else {
+            per_step.saturating_sub(reads).min((per_step * (idx + 1)).div_ceil(n_layers).saturating_sub(reads))
+        };
         if room == 0 {
             return Ok(());
         }
@@ -684,7 +919,8 @@ impl Engine {
         let mut best: Option<(f32, usize)> = None;
         for i in 0..t * k {
             let (v, x) = (hot.host[2 * i], hot.host[2 * i + 1] as usize);
-            if v >= min_share && best.is_none_or(|(bv, bx)| v > bv || (v == bv && x < bx)) {
+            if v >= min_share && (!rescue || (self.lut_h[l * e + x] < 0 && !self.adapt_pending(l * e + x)))
+                && best.is_none_or(|(bv, bx)| v > bv || (v == bv && x < bx)) {
                 best = Some((v, x));
             }
         }
@@ -715,6 +951,9 @@ impl Engine {
         self.allowed_h[l * e + x] = 1;
         self.lut_entry(l * e + x)?;
         self.res.stats.hot_reads += 1;
+        if rescue {
+            self.res.stats.hot_rescue += 1;
+        }
         self.res.stats.hot_s += t0.elapsed().as_secs_f64();
         Ok(())
     }
@@ -758,34 +997,75 @@ impl Engine {
     /// pick at or above the threshold (ties to the lower expert), the heaviest of those (ties to
     /// the lower layer) up to the step cap, each taking the next queued victim that still holds
     /// its slot. The victim stops being routable now; the reads start on the reader threads.
-    pub(crate) fn hot_plan(&mut self, t: usize) -> Result<()> {
+    /// With GLM_HOT_PREDICT the candidates are HotPredict's instead (the same cap and victims).
+    pub(crate) fn hot_plan(&mut self, ids: &[u32], pos0: usize) -> Result<()> {
+        let t = ids.len();
         let (e, k) = (self.cfg.experts, self.cfg.topk);
         let Some(h) = self.hot.as_ref() else { return Ok(()) };
-        let Some(a) = h.asynch.as_ref() else { return Ok(()) };
+        if h.asynch.is_none() || !self.hot_plan_on {
+            return Ok(());
+        }
         let w = crate::weights::MAX_ROWS * k * 2;
-        let mut cands: Vec<(f32, usize, usize)> = Vec::new();
-        for (i, &l) in self.moe_layers().iter().enumerate() {
-            let row = &a.table[i * w..i * w + t * k * 2];
-            let mut best: Option<(f32, usize)> = None;
-            for j in 0..t * k {
-                let (v, x) = (row[2 * j], row[2 * j + 1] as usize);
-                if v >= h.min_share && self.lut_h[l * e + x] < 0 && !self.adapt_pending(l * e + x)
-                    && best.is_none_or(|(bv, bx)| v > bv || (v == bv && x < bx)) {
-                    best = Some((v, x));
+        let per_step = h.per_step;
+        let min_share = h.min_share;
+        let moe: Vec<usize> = self.moe_layers().to_vec();
+        // (tier, score, layer, expert): the engine's own candidates tier 0, the tally's tier 1
+        let mut cands: Vec<(u8, f32, usize, usize)> = Vec::new();
+        // the predictor's state is folded with the table first (both ranks, same order)
+        let mut predict = self.hot.as_mut().unwrap().asynch.as_mut().unwrap().predict.take();
+        {
+            let a = self.hot.as_ref().unwrap().asynch.as_ref().unwrap();
+            for (i, &l) in moe.iter().enumerate() {
+                let row = &a.table[i * w..i * w + t * k * 2];
+                let mut best: Option<(f32, usize)> = None;
+                if predict.as_ref().is_none_or(|p| p.react) {
+                    for j in 0..t * k {
+                        let (v, x) = (row[2 * j], row[2 * j + 1] as usize);
+                        if v >= min_share && self.lut_h[l * e + x] < 0 && !self.adapt_pending(l * e + x)
+                            && best.is_none_or(|(bv, bx)| v > bv || (v == bv && x < bx)) {
+                            best = Some((v, x));
+                        }
+                    }
+                }
+                if let Some((v, x)) = best {
+                    cands.push((0, v, l, x));
+                }
+                if let Some(p) = predict.as_mut() {
+                    p.fold(i, e, row);
+                    let ok = |x: usize| self.lut_h[l * e + x] < 0 && !self.adapt_pending(l * e + x)
+                        && best.is_none_or(|(_, bx)| bx != x);
+                    for (v, x) in p.candidates(i, e, ok) {
+                        cands.push((1, v, l, x));
+                    }
                 }
             }
-            if let Some((v, x)) = best {
-                cands.push((v, l, x));
+        }
+        // TIDELM_GLM_HOT_ORACLE (debug): the recorded run's heavy misses of the next pass, first
+        {
+            let a = self.hot.as_ref().unwrap().asynch.as_ref().unwrap();
+            if let Some(o) = a.oracle.as_ref() {
+                for &(v, l, x) in o.next(a.plans, t)? {
+                    if self.lut_h[l * e + x] < 0 && !self.adapt_pending(l * e + x) {
+                        cands.retain(|c| (c.2, c.3) != (l, x));
+                        cands.push((0, 10.0 + v, l, x));
+                    }
+                }
             }
         }
-        cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap()); // stable: equal shares keep layer order
-        cands.truncate(h.per_step);
-        for (_, l, x) in cands {
+        // stable: equal shares keep layer order
+        cands.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.partial_cmp(&a.1).unwrap()));
+        cands.truncate(per_step);
+        let mut traced: Vec<u16> = Vec::new();
+        for (_, _, l, x) in cands {
             let r = self.pack.record(l, x)?;
             let Some((vl, ve, vs)) = self.take_victim(r.bits) else {
                 self.res.stats.hot_unkept += 1;
                 continue;
             };
+            if let Some(p) = predict.as_mut() {
+                p.taken(moe.binary_search(&l).unwrap(), e, x);
+            }
+            traced.extend([l as u16, x as u16, vl as u16, ve as u16]);
             self.lut_h[vl * e + ve] = -1;
             self.allowed_h[vl * e + ve] = 0;
             self.lut_entry(vl * e + ve)?;
@@ -797,6 +1077,133 @@ impl Engine {
             a.pending.push((vs, l, x, rx));
             self.res.stats.hot_reads += 1;
         }
+        let a = self.hot.as_mut().unwrap().asynch.as_mut().unwrap();
+        a.predict = predict;
+        a.plans += 1;
+        if a.trace.is_some() {
+            self.hot_trace_pass(ids, pos0, &traced)?;
+        }
+        Ok(())
+    }
+
+    /// TIDELM_GLM_HOT_TRACE: one pass appended - u32 rows, (GHT2:) u32 first row's position and
+    /// each row's u32 input token id, the table's rows of every MoE layer (f32 share, f32 expert pairs), u32 reads, then each
+    /// read's u16 (layer, expert, victim layer, victim expert). The file opens with the header
+    /// hot_trace_open wrote. The ids and position are for measuring predictors of a pass's routing
+    /// from what is known before it runs: its own tokens (an MTP draft's), and the routing of the
+    /// tokens before it in its sequence (the KV cache's) - unlike its hidden states.
+    fn hot_trace_pass(&mut self, ids: &[u32], pos0: usize, reads: &[u16]) -> Result<()> {
+        use std::io::Write;
+        let t = ids.len();
+        let k = self.cfg.topk;
+        let w = crate::weights::MAX_ROWS * k * 2;
+        let n = self.moe_layers().len();
+        let a = self.hot.as_mut().unwrap().asynch.as_mut().unwrap();
+        let mut b: Vec<u8> = Vec::with_capacity(8 + t * 4 + n * t * k * 8 + reads.len() * 2);
+        b.extend((t as u32).to_le_bytes());
+        b.extend((pos0 as u32).to_le_bytes());
+        for &id in ids {
+            b.extend(id.to_le_bytes());
+        }
+        for i in 0..n {
+            for v in &a.table[i * w..i * w + t * k * 2] {
+                b.extend(v.to_le_bytes());
+            }
+        }
+        b.extend(((reads.len() / 4) as u32).to_le_bytes());
+        for v in reads {
+            b.extend(v.to_le_bytes());
+        }
+        a.trace.as_mut().unwrap().write_all(&b)?;
+        Ok(())
+    }
+
+    /// The trace's header: magic "GHT2" ("GHT1": no token ids), u32 MoE layers, experts, topk, each MoE layer's u32
+    /// index, then the residency at the start, u8 a (MoE layer, expert).
+    fn hot_trace_open(&mut self, path: &str) -> Result<()> {
+        use std::io::Write;
+        let e = self.cfg.experts;
+        let moe: Vec<usize> = self.moe_layers().to_vec();
+        let mut b: Vec<u8> = b"GHT2".to_vec();
+        for v in [moe.len(), e, self.cfg.topk] {
+            b.extend((v as u32).to_le_bytes());
+        }
+        for &l in &moe {
+            b.extend((l as u32).to_le_bytes());
+        }
+        for &l in &moe {
+            b.extend((0..e).map(|x| (self.lut_h[l * e + x] >= 0) as u8));
+        }
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(&b)?;
+        self.hot.as_mut().unwrap().asynch.as_mut().unwrap().trace = Some(f);
+        eprintln!("[glm] hot trace: {path}");
+        Ok(())
+    }
+
+    /// TIDELM_GLM_VERIFY_PLAN=N (debug, both ranks): before the decode pass that follows the
+    /// N-th async plan, every resident slot checked against the pack byte for byte, every
+    /// owner against the LUT, and the device LUT / allowed against the host's. Changes nothing.
+    pub fn verify_residency(&mut self) -> Result<()> {
+        let want: usize = match std::env::var("TIDELM_GLM_VERIFY_PLAN").ok().and_then(|v| v.parse().ok()) {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+        if self.hot.as_ref().and_then(|h| h.asynch.as_ref()).is_none_or(|a| a.plans != want) {
+            return Ok(());
+        }
+        let t0 = Instant::now();
+        self.stream().synchronize()?;
+        let e = self.cfg.experts;
+        let (lut, allowed) = (self.lut.download()?, self.allowed.download()?);
+        let lut_bad = (0..lut.len()).filter(|&i| lut[i] != self.lut_h[i]).count();
+        let al_bad = (0..allowed.len()).filter(|&i| allowed[i] != self.allowed_h[i]).count();
+        let mut own_bad = 0;
+        for (i, &s) in self.lut_h.iter().enumerate() {
+            if s >= 0 && self.res.owner.get(s as usize).copied().flatten() != Some((i / e, i % e)) {
+                own_bad += 1;
+                if own_bad <= 5 {
+                    eprintln!("verify: lut ({}, {}) -> slot {s}, whose owner is {:?}", i / e, i % e, self.res.owner[s as usize]);
+                }
+            }
+        }
+        let mut buf = self.pack.buffer()?;
+        let (mut checked, mut bad) = (0usize, 0usize);
+        for s in 0..self.arena.slots - 1 {
+            let Some((l, x)) = self.res.owner[s] else { continue };
+            if self.lut_h[l * e + x] != s as i32 {
+                continue; // a victim whose read is in flight, or a stale owner: counted above if routed
+            }
+            let r = self.pack.read(l, x, &mut buf)?;
+            if r.bits != self.arena.bits(s) {
+                bad += 1;
+                eprintln!("verify: slot {s} ({l}, {x}) is of widths {:?}, its record {:?}", self.arena.bits(s), r.bits);
+                continue;
+            }
+            let mut off = 0;
+            let mut diff = vec![];
+            for (t, (dst, n)) in self.arena.slot_dsts(s).into_iter().enumerate() {
+                let mut h = vec![0u8; n];
+                unsafe {
+                    tidelm_cuda::memcpy_async(h.as_mut_ptr() as *mut c_void, dst as *const c_void, n,
+                                              tidelm_cuda::ffi::MEMCPY_DEVICE_TO_HOST, self.stream())?;
+                }
+                self.stream().synchronize()?;
+                if h[..] != buf[off..off + n] {
+                    diff.push(t);
+                }
+                off += n;
+            }
+            checked += 1;
+            if !diff.is_empty() {
+                bad += 1;
+                if bad <= 20 {
+                    eprintln!("verify: slot {s} ({l}, {x}) differs from the pack in tensors {diff:?}");
+                }
+            }
+        }
+        eprintln!("verify (plan {want}, rank {}): {checked} resident slots read back, {bad} differ; lut {lut_bad} / allowed {al_bad} \
+                   entries differ from the host's; {own_bad} lut entries not owned; {:.1} s", self.rank, t0.elapsed().as_secs_f64());
         Ok(())
     }
 
@@ -847,19 +1254,63 @@ impl Engine {
     }
 
     /// Hot reads on: synchronous between a decode pass's segments, or `asynch` (both need the
-    /// background period's victims to keep a read).
-    pub fn enable_hot(&mut self, asynch: bool) -> Result<()> {
-        // a decode pass's rows, as many as act.hot's region a layer holds: a pass of 9-16 rows (a short
-        // prompt prefilled on the decode path, two lanes' verify rows) copied past a table of
-        // VERIFY_ROWS (cudaMemcpyAsync: invalid argument, the engine down)
+    /// background period's victims to keep a read). `predict`: GLM_HOT_PREDICT's spec;
+    /// `rescue`: GLM_HOT_RESCUE's threshold (""/"0": off).
+    pub fn enable_hot(&mut self, asynch: bool, predict: &str, rescue: &str) -> Result<()> {
+        // the graphed pass runs up to MAX_ROWS rows and the segment path copies every row's
+        // candidates into the host buffer: sized by VERIFY_ROWS it overran 512 bytes at 9-16
+        // rows and cudaMemcpyAsync failed with invalid argument (the sync path's latent bug,
+        // 2026-11-08; the async path never copies per layer, which hid it)
         let rows = crate::weights::MAX_ROWS;
         // the decoder arena's last slot is the transient one (forward.rs class_arena)
         let mut h = Hot::new(self.arena.slots - 1, self.pack.max_record, rows, self.cfg.topk)?;
+        let p = HotPredict::parse(predict, self.moe_layers().len(), self.cfg.experts)?;
+        if p.is_some() && !asynch {
+            return Err("GLM_HOT_PREDICT plans async hot reads: it needs GLM_HOT_ASYNC=1".into());
+        }
+        let r = rescue.trim();
+        let r = if r.is_empty() || r == "0" {
+            None
+        } else {
+            let th: f32 = r.parse().map_err(|_| format!("GLM_HOT_RESCUE={r}: TH (0 < TH <= 1, a missed pick's share read inline)"))?;
+            if !(0.0..=1.0).contains(&th) {
+                return Err(format!("GLM_HOT_RESCUE={r}: TH (0 < TH <= 1, a missed pick's share read inline)").into());
+            }
+            if !asynch {
+                return Err("GLM_HOT_RESCUE reads inline beside the async plan: it needs GLM_HOT_ASYNC=1".into());
+            }
+            Some(th)
+        };
+        h.rescue = r;
+        h.rescue_boot = r;
         if asynch {
             let len = self.moe_layers().len() * crate::weights::MAX_ROWS * self.cfg.topk * 2;
-            h.asynch = Some(HotAsync::new(&self.pack, h.per_step.min(8), len)?);
+            let mut a = HotAsync::new(&self.pack, h.per_step.min(8), len)?;
+            a.predict = p;
+            h.asynch = Some(a);
         }
         self.hot = Some(h);
+        if asynch {
+            // rank 1 traces too (PATH.r1, on its own box): replicated routing means the two
+            // files are the same bytes, and a pair that plans apart shows where
+            if let Ok(path) = std::env::var("TIDELM_GLM_HOT_TRACE") {
+                if !path.is_empty() {
+                    let path = if self.rank == 0 { path } else { format!("{path}.r{}", self.rank) };
+                    self.hot_trace_open(&path)?;
+                }
+            }
+        }
+        let v = std::env::var("TIDELM_GLM_HOT_ORACLE").unwrap_or_default();
+        if !v.is_empty() {
+            if !asynch {
+                return Err("TIDELM_GLM_HOT_ORACLE plans async hot reads: it needs GLM_HOT_ASYNC=1".into());
+            }
+            let (path, min) = HotOracle::spec(&v, self.rank)?;
+            let o = HotOracle::load(&path, min, &self.moe_layers().to_vec(), self.cfg.experts, self.cfg.topk)?;
+            let (np, nm) = o.summary();
+            eprintln!("[glm] hot oracle: {path}, misses >= {min}: {nm} in {np} passes");
+            self.hot.as_mut().unwrap().asynch.as_mut().unwrap().oracle = Some(o);
+        }
         ck(0, "")
     }
 }
@@ -867,6 +1318,102 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hot_predict_accumulates_missed_shares_over_rows_and_decays_over_passes() {
+        let e = 4usize;
+        let mut p = HotPredict::parse("0.5,0.3,2", 2, e).unwrap().unwrap();
+        // layer index 1, two rows: expert 2 missed in both (0.2 + 0.15), expert 1 resident
+        // (negated, ignored), expert 3 missed once (0.25)
+        let row = [0.2, 2.0, -0.4, 1.0, 0.15, 2.0, 0.25, 3.0];
+        p.fold(1, e, &row);
+        assert!((p.acc[e + 2] - 0.35).abs() < 1e-6);
+        assert_eq!(p.acc[e + 1], 0.0);
+        assert_eq!(p.acc[e + 3], 0.25);
+        assert!(p.acc[..e].iter().all(|&x| x == 0.0));
+        // one row's 0.25 is below MIN, the two rows' 0.35 is not: the sum, not the max, ranks
+        assert_eq!(p.candidates(1, e, |_| true), vec![(p.acc[e + 2], 2)]);
+        // a pass with no misses halves both; another miss of 3 at 0.2 lifts it to 0.325
+        p.fold(1, e, &[-0.5, 1.0]);
+        p.fold(1, e, &[0.2, 3.0]);
+        assert!((p.acc[e + 3] - (0.25 * 0.25 + 0.2)).abs() < 1e-6);
+        // `ok` excludes (a resident or a pending newcomer); per_layer caps, heaviest first
+        p.acc[e] = 0.9;
+        assert_eq!(p.candidates(1, e, |_| true).iter().map(|c| c.1).collect::<Vec<_>>(), vec![0]);
+        p.acc[e + 3] = 0.5;
+        assert_eq!(p.candidates(1, e, |_| true).iter().map(|c| c.1).collect::<Vec<_>>(), vec![0, 3]);
+        assert_eq!(p.candidates(1, e, |x| x != 0).iter().map(|c| c.1).collect::<Vec<_>>(), vec![3]);
+        // a planned read starts its expert over
+        p.taken(1, e, 0);
+        assert_eq!(p.acc[e], 0.0);
+    }
+
+    #[test]
+    fn hot_oracle_reads_the_next_passes_heavy_misses_of_a_trace() {
+        // 2 MoE layers (3, 5) of 4 experts, top-2; pass 0 one row, pass 1 two rows
+        let (moe, e, k) = ([3usize, 5], 4usize, 2usize);
+        let mut b: Vec<u8> = b"GHT1".to_vec();
+        for v in [2u32, 4, 2, 3, 5] {
+            b.extend(v.to_le_bytes());
+        }
+        b.extend([1u8; 8]);
+        let pass = |b: &mut Vec<u8>, t: u32, pairs: &[(f32, f32)], reads: u32| {
+            b.extend(t.to_le_bytes());
+            for &(v, x) in pairs {
+                b.extend(v.to_le_bytes());
+                b.extend(x.to_le_bytes());
+            }
+            b.extend(reads.to_le_bytes());
+            b.extend(vec![0u8; 8 * reads as usize]);
+        };
+        pass(&mut b, 1, &[(0.5, 1.0), (-0.4, 2.0), (0.1, 0.0), (0.2, 3.0)], 1);
+        // layer 3: expert 2 missed at 0.35 and 0.3 (one entry, its max), a resident 0.6 (negated);
+        // layer 5: expert 0 at 0.29 (below MIN)
+        pass(&mut b, 2, &[(0.35, 2.0), (-0.6, 1.0), (0.3, 2.0), (0.1, 0.0),
+                          (0.29, 0.0), (0.2, 1.0), (0.05, 3.0), (0.01, 2.0)], 0);
+        let path = std::env::temp_dir().join(format!("hot_oracle_test_{}.trace", std::process::id()));
+        std::fs::write(&path, &b).unwrap();
+        let o = HotOracle::load(path.to_str().unwrap(), 0.3, &moe, e, k).unwrap();
+        assert_eq!(o.summary(), (2, 2));
+        assert_eq!(o.next(0, 1).unwrap(), &[(0.35, 3, 2)]);
+        assert!(o.next(1, 2).unwrap().is_empty());
+        assert!(o.next(0, 2).is_err());
+        assert!(HotOracle::load(path.to_str().unwrap(), 0.3, &[3, 6], e, k).is_err());
+        std::fs::write(&path, &b[..b.len() - 3]).unwrap();
+        assert!(HotOracle::load(path.to_str().unwrap(), 0.3, &moe, e, k).is_err());
+        // the same as GHT2: each pass's first position and row ids after its row count
+        // (header 32 bytes; pass 0 at 32: rows, 4 pairs, 1 read, to 80; pass 1 at 80: rows, 8 pairs, 0 reads)
+        assert_eq!(b.len(), 152);
+        let mut b2: Vec<u8> = b"GHT2".to_vec();
+        b2.extend(&b[4..32]);
+        b2.extend([1u32, 40, 7].iter().flat_map(|v| v.to_le_bytes()));
+        b2.extend(&b[36..80]);
+        b2.extend([2u32, 41, 8, 9].iter().flat_map(|v| v.to_le_bytes()));
+        b2.extend(&b[84..]);
+        std::fs::write(&path, &b2).unwrap();
+        let o = HotOracle::load(path.to_str().unwrap(), 0.3, &moe, e, k).unwrap();
+        assert_eq!(o.summary(), (2, 2));
+        assert_eq!(o.next(0, 1).unwrap(), &[(0.35, 3, 2)]);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(HotOracle::spec("/a/b.trace,0.4", 1).unwrap(), ("/a/b.trace.r1".to_string(), 0.4));
+        assert!(HotOracle::spec("/a/b.trace", 0).is_err());
+        assert!(HotOracle::spec("/a/b.trace,0", 0).is_err());
+    }
+
+    #[test]
+    fn hot_predict_settings_parse_or_refuse() {
+        assert!(HotPredict::parse("", 2, 4).unwrap().is_none());
+        assert!(HotPredict::parse("0", 2, 4).unwrap().is_none());
+        assert!(HotPredict::parse("1.0,0.3,1", 2, 4).is_err());
+        assert!(HotPredict::parse("0.5,0,1", 2, 4).is_err());
+        assert!(HotPredict::parse("0.5,0.3,0", 2, 4).is_err());
+        assert!(HotPredict::parse("0.5,0.3", 2, 4).is_err());
+        let p = HotPredict::parse(" 0.25, 0.4, 3 ", 2, 4).unwrap().unwrap();
+        assert_eq!((p.decay, p.min, p.per_layer, p.react, p.acc.len()), (0.25, 0.4, 3, false, 8));
+        assert!(HotPredict::parse("0.9,1.0,1,1", 2, 4).unwrap().unwrap().react);
+        assert!(!HotPredict::parse("0.9,1.0,1,0", 2, 4).unwrap().unwrap().react);
+        assert!(HotPredict::parse("0.9,1.0,1,2", 2, 4).is_err());
+    }
 
     #[test]
     fn conv_votes_fold_per_layer_normalized_and_accumulate() {

@@ -923,7 +923,7 @@ fn absorb_and_router() {
             assert_eq!(ids[r * 8 + k], 1000 + rch[k] as i32);
             assert!((rw[r * 8 + k] - rwt[k]).abs() < 1e-6);
             let miss = ech[k] % 3 == 0;
-            assert_eq!(hot[(r * 8 + k) * 2], if miss { ewt[k] / 2.5 } else { 0.0 });
+            assert_eq!(hot[(r * 8 + k) * 2], if miss { ewt[k] / 2.5 } else { -(ewt[k] / 2.5) });
             assert_eq!(hot[(r * 8 + k) * 2 + 1], ech[k] as f32);
             want_dem[ech[k]] += ewt[k] as f64;
             missed += miss as u32 as f64;

@@ -5,7 +5,7 @@
 //!
 //!   tidelm-server --model-dir DIR --pack PACK_r{rank}of2.bin --db HISTORY [--world 2 --rank R
 //!                 --addr H:P] [--slots 12500] [--max-seq 262144] [--chunk 4096] [--graphs]
-//!                 [--hot 1] [--hot-async 0] [--hot-keep 32] [--depth 7] [--cal 0.36 | --dyn 0.9] [--lookup 8] [--copy 1]
+//!                 [--hot 1] [--hot-async 0] [--hot-keep 32] [--hot-rescue 0.4] [--depth 7] [--cal 0.36 | --dyn 0.9] [--lookup 8] [--copy 1]
 //!                 [--adapt 1] [--adapt-every 200] [--adapt-prefill 512] [--adapt-decode 256]
 //!                 [--bg-every 2] [--loop-break 12] [--two-pass 512] [--two-pass-miss 0.15] [--preload 512]
 //!                 [--lanes 1] [--lane-chunk 1024]
@@ -34,7 +34,7 @@ pub fn is_glm(model_dir: &std::path::Path) -> bool {
 }
 
 pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
-    const VALUED: [&str; 54] = ["--exlr8-round", "--kv-tokens", "--bench-nll-ab", "--bench-nll-adapt", "--bench-prefill-ab", "--bench-ab", "--bench-ab-rounds", "--bench-nll-skip", "--bench-nll-rows", "--bench-nll-max", "--lanes", "--lane-chunk", "--bench-nll-out", "--bench-nll", "--bench-widths", "--copy", "--hot-async", "--bench-width", "--bench-ctx", "--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
+    const VALUED: [&str; 57] = ["--exlr8-round", "--kv-tokens", "--bench-nll-ab", "--bench-nll-adapt", "--hot-predict", "--hot-victim", "--hot-rescue", "--bench-prefill-ab", "--bench-ab", "--bench-ab-rounds", "--bench-nll-skip", "--bench-nll-rows", "--bench-nll-max", "--lanes", "--lane-chunk", "--bench-nll-out", "--bench-nll", "--bench-widths", "--copy", "--hot-async", "--bench-width", "--bench-ctx", "--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
                                 "--max-seq", "--chunk", "--hot", "--hot-keep", "--depth", "--cal", "--dyn", "--lookup",
                                 "--adapt", "--adapt-every", "--adapt-prefill", "--adapt-decode", "--bg-every", "--loop-break",
                                 "--two-pass", "--two-pass-miss", "--host", "--port", "--served-model-name", "--moe-rows",
@@ -77,9 +77,12 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         moe_rows: num("--moe-rows", 2048.0)? as usize,
         pack: PathBuf::from(&pack),
         lanes: num("--lanes", 1.0)? as usize,
-        guard_extra: format!("graphs {} hot {} async {} prefix {} gb {} preload {} exlr8-round {}", args.iter().any(|a| a == "--graphs"),
+        guard_extra: format!("graphs {} hot {} async {} predict {} victim {} rescue {} oracle {} prefix {} gb {} preload {} exlr8-round {}",
+                             args.iter().any(|a| a == "--graphs"),
                              arg(args, "--hot").unwrap_or_else(|| "1".into()), arg(args, "--hot-async").unwrap_or_default(),
-                             arg(args, "--prefix-disk").is_some(), arg(args, "--prefix-disk-gb").unwrap_or_default(),
+                             arg(args, "--hot-predict").unwrap_or_default(), arg(args, "--hot-victim").unwrap_or_default(),
+                             arg(args, "--hot-rescue").unwrap_or_default(),
+                             tidelm_glm::adapt::HotOracle::guard(rank)?, arg(args, "--prefix-disk").is_some(), arg(args, "--prefix-disk-gb").unwrap_or_default(),
                              arg(args, "--preload").unwrap_or_default(), if exlr8_exact { "exact" } else { "fast" }),
     };
     tidelm_cuda::set_device(0)?;
@@ -139,7 +142,15 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         return Err("--hot-async 1 needs --hot 1, --adapt 1 and the background period's victims (--bg-every, --hot-keep)".into());
     }
     if num("--hot", 1.0)? > 0.0 {
-        eng.enable_hot(hot_async)?;
+        eng.enable_hot(hot_async, &arg(args, "--hot-predict").unwrap_or_default(),
+                       &arg(args, "--hot-rescue").unwrap_or_default())?;
+        // --hot-victim slow (GLM_HOT_VICTIM): kept hot reads' cold victims ranked by slowly
+        // decayed demand first (adapt.rs BG_SLOW), else by the long-run score
+        eng.res.victim_slow = match arg(args, "--hot-victim").as_deref() {
+            None | Some("") | Some("score") => false,
+            Some("slow") => true,
+            Some(v) => return Err(format!("--hot-victim {v}: score or slow").into()),
+        };
     }
     // GLM-5.3-Flash's image input (GLM_VISION=1): the tower and a request's features on demand
     if eng.cfg.is_flash() && std::env::var("GLM_VISION").as_deref() == Ok("1") {
@@ -260,8 +271,9 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
                 srv.eng.bench_knob_reset(knob)?;
             }
         } else {
-            // --bench-nll-adapt 0: no adaptation in the bench (with GLM_HOT=0 the residents are the
-            // boot's: two packs of one history are then scored over the same experts)
+            // --bench-nll-adapt 0: no adaptation in the bench. Residents then move only by hot reads,
+            // which a TIDELM_GLM_HOT_TRACE replay can follow; with GLM_HOT=0 they are the boot's, and
+            // two packs of one history are scored over the same experts.
             let adapt = num("--bench-nll-adapt", 1.0)? > 0.0;
             bench_nll(&mut srv.eng, &path, &text, keep, arg(args, "--bench-nll-out"), &shape, last, adapt)?;
         }
@@ -487,6 +499,39 @@ fn bench_widths(eng: &mut Engine, ids: &[u32], ctx: usize, widths: &[usize]) -> 
 /// reads, the background period's victims every 2 passes, an adaptation every 200 tokens). A row's
 /// next token's -log p at T = 1 comes from the pair's candidates, or the whole row when it is not
 /// among them; top-1 is the row's argmax. Texts are cut at 4,096 tokens.
+/// The NLL of `t` from a pass's row `r` (bench_nll's formula), and the row's top candidate.
+fn row_nll(eng: &mut Engine, r: usize, t: u32) -> tidelm_engine::Result<(f64, u32)> {
+    let rc = eng.candidates(r);
+    let m = rc.lse.iter().map(|x| x.0).fold(f32::NEG_INFINITY, f32::max);
+    let z: f64 = rc.lse.iter().map(|&(mr, s)| s as f64 * ((mr - m) as f64).exp()).sum();
+    let zt = match rc.ids.iter().position(|&x| x == t) {
+        Some(j) => rc.vals[j] as f64,
+        None => eng.full_row(r)?[t as usize] as f64,
+    };
+    let top = rc.vals.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(j, _)| rc.ids[j]).unwrap_or(0);
+    Ok((m as f64 + z.ln() - zt, top))
+}
+
+/// TIDELM_GLM_PREFILL_CHECK: the prefill just made (its last row's candidates) against the same
+/// tokens again as decode passes of up to 8 rows, hot reads held; the decode passes' KV stays.
+fn prefill_check(eng: &mut Engine, ids: &[u32], skip: usize, n: usize) -> tidelm_engine::Result<()> {
+    let (a, ta) = row_nll(eng, 0, ids[skip])?;
+    eng.bench_knob("hot_plan", false)?;
+    eng.set_pos(0)?;
+    let mut c = 0;
+    let mut last = 0;
+    while c < skip {
+        let m = (skip - c).min(8);
+        eng.forward(&ids[c..c + m], false)?;
+        last = m;
+        c += m;
+    }
+    let (b, tb) = row_nll(eng, last - 1, ids[skip])?;
+    eng.bench_knob("hot_plan", true)?;
+    eprintln!("prefill check, text {n}: next-token NLL {a:.4} through the prefill path (top {ta}), {b:.4} as decode passes (top {tb})");
+    Ok(())
+}
+
 fn bench_nll(eng: &mut Engine, path: &str, text: &Text, keep: usize, out: Option<String>,
              (skip, rows, max): &(usize, Vec<usize>, usize), last: bool, adapt: bool) -> tidelm_engine::Result<()> {
     eng.set_sampling(Some(1.0))?;
@@ -495,6 +540,13 @@ fn bench_nll(eng: &mut Engine, path: &str, text: &Text, keep: usize, out: Option
     let mut acc: std::collections::BTreeMap<String, (f64, f64, f64, usize)> = Default::default();
     let t0 = Instant::now();
     let mut nans = 0usize;
+    // the scored passes' miss counters [picks, missed, mass, missed mass], hot reads, and passes
+    let (mut miss, s0, mut npass) = ([0f64; 4], (eng.res.stats.hot_reads, eng.res.stats.hot_unkept, eng.res.stats.hot_wait_s,
+                                                  eng.res.stats.hot_rescue), 0usize);
+    // TIDELM_GLM_PREFILL_CHECK=N (debug): text N's prefill computed twice, through the prefill
+    // path and as decode passes of 8 rows (no hot reads planned between), the last row compared
+    let check: Option<usize> = std::env::var("TIDELM_GLM_PREFILL_CHECK").ok().and_then(|v| v.parse().ok());
+    let mut ntext = 0usize;
     for line in std::fs::read_to_string(path)?.lines().filter(|l| !l.trim().is_empty()) {
         let v: serde_json::Value = serde_json::from_str(line)?;
         let cat = v["category"].as_str().unwrap_or("all").to_string();
@@ -505,9 +557,14 @@ fn bench_nll(eng: &mut Engine, path: &str, text: &Text, keep: usize, out: Option
         let ids = &ids[..ids.len().min(*max)];
         eng.set_pos(0)?;
         eng.forward(&ids[..*skip], false)?;
+        if check.is_some_and(|c| c == ntext) {
+            prefill_check(eng, &ids, *skip, ntext)?;
+        }
+        ntext += 1;
         if adapt {
             eng.adapt(512)?;
         }
+        let ma = eng.miss_totals()?;
         let (mut i, mut since, mut passes) = (*skip, 0usize, 0usize);
         let a = acc.entry(cat).or_default();
         while i + 1 < ids.len() {
@@ -549,6 +606,11 @@ fn bench_nll(eng: &mut Engine, path: &str, text: &Text, keep: usize, out: Option
                 since = 0;
             }
         }
+        let mb = eng.miss_totals()?;
+        for j in 0..4 {
+            miss[j] += mb[j] - ma[j];
+        }
+        npass += passes;
     }
     let (mut tn, mut tsum) = (0usize, 0f64);
     for (cat, (s, s2, top, n)) in &acc {
@@ -560,6 +622,12 @@ fn bench_nll(eng: &mut Engine, path: &str, text: &Text, keep: usize, out: Option
     }
     eprintln!("bench-nll: all: {tn} tokens, NLL {:.4}, {:.0} s, {nans} rows with NaN", tsum / tn.max(1) as f64,
               t0.elapsed().as_secs_f64());
+    let st = &eng.res.stats;
+    let reads = st.hot_reads - s0.0;
+    eprintln!("bench-nll: scored passes {npass}: miss {:.2}% (by score {:.2}%), hot reads {reads} ({:.2} a pass, {:.3} a token; \
+               {} unkept, {} inline rescues, {:.2} s waited)", 100.0 * miss[1] / miss[0].max(1.0), 100.0 * miss[3] / miss[2].max(1e-20),
+              reads as f64 / npass.max(1) as f64, reads as f64 / tn.max(1) as f64, st.hot_unkept - s0.1, st.hot_rescue - s0.3,
+              st.hot_wait_s - s0.2);
     if last {
         eng.stop_follower()?;
     }

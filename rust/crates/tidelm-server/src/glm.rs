@@ -13,12 +13,13 @@
 //!   top_k; generation_config has none either).
 //! - answers: reasoning_content, content and tool_calls (parsed once the answer is done), usage
 //!   with the engine's stats under `muse`. Streamed: one chunk per routed delta, a `: keepalive`
-//!   comment after a second without one while tokens flow, all tool calls in one chunk at the
-//!   end, usage and the stats on the final chunk.
+//!   comment after a second without one (while the prompt is queued or prefills too), all tool
+//!   calls in one chunk at the end, usage and the stats on the final chunk.
 
 use std::io::Write;
 use std::net::TcpStream;
 use std::path::Path;
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -387,6 +388,20 @@ impl Sse<'_> {
     }
 }
 
+/// Whether the client closed its end of `s`: a read would return end of file now (a peek that
+/// does not wait). Bytes waiting (a pipelined request) or none yet both mean it is still there.
+fn closed(s: &TcpStream) -> bool {
+    if s.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let r = s.peek(&mut [0u8; 1]);
+    let _ = s.set_nonblocking(false);
+    match r {
+        Ok(n) => n == 0,
+        Err(e) => !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted),
+    }
+}
+
 /// A request through the engine: `body` is a chat request's (None: /v1/completions), which the
 /// conversation log records and whose x_debug puts the prompt and answer ids in the stats
 #[allow(clippy::too_many_arguments)]
@@ -411,6 +426,8 @@ fn run(stream: &mut TcpStream, ctx: &Ctx, g: &GlmSettings, req: Request, tools: 
         let _ = ctx.engine.send(Cmd::Cancel(id));
         Failure::Io
     };
+    // the socket again, for the closed-client check while the stream is borrowed for writing
+    let probe = stream.try_clone().ok();
     let mut sse = None;
     if streaming {
         start_events(stream)?;
@@ -418,8 +435,27 @@ fn run(stream: &mut TcpStream, ctx: &Ctx, g: &GlmSettings, req: Request, tools: 
         s.send(&chunk(json!({"role": "assistant"}), Value::Null)).map_err(gone)?;
         sse = Some(s);
     }
+    // The engine says nothing while a prompt is queued or prefills: minutes for a 150K-token
+    // prompt. A keepalive a second (streamed) keeps a client's idle timeout from firing and
+    // retrying, which prefills the prompt a second time beside the first. A closed client is
+    // noticed here too, not at its first token (and a write into a closed socket succeeds once):
+    // its cancel ends it in the queue at once, and a prefill beside another lane at its next
+    // part. A prefill alone still runs to its end; the engine takes the cancel after it.
+    // 2026-11-09: a 152K-token prompt re-prefilled from token 7 (the request's reasoning effort
+    // changed, and the template writes it near the start) was silent for 363 s. The client (a
+    // Node agent) retried after 300 s of silence, and the retry did the same. That retry's
+    // 428 s prefill, for a client already gone, held the other lane's decode to 1-2 tok/s.
     let (finish, gen) = loop {
-        match rx.recv() {
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(s) = sse.as_mut() {
+                    s.keepalive().map_err(gone)?;
+                }
+                if probe.as_ref().is_some_and(closed) {
+                    let _ = ctx.engine.send(Cmd::Cancel(id));
+                    return Err(Failure::Io);
+                }
+            }
             Ok(Event::Tokens(t)) => {
                 first.get_or_insert_with(|| t0.elapsed().as_secs_f64());
                 let before = answer.tokens();
@@ -442,7 +478,9 @@ fn run(stream: &mut TcpStream, ctx: &Ctx, g: &GlmSettings, req: Request, tools: 
                 return Err(ApiError { status: 500, message: e, param: None }.into());
             }
             Ok(Event::Done(f, gen)) => break (f, gen),
-            Err(_) => return Err(ApiError { status: 500, message: "the engine dropped the request".into(), param: None }.into()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(ApiError { status: 500, message: "the engine dropped the request".into(), param: None }.into())
+            }
         }
     };
     let tail = answer.finish(&ctx.text);

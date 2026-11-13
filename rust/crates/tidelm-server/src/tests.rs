@@ -10,6 +10,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tidelm_engine::decode::{Event, Finish, Generation};
@@ -30,6 +31,11 @@ fn dir(var: &str, default: &str) -> Option<PathBuf> {
 struct Engine {
     jobs: Mutex<Vec<(Vec<u32>, usize, Vec<u32>)>>,
     answer: Mutex<Vec<u32>>,
+    /// silence before a job's first event (a prompt queued or prefilling); a cancel meanwhile
+    /// ends the job, as the scheduler ends a queued one
+    delay: Mutex<Duration>,
+    /// the cancels the routes sent
+    cancels: Mutex<Vec<u64>>,
 }
 
 impl Engine {
@@ -39,7 +45,7 @@ impl Engine {
 }
 
 /// A server on 127.0.0.1 with `family`; the engine thread answers every job with
-/// `engine.answer`, three tokens a step, reusing 7 prompt tokens.
+/// `engine.answer`, three tokens a step, reusing 7 prompt tokens, after `engine.delay`.
 fn serve(text: Text, family: Family, eos: u32, max_seq: usize, api_keys: Vec<String>) -> (String, Arc<Engine>, Arc<Ctx>) {
     serve_with(text, family, eos, max_seq, api_keys, None)
 }
@@ -67,9 +73,35 @@ fn serve_with(text: Text, family: Family, eos: u32, max_seq: usize, api_keys: Ve
     });
     let e = engine.clone();
     std::thread::spawn(move || {
-        for cmd in rx {
-            let Cmd::Submit(mut job) = cmd else { continue };
+        while let Ok(cmd) = rx.recv() {
+            let mut job = match cmd {
+                Cmd::Submit(job) => job,
+                Cmd::Cancel(id) => {
+                    e.cancels.lock().unwrap().push(id);
+                    continue;
+                }
+            };
             e.jobs.lock().unwrap().push((job.prompt.clone(), job.max_tokens, job.stop.clone()));
+            let until = Instant::now() + *e.delay.lock().unwrap();
+            let mut cancelled = false;
+            while !cancelled {
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                match rx.recv_timeout(left) {
+                    Ok(Cmd::Cancel(id)) => {
+                        e.cancels.lock().unwrap().push(id);
+                        cancelled = id == job.id;
+                    }
+                    Ok(Cmd::Submit(_)) => panic!("the fake engine takes one job at a time"),
+                    Err(_) => {}
+                }
+            }
+            if cancelled {
+                (job.sink)(Event::Done(Finish::Cancelled, Generation::default()));
+                continue;
+            }
             let answer = e.answer.lock().unwrap().clone();
             let mut gen = Generation { cached: 7, ..Default::default() };
             let mut finish = Finish::Length;
@@ -534,6 +566,59 @@ fn api_key_auth() {
 /// DSV41_DREAM's log on the GLM routes: the client's body and the parsed reply, plus the exact
 /// prompt ids the engine was given and the answer's ids through the stop id (a drafter's training
 /// sequence), the same ids x_debug returns; /v1/messages logged too; /v1/completions not.
+/// GLM streamed: while the prompt is queued or prefills (no event for 3.5 s here; minutes for a
+/// 150K-token one), SSE keepalive comments go out before the first delta, so a client's idle
+/// timeout does not fire and retry the prompt; the answer is as without the wait.
+#[test]
+fn glm_stream_keepalive_while_prefilling() {
+    let Some((addr, engine, ctx)) = glm() else {
+        eprintln!("GLM tokenizer not present; skipping");
+        return;
+    };
+    *engine.answer.lock().unwrap() = ctx.text.encode("</think>Hello!<|user|>").unwrap();
+    *engine.delay.lock().unwrap() = Duration::from_millis(3500);
+    let body = json!({"messages": [{"role": "user", "content": "Hi"}], "stream": true});
+    let (status, _, out) = post(&addr, "/v1/chat/completions", &body);
+    assert_eq!(status, 200, "{out}");
+    let first = out.find("Hello").expect("the answer");
+    let keep = out[..first].matches(": keepalive").count();
+    assert!(keep >= 2, "{keep} keepalives before the first delta in {out:?}");
+    let text: String = sse_data(&out).iter().filter_map(|c| c["choices"][0]["delta"]["content"].as_str()).collect();
+    assert_eq!(text, "Hello!");
+    assert!(engine.cancels.lock().unwrap().is_empty());
+}
+
+/// GLM: a client that leaves while its prompt is queued or prefills is noticed then, not at its
+/// first token - streamed (the keepalive's write) or not (the socket's end of file) - and its
+/// request cancelled, so the engine does not prefill for nobody.
+#[test]
+fn glm_left_client_cancels_while_prefilling() {
+    let Some((addr, engine, _)) = glm() else {
+        eprintln!("GLM tokenizer not present; skipping");
+        return;
+    };
+    *engine.delay.lock().unwrap() = Duration::from_secs(20);
+    for (n, stream) in [(1, false), (2, true)] {
+        let body = json!({"messages": [{"role": "user", "content": "Hi"}], "stream": stream}).to_string();
+        let mut s = TcpStream::connect(&addr).unwrap();
+        write!(s, "POST /v1/chat/completions HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+               body.len()).unwrap();
+        // the request is in the engine before the client leaves
+        let t0 = Instant::now();
+        while engine.jobs.lock().unwrap().len() < n {
+            assert!(t0.elapsed() < Duration::from_secs(5), "the request never reached the engine");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(s);
+        let t0 = Instant::now();
+        while engine.cancels.lock().unwrap().len() < n {
+            assert!(t0.elapsed() < Duration::from_secs(5), "no cancel {:.1} s after the client left (stream {stream})",
+                    t0.elapsed().as_secs_f64());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
 #[test]
 fn glm_conversation_log() {
     let Some(d) = dir("GLM_TOKENIZER_DIR", "models/GLM-5.3-EXL3-3.0bpw") else {

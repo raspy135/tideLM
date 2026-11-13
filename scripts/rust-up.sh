@@ -117,6 +117,15 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
           --adapt-decode "${GLM_ADAPT_DECODE_SWAPS:-256}" --bg-every "$bg" --loop-break "${GLM_LOOP_BREAK:-0}"
           --two-pass "${GLM_PREFILL_TWO_PASS:-0}" --two-pass-miss "${GLM_PREFILL_TWO_PASS_MISS:-0}"
           --preload "${GLM_PRELOAD:-0}")
+    # GLM_HOT_PREDICT=DECAY,MIN,PER_LAYER[,REACT]: async hot reads chosen by recent missed demand,
+    # REACT=1 after the engine's own heaviest-miss candidates (unset: off; adapt.rs HotPredict)
+    [[ -n "${GLM_HOT_PREDICT:-}" ]] && args+=(--hot-predict "$GLM_HOT_PREDICT")
+    # GLM_HOT_VICTIM=slow: kept hot reads evict the residents least demanded over ~70 passes first
+    [[ -n "${GLM_HOT_VICTIM:-}" ]] && args+=(--hot-victim "$GLM_HOT_VICTIM")
+    # GLM_HOT_RESCUE=TH (GLM_HOT_ASYNC=1): a missed pick with share >= TH read into the transient
+    # slot before its layer's MoE, inline in the pass (the catastrophic first occurrence; the
+    # pass pays the segment structure - measure the arm before shipping it; unset: off)
+    [[ -n "${GLM_HOT_RESCUE:-}" ]] && args+=(--hot-rescue "$GLM_HOT_RESCUE")
     [[ "${GLM_GRAPHS:-1}" == 1 ]] && args+=(--graphs)
     # GLM_EXLR8_ROUND=exact|fast: an exlr8 pack's (tools/glm_pack_exlr8.py) and exlr8 dense matrices'
     # (tools/glm_exlr8_dense.py) codebook rounded to E4M3 as the format defines it, or in two
@@ -265,8 +274,12 @@ fi
 # TIDELM_GLM_MLA_HALF=0: GLM decode attention's split partials in fp32 (default fp16);
 # TIDELM_GLM_INDEX_SIDE=0: GLM, the indexer chain of a decode pass on the main stream (default beside q_b)
 # TIDELM_GLM_FAT=0: GLM, prefill's routed experts through the smem tile instead of the fat tile (same bits)
+# TIDELM_GLM_HOT_ORACLE=PATH,MIN: GLM debug (--bench-nll), an earlier run's trace's next-pass misses >= MIN
+# read first - what rescuing the heavy misses is worth (adapt.rs HotOracle)
+# TIDELM_GLM_HOT_TRACE: GLM, rank 0 appends every decode pass's routing table and async hot reads to
+# this path (in a mounted directory), for tools/glm_hot_sim.py
 for v in TIDELM_MEM_LOG_MB TIDELM_GRAPH_CACHE TIDELM_STEP_SPLIT TIDELM_GLM_WIDE_DECODE_FROM TIDELM_GLM_ROUND_LOG TIDELM_PDL \
-         TIDELM_L2_PREFETCH TIDELM_GLM_EVICT_FIRST TIDELM_GLM_MLA_HALF TIDELM_GLM_INDEX_SIDE TIDELM_GLM_FAT; do [[ -n "${!v:-}" ]] && envs+=("$v=${!v}"); done
+         TIDELM_L2_PREFETCH TIDELM_GLM_EVICT_FIRST TIDELM_GLM_MLA_HALF TIDELM_GLM_INDEX_SIDE TIDELM_GLM_FAT TIDELM_GLM_HOT_TRACE TIDELM_GLM_VERIFY_PLAN TIDELM_GLM_ACT_PLAN TIDELM_GLM_PREFILL_CHECK TIDELM_GLM_HOT_ORACLE; do [[ -n "${!v:-}" ]] && envs+=("$v=${!v}"); done
 for e in "${envs[@]}"; do envf+=(-e "$e"); done
 vols=() seen=" "
 for p in "${rw[@]}"; do [[ $seen == *" $p "* ]] && continue; seen+="$p "; vols+=(-v "$p:$p"); done
@@ -312,6 +325,13 @@ if [[ -n "${PEER:-}" ]]; then
         --name tidelm-rank1 --user \$(id -u):\$(id -g) -e HOME=\$HOME --no-healthcheck \
         $(printf '%q ' "${vols[@]}" "${envf[@]}" "${peer_bin[@]}" "$IMAGE" "$guard" tidelm-server "${args[@]}" "${pair[@]}") \
         --rank 1 > /dev/null"
+fi
+if [[ "${RUST_ARGS:-}" == *--bench* ]]; then
+    # a bench drives the pair and exits (no HTTP server, no "serving" line): wait for rank 0's
+    # pass, then show its log instead of the health probe below
+    while [[ $(docker inspect -f '{{.State.Running}}' tidelm-rank0 2>/dev/null) != false ]]; do sleep 2; done
+    docker logs tidelm-rank0 2>&1
+    exit 0
 fi
 running() { [[ $(docker inspect -f '{{.State.Running}}' tidelm-rank0 2>/dev/null) == true ]]; }
 for _ in $(seq 600); do

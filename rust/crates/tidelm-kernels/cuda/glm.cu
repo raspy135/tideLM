@@ -1178,7 +1178,8 @@ __global__ void mla_merge_kernel(const float* __restrict__ own_o, const float* _
 // zero-weight -1 picks (the EXL3 kernels skip a negative pick: an exact 0, rather than
 // tp.py's zero-weight pick of a loaded slot). One block of E threads per row.
 //   exact (allowed null): ids [T][K] experts, w [T][K]; `hot` [T * K][2]: per pick (its share
-//     w / scale if the expert is not in `resident`, else 0; the expert), the hot reads' candidates.
+//     w / scale if the expert is not in `resident`, else minus it; the expert), the hot reads'
+//     candidates (a positive share) and, with the sign, every pick's demand for the routing trace.
 //   routed (allowed set): ids [T][K] = lut[expert] arena slots (-1 when slotless: weight 0);
 //     demand[e] += the exact weights (ex_ids / ex_w) and acc[4] += (picks, missed, mass,
 //     missed mass) for rows below live[0] (null: all rows).
@@ -1262,7 +1263,7 @@ __global__ void __launch_bounds__(E) router_kernel(const float* __restrict__ log
         w[t * K + k] = wt;
         if (hot) {
             const bool miss = ex >= 0 && resident && !resident[ex];
-            hot[(t * K + k) * 2] = miss ? wt / scale : 0.f;
+            hot[(t * K + k) * 2] = miss ? wt / scale : -(wt / scale);
             hot[(t * K + k) * 2 + 1] = (float)ex;
         }
     }

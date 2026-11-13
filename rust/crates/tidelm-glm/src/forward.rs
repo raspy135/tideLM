@@ -82,8 +82,8 @@ const OP_SNAP_COMMIT: u32 = 14;
 
 /// Schedule knobs a benchmark can switch on both ranks inside one boot (Engine::bench_knob): each
 /// moves no value, only when and where kernels run.
-pub const BENCH_KNOBS: [&str; 13] = ["l2pf", "pdl", "evict_first", "evict_kvb", "evict_skinny", "mla_half", "index_side", "fat",
-                                      "split", "osplit", "qsplit", "rot1", "round"];
+pub const BENCH_KNOBS: [&str; 15] = ["l2pf", "pdl", "evict_first", "evict_kvb", "evict_skinny", "mla_half", "index_side", "fat",
+                                      "split", "osplit", "qsplit", "rot1", "round", "hot_plan", "rescue"];
 
 /// Lanes a pass may carry (glm.cu kMaxLanes).
 pub const MAX_LANES: usize = 4;
@@ -367,9 +367,9 @@ pub struct Engine {
     pub arena: Arena,
     pub mtp_arena: Option<Arena>,
     /// [layer][expert] -> arena slot, -1 not resident (device and host)
-    lut: DeviceBuffer<i32>,
+    pub(crate) lut: DeviceBuffer<i32>,
     pub lut_h: Vec<i32>,
-    allowed: DeviceBuffer<u8>,
+    pub(crate) allowed: DeviceBuffer<u8>,
     pub allowed_h: Vec<u8>,
     /// the MTP layer: every expert in its own slot
     mtp_lut: DeviceBuffer<i32>,
@@ -409,6 +409,8 @@ pub struct Engine {
     moe_layers: Vec<usize>,
     /// decode passes replay CUDA graphs (captured per row count on first use)
     pub graphs: bool,
+    /// bench knob "hot_plan" (debug): off, a decode pass plans no async hot reads
+    pub(crate) hot_plan_on: bool,
     graphs_map: std::collections::HashMap<GraphKey, tidelm_cuda::GraphExec>,
     /// synchronous hot reads between a decode pass's segments (None: off)
     pub hot: Option<crate::adapt::Hot>,
@@ -678,6 +680,7 @@ impl Engine {
             row2: row2_bytes(hl),
             moe_layers,
             graphs: false,
+            hot_plan_on: true,
             graphs_map: std::collections::HashMap::new(),
             hot: None,
             wide_from: wide_decode_from(),
@@ -1591,8 +1594,8 @@ impl Engine {
             self.layer_pre(end, t, false)?;
             self.moe_exact(end, 0, t)?;
             self.prefetch_join()?;
-            if let Some(h) = self.hot.as_ref().filter(|h| h.asynch.is_none()) {
-                // a segment its own graph (synchronous hot reads): its side work ends inside it
+            if let Some(h) = self.hot.as_ref().filter(|h| h.asynch.is_none() || h.rescue.is_some()) {
+                // a segment its own graph (synchronous or rescue hot reads): its side work ends inside it
                 self.shared_join()?;
                 unsafe {
                     tidelm_cuda::memcpy_async(h.host.raw(), self.hot_region(end), t * self.cfg.topk * 8,
@@ -1605,6 +1608,38 @@ impl Engine {
         self.head_dev(np(&self.act.hn), t, false)?;
         self.prefetch_join()?;
         self.hot_table_copy()
+    }
+
+    /// TIDELM_GLM_ACT_PLAN=N (debug): the decode pass after the N-th async plan.
+    fn act_debug_now(&self) -> bool {
+        let Some(a) = self.hot.as_ref().and_then(|h| h.asynch.as_ref()) else { return false };
+        std::env::var("TIDELM_GLM_ACT_PLAN").ok().and_then(|v| v.parse::<usize>().ok()) == Some(a.plans)
+    }
+
+    /// After decode segment `seg` (MoE layer seg-1's experts, then through MoE layer seg's
+    /// attention): each row's residual max |x| and rms, and the non-finite count.
+    fn act_stats(&self, seg: usize, t: usize) -> Result<()> {
+        self.st.synchronize()?;
+        let h = self.cfg.hidden;
+        let v = self.act.h.download()?;
+        let mut line = format!("act rank {} seg {seg} (to layer {}):", self.rank,
+                               self.moe_layers.get(seg).copied().unwrap_or(self.cfg.layers));
+        for r in 0..t {
+            let row = &v[r * h..(r + 1) * h];
+            let (mut mx, mut ss, mut bad) = (0f32, 0f64, 0usize);
+            for &b in row {
+                let x = f32::from_bits((b as u32) << 16);
+                if !x.is_finite() {
+                    bad += 1;
+                    continue;
+                }
+                mx = mx.max(x.abs());
+                ss += (x as f64) * (x as f64);
+            }
+            line += &format!(" [max {mx:.1} rms {:.3}{}]", (ss / h as f64).sqrt(), if bad > 0 { format!(" nonfinite {bad}") } else { String::new() });
+        }
+        eprintln!("{line}");
+        Ok(())
     }
 
     /// Async hot reads: every MoE layer's candidates to the host behind the head (inside a
@@ -2237,6 +2272,7 @@ impl Engine {
         self.hot_install()?;
         self.passes += 1;
         self.adapt_install(false)?;
+        self.verify_residency()?;
         // a pass over image rows writes them into the stream eagerly: never a captured decode pass
         let images = self.has_image_spans(lane);
         // the lane's snapshot (want_snapshot): taken where this forward reaches its position
@@ -2309,8 +2345,17 @@ impl Engine {
         let t = ids.len();
         let nl = groups.len();
         self.stage(ids, groups, false)?;
-        if t <= MAX_ROWS && self.graphs {
-            if self.hot.as_ref().is_some_and(|h| h.asynch.is_none()) {
+        if t <= MAX_ROWS && self.graphs && self.act_debug_now() {
+            // TIDELM_GLM_ACT_PLAN (debug): this pass's graph run as its segments, eagerly, with
+            // the residual stream's statistics between them
+            for seg in 0..=self.moe_layers.len() {
+                self.decode_segment(seg, t)?;
+                self.act_stats(seg, t)?;
+            }
+        } else if t <= MAX_ROWS && self.graphs {
+            // segments with host points when hot reads are synchronous, or GLM_HOT_RESCUE reads
+            // inline beside the async plan; else the whole pass one graph (its table copy inside)
+            if self.hot.as_ref().is_some_and(|h| h.asynch.is_none() || h.rescue.is_some()) {
                 self.hot_begin();
                 let n = self.moe_layers.len();
                 for seg in 0..=n {
@@ -2334,7 +2379,7 @@ impl Engine {
         self.flash_commit(groups);
         let out = self.read_tokens(t)?;
         if t <= MAX_ROWS {
-            self.hot_plan(t)?; // wider passes leave no candidates (moe_exact)
+            self.hot_plan(ids, groups[0].2)?; // wider passes leave no candidates (moe_exact)
         }
         Ok(out)
     }
@@ -2563,6 +2608,9 @@ impl Engine {
             self.routed_split = None;
             return Ok(());
         }
+        if name == "rescue" {
+            return self.bench_knob(name, true); // a rescue A/B boots with it on
+        }
         if name == "round" {
             let boot = self.exlr8_boot_exact;
             return self.bench_knob(name, boot);
@@ -2576,6 +2624,7 @@ impl Engine {
             "mla_half" => "TIDELM_GLM_MLA_HALF",
             "index_side" => "TIDELM_GLM_INDEX_SIDE",
             "fat" => "TIDELM_GLM_FAT",
+            "hot_plan" => "TIDELM_GLM_HOT_PLAN",
             _ => "TIDELM_GLM_EVICT_FIRST",
         };
         self.bench_knob(name, std::env::var(var).as_deref() != Ok("0"))
@@ -2614,6 +2663,12 @@ impl Engine {
                 .for_each(|m| m.o.split = if on { crate::weights::SPLIT_O_E4M3 } else { crate::weights::SPLIT_O }),
             10 => self.w.layers.iter_mut().filter_map(|l| if let crate::weights::Attn::Mla(m) = &mut l.attn { Some(m) } else { None })
                 .filter(|m| is_exlr8(m.q_b.cb)).for_each(|m| m.q_b.split = if on { 4 } else { crate::weights::SPLIT_QB }),
+            13 => self.hot_plan_on = on,
+            // GLM_HOT_RESCUE at the boot's threshold, or off: the segment structure's cost in one boot
+            14 => match self.hot.as_mut() {
+                Some(h) if h.rescue_boot.is_some() => h.rescue = if on { h.rescue_boot } else { None },
+                _ => return Err("bench knob rescue: boot with GLM_HOT_RESCUE (and GLM_HOT_ASYNC=1)".into()),
+            },
             _ => return Err(format!("bench knob {code}").into()),
         }
         self.graphs_map.clear();

@@ -291,6 +291,12 @@ pub struct Stats {
 /// (the lanes share one KV pool: tidelm_engine::kv).
 const KV_HEADROOM: usize = 4096;
 
+/// Tokens of a queued prompt a running request's must share beyond what a free lane and the
+/// disk store hold before the queued one waits for it instead of prefilling them itself
+/// (Server::share_running): about 2.5 s of prefill at 150K positions, against the store's save
+/// and restore of the rows (0.46 and 0.43 s for 152K of them).
+const SHARE_MIN: usize = 1024;
+
 /// Conversations whose cumulative votes GLM_PRELOAD keeps, each an [layers x experts] f64 on
 /// the host; the least recently used beyond it are dropped.
 const CONV_KEEP: usize = 32;
@@ -385,6 +391,10 @@ pub struct Server {
     round_log: Option<std::fs::File>,
     runs: Vec<Option<Run>>,
     queue: VecDeque<Job>,
+    /// share_running's wait: the queued request's id and the running one's whose prefill it waits for
+    held: Option<(u64, u64)>,
+    /// share_running's early save, made: the queued request's id and the running one's
+    saved_for: Option<(u64, u64)>,
     /// lanes by last use, oldest first: a prompt that matches none better takes the oldest
     lru: Vec<usize>,
     done: Vec<Finished>,
@@ -397,7 +407,7 @@ impl Server {
             .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
         let lanes = eng.lanes();
         Server { eng, opt, cal, stats: Stats::default(), store: None, ds_history: None, conv_votes: HashMap::new(), conv_seq: 0, sampling: vec![None; lanes], log, round_log,
-                 runs: (0..lanes).map(|_| None).collect(), queue: VecDeque::new(), lru: (0..lanes).collect(), done: vec![] }
+                 runs: (0..lanes).map(|_| None).collect(), queue: VecDeque::new(), held: None, saved_for: None, lru: (0..lanes).collect(), done: vec![] }
     }
 
     fn log_json(&mut self, v: serde_json::Value) {
@@ -523,7 +533,8 @@ impl Server {
     }
 
     /// Queued requests into free lanes while the pool can take them: each to the free lane
-    /// whose sequence shares most of its prompt (ties: the lane used longest ago).
+    /// whose sequence shares most of its prompt (ties: the lane used longest ago), unless a
+    /// running request's prompt shares more of it (share_running).
     fn admit(&mut self) -> Result<()> {
         while let Some(job) = self.queue.front() {
             let free: Vec<usize> = self.lru.iter().copied().filter(|&l| self.runs[l].is_none()).collect();
@@ -532,14 +543,18 @@ impl Server {
             }
             let prompt = &job.prompt;
             let shared = |l: usize| prompt.iter().zip(self.eng.lane_tokens(l)).take_while(|(a, b)| a == b).count();
-            let lane = free.iter().copied().fold(None, |best: Option<(usize, usize)>, l| {
+            let (lane, here) = free.iter().copied().fold(None, |best: Option<(usize, usize)>, l| {
                 let c = shared(l);
                 if best.is_none_or(|b| c > b.1) { Some((l, c)) } else { best }
-            }).unwrap().0;
+            }).unwrap();
+            let plen = prompt.len();
+            if !self.share_running(here)? {
+                return Ok(()); // waits for a running request's prefill
+            }
             let max_seq = self.eng.opt.max_seq;
             let others = self.runs.iter().any(|r| r.is_some());
-            let want = if others { (prompt.len() + KV_HEADROOM).min(max_seq) } else { prompt.len().min(max_seq) };
-            if !prompt.is_empty() && prompt.len() < max_seq && !self.make_room(lane, want)? {
+            let want = if others { (plen + KV_HEADROOM).min(max_seq) } else { plen.min(max_seq) };
+            if plen > 0 && plen < max_seq && !self.make_room(lane, want)? {
                 if others {
                     return Ok(()); // waits for a lane to end
                 }
@@ -549,6 +564,53 @@ impl Server {
             self.start(lane, job)?;
         }
         Ok(())
+    }
+
+    /// The queue's first request against the running ones, before it is admitted to a free lane
+    /// that holds `here` tokens of its prompt: whether it may go now. A running request whose
+    /// prompt shares SHARE_MIN more tokens with it than that lane and the disk store hold is not
+    /// prefilled a second time beside it. While that prefill runs, this one waits (false), and so
+    /// do the requests queued after it; it would otherwise compute the same rows at the same
+    /// time and finish no sooner. Once the other decodes, its prompt goes to the disk store now
+    /// instead of at its end, and this one restores it. Without the store nothing waits: with
+    /// no way to share the rows, waiting would only add the other's prefill to this one's.
+    /// 2026-11-09: a client's retry of a 152K-token prompt came while the first was still
+    /// decoding its first token, 2 s before that prompt was saved at its end; it prefilled all
+    /// 152K tokens again (428 s), and the other lane decoded at 1-2 tok/s meanwhile.
+    fn share_running(&mut self, here: usize) -> Result<bool> {
+        let Some(store) = self.store.as_ref() else { return Ok(true) };
+        let job = self.queue.front().unwrap();
+        let (id, prompt) = (job.id, &job.prompt);
+        let limit = prompt.len().saturating_sub(1);
+        let best = self.runs.iter().flatten()
+            .map(|r| (r.lane, prompt.iter().zip(&r.job.prompt).take_while(|(a, b)| a == b).count().min(limit)))
+            .max_by_key(|&(_, n)| n);
+        let Some((lane, n)) = best.filter(|&(_, n)| n >= here + SHARE_MIN) else { return Ok(true) };
+        let run = self.runs[lane].as_ref().unwrap();
+        let other = run.job.id;
+        if run.part.is_some() && self.held == Some((id, other)) {
+            return Ok(false); // still prefilling: decided at the first look
+        }
+        if self.saved_for == Some((id, other)) {
+            return Ok(true); // saved (or the store declined) at an earlier look; the pool was full
+        }
+        // the store already holding the shared rows (the other restored them) leaves nothing to
+        // wait for; a disk short of room leaves this one to prefill them, as without the store
+        let stored = store.plan_restore(prompt, here).map_or(here, |(_, end)| end);
+        if n < stored + SHARE_MIN || crate::prefix::free_bytes(&store.dir) < 10_000_000_000 {
+            return Ok(true);
+        }
+        if run.part.is_some() {
+            self.held = Some((id, other));
+            (self.log)(&format!("[prefix] request {id} waits for request {other}'s prefill: their prompts share {n} tokens"));
+            return Ok(false);
+        }
+        let p = run.job.prompt.clone();
+        self.saved_for = Some((id, other));
+        (self.log)(&format!("[prefix] request {id} shares {n} tokens with request {other}'s prompt: saving that now, to restore it"));
+        self.eng.select(lane)?;
+        self.disk_save(&p)?;
+        Ok(true)
     }
 
     /// generate's start for a request in `lane`: the prompt's reuse of the lane's sequence or the
@@ -829,12 +891,13 @@ impl Server {
             String::new()
         };
         let line = format!("request {}, GLM: {:.2} drafted / {:.2} accepted a round, copy rounds {} ({} long, {} accepted), \
-                            miss rate {:.1}% (prompt {:.1}%, decode {:.1}%; by score {:.1}%), hot reads {} (kept {}, {:.2} s waited), \
+                            miss rate {:.1}% (prompt {:.1}%, decode {:.1}%; by score {:.1}%), hot reads {} (kept {}, {} inline, {:.2} s waited), \
                             swaps {} ({:.2} s waited), preload {} ({} MB, {:.2} s), fallbacks {}{nan}{beside}",
                            run.job.id, s.drafted as f64 / rounds, s.accepted as f64 / rounds, s.copy_rounds, s.long_copies,
                            s.copy_accepted, pct(p[0] + d[0], p[1] + d[1]), pct(p[0], p[1]), pct(d[0], d[1]),
                            pct(p[2] + d[2], p[3] + d[3]), r1.hot_reads - r0.hot_reads, r1.hot_kept - r0.hot_kept,
-                           r1.hot_wait_s - r0.hot_wait_s, r1.swaps - r0.swaps, r1.adapt_wait_s - r0.adapt_wait_s,
+                           r1.hot_rescue - r0.hot_rescue, r1.hot_wait_s - r0.hot_wait_s, r1.swaps - r0.swaps,
+                           r1.adapt_wait_s - r0.adapt_wait_s,
                            r1.preload - r0.preload, (r1.preload_mb - r0.preload_mb) / 1_000_000, r1.preload_s - r0.preload_s,
                            s.fallbacks);
         let (id, lane, prompt) = (run.job.id, run.lane, run.job.prompt.clone());
