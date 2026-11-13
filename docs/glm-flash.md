@@ -236,3 +236,45 @@ read and wrote the wrong rows and served garbage ("## ## ##" from the first toke
 (glm_run's one lane gave the 327,680 tokens exactly). The offset is now the caches' own stride; the
 configurations served before get the same value. Checked: two concurrent requests and a third, at 1M
 on the pair, all answer right.
+
+### TP=1 prefill by length (2026-11-13)
+
+Fresh prompts of the repo's text (a nonce first: no prefix reuse), greedy, reasoning low, one
+request at a time on the TP=1 profile: 23,181-25,239 tokens 709-713 tok/s (three runs), 30,212 /
+30,327 tokens 713 / 720 tok/s, 305,387 tokens 690 tok/s (442.5 s) - prefill falls 4% over 10x the
+length (34 of 45 layers are KDA; the 11 sparse layers' indexer is the part that grows). Prompt misses
+fell with length (18.9% at 25K, 13.9% at 305K: the hot reads catch up), which hides some of it.
+Decode after the 305K prompt 28.0 tok/s.
+
+### Inline rescue and seed v1 (2026-11-13)
+
+A user reported a thinking loop the author had not met. A new install's residency comes from the
+bundled seed; v0 (150K tokens of the repo's sources, prefill only) placed a 69% residency over
+74.6% of the author's served traffic's routed weight, against 84.2% placed by the traffic itself
+(the traffic's file still holds v0, so the gap to a stranger's traffic is wider). Two changes:
+
+- Seed v1 (profiles/glm53-flash-history-v1.npz): the development box's state file after a day of
+  serving - 2.9M routed rows (chat, bench.py, 438K prompt tokens of long-prompt tests, v0). Read only
+  while RUST_GLM_STATE_DB's file does not exist.
+- GLM_HOT_RESCUE=0.4 on the TP=1 profile (docs/hot-predict.md: built for GLM-5.3 and never qualified
+  there). Flash runs it through the shared decode_segment path (layer_pre and final_norm dispatch to
+  Flash's own); the transient slot is its own class, last in the arena.
+
+Rescue, two boots from one frozen state file, `--bench-nll` over heldout_quick + heldout_eval (57,315
+tokens, 8-row passes, no adaptation in the bench), then `--bench-width --bench-ab rescue` in the
+second boot (the knob switches between the boot's threshold and off):
+
+| | off | rescue 0.4 |
+|---|---:|---:|
+| NLL | 1.7121 | 1.7169 (+0.0048 +- 0.0015 paired; coding +0.0120, general -0.0034) |
+| top-1 | 62.96% | 62.92% |
+| blown windows | | 0 / 0 (median 250-window +0.0035) |
+| miss (by score) | 11.48% (7.17%) | 11.42% (7.13%) |
+| hot reads, waited | 15,635, 65.6 s | 15,581 incl. 728 rescues, 61.4 s |
+| run | 1,095 s | 1,069 s |
+| decode pass 1 / 4 / 8 / 16 rows | 62.93 / 105.75 / 142.33 / 198.68 ms | +0.1 / +0.2 / +0.0 / +0.2% |
+
+The segment structure costs nothing measurable here (DS's sync arm lost 6-16% to it). The NLL moved
+the wrong way for a change that computes misses exactly; the two boots' hot reads diverge from the
+first rescued token on, which the paired error does not see. Shipped at the author's call; the
+noise-floor arm (a numerics-neutral perturbation, the same two-boot harness) decides whether it stays.
