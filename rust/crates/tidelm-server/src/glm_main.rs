@@ -207,9 +207,16 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
     }
     let mut srv = Server::new(eng, sopt, Box::new(|s: &str| eprintln!("{s}")));
     srv.store = store;
-    // DS's routing history for GLM's traffic, beside the state db (residency::DsHistory)
+    // DS's routing history for GLM's traffic, beside the state db (residency::DsHistory). GLM-5.3's
+    // profiles share glm-ds-history.npz (one model); GLM-5.3-Flash's is its state db's own
+    // (<state db>.ds-history.npz): sharing GLM-5.3's name, its first save replaced GLM-5.3's history
+    // (another shape, so opened empty) with its own (2026-11-12)
     if let Some(p) = srv.eng.res.db_path.clone() {
-        let path = p.with_file_name("glm-ds-history.npz");
+        let path = if srv.eng.cfg.is_flash() {
+            p.with_extension("ds-history.npz")
+        } else {
+            p.with_file_name("glm-ds-history.npz")
+        };
         let h = tidelm_glm::residency::DsHistory::open(&path, srv.eng.cfg.n_layers(), srv.eng.cfg.experts);
         eprintln!("boot: DS-rule routing history {} ({} folds)", path.display(), h.folds);
         srv.ds_history = Some(h);

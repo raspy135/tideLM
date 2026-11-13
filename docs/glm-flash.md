@@ -191,3 +191,21 @@ state file, 9700 slots:
 
 Depth 7 with the gate is the profile's now: prose +9.1%, code within its spread. Fewer tokens a step
 in cheaper rounds - the gate leaves out the rows that would be rejected.
+
+## TP=2 (2026-11-12, first run)
+
+configs/glm53-flash-35-tp2.env.example: each rank's pack re-sliced from the one-box pack
+(`glm_pack_exl3.py --from-pack ... --world 2 --rank R`, 68.6 GB a rank, ~1 min each at 2.2-2.7 GB/s;
+rank 1's copied to the peer at ~490 MB/s), the dense dir on both nodes. All 12,096 routed experts
+resident (66.8 GB a rank), dense 5.76 GB a rank, KV 2.24 GB (whole on each rank: GLM-5.3's position
+split is refused for Flash), device 74.5 GiB, ~38 GiB MemAvailable a box; residency, hot reads and
+adaptation off, no vision (one box's only). Boot 44 s.
+
+First requests (greedy, single runs - not bench.py): a 129-token poem at 33.5 tok/s, a 219-token
+function at 53.2; a 24,146-token prompt prefilled at 1,101 tok/s (TP=1: 700), decoded at 48.9; its
+follow-up's first token 0.42 s from the snapshot (24,144 reused), a regenerate 0.08 s. Not tuned.
+
+Found with it: the DS-rule routing history (residency::DsHistory, written at each request's end, read
+by nothing in serving) had a fixed name beside the state db, glm-ds-history.npz - GLM-5.3's. Flash
+opened it, found another shape, started empty and saved its own over GLM-5.3's (unrecoverable;
+GLM-5.3's next boot starts it anew). Flash's is now its state db's own (<state db>.ds-history.npz).

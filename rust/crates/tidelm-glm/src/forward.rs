@@ -458,6 +458,11 @@ impl Engine {
     pub fn load(model_dir: &Path, opt: Options, rank: usize, world: usize, pair: Option<Pair>,
                 residents: &[(usize, usize)], log: &dyn Fn(&str)) -> Result<Self> {
         let cfg = GlmConfig::load(model_dir)?;
+        if cfg.is_flash() && opt.kv_split && world > 1 {
+            // the split cache is GLM-5.3's MLA path (its decode gathers merge the ranks' positions);
+            // GLM-5.3-Flash's sparse attention reads a whole cache on each rank
+            return Err("GLM-5.3-Flash on the pair: the KV split is GLM-5.3's only (GLM_KV_SPLIT=0)".into());
+        }
         // programmatic dependent launch for every kernel of glm.cu, the EXL3 file and the ds41.cu ones
         // GLM calls (each starts with griddepcontrol.wait): the next kernel launches while this one
         // drains. Bit-identical; TIDELM_PDL=0 turns it off
