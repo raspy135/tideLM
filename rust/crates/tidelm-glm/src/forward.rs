@@ -77,6 +77,8 @@ const OP_FORWARD_LANES: u32 = 8;
 const OP_KV_SHRINK: u32 = 10;
 const OP_FORWARD_PART: u32 = 11;
 const OP_BENCH_KNOB: u32 = 12;
+const OP_SNAP_WANT: u32 = 13;
+const OP_SNAP_COMMIT: u32 = 14;
 
 /// Schedule knobs a benchmark can switch on both ranks inside one boot (Engine::bench_knob): each
 /// moves no value, only when and where kernels run.
@@ -2162,9 +2164,11 @@ impl Engine {
     fn kv_shrink_local(&mut self, lane: usize, n: usize) -> Result<usize> {
         let sel = self.lane;
         self.select(lane)?;
-        self.pos = self.pos.min(n);
-        self.tokens.truncate(self.pos);
+        // through set_pos: GLM-5.3-Flash's KDA state must go back with the positions (truncating
+        // only them left an emptied lane's next prompt starting from its old sequence's state)
+        let cut = if n < self.pos { self.set_pos_local(n) } else { Ok(()) };
         self.select(sel)?;
+        cut?;
         // chunks_for(n) covers the rows below n (PagedKv's floor keeps a row past it); 0 gives back all
         Ok(self.paged.shrink(lane, n)?)
     }
@@ -2216,11 +2220,20 @@ impl Engine {
         self.adapt_install(false)?;
         // a pass over image rows writes them into the stream eagerly: never a captured decode pass
         let images = self.has_image_spans(lane);
+        // the lane's snapshot (want_snapshot): taken where this forward reaches its position
+        let want = self.fl.as_ref().and_then(|fl| fl.snap_want[lane]).filter(|&p| p >= self.pos && p <= self.pos + t);
+        if want == Some(self.pos) {
+            self.flash_take_snapshot(lane, self.pos, self.pos)?;
+        }
         if next.is_none() && !images && (t <= MAX_ROWS || (t <= HEAD_ROWS && self.pos >= self.wide_from)) {
             let p0 = self.pos;
             let out = self.decode_pass(ids, &[(lane, t, p0)])?;
             self.tokens.extend_from_slice(ids);
             self.pos += t;
+            if let Some(p) = want.filter(|&p| p > p0) {
+                // the pass saved its rows (t <= SAVE_ROWS): a replay to p, or the state at its end
+                self.flash_take_snapshot(lane, self.pos, p)?;
+            }
             if mtp && t > 1 {
                 self.mtp_core(&[MtpRows { lane, ids: &ids[1..], hidden: Hidden::Target(0), pos0: p0 }], false)?;
             }
@@ -2229,7 +2242,13 @@ impl Engine {
         let mut out = vec![];
         let mut c0 = 0;
         while c0 < t {
-            let n = self.opt.chunk.min(t - c0);
+            let mut n = self.opt.chunk.min(t - c0);
+            // a chunk's edge at the snapshot's position (more than HEAD_ROWS rows: the forward returns
+            // the last row's argmax alone, so the split changes nothing it gives back; up to HEAD_ROWS
+            // the one chunk saves its rows and the snapshot replays them)
+            if let Some(p) = want.filter(|&p| t > HEAD_ROWS && p > self.pos && p < self.pos + n) {
+                n = p - self.pos;
+            }
             let part = &ids[c0..c0 + n];
             self.stage(part, &[(lane, n, self.pos)], false)?;
             self.layers(n, true)?;
@@ -2247,6 +2266,9 @@ impl Engine {
             let p0 = self.pos;
             self.tokens.extend_from_slice(part);
             self.pos += n;
+            if let Some(p) = want.filter(|&p| p > p0 && p <= self.pos) {
+                self.flash_take_snapshot(lane, self.pos, p)?;
+            }
             if mtp {
                 let mut fill = ids[c0 + 1..(c0 + n + 1).min(t)].to_vec();
                 if c0 + n == t {
@@ -2399,12 +2421,57 @@ impl Engine {
         self.fl.is_none() || self.flash_can_rewind(self.lane, self.pos, n)
     }
 
+    /// The furthest position at most `keep` the lane's sequence can go back to when `keep`
+    /// itself is out of reach: its KDA snapshot's, else 0 (GLM-5.3: `keep`).
+    pub fn restore_point(&self, lane: usize, keep: usize) -> usize {
+        if self.fl.is_none() { keep } else { self.flash_restore_point(lane, keep) }
+    }
+
+    /// GLM-5.3-Flash: the selected lane's next forward snapshots its KDA state at position `p`
+    /// (a prompt's end: Engine docs in flash_fwd), committed by commit_snapshot. Both ranks: it
+    /// splits the prefill at `p`.
+    pub fn want_snapshot(&mut self, p: usize) -> Result<()> {
+        if self.fl.is_none() || p == 0 {
+            return Ok(());
+        }
+        let lane = self.lane;
+        self.mirror(|m| {
+            m.u32(OP_SNAP_WANT).u32(lane as u32).u32(p as u32);
+        })?;
+        self.want_snapshot_local(lane, p);
+        Ok(())
+    }
+
+    fn want_snapshot_local(&mut self, lane: usize, p: usize) {
+        if let Some(fl) = self.fl.as_mut() {
+            fl.snap_want[lane] = Some(p);
+        }
+    }
+
+    /// The lane decodes: the snapshot its prompt's prefill took is the one a later prompt restores.
+    pub fn commit_snapshot(&mut self, lane: usize) -> Result<()> {
+        if self.fl.is_none() {
+            return Ok(());
+        }
+        self.mirror(|m| {
+            m.u32(OP_SNAP_COMMIT).u32(lane as u32);
+        })?;
+        self.flash_commit_snapshot(lane);
+        Ok(())
+    }
+
     /// Truncate the selected lane's sequence to `n` positions (rejected drafts; a new prompt's reuse).
     pub fn set_pos(&mut self, n: usize) -> Result<()> {
         let lane = self.lane;
         self.mirror(|m| {
             m.u32(OP_SET_POS).u32(lane as u32).u32(n as u32);
         })?;
+        self.set_pos_local(n)
+    }
+
+    /// set_pos on this rank (rank 1 as rank 0 does: KDA's state goes back with the positions).
+    fn set_pos_local(&mut self, n: usize) -> Result<()> {
+        let lane = self.lane;
         if n > self.pos {
             return Err(format!("set_pos {n} past lane {lane}'s {}", self.pos).into());
         }
@@ -2592,9 +2659,16 @@ impl Engine {
                 }
                 OP_SET_POS => {
                     self.select(r.u32()? as usize)?;
-                    let n = r.u32()? as usize;
-                    self.pos = n.min(self.pos);
-                    self.tokens.truncate(self.pos);
+                    let n = (r.u32()? as usize).min(self.pos);
+                    self.set_pos_local(n)?;
+                }
+                OP_SNAP_WANT => {
+                    let (lane, p) = (r.u32()? as usize, r.u32()? as usize);
+                    self.want_snapshot_local(lane, p);
+                }
+                OP_SNAP_COMMIT => {
+                    let lane = r.u32()? as usize;
+                    self.flash_commit_snapshot(lane);
                 }
                 OP_KV_SHRINK => {
                     let (lane, n) = (r.u32()? as usize, r.u32()? as usize);

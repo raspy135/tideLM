@@ -24,7 +24,7 @@ pub const ROW: usize = 4096;
 /// MemAvailable an image request's features must leave: memguard stops the server below 4 GiB.
 /// (/proc/meminfo, not cudaMemGetInfo: on the Spark's shared memory that reports about MemFree,
 /// leaving out the page cache the kernel gives back.)
-const FEATS_MARGIN: usize = 6 << 30;
+const FEATS_MARGIN: usize = 5 << 30;
 
 fn mem_available() -> Option<usize> {
     let s = std::fs::read_to_string("/proc/meminfo").ok()?;

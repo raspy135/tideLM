@@ -123,6 +123,9 @@ fn main() -> Result<()> {
             (1000 + x % 100000) as u32
         }).collect();
     }
+    if args.iter().any(|a| a == "--snap-check") {
+        return snap_check(&mut eng, &ids, &text);
+    }
     let max_tokens: usize = arg(&args, "--max-tokens").map(|s| s.parse()).transpose()?.unwrap_or(64);
     let depth: usize = arg(&args, "--depth").map(|s| s.parse()).transpose()?.unwrap_or(0);
     let stop = cfg.eos.clone();
@@ -267,4 +270,110 @@ fn main() -> Result<()> {
     }
     eng.stop_follower()?;
     Ok(())
+}
+
+/// --snap-check (GLM-5.3-Flash, one lane, no hot reads: residency stays put): KDA's prompt-end
+/// snapshots (flash_fwd) against the passes they stand in for.
+/// - exact: a prompt prefilled with a snapshot 40 rows before its end, a few tokens decoded, then
+///   the lane back to the snapshot and those 40 rows prefilled again - the same chunk on the same
+///   state, so the same logits bit for bit;
+/// - follow-up: a prompt that extends the first, from the snapshot, against a fresh prefill of it
+///   (other chunk edges: close, not equal);
+/// - replay: a snapshot inside a 10-row decode-path pass (replayed from its saved rows), the rows
+///   after it decoded again from it, against the pass's own logits for them;
+/// - an emptied lane (kv_shrink) prefills as a fresh one does.
+fn snap_check(eng: &mut Engine, ids: &[u32], text: &tidelm_text::Text) -> Result<()> {
+    let cmp = |name: &str, a: &[f32], b: &[f32]| {
+        let am = |v: &[f32]| v.iter().enumerate().fold((0, f32::MIN), |m, (i, &x)| if x > m.1 { (i, x) } else { m }).0;
+        let (mut d2, mut n2, mut mx, mut same) = (0f64, 0f64, 0f32, 0usize);
+        for (x, y) in a.iter().zip(b) {
+            d2 += ((x - y) as f64).powi(2);
+            n2 += (*y as f64).powi(2);
+            mx = mx.max((x - y).abs());
+            same += (x.to_bits() == y.to_bits()) as usize;
+        }
+        eprintln!("[snap-check] {name}: argmax {} / {}, rel err {:.3e}, max |diff| {mx:.3e}, bit-identical {same} of {}", am(a), am(b),
+                  (d2 / n2.max(1e-30)).sqrt(), a.len());
+        am(a) == am(b)
+    };
+    let n = ids.len();
+    if n < 200 {
+        return Err("--snap-check wants a prompt of 200 tokens or more".into());
+    }
+    let mut ok = true;
+    // exact
+    let s1 = n - 40;
+    eng.set_pos(0)?;
+    eng.want_snapshot(s1)?;
+    let mut tok = eng.forward(ids, false)?[0];
+    let la = eng.full_row(0)?;
+    eng.commit_snapshot(0)?;
+    for _ in 0..5 {
+        tok = eng.forward(&[tok], false)?[0];
+    }
+    if !eng.can_rewind(s1) {
+        return Err(format!("the snapshot at {s1} is not reachable").into());
+    }
+    eng.set_pos(s1)?;
+    eng.forward(&ids[s1..], false)?;
+    let la2 = eng.full_row(0)?;
+    ok &= cmp("exact (40 rows again from the snapshot)", &la2, &la);
+    ok &= la2.iter().zip(&la).all(|(x, y)| x.to_bits() == y.to_bits());
+    // follow-up: the prompt, then a user turn of its own (the snapshot at s1 is still committed)
+    let mut b = ids.to_vec();
+    b.extend(text.encode("<|user|>Now summarise the above in one sentence, please.<|assistant|><think></think>")?);
+    eng.set_pos(s1)?;
+    eng.forward(&b[s1..], false)?;
+    let lb = eng.full_row(0)?;
+    eng.set_pos(0)?;
+    eng.forward(&b, false)?;
+    let lb0 = eng.full_row(0)?;
+    cmp("follow-up from the snapshot vs a fresh prefill (other chunk edges)", &lb, &lb0);
+    // the same chunk edges without a snapshot: the prompt to s1, then the rest - what the restore stands for
+    eng.set_pos(0)?;
+    eng.forward(&b[..s1], false)?;
+    eng.forward(&b[s1..], false)?;
+    let lbs = eng.full_row(0)?;
+    cmp("baseline: a fresh prefill split at s1 vs in one", &lbs, &lb0);
+    ok &= cmp("follow-up from the snapshot vs a fresh prefill split at s1", &lb, &lbs);
+    ok &= lb.iter().zip(&lbs).all(|(x, y)| x.to_bits() == y.to_bits());
+    eng.set_pos(0)?;
+    eng.forward(&b, false)?;
+    // replay: a snapshot 7 rows into a 10-row pass
+    let p0 = eng.pos;
+    let c: Vec<u32> = text.encode(" The quick brown fox jumps over the lazy dog again and again")?.into_iter().take(10).collect();
+    let k = 7;
+    eng.want_snapshot(p0 + k)?;
+    eng.forward(&c, false)?;
+    let lc = eng.full_row(c.len() - 1)?;
+    eng.commit_snapshot(0)?;
+    let mut t2 = 0u32;
+    for _ in 0..3 {
+        t2 = eng.forward(&[t2.max(1000)], false)?[0];
+    }
+    if !eng.can_rewind(p0 + k) {
+        return Err(format!("the replayed snapshot at {} is not reachable", p0 + k).into());
+    }
+    eng.set_pos(p0 + k)?;
+    eng.forward(&c[k..], false)?;
+    let lc2 = eng.full_row(c.len() - k - 1)?;
+    cmp("replay: 3 rows again from a snapshot inside a 10-row pass vs that pass", &lc2, &lc);
+    // the in-pass rollback the snapshot's replay copies: the 10-row pass, back to k, the 3 rows again
+    eng.set_pos(0)?;
+    eng.forward(&b, false)?;
+    eng.forward(&c, false)?;
+    eng.set_pos(p0 + k)?;
+    eng.forward(&c[k..], false)?;
+    let lcr = eng.full_row(c.len() - k - 1)?;
+    ok &= cmp("replay snapshot vs the in-pass rollback", &lc2, &lcr);
+    ok &= lc2.iter().zip(&lcr).all(|(x, y)| x.to_bits() == y.to_bits());
+    // an emptied lane
+    eng.kv_shrink(0, 0)?;
+    eng.set_pos(0)?;
+    eng.forward(&b, false)?;
+    let lb1 = eng.full_row(0)?;
+    ok &= cmp("an emptied lane's prefill vs a fresh one", &lb1, &lb0);
+    ok &= lb1.iter().zip(&lb0).all(|(x, y)| x.to_bits() == y.to_bits());
+    eprintln!("[snap-check] {}", if ok { "PASS" } else { "FAIL" });
+    if ok { Ok(()) } else { Err("snap-check failed".into()) }
 }

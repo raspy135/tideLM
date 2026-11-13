@@ -616,8 +616,10 @@ impl Server {
             }
         }
         let keep = common.saturating_sub(1);
-        // KDA's state goes back only within its last pass: a prefix further back is prefilled again
-        let keep = if self.eng.can_rewind(keep) { keep } else { 0 };
+        // KDA's state goes back within its last pass, or to the lane's snapshot near its last prompt's
+        // end (a chat's follow-up: the template drops the last answer's reasoning, so the prompt leaves
+        // the lane's sequence where that answer began; a regenerate); anything else prefills again
+        let keep = if self.eng.can_rewind(keep) { keep } else { self.eng.restore_point(lane, keep) };
         self.eng.set_pos(keep)?;
         let mut g = g;
         g.cached = keep;
@@ -666,6 +668,9 @@ impl Server {
                 }
             }
         }
+        // GLM-5.3-Flash: the KDA state two rows before the prompt's end, for the next turn (its prompt
+        // shares this one to its end; a regenerate's reprefills its last two rows)
+        self.eng.want_snapshot(prompt.len().saturating_sub(2))?;
         let beside = self.runs.iter().any(|r| r.is_some());
         if beside && suffix.len() > self.opt.lane_chunk.max(self.opt.two_pass) {
             run.part = Some((suffix, 0));
@@ -683,6 +688,7 @@ impl Server {
             if miss >= opt.two_pass_miss {
                 self.eng.adapt(opt.adapt_prefill)?;
                 self.eng.set_pos(keep)?;
+                self.eng.want_snapshot(prompt.len().saturating_sub(2))?;
                 first = self.eng.forward(&suffix, depth > 0)?;
                 adapted = true;
                 self.stats.two_pass += 1;
@@ -731,6 +737,7 @@ impl Server {
     /// hidden, the drafters; the run decodes from the next round.
     fn begin_decode(&mut self, mut run: Run, first: &[u32]) -> Result<()> {
         self.eng.clear_image_spans(run.lane);
+        self.eng.commit_snapshot(run.lane)?;
         let last = self.eng.last_rows - 1;
         // a forward returns every row's argmax up to HEAD_ROWS: the suffix's next token is its
         // last row's (a prefill chunk's head ran on that row alone: row 0)

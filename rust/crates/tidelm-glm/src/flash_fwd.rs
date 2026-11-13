@@ -10,6 +10,13 @@
 //! KDA's state is a lane's two slots (flash.cu): stage() names each lane's read and write slot,
 //! a decoder pass flips the lane to the slot it wrote (flash_commit), and set_pos inside the lane's
 //! last pass replays the kept rows from the slot it read (flash_set_pos).
+//!
+//! A lane also keeps a snapshot of its state near its last prompt's end (Engine::want_snapshot,
+//! taken at a prefill chunk's edge or by a replay), so a set_pos there - a chat's follow-up, whose
+//! template drops the last answer's reasoning and so leaves the lane's sequence where that answer
+//! began, or a regenerate - restores it instead of prefilling from 0. Two snapshot slots a lane:
+//! the committed one, and the one this request's prefill takes, committed when it decodes (a
+//! two-pass prefill goes back to the committed one between its passes).
 
 use super::*;
 use tidelm_kernels::flash::*;
@@ -69,6 +76,15 @@ pub(crate) struct FlashState {
     /// the sparse layers' K | gate rings [sparse layers][lanes][64][256]
     ring: DeviceBuffer<u16>,
     lanes: usize,
+    nd: usize,
+    /// prompt-end snapshots: slots 2 lanes + 2 lane + 0 / 1 of `state` and `conv`, and their rings
+    /// [2 lanes][sparse layers][64][256]; per lane the committed one (0 / 1) and its position, the
+    /// pending one's position, and the position its next forward is to snapshot
+    snap_ring: DeviceBuffer<u16>,
+    snap_cur: Vec<usize>,
+    snap_pos: Vec<Option<usize>>,
+    snap_pend: Vec<Option<usize>>,
+    pub(crate) snap_want: Vec<Option<usize>>,
     /// the pass's [2][MAX_LANES][4] (decoder, MTP): lane, KDA slot read, slot written, pool offset
     meta: DeviceBuffer<i32>,
     h_meta: tidelm_cuda::PinnedBuffer<i32>,
@@ -129,7 +145,8 @@ impl FlashState {
             idx: DeviceBuffer::new(r * IDX_LD)?,
             kvb_bf: z(hl * cfg.kvb_rows() * cfg.kv_lora)?,
         };
-        let slots = 2 * lanes;
+        // two working slots a lane, then two snapshot slots a lane
+        let slots = 4 * lanes;
         Ok(FlashState {
             kda_of,
             dsa_of,
@@ -145,6 +162,12 @@ impl FlashState {
             save_raw: DeviceBuffer::zeroed(lanes * nk * SAVE_ROWS * c)?,
             ring: DeviceBuffer::zeroed(nd * lanes * 64 * 256)?,
             lanes,
+            nd,
+            snap_ring: DeviceBuffer::zeroed(2 * lanes * nd * 64 * 256)?,
+            snap_cur: vec![0; lanes],
+            snap_pos: vec![None; lanes],
+            snap_pend: vec![None; lanes],
+            snap_want: vec![None; lanes],
             meta: DeviceBuffer::zeroed(2 * MAX_LANES * 4)?,
             h_meta: tidelm_cuda::PinnedBuffer::zeroed(2 * MAX_LANES * 4)?,
             parity: vec![0; lanes],
@@ -156,7 +179,12 @@ impl FlashState {
     /// Device bytes held (the boot log).
     pub(crate) fn bytes(&self) -> usize {
         4 * (self.state.len() + self.save_k.len() + self.save_g.len() + self.save_b.len())
-            + 2 * (self.conv.len() + self.save_v.len() + self.save_raw.len() + self.ring.len())
+            + 2 * (self.conv.len() + self.save_v.len() + self.save_raw.len() + self.ring.len() + self.snap_ring.len())
+    }
+
+    /// Lane `lane`'s snapshot slot `which` (0 / 1) in `state` / `conv`.
+    fn snap_slot(&self, lane: usize, which: usize) -> usize {
+        2 * self.lanes + 2 * lane + which
     }
 }
 
@@ -196,35 +224,134 @@ impl Engine {
     }
 
     pub(crate) fn flash_can_rewind(&self, lane: usize, pos: usize, n: usize) -> bool {
-        n == pos || n == 0 || self.fl().last[lane].is_some_and(|(p0, rows, saved)| saved && n >= p0 && n < p0 + rows)
+        let fl = self.fl();
+        n == pos || n == 0 || fl.last[lane].is_some_and(|(p0, rows, saved)| saved && n >= p0 && n < p0 + rows)
+            || (n < pos && (fl.snap_pos[lane] == Some(n) || fl.snap_pend[lane] == Some(n)))
+    }
+
+    /// The furthest position at most `keep` a set_pos can take the lane back to through its
+    /// snapshot (0: none).
+    pub(crate) fn flash_restore_point(&self, lane: usize, keep: usize) -> usize {
+        let fl = self.fl();
+        [fl.snap_pos[lane], fl.snap_pend[lane]].into_iter().flatten().filter(|&s| s <= keep).max().unwrap_or(0)
+    }
+
+    /// Copy slot `from`'s KDA state and conv rows to slot `to`.
+    fn flash_copy_slot(&self, from: usize, to: usize) -> Result<()> {
+        let fl = self.fl();
+        let (slot_f, slot_c) = (fl.nkda * fl.khl * 128 * 128, fl.nkda * 3 * 3 * fl.dl);
+        unsafe {
+            tidelm_cuda::memcpy_async(at(&fl.state, to * slot_f), at(&fl.state, from * slot_f), slot_f * 4,
+                                      tidelm_cuda::ffi::MEMCPY_DEVICE_TO_DEVICE, &self.st)?;
+            tidelm_cuda::memcpy_async(at(&fl.conv, to * slot_c), at(&fl.conv, from * slot_c), slot_c * 2,
+                                      tidelm_cuda::ffi::MEMCPY_DEVICE_TO_DEVICE, &self.st)?;
+        }
+        Ok(())
+    }
+
+    /// The lane's sparse-layer rings into snapshot ring `snap` (`save`), or back from it.
+    fn flash_copy_ring(&self, lane: usize, snap: usize, save: bool) -> Result<()> {
+        let fl = self.fl();
+        let r = 64 * 256;
+        let (lane_at, snap_at) = (at(&fl.ring, lane * r), at(&fl.snap_ring, snap * fl.nd * r));
+        let (lane_pitch, snap_pitch) = (fl.lanes * r * 2, r * 2);
+        let (dst, dp, src, sp) = if save { (snap_at, snap_pitch, lane_at, lane_pitch) } else { (lane_at, lane_pitch, snap_at, snap_pitch) };
+        ck(unsafe { tidelm_cuda::ffi::cudaMemcpy2DAsync(dst, dp, src, sp, r * 2, fl.nd, tidelm_cuda::ffi::MEMCPY_DEVICE_TO_DEVICE,
+                                                       self.st.raw()) }, "kda snapshot ring")
+    }
+
+    /// The lane's state at position `p` into its pending snapshot: the committed slot when the
+    /// lane is at `p` (`pos`), else a replay of its last pass's kept rows when that pass saved them
+    /// and holds `p`; out of reach, no snapshot. Its want is done either way.
+    pub(crate) fn flash_take_snapshot(&mut self, lane: usize, pos: usize, p: usize) -> Result<()> {
+        let fl = self.fl.as_mut().unwrap();
+        fl.snap_want[lane] = None;
+        let which = 1 - fl.snap_cur[lane];
+        let dst = fl.snap_slot(lane, which);
+        let (cur, prev) = (2 * lane + fl.parity[lane], 2 * lane + 1 - fl.parity[lane]);
+        if p == pos {
+            self.flash_copy_slot(cur, dst)?;
+        } else if let Some((p0, _, _)) = fl.last[lane].filter(|&(p0, rows, saved)| saved && p >= p0 && p < p0 + rows) {
+            let st = self.st.raw();
+            let (nk, khl, c) = (fl.nkda, fl.khl, 3 * fl.dl);
+            let (slot_f, slot_c) = (nk * khl * 128 * 128, nk * 3 * c);
+            let lk = nk * SAVE_ROWS * fl.dl;
+            unsafe {
+                ck(flash_kda_replay(st, fl.state.raw(), (khl * 128 * 128) as i64, slot_f as i64, nk as i32, prev as i32, dst as i32,
+                                    at(&fl.save_k, lane * lk), at(&fl.save_g, lane * lk), at(&fl.save_v, lane * lk),
+                                    at(&fl.save_b, lane * nk * SAVE_ROWS * khl), (SAVE_ROWS * khl * 128) as i64, (p - p0) as i32,
+                                    khl as i32), "kda snapshot replay")?;
+                ck(flash_kda_conv_replay(st, fl.conv.raw(), (3 * c) as i64, slot_c as i64, c as i32, nk as i32, prev as i32, dst as i32,
+                                         at(&fl.save_raw, lane * nk * SAVE_ROWS * c), (SAVE_ROWS * c) as i64, (p - p0) as i32),
+                   "kda snapshot conv replay")?;
+            }
+        } else {
+            return Ok(());
+        }
+        // the rings' rows past p are rewritten by whatever prefills from p before they are read
+        self.flash_copy_ring(lane, 2 * lane + which, true)?;
+        self.fl.as_mut().unwrap().snap_pend[lane] = Some(p);
+        Ok(())
+    }
+
+    /// The lane has decoded past its prompt: its pending snapshot becomes the committed one.
+    pub(crate) fn flash_commit_snapshot(&mut self, lane: usize) {
+        if let Some(fl) = self.fl.as_mut() {
+            if let Some(p) = fl.snap_pend[lane].take() {
+                fl.snap_cur[lane] ^= 1;
+                fl.snap_pos[lane] = Some(p);
+            }
+        }
     }
 
     /// set_pos on a GLM-5.3-Flash lane at `pos`: to 0 a fresh state, inside the lane's last pass a
     /// replay of its kept rows, anything else is out of KDA's reach (no saved state).
     pub(crate) fn flash_set_pos(&mut self, lane: usize, pos: usize, n: usize) -> Result<()> {
-        if n == pos {
-            return Ok(());
-        }
         let st = self.st.raw();
         let fl = self.fl.as_mut().unwrap();
         let (nk, khl, c) = (fl.nkda, fl.khl, 3 * fl.dl);
         let slot_f = nk * khl * 128 * 128;
         let slot_c = nk * 3 * c;
+        // a set_pos ends a want its forward did not reach
+        fl.snap_want[lane] = None;
         if n == 0 {
+            // always, at 0 too: a lane emptied any other way (kv_shrink) must not keep its old state
             unsafe {
                 ck(tidelm_cuda::ffi::cudaMemsetAsync(at(&fl.state, 2 * lane * slot_f), 0, 2 * slot_f * 4, st), "kda state reset")?;
                 ck(tidelm_cuda::ffi::cudaMemsetAsync(at(&fl.conv, 2 * lane * slot_c), 0, 2 * slot_c * 2, st), "kda conv reset")?;
             }
             fl.parity[lane] = 0;
             fl.last[lane] = None;
+            fl.snap_pos[lane] = None;
+            fl.snap_pend[lane] = None;
             return Ok(());
         }
-        let Some((p0, rows, saved)) = fl.last[lane] else {
-            return Err(format!("lane {lane}: KDA's state cannot go back from {pos} to {n} (no pass to roll back)").into());
-        };
-        if n < p0 || n >= p0 + rows || !saved {
-            return Err(format!("lane {lane}: KDA's state cannot go back from {pos} to {n} (its last pass: {rows} rows from {p0})").into());
+        if n == pos {
+            return Ok(());
         }
+        // snapshots past n held positions that are no longer the lane's
+        if fl.snap_pos[lane].is_some_and(|s| s > n) {
+            fl.snap_pos[lane] = None;
+        }
+        if fl.snap_pend[lane].is_some_and(|s| s > n) {
+            fl.snap_pend[lane] = None;
+        }
+        let in_pass = fl.last[lane].filter(|&(p0, rows, saved)| saved && n >= p0 && n < p0 + rows);
+        let Some((p0, _, _)) = in_pass else {
+            let which = if fl.snap_pos[lane] == Some(n) {
+                fl.snap_cur[lane]
+            } else if fl.snap_pend[lane] == Some(n) {
+                1 - fl.snap_cur[lane]
+            } else {
+                let last = fl.last[lane].map_or("none".to_string(), |(p0, rows, _)| format!("{rows} rows from {p0}"));
+                return Err(format!("lane {lane}: KDA's state cannot go back from {pos} to {n} (its last pass: {last}; snapshots \
+                                    {:?} / {:?})", fl.snap_pos[lane], fl.snap_pend[lane]).into());
+            };
+            let (from, to) = (fl.snap_slot(lane, which), 2 * lane + fl.parity[lane]);
+            fl.last[lane] = None;
+            self.flash_copy_slot(from, to)?;
+            return self.flash_copy_ring(lane, 2 * lane + which, false);
+        };
         let keep = n - p0;
         let cur = 2 * lane + fl.parity[lane];
         let prev = 2 * lane + 1 - fl.parity[lane];
