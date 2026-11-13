@@ -441,6 +441,8 @@ pub struct Engine {
     cand_rows: usize,
     /// GLM-5.3-Flash: KDA's state, the indexer's rings, the pass's lane slots (flash_fwd)
     fl: Option<flash_fwd::FlashState>,
+    /// GLM-5.3-Flash's image input (flash_image; None: off)
+    pub vis: Option<crate::flash_image::VisionState>,
 }
 
 fn np<T: Copy>(b: &DeviceBuffer<T>) -> *mut c_void {
@@ -677,6 +679,7 @@ impl Engine {
             h_cand: tidelm_cuda::PinnedBuffer::zeroed(world * HEAD_ROWS * CROW)?,
             cand_rows: 0,
             fl,
+            vis: None,
         };
         engine.st.synchronize()?;
         Ok(engine)
@@ -2211,7 +2214,9 @@ impl Engine {
         self.hot_install()?;
         self.passes += 1;
         self.adapt_install(false)?;
-        if next.is_none() && (t <= MAX_ROWS || (t <= HEAD_ROWS && self.pos >= self.wide_from)) {
+        // a pass over image rows writes them into the stream eagerly: never a captured decode pass
+        let images = self.vis.as_ref().is_some_and(|v| v.lane == lane && !v.spans.is_empty());
+        if next.is_none() && !images && (t <= MAX_ROWS || (t <= HEAD_ROWS && self.pos >= self.wide_from)) {
             let p0 = self.pos;
             let out = self.decode_pass(ids, &[(lane, t, p0)])?;
             self.tokens.extend_from_slice(ids);
@@ -2405,6 +2410,11 @@ impl Engine {
         }
         if self.fl.is_some() {
             self.flash_set_pos(lane, self.pos, n)?;
+        }
+        if let Some(v) = self.vis.as_mut() {
+            if n <= v.floor[lane] {
+                v.floor[lane] = usize::MAX;
+            }
         }
         self.pos = n;
         self.tokens.truncate(n);

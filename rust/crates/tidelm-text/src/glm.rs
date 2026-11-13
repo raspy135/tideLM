@@ -45,6 +45,13 @@ You are provided with function signatures within <tools></tools> XML tags:\n<too
 const TOOLS_TAIL: &str = "</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n\
 <tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>";
 const MEDIA: [&str; 7] = ["image", "image_url", "video", "video_url", "audio", "audio_url", "input_audio"];
+/// the content parts a vision server shows (render_vision)
+pub const IMAGES: [&str; 3] = ["image", "image_url", "input_image"];
+/// an image part's text in a vision prompt (GLM-5.3-Flash: begin / image / end of image)
+pub const IMAGE_PLACEHOLDER: &str = "<|begin_of_image|><|image|><|end_of_image|>";
+thread_local! {
+    static VISION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 // ---------------------------------------------------------------- Python's values
 
@@ -246,6 +253,10 @@ fn visible_text(content: J) -> String {
                         let ty = J::of(m.get("type"));
                         if ty.is("text") {
                             out.push_str(&J::of(m.get("text")).render());
+                        } else if ty.string().is_some_and(|t| IMAGES.contains(&t)) && VISION.with(|v| v.get()) {
+                            // a vision server (render_vision): the image's placeholder, as GLM-5.3-Flash's
+                            // processor expands it (its `<|image|>` becomes the image's tokens)
+                            out.push_str(IMAGE_PLACEHOLDER);
                         } else if let Some(t) = ty.string().filter(|t| MEDIA.contains(t)) {
                             let media = t.replace("_url", "").replace("input_", "");
                             out.push_str(&format!("<reminder>You are unable to process this {media} because you don't have \
@@ -533,6 +544,15 @@ fn prepare(messages: &[Value]) -> Result<Vec<Value>, String> {
 
 /// The prompt text for OpenAI-shaped `messages` and `tools` (GlmTemplate.render). `effort`
 /// "low" or "high" is honored; anything else, and none, is Max.
+/// render() with every image part as IMAGE_PLACEHOLDER (a server with a vision tower) instead
+/// of the template's reminder that the model cannot see it.
+pub fn render_vision(messages: &[Value], tools: Option<&Value>, effort: Option<&str>) -> Result<String, String> {
+    VISION.with(|v| v.set(true));
+    let r = render(messages, tools, effort);
+    VISION.with(|v| v.set(false));
+    r
+}
+
 pub fn render(messages: &[Value], tools: Option<&Value>, effort: Option<&str>) -> Result<String, String> {
     let msgs = prepare(messages)?;
     let tools = match tools {

@@ -120,6 +120,12 @@ pub fn bytes_for(max: usize) -> usize {
     w + scratch + (DEPTH * 12 + 32) * 256
 }
 
+/// Bytes to give Tower::load when its Mem is several regions: bytes_for plus, for the room a
+/// region's end may leave unused, twice the largest piece (the merger's gate | up, or qkv's scratch).
+pub fn bytes_for_regions(max: usize) -> usize {
+    bytes_for(max) + 2 * (2 * 2 * PINTER * OUT).max(2 * max * 3 * D)
+}
+
 fn u16s(b: &[u8]) -> Vec<u16> {
     b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
 }

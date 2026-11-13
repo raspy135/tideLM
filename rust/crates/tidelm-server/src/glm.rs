@@ -25,7 +25,8 @@ use serde_json::{json, Value};
 use tidelm_engine::decode::{Event, Finish, Generation};
 use tidelm_engine::forward::Sampling;
 use tidelm_text::chat::py_json;
-use tidelm_text::glm::{render, truthy, GlmIds};
+use tidelm_engine::vision::ImageIn;
+use tidelm_text::glm::{render, render_vision, truthy, GlmIds, IMAGES};
 use tidelm_text::Text;
 
 use crate::anthropic::{Prep, Prepared, Room};
@@ -45,6 +46,15 @@ pub struct GlmSettings {
     /// generation_config.json's temperature and top_p (1.0 when absent)
     pub temperature: f64,
     pub top_p: f64,
+    /// GLM-5.3-Flash with GLM_VISION=1: images are shown to the model (else the template's reminder)
+    pub vision: Option<VisionSet>,
+}
+
+/// A vision server's image settings: an image's merged-token cap (GLM_VISION_MAX_TOKENS, the
+/// processor's 8000) and the `<|image|>` id a placeholder expands into.
+pub struct VisionSet {
+    pub max_tokens: usize,
+    pub image_id: u32,
 }
 
 impl GlmSettings {
@@ -62,6 +72,19 @@ impl GlmSettings {
             },
             temperature: f("temperature"),
             top_p: f("top_p"),
+            vision: {
+                let cfg: Value = serde_json::from_slice(&std::fs::read(model_dir.join("config.json"))?)?;
+                if cfg["model_type"].as_str() == Some("glm5_next") && std::env::var("GLM_VISION").as_deref() == Ok("1") {
+                    let max_tokens = match std::env::var("GLM_VISION_MAX_TOKENS") {
+                        Ok(v) => v.parse().map_err(|_| format!("GLM_VISION_MAX_TOKENS={v}: not an integer"))?,
+                        Err(_) => 8000,
+                    };
+                    let image_id = text.tokenizer.token_to_id("<|image|>").ok_or("the tokenizer has no <|image|> token")?;
+                    Some(VisionSet { max_tokens, image_id })
+                } else {
+                    None
+                }
+            },
         })
     }
 }
@@ -163,22 +186,70 @@ fn object(body: Value) -> Result<Value, ApiError> {
     }
 }
 
-/// The prompt of a chat body: its messages (none: []) and tools at its effort
-fn prompt(body: &Value, ctx: &Ctx, effort: Option<&str>) -> Result<(String, Vec<u32>), ApiError> {
+/// The prompt of a chat body: its messages (none: []) and tools at its effort, with its images
+fn prompt(body: &Value, ctx: &Ctx, effort: Option<&str>, g: &GlmSettings) -> Result<(String, Vec<u32>, Vec<ImageIn>), ApiError> {
     let msgs: &[Value] = match body.get("messages") {
         None => &[],
         Some(Value::Array(a)) => a,
         Some(_) => return Err(ApiError::bad("`messages` must be a list", Some("messages"))),
     };
-    let text = render(msgs, body.get("tools"), effort).map_err(|e| ApiError::bad(format!("cannot render messages: {e}"), Some("messages")))?;
-    let ids = encode(ctx, &text)?;
-    Ok((text, ids))
+    with_images(msgs, body.get("tools"), effort, ctx, g)
 }
 
-fn request(prompt: Vec<u32>, p: &Params, g: &GlmSettings) -> Request {
+/// An image part's record for vision::load_bytes: OpenAI's image_url (an object or a URL),
+/// input_image's image_url, Anthropic's image block itself (its source)
+fn image_record(part: &serde_json::Map<String, Value>) -> Value {
+    match part.get("image_url") {
+        Some(Value::String(u)) => json!({ "url": u }),
+        Some(v @ Value::Object(_)) => v.clone(),
+        _ => Value::Object(part.clone()),
+    }
+}
+
+/// Render messages; on a vision server each image part becomes the placeholder, its `<|image|>`
+/// the image's tokens (one a 2 x 2 patch window), and the images go with the ids in prompt order.
+fn with_images(msgs: &[Value], tools: Option<&Value>, effort: Option<&str>, ctx: &Ctx, g: &GlmSettings)
+               -> Result<(String, Vec<u32>, Vec<ImageIn>), ApiError> {
+    let parts: Vec<Value> = msgs.iter().filter_map(|m| m.get("content").and_then(|c| c.as_array()))
+        .flat_map(|c| c.iter())
+        .filter(|p| p.get("type").and_then(|t| t.as_str()).is_some_and(|t| IMAGES.contains(&t)))
+        .filter_map(|p| p.as_object().map(image_record)).collect();
+    let Some(v) = g.vision.as_ref().filter(|_| !parts.is_empty()) else {
+        let text = render(msgs, tools, effort).map_err(|e| ApiError::bad(format!("cannot render messages: {e}"), Some("messages")))?;
+        let ids = encode(ctx, &text)?;
+        return Ok((text, ids, vec![]));
+    };
+    let text = render_vision(msgs, tools, effort).map_err(|e| ApiError::bad(format!("cannot render messages: {e}"), Some("messages")))?;
+    let ids = encode(ctx, &text)?;
+    let found = ids.iter().filter(|&&t| t == v.image_id).count();
+    if found != parts.len() {
+        return Err(ApiError::bad(format!("{found} image tokens for {} images (is <|image|> typed in the text?)", parts.len()),
+                                 Some("messages")));
+    }
+    let mut prepared = vec![];
+    for rec in &parts {
+        let bytes = crate::vision::load_bytes(rec).map_err(|e| ApiError::bad(e, Some("messages")))?;
+        prepared.push(tidelm_image::glm5next::prepare(&bytes, 16, v.max_tokens).map_err(|e| ApiError::bad(e, Some("messages")))?);
+    }
+    let (mut out, mut images, mut k) = (Vec::with_capacity(ids.len()), vec![], 0);
+    for &t in &ids {
+        if t != v.image_id {
+            out.push(t);
+            continue;
+        }
+        let p = std::mem::replace(&mut prepared[k], tidelm_image::glm5next::Prepared { gh: 0, gw: 0, patches: vec![], digest: [0; 32] });
+        k += 1;
+        let n = p.tokens();
+        images.push(ImageIn { start: out.len(), vit_h: p.gh, vit_w: p.gw, patches: p.patches });
+        out.extend(std::iter::repeat(v.image_id).take(n));
+    }
+    Ok((text, out, images))
+}
+
+fn request(prompt: Vec<u32>, images: Vec<ImageIn>, p: &Params, g: &GlmSettings) -> Request {
     Request {
         prompt,
-        images: Vec::new(),
+        images,
         key: None,
         max_tokens: p.max_tokens,
         sampling: Sampling { temperature: p.temperature, top_p: p.top_p },
@@ -197,19 +268,19 @@ fn exceeds(n: usize) -> ApiError {
 pub fn debug_prompt(stream: &mut TcpStream, body: &[u8], ctx: &Ctx, g: &GlmSettings) -> Result<(), Failure> {
     let body = object(body_json(body)?)?;
     let effort = template_effort(&body, g);
-    let (text, ids) = prompt(&body, ctx, effort)?;
-    send_json(stream, 200, &json!({"prompt_tokens": ids.len(), "prompt": text, "ids": ids, "effort": effort}))?;
+    let (text, ids, images) = prompt(&body, ctx, effort, g)?;
+    send_json(stream, 200, &json!({"prompt_tokens": ids.len(), "prompt": text, "ids": ids, "effort": effort, "images": images.len()}))?;
     Ok(())
 }
 
 pub fn chat(stream: &mut TcpStream, body: &[u8], ctx: &Ctx, g: &GlmSettings) -> Result<(), Failure> {
     let t0 = Instant::now();
     let body = object(body_json(body)?)?;
-    let (_, ids) = prompt(&body, ctx, template_effort(&body, g))?;
+    let (_, ids, images) = prompt(&body, ctx, template_effort(&body, g), g)?;
     let mut p = params(&body, g)?;
     p.max_tokens = Room::Glm.fit(ids.len(), p.max_tokens, ctx.max_seq).ok_or_else(|| exceeds(ids.len()))?;
     let tools = body.get("tools").filter(|t| !t.is_null());
-    run(stream, ctx, g, request(ids, &p, g), tools, body.get("stream").is_some_and(truthy), Some(&body), t0)
+    run(stream, ctx, g, request(ids, images, &p, g), tools, body.get("stream").is_some_and(truthy), Some(&body), t0)
 }
 
 /// /v1/completions: a raw prompt; `text` is the decode of every answer id, the stop id too
@@ -227,20 +298,19 @@ pub fn completions(stream: &mut TcpStream, body: &[u8], ctx: &Ctx, g: &GlmSettin
     }
     let mut p = params(&body, g)?;
     p.max_tokens = Room::Glm.fit(ids.len(), p.max_tokens, ctx.max_seq).ok_or_else(|| exceeds(ids.len()))?;
-    run(stream, ctx, g, request(ids, &p, g), None, body.get("stream").is_some_and(truthy), None, t0)
+    run(stream, ctx, g, request(ids, vec![], &p, g), None, body.get("stream").is_some_and(truthy), None, t0)
 }
 
 /// /v1/messages on GLM: the translated request rendered at the server's effort, muse_app's
 /// params from the Anthropic body
 pub fn anthropic_prepare(req: &Value, msgs: &[Value], tools: Vec<Value>, ctx: &Ctx, g: &GlmSettings, count: bool) -> Result<Prep, ApiError> {
     let tools = Value::Array(tools);
-    let text = render(msgs, Some(&tools), Some(&g.default_effort)).map_err(|e| ApiError::bad(format!("cannot render messages: {e}"), Some("messages")))?;
-    let ids = encode(ctx, &text)?;
+    let (_, ids, images) = with_images(msgs, Some(&tools), Some(&g.default_effort), ctx, g)?;
     if count {
         return Ok(Prep::Count(ids.len()));
     }
     let p = params(req, g)?;
-    Ok(Prep::Run(Prepared { request: request(ids, &p, g), answer: Box::new(GlmAnswer::new(&g.ids)), room: Room::Glm, tools }))
+    Ok(Prep::Run(Prepared { request: request(ids, images, &p, g), answer: Box::new(GlmAnswer::new(&g.ids)), room: Room::Glm, tools }))
 }
 
 fn now() -> u64 {

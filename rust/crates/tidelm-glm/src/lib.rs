@@ -7,6 +7,7 @@ pub mod adapt;
 pub mod arena;
 pub mod config;
 pub mod flash;
+pub mod flash_image;
 pub mod flash_vision;
 pub mod forward;
 pub mod lend;

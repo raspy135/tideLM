@@ -583,6 +583,8 @@ impl Server {
         let depth = if self.eng.cfg.mtp { self.opt.depth } else { 0 };
         // the lane's sequence's prefix, one token back so the reprefilled row refills its MTP row
         let mut common = prompt.iter().zip(&self.eng.tokens).take_while(|(a, b)| a == b).count().min(prompt.len() - 1);
+        // images share one placeholder id: no prefix past the lane's or the prompt's first image
+        common = common.min(self.eng.image_floor(lane)).min(job.images.first().map_or(usize::MAX, |i| i.start));
         // the disk store's deepest saved prefix, when it gains enough over the lane's (not with KDA:
         // the store holds KV rows, not the linear-attention state)
         if let Some(store) = self.store.as_mut().filter(|_| !self.eng.cfg.is_flash()) {
@@ -618,6 +620,22 @@ impl Server {
         let mut g = g;
         g.cached = keep;
         let suffix = prompt[keep..].to_vec();
+        // the request's images, encoded with the tower in lent expert slots, before the prefill
+        if self.eng.vis.is_some() || !job.images.is_empty() {
+            match self.eng.encode_images(lane, &job.images) {
+                Ok(secs) if !job.images.is_empty() => {
+                    (self.log)(&format!("[vision] request {}: {} image(s), {} rows, encoded in {:.2} s", job.id, job.images.len(),
+                                        job.images.iter().map(|i| i.vit_h * i.vit_w / 4).sum::<usize>(), secs));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    // the request's failure, not the engine's (the lent slots are back)
+                    (self.log)(&format!("[vision] request {}: {e}", job.id));
+                    (job.sink)(Event::Done(Finish::Error(format!("images: {e}")), g));
+                    return Ok(());
+                }
+            }
+        }
         self.eng.take_lane_demand(lane)?; // the lane's demand restarts with this request
         // the conversation's key (its opening): its votes accumulate at each of its requests' ends,
         // its continuations preload from them (GLM_PRELOAD)
@@ -708,6 +726,7 @@ impl Server {
     /// After a prefill (the selected lane's, its argmaxes `first`): the first anchor, the kept
     /// hidden, the drafters; the run decodes from the next round.
     fn begin_decode(&mut self, mut run: Run, first: &[u32]) -> Result<()> {
+        self.eng.clear_image_spans(run.lane);
         let last = self.eng.last_rows - 1;
         // a forward returns every row's argmax up to HEAD_ROWS: the suffix's next token is its
         // last row's (a prefill chunk's head ran on that row alone: row 0)

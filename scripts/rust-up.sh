@@ -136,6 +136,8 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
     # GLM-5.3-Flash's non-expert weights: fp8 (32 x 32 block scales, the default) or bf16 (the
     # checkpoint's); it moves values, so the boot guard hashes it
     [[ -n "${GLM_FLASH_DENSE:-}" ]] && envs+=(GLM_FLASH_DENSE="$GLM_FLASH_DENSE")
+    # GLM-5.3-Flash's image input: the tower is loaded on demand into lent expert slots
+    [[ "${GLM_VISION:-0}" == 1 ]] && envs+=(GLM_VISION=1 GLM_VISION_MAX_TOKENS="${GLM_VISION_MAX_TOKENS:-8000}")
     # GLM_ABLIT: the abliteration's directions (rust/crates/tidelm-glm/src/ablit.rs), a host path
     # mounted at that path on both ranks; unset serves the stock model
     if [[ -n "${GLM_ABLIT:-}" ]]; then
