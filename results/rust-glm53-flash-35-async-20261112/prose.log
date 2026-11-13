@@ -1,0 +1,12 @@
+== p2-prose: workload=prose isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=53 ttft=    503.8 ms  tpot=  52.40 ms  decode= 19.08 tok/s  out=1024 (length)
+          accept_len=2.126819126819127  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=53 ttft=    502.1 ms  tpot=  49.74 ms  decode= 20.11 tok/s  out=994 (stop)
+          accept_len=2.2314606741573035  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=53 ttft=    422.8 ms  tpot=  50.45 ms  decode= 19.82 tok/s  out=1024 (length)
+          accept_len=2.1952789699570814  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=53 ttft=    513.0 ms  tpot=  51.71 ms  decode= 19.34 tok/s  out=1024 (length)
+          accept_len=2.1401673640167362  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=502.1231 ms  tpot=50.4537 ms  decode=19.8201 tok/s
+  -> ENGINE  accept_len=2.1953  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote results/rust-glm53-flash-35-async-20261112/prose.json
