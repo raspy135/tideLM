@@ -288,8 +288,8 @@ uv run --no-project --with numpy python tools/glm_pack_exl3.py --world 1 --resum
 
 Set `GLM_MODEL_DIR=<dense dir>` and `GLM_EXL3_DIR=<packs dir>` in the profile. Residency starts from
 the bundled routing history (`profiles/glm53-flash-history-v1.npz`, a day of the author's serving) and
-learns from your traffic into `RUST_GLM_STATE_DB`; the seed is read only while that file does not exist,
-so an install from before 2026-11-13 picks up v1 by moving its state file aside.
+learns from your traffic into `RUST_GLM_STATE_DB` (to start over from the seed, see
+[Resetting the routing history](#resetting-the-routing-history)).
 
 **3. Image and start** (`--local-only`: there is no worker to ship it to):
 
@@ -349,6 +349,39 @@ adaptation catches up with your traffic. One profile serves at a time: each fill
 the head. `TIDE_ENGINE=python` still starts the Python containers, from a profile with
 their settings (the examples as of `a6ec917`), and a profile the Rust engine does not serve
 (MXFP4 GLM experts, FP4 KV) goes to them with a note.
+
+### Updating
+
+```bash
+git pull                                   # on both nodes for a two-Spark profile
+scripts/tide.sh build .env.glm53-exlr8     # the image again (--local-only on one Spark)
+diff .env.glm53-exlr8 configs/glm53-exlr8.env.example
+scripts/tide.sh start .env.glm53-exlr8
+```
+
+The engine refuses an image built from other sources than the checkout, so every `git pull` needs
+the build. New settings and changed defaults arrive in `configs/*.env.example`, not in your copy:
+the `diff` shows what to carry over (keep your own paths). The learned routing history is kept
+across updates.
+
+### Resetting the routing history
+
+A GLM profile places its resident experts from a routing history the engine keeps learning into
+(`RUST_GLM_STATE_DB`; GLM-5.3's default `~/tidelm-rust-state/glm-stats-rust.npz`). The bundled seed
+(`GLM_STATS_DB`) is read only on a boot that finds no such file. To start over from the seed - a
+new seed, or traffic that has changed:
+
+```bash
+grep GLM_STATS_DB configs/glm53-flash-35-tp1.env.example   # the current seed: your profile must name it
+scripts/tide.sh stop
+mv ~/tidelm-rust-state/glm-flash-stats.npz ~/tidelm-rust-state/glm-flash-stats.old.npz
+scripts/tide.sh start .env.glm53-flash-35
+```
+
+The boot log then reads `boot: routing history /app/profiles/...` (the seed) instead of your state
+file, and the first requests are slower while adaptation catches up. Moving the old file back
+restores it. GLM-5.3-Flash installs from before 2026-11-13 name seed v0 in their profile: set
+`GLM_STATS_DB=/app/profiles/glm53-flash-history-v1.npz` and update the image first.
 
 ## Abliterated overlay (DeepSeek V4.1)
 
