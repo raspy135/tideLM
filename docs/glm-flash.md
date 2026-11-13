@@ -216,8 +216,18 @@ The model's own context (max_position_embeddings 1,048,576; no RoPE) for each of
 GLM_MAX_SEQ=1048576 and GLM_KV_TOKENS=2097152, a new key (the KV pool in positions over all lanes;
 unset, one lane's max_seq shared as before). KV 14.42 GB a rank, device 86.9 GiB, MemAvailable
 26-28 GiB a box. One box keeps 327,680: there the same memory is ~1,300 expert slots. bench.py was
-not rerun (its rows were measured at 327,680, short prompts); no prompt past 327,680 positions has run
-yet.
+not rerun (its rows were measured at 327,680, short prompts).
+
+Long prompts on the pair (2026-11-13, greedy, reasoning low): the repo's own text (repeated past its
+length) with two facts planted at 3% and 97% of it, both asked for at the end - sized by
+/v1/debug/prompt, one request each:
+
+| prompt | prefill | first token | decode | both facts |
+|---:|---:|---:|---:|---|
+| 343,326 | 337 s, 1,018 tok/s | 337.6 s | 43.3 tok/s | yes |
+| 1,008,546 | 1,230 s, 820 tok/s | 1,231 s | 42.3 tok/s | yes |
+
+Device memory did not move (86.9 GiB, the pool allocated at boot); MemAvailable 25 GiB after.
 
 Found with it: the pass's decoder lane offsets took the split cache's lane stride (dec_rows, padded
 from s_loc + 1) where the caches are whole (mtp_rows, padded from max_seq). Rows pad to 524,288, so
