@@ -445,12 +445,18 @@ fn run(stream: &mut TcpStream, ctx: &Ctx, g: &GlmSettings, req: Request, tools: 
     // changed, and the template writes it near the start) was silent for 363 s. The client (a
     // Node agent) retried after 300 s of silence, and the retry did the same. That retry's
     // 428 s prefill, for a client already gone, held the other lane's decode to 1-2 tok/s.
+    // A non-streamed answer writes nothing until its end, and while tokens arrive the timeout below
+    // never fires: its closed-client check runs between tokens too, a second apart. Until 2026-11-13 it
+    // did not, and a stream:false request whose client had gone decoded to its stop or max_tokens (the
+    // profile's 32,768: ~25 minutes of a lane).
+    let mut probed = Instant::now();
     let (finish, gen) = loop {
         match rx.recv_timeout(Duration::from_secs(1)) {
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if let Some(s) = sse.as_mut() {
                     s.keepalive().map_err(gone)?;
                 }
+                probed = Instant::now();
                 if probe.as_ref().is_some_and(closed) {
                     let _ = ctx.engine.send(Cmd::Cancel(id));
                     return Err(Failure::Io);
@@ -467,6 +473,12 @@ fn run(stream: &mut TcpStream, ctx: &Ctx, g: &GlmSettings, req: Request, tools: 
                     }
                     if events.is_empty() {
                         s.keepalive().map_err(gone)?;
+                    }
+                } else if probed.elapsed() >= Duration::from_secs(1) {
+                    probed = Instant::now();
+                    if probe.as_ref().is_some_and(closed) {
+                        let _ = ctx.engine.send(Cmd::Cancel(id));
+                        return Err(Failure::Io);
                     }
                 }
             }

@@ -48,6 +48,15 @@ extern "C" {
     /// out [m][n] = gelu(bf16(LayerNorm(x; w, b, eps))), exact gelu, n % 256 == 0
     pub fn flash_vit_ln_gelu(stream: CudaStream, x: *const c_void, w: *const c_void, b: *const c_void, out: *mut c_void, m: c_int,
                              n: c_int, eps: f32) -> c_int;
+    /// An mHC site of 1..16 decode rows in two launches (flash.cu, "mHC sites of decode rows, fused"):
+    /// the last site (`y` its sublayer's output, null for none; `ppost` / `pcomb`) closed into the
+    /// stream `h` in place, this site's pre / post / comb and its normed input `xn`. `partial`: fp32
+    /// [16][m][24]; `ssw`: fp32 [m][32]. H 4096, 4 streams, 24 mixes, 16 splits, or an error.
+    pub fn flash_hc_site(stream: CudaStream, y: *const c_void, h: *mut c_void, ppost: *const c_void, pcomb: *const c_void,
+                         fn_w: *const c_void, n_mix: c_int, hidden: c_int, hc: c_int, splits: c_int, partial: *mut c_void,
+                         ssw: *mut c_void, scale: *const c_void, base: *const c_void, iters: c_int, hc_eps: f32,
+                         pre: *mut c_void, post: *mut c_void, comb: *mut c_void, w: *const c_void, xn: *mut c_void, m: c_int,
+                         eps: f32) -> c_int;
     pub fn flash_expand(stream: CudaStream, pools: *const c_void, ldp: i64, kp: c_int, pos: *const c_void, out: *mut c_void,
                         ldo: i64, t: c_int) -> c_int;
 }

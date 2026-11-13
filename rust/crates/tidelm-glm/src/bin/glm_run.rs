@@ -282,6 +282,7 @@ fn main() -> Result<()> {
 ///   (other chunk edges: close, not equal);
 /// - replay: a snapshot inside a 10-row decode-path pass (replayed from its saved rows), the rows
 ///   after it decoded again from it, against the pass's own logits for them;
+/// - a rollback inside the rows an earlier rollback of the same pass kept equals one rollback;
 /// - an emptied lane (kv_shrink) prefills as a fresh one does.
 fn snap_check(eng: &mut Engine, ids: &[u32], text: &tidelm_text::Text) -> Result<()> {
     let cmp = |name: &str, a: &[f32], b: &[f32]| {
@@ -368,6 +369,27 @@ fn snap_check(eng: &mut Engine, ids: &[u32], text: &tidelm_text::Text) -> Result
     let lcr = eng.full_row(c.len() - k - 1)?;
     ok &= cmp("replay snapshot vs the in-pass rollback", &lc2, &lcr);
     ok &= lc2.iter().zip(&lcr).all(|(x, y)| x.to_bits() == y.to_bits());
+    // a second rollback, inside the rows the first kept (the pass stays the lane's rollback): back to
+    // k, then to 4, the 6 rows again - against one rollback straight to 4
+    let k2 = 4;
+    eng.set_pos(0)?;
+    eng.forward(&b, false)?;
+    eng.forward(&c, false)?;
+    eng.set_pos(p0 + k2)?;
+    eng.forward(&c[k2..], false)?;
+    let ld = eng.full_row(c.len() - k2 - 1)?;
+    eng.set_pos(0)?;
+    eng.forward(&b, false)?;
+    eng.forward(&c, false)?;
+    eng.set_pos(p0 + k)?;
+    if !eng.can_rewind(p0 + k2) {
+        return Err(format!("after a rollback to {}, {} is not reachable", p0 + k, p0 + k2).into());
+    }
+    eng.set_pos(p0 + k2)?;
+    eng.forward(&c[k2..], false)?;
+    let ld2 = eng.full_row(c.len() - k2 - 1)?;
+    ok &= cmp("a rollback inside a rollback's kept rows vs one rollback", &ld2, &ld);
+    ok &= ld2.iter().zip(&ld).all(|(x, y)| x.to_bits() == y.to_bits());
     // an emptied lane
     eng.kv_shrink(0, 0)?;
     eng.set_pos(0)?;

@@ -285,3 +285,131 @@ back to off. Cause not found; next to look at: the same harness with GLM_HOT_RES
 segment path with no rescue read - whether the per-segment graphs alone differ from the whole
 pass on Flash), then whether keeping rescued experts over the queued victims costs the code
 texts their residents.
+
+## Review and decode tuning (2026-11-13, branch `flash-opt`)
+
+Three read-only reviews of the released engine (KDA and its lane state, the sparse layers and mHC,
+the serving layer) and a decode profile. The head box kept serving; everything was measured on the
+second Spark as a one-box engine (the one-box pack copied there, the TP=1 example profile with
+vision off, the frozen routing state and text of the rescue A/B: `--bench-width`, 2.5K context).
+
+### Where a decode pass goes
+
+The released build: 60.7 / 73.7 / 98.7 / 131.1 ms for a verify pass of 1 / 2 / 4 / 8 rows, an MTP
+draft pass 3.6-3.7 ms. nsys with graph nodes traced, a pass's span attributed by completion order;
+one KDA + MoE layer of a 1-row pass, 1,231 us:
+
+| piece | us | bytes read, rate |
+|---|---:|---|
+| KDA q \| k \| v \| f_a \| g_a \| b | 422 | 102 MB, 242 GB/s |
+| f_b, g_b, the conv and its state | 21 | |
+| the KDA chain | 27.5 | 8.4 MB of state read and written |
+| o_proj | 161.5 | 33.6 MB, 208 GB/s |
+| the MLP's mHC site (seven launches) | 18 | |
+| router and shared gate \| up (side stream) | 103 | 19.2 MB, 186 GB/s |
+| routed gate + up | 230 | ~60 MB |
+| epilogue, the one-box copies | 8 | |
+| routed and shared down, the next proj's prefetch | 200 | 46 MB, 230 GB/s |
+| combine, output | 7.5 | |
+| the next layer's attention site (seven launches) | 30 | |
+
+About 90% of the pass is weight bytes at 190-240 GB/s; the launches between them are ~120 us a
+layer. An MTP draft pass is its head: 2.71 of 3.66 ms (634 MB).
+
+### Decode: two changes, bit for bit
+
+| in-boot A/B, ABBA rounds | 1 row | 2 rows | 3 rows | 4 rows | 8 rows |
+|---|---:|---:|---:|---:|---:|
+| fused mHC sites alone (3 rounds) | -1.8% | -0.3% | | -0.5% | 0.0% |
+| fused mHC sites, prefetch on (5) | 0.0% | -1.0% | | -0.8% | |
+| prefetch, fused sites on (5) | -1.6% | -0.8% | | -0.6% | |
+| **both** (5; 61.11 -> 60.39, 75.32 -> 74.31, 87.36 -> 86.39, 99.53 -> 98.39 ms) | **-1.2%** | **-1.3%** | **-1.1%** | **-1.1%** | |
+
+- An mHC site's seven launches (the last site's hc_post, the stream's rsqrt, the mix GEMV and its
+  reduce, Sinkhorn, hc_pre, the RMSNorm) as two, `flash_hc_site` (flash.cu): the GEMV's grid, which
+  computes the post on the way in and the rsqrt's partial sums beside its own, then one block a row
+  for the rest. Same sums in the same order: `hc_site_is_the_seven_launches` compares stream, pre,
+  post, comb and the normed input bit for bit at 1-16 rows (one unrolled product had to be an explicit
+  FMA: the old kernel's runtime loop rounded it the other way in ~1 element of 10^4). 90 sites back
+  to back, 33.8 -> 17.6 us a site at one row. `TIDELM_FLASH_HC_FUSED=0` keeps the seven; in the boot
+  guard. One block a row for the whole site was ruled out on paper: the mix weights' 0.8 MB through
+  one SM.
+- L2 prefetches in a KDA layer's two idle windows (`TIDELM_FLASH_PF`): o_proj's first 6 MB during
+  f_b / g_b / the conv, the shared gate | up's first 3 MB during the MLP's site. Other budgets
+  (3 / 2, 6 / 6, 12 / 3, 12 / 6 MB, a boot each) measured the same within +-0.4%.
+
+The two overlap: a site's time was already partly the prefetch branch's, so their gains do not add.
+A greedy 160-token decode with both off and both on gives the same ids (glm_run, 24.85 and 25.04
+tok/s). bench.py was not rerun: 1.2% is under what it resolves between boots.
+
+Measured and not taken: on one box the pair's collectives are copies (two in the MoE, its output's,
+o_proj's f32 -> bf16); reading each source in place removes 177 launches a pass and measured
++0.1 / +0.2 / +0.4 / -0.2% at 1 / 2 / 4 / 8 rows. They are 2-3 us each and the prefetch branch uses
+the memory meanwhile.
+
+The larger lever, not built: a listed draft vocabulary for the MTP head (the DS engine's
+docs/draft-vocab.md). At ~32K listed ids the head is ~0.6 of its 2.7 ms; with 1.5-2.4 drafts a round
+(the README runs) that is ~4-6 ms of a 90-105 ms round. It needs a ranking for this tokenizer that
+the public sequences on this box cannot give: by id order the lowest 32,768 ids miss 9-43% of
+held-out tokens, and ranked by counts over 1.4M tokens (agent traces, chat, Japanese) they miss 0.1-0.3%
+of the agent traces but 5.8% of general chat and 3.8-6.9% of Japanese - each miss ends a draft
+chain, which costs about what the smaller head saves. With a ranking at the DS list's 0.3%: ~+4%.
+
+### Fixed
+
+- **Lane admission** (serve.rs `pick_lane`). A queued prompt went to the free lane sharing the most
+  tokens with it. Every chat prompt shares the template's first tokens with every lane, so any
+  unrelated request - a client's title request after a chat's first turn - took the lane of the
+  conversation instead of the empty lane beside it, and on this model kept nothing of it (KDA goes
+  back to a snapshot or to 0). The conversation's next turn prefilled from 0. Now the lane with the
+  largest 3 x reusable - held: what the prompt can really keep, against half of what it would destroy.
+  Served, a 4.7K-token chat with a title request after each turn:
+
+  | | released | now |
+  |---|---|---|
+  | turn 2 (4,807 tokens) | 0 reused, first token 7.26 s | 4,733 reused, 1.05 s |
+  | turn 3 (4,869) | 0 reused, 6.9 s | 4,805 reused, 0.51 s |
+
+  At 100K tokens the released build's turn is the 132-155 s this document's chat section set out to
+  remove.
+- **A non-streamed request whose client has gone** decoded to its stop or max_tokens (the profile's
+  32,768): the closed-client check ran only when no token arrived for a second. Now a second apart
+  between tokens too: a `stream: false` client leaving after 3 s is cancelled at 67 tokens.
+- **The indexer's ring** (flash.cu ring_kernel): every row of a pass wrote slot `position % 64`, so a
+  pass of more than 64 rows wrote each slot from several blocks of one launch, the last to land
+  staying. The slot is read when the lane's next pass starts off a multiple of 4 (a pool's tokens
+  before the pass: the snapshot split, a follow-up's chunk edges, the MTP fills); a pair's ranks
+  each settled it on their own. Now a lane's last 64 rows only
+  (`ring_of_a_long_pass_is_its_last_64_rows`). How often the wrong row won was not measured.
+- **Staging** (forward.rs stage): the decoder's and the MTP layer's passes share pinned staging
+  buffers that the stream reads when it reaches the copy. A prompt's chunks are queued without a
+  wait, so a chunk's MTP fill could read ids the next chunk had already staged. Counted on a 9,000-token
+  prompt: none at 2,048-row chunks (their launches block), one in each short prefill split at its
+  snapshot (the 2-row chunk after it rewrote the fill's first two ids). Drafts only. Each stage now
+  waits for the last one's copies.
+- **Snapshots**: taken after the chunk's MTP fill (the snapshot holds the MTP layer's ring, which a
+  restore then put back without that chunk's rows); a rollback keeps its pass as the lane's rollback
+  (`last` was dropped, so a request ending on a rejected draft left only the prompt-end snapshot,
+  and a tool loop's next turn prefilled the whole answer again). `--snap-check` gained the rollback
+  inside a rollback's kept rows: bit for bit.
+- **Image requests**: expert reads still on their way into slots (a background adaptation's, the
+  async hot reads') are waited for before those slots are lent to the tower.
+- **The KV pool between two lanes**: a round checked each lane's growth against the free chunks on
+  its own, so two lanes crossing a chunk edge in one round could both pass for the same chunks, and
+  the mapping that then failed ended the process. The check now counts what the round's earlier
+  lanes will map; the lane that does not fit ends with `length`. Not reproduced (it needs the pool
+  nearly full): by reading.
+- GLM_PREFIX_DISK on this model built the store and saved every request's rows with nothing able to
+  restore them: off with a boot line. GLM_ABLIT edited the MLPs' writes and not the attentions'.
+
+### Found, not changed
+
+One box is the audience (the user, 2026-11-13: the pair has better recipes elsewhere): nothing here
+was rerun at TP=2, and the pair-only items below stay as notes.
+
+- The Flash profiles do not set GLM_LOOP_BREAK (rust-up's default is 0; GLM-5.3's profiles set 12).
+- Of two lanes prefilling in parts only the lower-numbered advances until it is done.
+- A pair whose rank 1 fails at boot (a missing pack) is reported after 600 s, by rank 0's log.
+- GLM_MTP_DEPTH is not checked against GLM_LANES (a shared verify past 33 rows exits).
+- GLM_FLASH_DENSE=bf16 still quantizes kv_b, the latent cache and the pooled keys to FP8: a BF16 /
+  FP8 NLL pair isolates the linear layers only.

@@ -291,6 +291,26 @@ pub struct Stats {
 /// (the lanes share one KV pool: tidelm_engine::kv).
 const KV_HEADROOM: usize = 4096;
 
+/// The free lane a prompt goes to, of `(lane, reusable, held)` in least-recently-used order: the one
+/// with the largest 3 x reusable - held (ties: the first, the lane used longest ago), with its
+/// reusable count.
+///
+/// A prompt's prefill costs its length less what it reuses, and taking a lane destroys what the lane
+/// holds past that: counted at half (the conversation there may not come back), the cost is
+/// len - reusable + (held - reusable) / 2. Until 2026-11-13 the lane sharing the most tokens won,
+/// whatever it held and whether those tokens could be kept. Every chat prompt shares the template's
+/// first tokens with every lane, so an unrelated request (a client's title or follow-up-suggestion
+/// request after a chat turn, a second chat) took the lane of a 100K-token conversation rather than
+/// the empty lane beside it; on GLM-5.3-Flash, whose KDA state goes back only to a snapshot or to 0,
+/// it kept nothing of it, and the conversation's next turn prefilled from 0 (132-155 s at 100K).
+pub fn pick_lane(cand: &[(usize, usize, usize)]) -> (usize, usize) {
+    let score = |&(_, reuse, held): &(usize, usize, usize)| 3 * reuse as i64 - held as i64;
+    let best = cand.iter().fold(None, |best: Option<&(usize, usize, usize)>, c| {
+        if best.is_none_or(|b| score(c) > score(b)) { Some(c) } else { best }
+    }).expect("pick_lane: no free lane");
+    (best.0, best.1)
+}
+
 /// Tokens of a queued prompt a running request's must share beyond what a free lane and the
 /// disk store hold before the queued one waits for it instead of prefilling them itself
 /// (Server::share_running): about 2.5 s of prefill at 150K positions, against the store's save
@@ -515,16 +535,17 @@ impl Server {
         self.lru.push(lane);
     }
 
-    /// Whether `lane` can grow to `end` positions, idle lanes' chunks given back first, oldest
-    /// first (their sequences then start over).
-    fn make_room(&mut self, lane: usize, end: usize) -> Result<bool> {
-        if self.eng.kv_room(lane, end) {
+    /// Whether `lane` can grow to `end` positions with `promised` of the free chunks spoken for,
+    /// idle lanes' chunks given back first, oldest first (their sequences then start over).
+    fn make_room(&mut self, lane: usize, end: usize, promised: usize) -> Result<bool> {
+        let room = |s: &Self| s.eng.kv_need(lane, end) + promised <= s.eng.kv_chunks().0;
+        if room(self) {
             return Ok(true);
         }
         for l in self.lru.clone() {
             if l != lane && self.runs[l].is_none() && self.eng.kv_held(l) > 0 {
                 self.eng.kv_shrink(l, 0)?;
-                if self.eng.kv_room(lane, end) {
+                if room(self) {
                     return Ok(true);
                 }
             }
@@ -533,8 +554,8 @@ impl Server {
     }
 
     /// Queued requests into free lanes while the pool can take them: each to the free lane
-    /// whose sequence shares most of its prompt (ties: the lane used longest ago), unless a
-    /// running request's prompt shares more of it (share_running).
+    /// pick_lane chooses (what the prompt can keep of the lane's sequence against what it would
+    /// destroy there), unless a running request's prompt shares more of it (share_running).
     fn admit(&mut self) -> Result<()> {
         while let Some(job) = self.queue.front() {
             let free: Vec<usize> = self.lru.iter().copied().filter(|&l| self.runs[l].is_none()).collect();
@@ -542,19 +563,22 @@ impl Server {
                 return Ok(());
             }
             let prompt = &job.prompt;
-            let shared = |l: usize| prompt.iter().zip(self.eng.lane_tokens(l)).take_while(|(a, b)| a == b).count();
-            let (lane, here) = free.iter().copied().fold(None, |best: Option<(usize, usize)>, l| {
-                let c = shared(l);
-                if best.is_none_or(|b| c > b.1) { Some((l, c)) } else { best }
-            }).unwrap();
             let plen = prompt.len();
+            // a lane's (reusable, held): the shared prefix as start() will keep it (one row back, and
+            // for GLM-5.3-Flash only as far as KDA's state goes back), and the lane's positions
+            let cand: Vec<(usize, usize, usize)> = free.iter().map(|&l| {
+                let shared = prompt.iter().zip(self.eng.lane_tokens(l)).take_while(|(a, b)| a == b).count();
+                let keep = shared.min(plen.saturating_sub(1)).saturating_sub(1);
+                (l, self.eng.reusable(l, keep), self.eng.lane_pos(l))
+            }).collect();
+            let (lane, here) = pick_lane(&cand);
             if !self.share_running(here)? {
                 return Ok(()); // waits for a running request's prefill
             }
             let max_seq = self.eng.opt.max_seq;
             let others = self.runs.iter().any(|r| r.is_some());
             let want = if others { (plen + KV_HEADROOM).min(max_seq) } else { plen.min(max_seq) };
-            if plen > 0 && plen < max_seq && !self.make_room(lane, want)? {
+            if plen > 0 && plen < max_seq && !self.make_room(lane, want, 0)? {
                 if others {
                     return Ok(()); // waits for a lane to end
                 }
@@ -776,7 +800,7 @@ impl Server {
         let depth = self.runs[lane].as_ref().unwrap().depth;
         let n = self.opt.lane_chunk.max(HEAD_ROWS + 1).min(suffix.len() - c0);
         let end = self.eng.lane_pos(lane) + n;
-        if !self.make_room(lane, end)? {
+        if !self.make_room(lane, end, 0)? {
             return Ok(()); // waits for the decoding lanes to give chunks back
         }
         self.eng.select(lane)?;
@@ -1002,7 +1026,7 @@ impl Server {
             r.g.tokens.push(r.anchor);
             if r.job.stop.contains(&r.anchor) || r.out.len() >= r.job.max_tokens {
                 self.eng.select(r.lane)?;
-                if self.eng.pos < max_seq && self.make_room(r.lane, self.eng.pos + 1)? {
+                if self.eng.pos < max_seq && self.make_room(r.lane, self.eng.pos + 1, 0)? {
                     self.eng.forward(&[r.anchor], false)?;
                 }
                 let f = if r.job.stop.contains(&r.anchor) { Finish::Stop } else { Finish::Length };
@@ -1020,6 +1044,7 @@ impl Server {
         let share = if runs.len() > 1 { HEAD_ROWS / runs.len() } else { HEAD_ROWS };
         let mut blocks: Vec<Block> = vec![];
         let mut ended: Vec<usize> = vec![];
+        let mut promised = 0usize; // chunks the round's lanes so far will map in its passes
         for (i, r) in runs.iter_mut().enumerate() {
             let p = self.eng.lane_pos(r.lane);
             let room = max_seq.saturating_sub(p + 1).min(r.job.max_tokens - r.out.len());
@@ -1053,11 +1078,15 @@ impl Server {
                 }
             }
             let reach = p + 1 + if b.copy { b.drafts.len() } else { dmax };
-            if !self.make_room(r.lane, reach)? {
+            // against the free chunks less what this round's earlier lanes will map in it: each lane
+            // alone could pass for the same chunks, and the pass's mapping that then failed ended the
+            // process (one box: the pool is one lane's max_seq, shared by the lanes)
+            if !self.make_room(r.lane, reach, promised)? {
                 (self.log)(&format!("[kv] lane {}: the pool cannot grow it past {p} positions beside the other lanes; ended", r.lane));
                 ended.push(i);
                 continue;
             }
+            promised += self.eng.kv_need(r.lane, reach);
             blocks.push(b);
         }
         for &i in ended.iter().rev() {
@@ -1403,6 +1432,26 @@ mod tests {
         assert!(tail_cycle(&[5, 1, 1, 1], 3));
         assert!(!tail_cycle(&[5, 1, 1], 3));
         assert!(tail_cycle(&[9, 1, 2, 1, 2, 1, 2], 3));
+    }
+
+    #[test]
+    fn a_prompt_goes_to_the_lane_it_costs_least() {
+        // an unrelated request beside a long conversation: the empty lane, not the conversation's
+        // (GLM-5.3 would keep the template's 9 tokens there, GLM-5.3-Flash nothing)
+        assert_eq!(pick_lane(&[(0, 9, 100_000), (1, 0, 0)]), (1, 0));
+        assert_eq!(pick_lane(&[(0, 0, 100_000), (1, 0, 0)]), (1, 0));
+        // the conversation's next turn: its lane (the snapshot near its last prompt's end)
+        assert_eq!(pick_lane(&[(1, 0, 600), (0, 99_000, 100_500)]), (0, 99_000));
+        // a regenerate, and a short lane's follow-up
+        assert_eq!(pick_lane(&[(0, 1_998, 2_400), (1, 9, 50_000)]), (0, 1_998));
+        // nothing reusable anywhere: the lane that holds least, and between equals the first (the
+        // least recently used)
+        assert_eq!(pick_lane(&[(0, 0, 80_000), (1, 0, 700)]), (1, 0));
+        assert_eq!(pick_lane(&[(1, 0, 0), (0, 0, 0)]), (1, 0));
+        // an edit 40% into a conversation: its lane still (60K to prefill either way, 40K saved)
+        assert_eq!(pick_lane(&[(0, 40_000, 100_000), (1, 0, 0)]), (0, 40_000));
+        // an edit near its start: the empty lane, and the conversation stays whole beside it
+        assert_eq!(pick_lane(&[(0, 5_000, 100_000), (1, 0, 0)]), (1, 0));
     }
 
     #[test]

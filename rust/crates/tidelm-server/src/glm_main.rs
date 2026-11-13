@@ -185,7 +185,14 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
     };
     // the disk prefix store: its namespace is everything that changes what a cached row means
     let mut store = None;
-    if let Some(root) = arg(args, "--prefix-disk").map(PathBuf::from) {
+    // GLM-5.3-Flash: the store holds KV rows and not KDA's state, so nothing saved could be restored
+    // (serve.rs start()). Until 2026-11-13 GLM_PREFIX_DISK=1 there still built the store and saved every
+    // request's rows at its end (up to --prefix-disk-gb of disk, the engine thread held for each write).
+    let prefix_disk = arg(args, "--prefix-disk").map(PathBuf::from);
+    if prefix_disk.is_some() && eng.cfg.is_flash() && rank == 0 {
+        eprintln!("boot: GLM_PREFIX_DISK is not used for GLM-5.3-Flash (the store holds no KDA state): off");
+    }
+    if let Some(root) = prefix_disk.filter(|_| !eng.cfg.is_flash()) {
         use sha2::Digest;
         let cfg_bytes = std::fs::read(model_dir.join("config.json"))?;
         let key = format!("glm-rust-kv v1 {:x} {} {} {} {}", sha2::Sha256::digest(&cfg_bytes), eng.pack.source_sha256,

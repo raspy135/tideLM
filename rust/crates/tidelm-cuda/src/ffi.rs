@@ -82,6 +82,7 @@ extern "C" {
     pub fn cudaEventDestroy(event: cudaEvent_t) -> cudaError_t;
     pub fn cudaEventRecord(event: cudaEvent_t, stream: cudaStream_t) -> cudaError_t;
     pub fn cudaEventSynchronize(event: cudaEvent_t) -> cudaError_t;
+    pub fn cudaEventQuery(event: cudaEvent_t) -> cudaError_t;
     pub fn cudaEventElapsedTime(
         ms: *mut f32,
         start: cudaEvent_t,

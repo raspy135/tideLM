@@ -398,14 +398,19 @@ __global__ void __launch_bounds__(128) pool_kernel(const bf16* __restrict__ K, i
     if (d == 0) ps[row] = sc;
 }
 
-// The pass's K | gate rows into their lanes' rings (position % 64), after pool_kernel read them.
+// The pass's K | gate rows into their lanes' rings (position % 64), after pool_kernel read them:
+// a lane's last 64 rows only. Rows 64 positions apart share a slot, and until 2026-11-13 every row
+// of a longer pass (a prefill chunk, an MTP fill) wrote its own: one launch, a block a row, the slot
+// left to whichever block landed last - or to a mix of two rows' elements. The slot is read when the
+// lane's next pass starts off a multiple of 4 (pool_kernel: the pool's tokens before the pass), and a
+// pair's ranks each settled the race on their own.
 __global__ void ring_kernel(const bf16* __restrict__ K, int64_t ldk, const bf16* __restrict__ G, int64_t ldg,
                             bf16* __restrict__ ring, int64_t ring_lane, const int* __restrict__ pos,
                             const int* __restrict__ lanes, int nl, const int* __restrict__ meta) {
     pdl_enter();
     const int t = blockIdx.x, d = threadIdx.x;
     const int z = lane_of(lanes, nl, t);
-    if (z < 0) return;
+    if (z < 0 || lanes[4 * z] + lanes[4 * z + 1] - t > 64) return;
     bf16* e = ring + (int64_t)meta[4 * z] * ring_lane + (int64_t)(pos[t] & 63) * 256;
     e[d] = d < 128 ? K[(int64_t)t * ldk + d] : G[(int64_t)t * ldg + d - 128];
 }
@@ -465,6 +470,248 @@ __global__ void widen_kernel(const bf16* __restrict__ x, int64_t ldx, float* __r
     pdl_enter();
     const int t = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c < n) y[(int64_t)t * ldy + c] = bf(x[(int64_t)t * ldx + c]);
+}
+
+// ------------------------------------------------------------------ mHC sites of decode rows, fused
+// A decode pass's mHC site was seven launches: ds41.cu's hc_post of the site before it, row_rsqrt_v8
+// of the stream, the mix GEMV (skinny_kernel<1, 1, MT, 4> at 16 K-splits) and splits_reduce,
+// hc_sinkhorn, hc_pre_norm_v8, and glm.cu's rmsnorm - at one row 2-10 us of work each behind a launch,
+// 90 sites a pass. Here they are two launches with the same arithmetic in the same order, bit for
+// bit (tests/flash_gpu.rs hc_site_is_the_seven_launches):
+//   hc_mix    the GEMV's grid (N / 8 blocks x 16 splits x row tiles). A block stages its K slice of
+//             the stream *after* the last site's post, computed on the way in (hc_post's expression;
+//             nothing is written: the other blocks still read the stream), and runs the skinny
+//             kernel's FMA chains on it -> the split partials. The first N block's lower eight splits
+//             also give the rsqrt's per-warp sums of squares: thread i of row_rsqrt_v8's 1024 takes
+//             the 8-value chunks i and i + 1024, split i / 128's and split i / 128 + 8's.
+//   hc_close  one block of 1024 threads a row: the post again, written to the stream in place; the
+//             partials summed in split order and the rsqrt's last tree; Sinkhorn on a warp; hc_pre
+//             and the RMSNorm from the registers' copy of the stream.
+// One block a row cannot do the GEMV too: the 0.8 MB of mix weights through one SM's loads is slower
+// than the seven launches. GLM-5.3-Flash's shape only (H 4096, 4 streams, 24 mixes).
+constexpr int kHcH = 4096, kHcS = 4, kHcD = kHcS * kHcH, kHcN = 24, kHcSplits = 16, kHcKs = kHcD / kHcSplits;
+
+__device__ __forceinline__ void bf16x8_f32(uint4 v, float* out) {
+    const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        out[2 * i] = __uint_as_float(w[i] << 16);
+        out[2 * i + 1] = __uint_as_float(w[i] & 0xffff0000u);
+    }
+}
+
+// fixed-tree block sum (glm.cu's and ds41.cu's), every thread gets the result
+__device__ float hc_block_sum(float v, float* scratch) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = (blockDim.x + 31) >> 5;
+    v = warp_sum(v);
+    __syncthreads();
+    if (lane == 0) scratch[warp] = v;
+    __syncthreads();
+    float t = lane < nw ? scratch[lane] : 0.f;
+    return warp_sum(t);
+}
+
+// ds41.cu hc_post_kernel's stream j at one column: bf16(post[j] y + sum_i comb[i][j] r[i])
+__device__ __forceinline__ bf16 hc_post_at(float yv, const float* r, const float* cm, const float* pm, int j) {
+    float mixed = cm[0 * kHcS + j] * r[0];
+#pragma unroll
+    for (int i = 1; i < kHcS; ++i) mixed = fmaf(cm[i * kHcS + j], r[i], mixed);
+    return to_bf(pm[j] * yv + mixed);
+}
+
+// Values k .. k + 7 of row `row`'s stream ([4][H] flattened; k % 8 == 0) after the last site's post
+// (y null: as stored).
+__device__ __forceinline__ uint4 hc_stream8(const bf16* __restrict__ y, const bf16* __restrict__ h, const float* __restrict__ ppost,
+                                            const float* __restrict__ pcomb, int row, int k) {
+    const bf16* hr = h + (int64_t)row * kHcD;
+    if (!y) return *reinterpret_cast<const uint4*>(hr + k);
+    const int c = k / kHcH, d = k % kHcH;
+    float yv[8], r[kHcS][8];
+    bf16x8_f32(*reinterpret_cast<const uint4*>(y + (int64_t)row * kHcH + d), yv);
+#pragma unroll
+    for (int i = 0; i < kHcS; ++i) bf16x8_f32(*reinterpret_cast<const uint4*>(hr + i * kHcH + d), r[i]);
+    const float* cm = pcomb + row * kHcS * kHcS;
+    const float* pm = ppost + row * kHcS;
+    uint32_t o[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        const float r0[kHcS] = {r[0][2 * e], r[1][2 * e], r[2][2 * e], r[3][2 * e]};
+        const float r1[kHcS] = {r[0][2 * e + 1], r[1][2 * e + 1], r[2][2 * e + 1], r[3][2 * e + 1]};
+        const uint32_t lo = __bfloat16_as_ushort(hc_post_at(yv[2 * e], r0, cm, pm, c));
+        const uint32_t hi = __bfloat16_as_ushort(hc_post_at(yv[2 * e + 1], r1, cm, pm, c));
+        o[e] = lo | (hi << 16);
+    }
+    return make_uint4(o[0], o[1], o[2], o[3]);
+}
+
+template <int MT>
+__global__ void __launch_bounds__(256) hc_mix_kernel(const bf16* __restrict__ y, const bf16* __restrict__ h,
+                                                     const float* __restrict__ ppost, const float* __restrict__ pcomb,
+                                                     const bf16* __restrict__ fn, int M, float* __restrict__ partial,
+                                                     float* __restrict__ ssw) {
+    pdl_enter();
+    constexpr int V = 8, VW = V * 32, UNR = 4, KC = kHcKs;   // a split is one staging chunk of the skinny kernel
+    __shared__ __align__(16) bf16 xs[MT][KC];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int n0 = blockIdx.x * 8 + warp, split = blockIdx.y, k_begin = split * KC;
+    const int m_base = blockIdx.z * MT, Mt = min(MT, M - m_base);
+    for (int i = threadIdx.x; i < MT * (KC / 8); i += 256) {
+        const int m = i / (KC / 8), j = (i % (KC / 8)) * 8;
+        uint4 v = make_uint4(0, 0, 0, 0);
+        if (m < Mt) v = hc_stream8(y, h, ppost, pcomb, m_base + m, k_begin + j);
+        *reinterpret_cast<uint4*>(&xs[m][j]) = v;
+    }
+    __syncthreads();
+    if (blockIdx.x == 0 && split < kHcSplits / 2 && threadIdx.x < KC / 8) {
+        // row_rsqrt_v8's thread split * 128 + threadIdx.x (warps 4 split .. 4 split + 3 of its 32)
+        for (int m = 0; m < Mt; ++m) {
+            float v[8], ss = 0.f;
+            bf16x8_f32(*reinterpret_cast<const uint4*>(&xs[m][threadIdx.x * 8]), v);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) ss = fmaf(v[j], v[j], ss);
+            bf16x8_f32(hc_stream8(y, h, ppost, pcomb, m_base + m, k_begin + kHcD / 2 + threadIdx.x * 8), v);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) ss = fmaf(v[j], v[j], ss);
+            ss = warp_sum(ss);
+            if (lane == 0) ssw[(m_base + m) * 32 + split * 4 + warp] = ss;
+        }
+    }
+    float acc[MT];
+#pragma unroll
+    for (int m = 0; m < MT; ++m) acc[m] = 0.f;
+    uint4 raw[UNR];
+#pragma unroll
+    for (int u = 0; u < UNR; ++u)
+        raw[u] = *reinterpret_cast<const uint4*>(fn + (int64_t)n0 * kHcD + k_begin + u * VW + lane * V);
+#pragma unroll
+    for (int u = 0; u < UNR; ++u) {
+        const int kl = u * VW + lane * V;
+        float wv[V];
+        bf16x8_f32(raw[u], wv);
+#pragma unroll
+        for (int m = 0; m < MT; ++m) {
+            float xv[V];
+            bf16x8_f32(*reinterpret_cast<const uint4*>(&xs[m][kl]), xv);
+            float p = 0.f;
+#pragma unroll
+            for (int v = 0; v < V; ++v) p = fmaf(wv[v], xv[v], p);
+            acc[m] = acc[m] + p;
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < MT; ++m) acc[m] = warp_sum(acc[m]);
+    if (lane != 0) return;
+#pragma unroll
+    for (int m = 0; m < MT; ++m)
+        if (m < Mt) partial[((int64_t)split * M + m_base + m) * kHcN + n0] = acc[m];
+}
+
+__global__ void __launch_bounds__(1024) hc_close_kernel(const bf16* __restrict__ y, bf16* h, const float* __restrict__ ppost,
+                                                        const float* __restrict__ pcomb, const float* __restrict__ partial,
+                                                        const float* __restrict__ ssw, int M, const float* __restrict__ scale,
+                                                        const float* __restrict__ base, int iters, float hc_eps,
+                                                        float* __restrict__ pre, float* __restrict__ post,
+                                                        float* __restrict__ comb, const bf16* __restrict__ w,
+                                                        bf16* __restrict__ xn, float eps) {
+    pdl_enter();
+    constexpr int HC = kHcS;
+    __shared__ float s_mix[kHcN], s_pre[HC], red[32];
+    const int m = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    // this thread's four columns of the four streams after the last site's post, the stream updated
+    // in place (hc_post: every copy of a column is read before any is written)
+    bf16* hr = h + (int64_t)m * kHcD;
+    const float* cm = pcomb + m * HC * HC;
+    const float* pm = ppost + m * HC;
+    float hv[4][HC];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int c = threadIdx.x + i * 1024;
+        float r[HC];
+#pragma unroll
+        for (int k = 0; k < HC; ++k) r[k] = bf(hr[k * kHcH + c]);
+        if (y) {
+            const float yv = bf(y[(int64_t)m * kHcH + c]);
+            bf16 o[HC];
+#pragma unroll
+            for (int j = 0; j < HC; ++j) o[j] = hc_post_at(yv, r, cm, pm, j);
+#pragma unroll
+            for (int j = 0; j < HC; ++j) {
+                hr[j * kHcH + c] = o[j];
+                hv[i][j] = bf(o[j]);
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < HC; ++j) hv[i][j] = r[j];
+        }
+    }
+    if (warp == 0) {
+        // row_rsqrt_v8's last tree over its 32 warps' sums; splits_reduce's sum in split order
+        const float t = warp_sum(ssw[m * 32 + lane]);
+        const float r = rsqrtf(t * (1.f / (float)kHcD) + eps);
+        if (lane < kHcN) {
+            float acc = 0.f;
+            for (int s = 0; s < kHcSplits; ++s) acc += partial[((int64_t)s * M + m) * kHcN + lane];
+            s_mix[lane] = acc;
+        }
+        __syncwarp();
+        // ds41.cu hc_sinkhorn_kernel: lane i * 4 + j holds comb[i][j], sums in the serial order
+        const float* mr = s_mix;
+        if (lane < HC) {
+            const float pv = sigmoidf_(mr[lane] * r * scale[0] + base[lane]) + hc_eps;
+            pre[m * HC + lane] = pv;
+            s_pre[lane] = pv;
+        } else if (lane < 2 * HC) {
+            const int i = lane - HC;
+            post[m * HC + i] = 2.f * sigmoidf_(mr[HC + i] * r * scale[1] + base[HC + i]);
+        }
+        const int li = (lane & 15) >> 2, lj = lane & 3;
+        float c = mr[2 * HC + li * HC + lj] * r * scale[2] + base[2 * HC + li * HC + lj];
+        auto row = [&](float v, int k) { return __shfl_sync(0xffffffffu, v, li * 4 + k); };
+        auto col = [&](float v, int k) { return __shfl_sync(0xffffffffu, v, k * 4 + lj); };
+        {
+            float mxr = -INFINITY;
+            for (int k = 0; k < HC; ++k) mxr = fmaxf(mxr, row(c, k));
+            const float e = expf(c - mxr);
+            float sum = 0.f;
+            for (int k = 0; k < HC; ++k) sum += row(e, k);
+            c = e / sum + hc_eps;
+        }
+        {
+            float s = 0.f;
+            for (int k = 0; k < HC; ++k) s += col(c, k);
+            c = c / (s + hc_eps);
+        }
+        for (int it = 0; it < iters - 1; ++it) {
+            float s = 0.f;
+            for (int k = 0; k < HC; ++k) s += row(c, k);
+            c = c / (s + hc_eps);
+            s = 0.f;
+            for (int k = 0; k < HC; ++k) s += col(c, k);
+            c = c / (s + hc_eps);
+        }
+        if (lane < HC * HC) comb[(m * HC + li) * HC + lj] = c;
+    }
+    __syncthreads();
+    // ds41.cu hc_pre_norm_v8 (no norm: one bf16 rounding), then glm.cu rmsnorm_kernel at 1024 threads
+    float v[4], ss = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        // hc_pre_norm_v8's loop over the copies is a runtime one: its first product is rounded and each
+        // later one is an FMA onto the sum. Unrolled here, "p0 h0 + p1 h1" would let the compiler fuse
+        // the first product instead (one element in ~10^4 then rounds the other way): the FMAs explicit.
+        float acc = s_pre[0] * hv[i][0];
+#pragma unroll
+        for (int k = 1; k < HC; ++k) acc = fmaf(s_pre[k], hv[i][k], acc);
+        v[i] = rbf(acc);
+        ss += v[i] * v[i];
+    }
+    ss = hc_block_sum(ss, red);
+    const float rr = 1.f / sqrtf(ss / kHcH + eps);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int c = threadIdx.x + i * 1024;
+        xn[(int64_t)m * kHcH + c] = to_bf(bf(w[c]) * rbf(v[i] * rr));
+    }
 }
 
 // ------------------------------------------------------------------ the vision tower (glm5_next)
@@ -626,6 +873,40 @@ int flash_embed(void* stream, const void* ids, int T, const void* table, int H, 
 
 int flash_widen(void* stream, const void* x, int64_t ldx, void* y, int64_t ldy, int T, int n) {
     pdl_launch(widen_kernel, dim3((n + 127) / 128, T), 128, 0, GST, static_cast<const bf16*>(x), ldx, static_cast<float*>(y), ldy, n);
+    GRET;
+}
+
+// An mHC site of 1..16 decode rows (the two kernels above): `y` (null: no site to close) is the last
+// sublayer's output and ppost / pcomb that site's post and comb; the stream `h` [M][4][H] is updated
+// in place, this site's pre / post / comb and its normed input `xn` [M][H] written. `partial`: fp32
+// [16][M][24]; `ssw`: fp32 [M][32].
+int flash_hc_site(void* stream, const void* y, void* h, const void* ppost, const void* pcomb, const void* fn, int n_mix, int H,
+                  int hc, int splits, void* partial, void* ssw, const void* scale, const void* base, int iters, float hc_eps,
+                  void* pre, void* post, void* comb, const void* w, void* xn, int M, float eps) {
+    if (H != kHcH || hc != kHcS || n_mix != kHcN || splits != kHcSplits || M < 1 || M > 16) return (int)cudaErrorInvalidValue;
+    // the skinny kernel's row tiles (ds41.cu launch_skinny)
+    const int mt = M <= 6 ? M : M <= 8 ? 8 : M <= 12 ? 12 : 16;
+    const dim3 grid(kHcN / 8, kHcSplits, (M + mt - 1) / mt);
+#define HC_MIX(MT)                                                                                                              \
+    pdl_launch(hc_mix_kernel<MT>, grid, 256, 0, GST, static_cast<const bf16*>(y), static_cast<const bf16*>(h),                  \
+               static_cast<const float*>(ppost), static_cast<const float*>(pcomb), static_cast<const bf16*>(fn), M,             \
+               static_cast<float*>(partial), static_cast<float*>(ssw))
+    switch (mt) {
+        case 1: HC_MIX(1); break;
+        case 2: HC_MIX(2); break;
+        case 3: HC_MIX(3); break;
+        case 4: HC_MIX(4); break;
+        case 5: HC_MIX(5); break;
+        case 6: HC_MIX(6); break;
+        case 8: HC_MIX(8); break;
+        case 12: HC_MIX(12); break;
+        default: HC_MIX(16);
+    }
+#undef HC_MIX
+    pdl_launch(hc_close_kernel, M, 1024, 0, GST, static_cast<const bf16*>(y), static_cast<bf16*>(h), static_cast<const float*>(ppost),
+               static_cast<const float*>(pcomb), static_cast<const float*>(partial), static_cast<const float*>(ssw), M,
+               static_cast<const float*>(scale), static_cast<const float*>(base), iters, hc_eps, static_cast<float*>(pre),
+               static_cast<float*>(post), static_cast<float*>(comb), static_cast<const bf16*>(w), static_cast<bf16*>(xn), eps);
     GRET;
 }
 

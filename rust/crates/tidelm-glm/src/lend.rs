@@ -35,6 +35,14 @@ impl Engine {
         if self.world != 1 {
             return Err("lending slots on a pair is not implemented".into());
         }
+        // No expert read may still be on its way into a slot that is about to hold the tower: a
+        // background adaptation's and the async hot reads' reader threads write their records' slots
+        // after the plan returns, and the class's last slots - the ones lent - are the lowest-mass
+        // residents, adaptation's first victims. An image request admitted beside a decoding lane
+        // inside that window (0.1-1 s every GLM_ADAPT_EVERY tokens) had the tower's weights overwritten
+        // under it, with nothing in the log. Both are waited for and installed first.
+        self.hot_install()?;
+        self.adapt_install(true)?;
         let (c, cl) = self.arena.classes.iter().enumerate().max_by_key(|(_, c)| c.n).ok_or("arena: no classes")?;
         let per: usize = cl.sizes[..3].iter().sum();
         let n = bytes.div_ceil(per);

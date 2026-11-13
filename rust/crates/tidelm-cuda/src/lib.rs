@@ -213,6 +213,11 @@ impl Event {
     pub fn synchronize(&self) -> Result<()> {
         check(unsafe { ffi::cudaEventSynchronize(self.0) }, "cudaEventSynchronize")
     }
+
+    /// Whether the stream has passed the event's last record (true for one never recorded).
+    pub fn done(&self) -> bool {
+        unsafe { ffi::cudaEventQuery(self.0) == 0 }
+    }
 }
 
 impl Drop for Event {

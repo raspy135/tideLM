@@ -42,6 +42,8 @@ pub(crate) struct FlashAct {
     hy: DeviceBuffer<u16>,
     mixes: DeviceBuffer<f32>,
     rsq: DeviceBuffer<f32>,
+    /// the fused site's rsqrt partials [FMA_ROWS][32] (flash_hc_site)
+    ssw: DeviceBuffer<f32>,
     site: [[DeviceBuffer<f32>; 3]; 2],
     /// sparse attention: proj_b [r][q_b | wq_b], the indexer query [r][32 x 128], its keys after the
     /// LayerNorm [r][128], head weights [r][32] fp32, the selected pools [r][512], the tokens [r][IDX_LD]
@@ -136,6 +138,7 @@ impl FlashState {
             hy: z(r * h)?,
             mixes: f(r * 24)?,
             rsq: f(r)?,
+            ssw: f(crate::lin::FMA_ROWS * 32)?,
             site: [site()?, site()?],
             pb: z(r * ldb)?,
             qi: z(r * cfg.index_heads * cfg.index_dim)?,
@@ -365,7 +368,12 @@ impl Engine {
                                      at(&fl.save_raw, lane * nk * SAVE_ROWS * c), (SAVE_ROWS * c) as i64, keep as i32),
                "kda conv replay")?;
         }
-        fl.last[lane] = None;
+        // The pass's first `keep` rows are still its rollback: the slot it read is untouched and its
+        // saved rows are all there, so a further set_pos inside them replays again. (Until 2026-11-13
+        // the pass was forgotten here. A request whose last round rejected a draft then left its lane
+        // with no way back but the prompt-end snapshot, and a next turn that kept the answer - a tool
+        // loop - prefilled the whole answer again.)
+        fl.last[lane] = (keep > 0).then_some((p0, keep, true));
         Ok(())
     }
 
@@ -426,9 +434,45 @@ impl Engine {
                                                      self.cfg.hidden as i32) }, "hc post")
     }
 
+    /// Decode rows (up to FMA_ROWS: the mix GEMV's FMA path, whose bits the fused kernels keep): layer
+    /// l's site `site` in two launches - the site before it closed (`close`: its sublayer's output
+    /// in act.a; the other site's post and comb), this one's mixes, its input normed into xn.
+    fn hc_site(&self, l: usize, site: usize, t: usize, close: bool) -> Result<()> {
+        let hc = self.cfg.hc.unwrap();
+        let lw = &self.w.layers[l];
+        let hw: &HcW = lw.hc.as_ref().ok_or("an mHC site on a layer without one")?;
+        let (fnw, base, scale) = if site == 0 { (&hw.attn_fn, &hw.attn_base, &hw.attn_scale) } else { (&hw.ffn_fn, &hw.ffn_base, &hw.ffn_scale) };
+        let crate::lin::Lin::Bf16(m) = fnw else { return Err("an mHC mix matrix that is not BF16".into()) };
+        let (a, fa) = (&self.act, &self.fl().act);
+        let (s, prev) = (&fa.site[site], &fa.site[1 - site]);
+        let y = if close { np(&a.a) } else { std::ptr::null_mut() };
+        let w = if site == 0 { &lw.ln_in } else { &lw.ln_post };
+        ck(unsafe { flash_hc_site(self.st.raw(), y, np(&a.h), np(&prev[1]), np(&prev[2]), m.w.raw(), m.n as i32, self.cfg.hidden as i32,
+                                  hc.mult as i32, m.split as i32, np(&a.split_part), np(&fa.ssw), np(scale), np(base), hc.iters as i32,
+                                  hc.eps, np(&s[0]), np(&s[1]), np(&s[2]), np(w), np(&a.xn), t as i32, self.cfg.rms_eps) }, "hc site")
+    }
+
+    /// Whether `t` rows take the fused sites: the shape flash.cu's kernels are written for.
+    fn hc_fused_for(&self, t: usize) -> bool {
+        let hc = self.cfg.hc.unwrap();
+        self.hc_fused && t <= crate::lin::FMA_ROWS && self.cfg.hidden == 4096 && hc.mult == 4
+            && self.act.split_part.len() >= 16 * t * 24
+    }
+
     /// layer_pre on an mHC layer: the previous layer's MLP site closed, the attention site, the MLP
     /// site's input in xn.
     pub(crate) fn flash_layer_pre(&self, l: usize, t: usize, prefill: bool) -> Result<()> {
+        if self.hc_fused_for(t) {
+            self.hc_site(l, 0, t, l > 0)?;
+            if l > 0 {
+                self.dump(&format!("x{}", l - 1), np(&self.act.h), t * 4 * self.cfg.hidden * 2, Some(l - 1))?;
+            } else {
+                self.dump("tok", np(&self.act.tok), t * 4, None)?;
+            }
+            self.attention(l, t, prefill)?;
+            self.shared_up_prefetch(l, t, prefill)?;
+            return self.hc_site(l, 1, t, true);
+        }
         if l > 0 {
             self.hc_post(1, t)?;
             self.dump(&format!("x{}", l - 1), np(&self.act.h), t * 4 * self.cfg.hidden * 2, Some(l - 1))?;
@@ -437,8 +481,20 @@ impl Engine {
         }
         self.hc_pre(l, 0, t)?;
         self.attention(l, t, prefill)?;
+        self.shared_up_prefetch(l, t, prefill)?;
         self.hc_post(0, t)?;
         self.hc_pre(l, 1, t)
+    }
+
+    /// Decode rows: the MoE's shared gate | up into L2 while the MLP's mHC site runs (flash_pf).
+    fn shared_up_prefetch(&self, l: usize, t: usize, prefill: bool) -> Result<()> {
+        if prefill || !self.flash_pf || t > MAX_ROWS {
+            return Ok(());
+        }
+        match &self.w.layers[l].mlp {
+            crate::weights::Mlp::Moe { sh_gate_up, .. } => self.l2_lin(sh_gate_up, t, self.pf_sh_up),
+            crate::weights::Mlp::Dense { gate_up, .. } => self.l2_lin(gate_up, t, self.pf_sh_up),
+        }
     }
 
     /// The decoder's end on an mHC model: the last MLP site closed, the streams' mean (Glm5Next's
@@ -506,6 +562,9 @@ impl Engine {
         let off = KdaW::offsets(dl, khl);
         let ldp = fa.ldp;
         self.lin(&k.proj, np(&a.xn), h, t, np(&fa.proj), true)?;
+        if !prefill && self.flash_pf {
+            self.l2_lin(&k.o, t, self.pf_kda_o)?;
+        }
         // proj's own row stride is its width; the rest of the code reads it at ldp
         let ldq = k.proj.n_total();
         debug_assert!(ldq <= ldp);

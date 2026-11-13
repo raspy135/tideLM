@@ -408,6 +408,33 @@ fn key_pools_across_passes_and_the_expansion() {
 }
 
 #[test]
+fn ring_of_a_long_pass_is_its_last_64_rows() {
+    // two lanes, 300 and 70 rows from positions 5 and 130: every slot has 2-5 rows of lane 0 mapping
+    // to it; the one that stays must be the lane's last
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(0x51de);
+    let (n0, p0, n1, p1) = (300usize, 5usize, 70usize, 130usize);
+    let t = n0 + n1;
+    let (k, g) = (rng.bf16_vec(t * 128, 1.0), rng.bf16_vec(t * 128, 1.0));
+    let pos: Vec<i32> = (0..n0).map(|i| (p0 + i) as i32).chain((0..n1).map(|i| (p1 + i) as i32)).collect();
+    let lanes = dev(&[0, n0 as i32, p0 as i32, 0, n0 as i32, n1 as i32, p1 as i32, 0]);
+    let meta = dev(&[0, 0, 0, 0, 1, 0, 0, 0]);
+    let (kd, gd, posd) = (dev(&k), dev(&g), dev(&pos));
+    for _ in 0..20 {
+        let ring = DeviceBuffer::<u16>::zeroed(2 * 64 * 256).unwrap();
+        ok(unsafe { flash_ring(st.raw(), p(&kd), 128, p(&gd), 128, p(&ring), 64 * 256, p(&posd), p(&lanes), 2, p(&meta), t as i32) });
+        let r = ring.download().unwrap();
+        for (lane, row0, n) in [(0usize, 0usize, n0), (1, n0, n1)] {
+            for row in row0 + n - 64..row0 + n {
+                let e = &r[(lane * 64 + (pos[row] as usize & 63)) * 256..][..256];
+                assert_eq!(&e[..128], &k[row * 128..(row + 1) * 128], "lane {lane} row {row}: K");
+                assert_eq!(&e[128..], &g[row * 128..(row + 1) * 128], "lane {lane} row {row}: gate");
+            }
+        }
+    }
+}
+
+#[test]
 #[ignore]
 fn kda_bench() {
     // a decode pass's 34 KDA layers back to back, each with its own state (4 MB read and 4 MB written
@@ -463,6 +490,147 @@ fn kda_bench() {
 
 // ------------------------------------------------------------------ glm.cu's GLM-5.3-Flash instances
 use tidelm_kernels::glm::*;
+
+// ------------------------------------------------------------------ mHC sites, fused
+/// One site through the seven launches the engine made (flash_fwd.rs hc_post / hc_mixes / hc_pre):
+/// the stream after the post, pre / post / comb, the normed input.
+#[allow(clippy::type_complexity)]
+struct HcSite {
+    h: DeviceBuffer<u16>,
+    y: DeviceBuffer<u16>,
+    ppost: DeviceBuffer<f32>,
+    pcomb: DeviceBuffer<f32>,
+    fnw: DeviceBuffer<u16>,
+    scale: DeviceBuffer<f32>,
+    base: DeviceBuffer<f32>,
+    w: DeviceBuffer<u16>,
+    part: DeviceBuffer<f32>,
+    ssw: DeviceBuffer<f32>,
+    rsq: DeviceBuffer<f32>,
+    mixes: DeviceBuffer<f32>,
+    hy: DeviceBuffer<u16>,
+    pre: DeviceBuffer<f32>,
+    post: DeviceBuffer<f32>,
+    comb: DeviceBuffer<f32>,
+    xn: DeviceBuffer<u16>,
+    t: usize,
+}
+
+const HC_H: usize = 4096;
+const HC_D: usize = 4 * HC_H;
+
+impl HcSite {
+    fn new(rng: &mut Rng, t: usize) -> Self {
+        // a doubly stochastic-ish comb and post near 1, as a site leaves them
+        let pcomb: Vec<f32> = (0..t * 16).map(|_| 0.05 + 0.4 * rng.unif()).collect();
+        let ppost: Vec<f32> = (0..t * 4).map(|_| 0.5 + rng.unif()).collect();
+        HcSite {
+            h: dev(&rng.bf16_vec(t * HC_D, 1.5)),
+            y: dev(&rng.bf16_vec(t * HC_H, 0.7)),
+            ppost: dev(&ppost),
+            pcomb: dev(&pcomb),
+            fnw: dev(&rng.bf16_vec(24 * HC_D, 0.02)),
+            scale: dev(&[0.6 + rng.unif(), 0.6 + rng.unif(), 0.6 + rng.unif()]),
+            base: dev(&(0..24).map(|_| rng.normal()).collect::<Vec<f32>>()),
+            w: dev(&rng.bf16_vec(HC_H, 1.0)),
+            part: DeviceBuffer::zeroed(16 * t * 24).unwrap(),
+            ssw: DeviceBuffer::zeroed(t * 32).unwrap(),
+            rsq: DeviceBuffer::zeroed(t).unwrap(),
+            mixes: DeviceBuffer::zeroed(t * 24).unwrap(),
+            hy: DeviceBuffer::zeroed(t * HC_H).unwrap(),
+            pre: DeviceBuffer::zeroed(t * 4).unwrap(),
+            post: DeviceBuffer::zeroed(t * 4).unwrap(),
+            comb: DeviceBuffer::zeroed(t * 16).unwrap(),
+            xn: DeviceBuffer::zeroed(t * HC_H).unwrap(),
+            t,
+        }
+    }
+
+    /// The seven launches, unchecked (a bench calls it back to back).
+    unsafe fn seven(&self, st: &Stream, close: bool) {
+        use tidelm_kernels::ds41::*;
+        let (s, t) = (st.raw(), self.t as i32);
+        if close {
+            ds_hc_post(s, p(&self.y), p(&self.h), p(&self.ppost), p(&self.pcomb), p(&self.h), t, HC_H as i32);
+        }
+        ds_row_rsqrt(s, p(&self.h), HC_D as i64, t, HC_D as i32, 1e-5, p(&self.rsq));
+        ds_linear_bf16(s, p(&self.h), HC_D as i64, p(&self.fnw), t, 24, HC_D as i32, 16, p(&self.part), null(), 24, p(&self.part));
+        ds_splits_reduce(s, p(&self.part), 16, t, 24, null(), p(&self.mixes), 24);
+        ds_hc_sinkhorn(s, p(&self.mixes), p(&self.rsq), p(&self.scale), p(&self.base), t, 20, 1e-6, p(&self.pre), p(&self.post),
+                       p(&self.comb));
+        ds_hc_pre_norm(s, p(&self.h), p(&self.pre), null(), p(&self.hy), t, HC_H as i32, 4, 1e-5);
+        glm_rmsnorm(s, p(&self.hy), HC_H as i64, null(), 0, p(&self.w), p(&self.xn), HC_H as i64, t, HC_H as i32, 1e-5);
+    }
+
+    unsafe fn fused(&self, st: &Stream, close: bool) -> i32 {
+        let y = if close { p(&self.y) } else { null() };
+        flash_hc_site(st.raw(), y, p(&self.h), p(&self.ppost), p(&self.pcomb), p(&self.fnw), 24, HC_H as i32, 4, 16, p(&self.part),
+                      p(&self.ssw), p(&self.scale), p(&self.base), 20, 1e-6, p(&self.pre), p(&self.post), p(&self.comb), p(&self.w),
+                      p(&self.xn), self.t as i32, 1e-5)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn out(&self) -> (Vec<u16>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<u16>) {
+        let bits = |b: &DeviceBuffer<f32>| b.download().unwrap().iter().map(|v| v.to_bits()).collect::<Vec<u32>>();
+        (self.h.download().unwrap(), bits(&self.pre), bits(&self.post), bits(&self.comb), self.xn.download().unwrap())
+    }
+}
+
+#[test]
+fn hc_site_is_the_seven_launches() {
+    let Some(st) = setup() else { return };
+    for &t in &[1usize, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 16] {
+        for close in [false, true] {
+            let seed = 100 + 2 * t as u64 + close as u64;
+            let (a, b) = (HcSite::new(&mut Rng(seed), t), HcSite::new(&mut Rng(seed), t));
+            unsafe { a.seven(&st, close) };
+            ok(0);
+            ok(unsafe { b.fused(&st, close) });
+            let (ra, rb) = (a.out(), b.out());
+            let diff = |x: &[u16], y: &[u16]| x.iter().zip(y).filter(|(p, q)| p != q).count();
+            assert_eq!(diff(&ra.0, &rb.0), 0, "rows {t} close {close}: the stream");
+            assert_eq!(ra.1, rb.1, "rows {t} close {close}: pre");
+            assert_eq!(ra.2, rb.2, "rows {t} close {close}: post");
+            assert_eq!(ra.3, rb.3, "rows {t} close {close}: comb");
+            assert_eq!(diff(&ra.4, &rb.4), 0, "rows {t} close {close}: the normed input");
+            // not a trivial pass: the post moved the stream, the norm wrote something
+            assert!(ra.4.iter().any(|&v| v != 0));
+        }
+    }
+    // 17 rows are the tensor-core GEMM's: refused
+    let c = HcSite::new(&mut Rng(1), 17);
+    assert_ne!(unsafe { c.fused(&st, true) }, 0);
+}
+
+#[test]
+#[ignore]
+fn hc_site_bench() {
+    // a pass's 90 sites back to back, each with its own mix weights (0.8 MB: 71 MB a pass, past the L2)
+    let Some(st) = setup() else { return };
+    for &t in &[1usize, 2, 4, 8, 16] {
+        let sites: Vec<HcSite> = (0..90).map(|i| HcSite::new(&mut Rng(1000 + i), t)).collect();
+        let (e0, e1) = (Event::timing().unwrap(), Event::timing().unwrap());
+        let mut us = [0.0f64; 2];
+        let reps = 8;
+        for rep in 0..reps + 1 {
+            for (arm, slot) in us.iter_mut().enumerate() {
+                e0.record(&st).unwrap();
+                for s in &sites {
+                    unsafe {
+                        if arm == 0 { s.seven(&st, true) } else { s.fused(&st, true); }
+                    }
+                }
+                e1.record(&st).unwrap();
+                e1.synchronize().unwrap();
+                if rep > 0 {
+                    *slot += 1e3 * e1.elapsed_ms(&e0).unwrap() as f64 / 90.0;
+                }
+            }
+        }
+        eprintln!("rows {t:2}: a site, seven launches {:6.1} us, fused {:6.1} us; a pass's 90: {:.2} -> {:.2} ms", us[0] / reps as f64,
+                  us[1] / reps as f64, us[0] / reps as f64 * 0.09, us[1] / reps as f64 * 0.09);
+    }
+}
 
 #[test]
 fn mla_without_rope_is_mla_with_a_zero_rope_slot() {

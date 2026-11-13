@@ -82,8 +82,8 @@ const OP_SNAP_COMMIT: u32 = 14;
 
 /// Schedule knobs a benchmark can switch on both ranks inside one boot (Engine::bench_knob): each
 /// moves no value, only when and where kernels run.
-pub const BENCH_KNOBS: [&str; 15] = ["l2pf", "pdl", "evict_first", "evict_kvb", "evict_skinny", "mla_half", "index_side", "fat",
-                                      "split", "osplit", "qsplit", "rot1", "round", "hot_plan", "rescue"];
+pub const BENCH_KNOBS: [&str; 18] = ["l2pf", "pdl", "evict_first", "evict_kvb", "evict_skinny", "mla_half", "index_side", "fat",
+                                      "split", "osplit", "qsplit", "rot1", "round", "hot_plan", "rescue", "hc_fused", "flash_pf", "flash_both"];
 
 /// Lanes a pass may carry (glm.cu kMaxLanes).
 pub const MAX_LANES: usize = 4;
@@ -130,7 +130,7 @@ impl Options {
              lanes {}\nkv_tokens {}\npack_source {}\nablit {}\nenv {}\nflags {}\n",
             sha2::Sha256::digest(&cfg), sha2::Sha256::digest(&exe), self.max_seq, self.chunk, self.slots, self.kv_split,
             self.prefill_reduce_bf16, self.moe_rows, self.lanes, self.kv_tokens, pack.source_sha256, crate::ablit::digest()?,
-            ["TIDELM_GLM_HOT", "TIDELM_GLM_WIDE_DECODE_FROM", "NCCL_PROTO", "TIDELM_GLM_MLA_HALF", "TIDELM_GLM_FAT", "GLM_FLASH_DENSE"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
+            ["TIDELM_GLM_HOT", "TIDELM_GLM_WIDE_DECODE_FROM", "NCCL_PROTO", "TIDELM_GLM_MLA_HALF", "TIDELM_GLM_FAT", "GLM_FLASH_DENSE", "TIDELM_FLASH_HC_FUSED"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
                 .collect::<Vec<_>>().join(" "), self.guard_extra);
         Ok(s.into_bytes())
     }
@@ -361,6 +361,26 @@ pub struct Engine {
     /// 11.5 -> 6.5 ms, with the epilogue 12.8 -> 6.6, down 5.6 -> 3.1; the pair's 8K prefill
     /// (--bench-prefill-ab, 2026-10-30) 18.29 -> 15.82 s. TIDELM_GLM_FAT=0 off.
     fat: bool,
+    /// GLM-5.3-Flash decode rows: an mHC site's seven launches (the last site's hc_post, the stream's
+    /// rsqrt, the mix GEMV and its split reduce, Sinkhorn, hc_pre, the RMSNorm) as two
+    /// (flash_hc_mix, flash_hc_close), bit for bit. TIDELM_FLASH_HC_FUSED=0 keeps the seven (in the
+    /// boot guard: a pair's ranks take the same path). flash_gpu hc_site_bench, 90 sites back to
+    /// back: 33.8 -> 17.6 us a site at one row, 34.6 -> 20.1 at four. In the pass (one Spark, in-boot
+    /// A/B 2026-11-13, 2.5K context) it is less, the sites' time being partly the prefetch branch's:
+    /// alone -1.8 / -0.3 / -0.5 / 0.0% at 1 / 2 / 4 / 8 rows (3 rounds); with flash_pf on 0.0 / -1.0 /
+    /// -0.8% at 1 / 2 / 4 (5 rounds); the two together -1.2 / -1.3 / -1.1 / -1.1% at 1 / 2 / 3 / 4.
+    pub(crate) hc_fused: bool,
+    /// GLM-5.3-Flash decode rows: L2 prefetches in the two windows of a KDA layer where the memory
+    /// idles - o_proj's first bytes while f_b / g_b / the conv run (PF_KDA_O), the shared expert's
+    /// gate | up while the MLP's mHC site does (PF_SH_UP). TIDELM_FLASH_PF=0 off. No value moves.
+    /// In-boot A/B (hc_fused on, 5 rounds): -1.6 / -0.8 / -0.6% at 1 / 2 / 4 rows. Other budgets
+    /// (o_proj / shared MB, 4 rounds each, one boot a pair) are the same within the bench's +-0.4%:
+    /// 3 / 2 -1.8 / -1.0 / 0.0, 6 / 6 -1.7 / -1.0 / -0.7, 12 / 3 -0.9 / -0.8 / -0.7, 12 / 6 -1.5 / -1.1 /
+    /// -0.4. The windows are ~25 us and ~10 us: the first megabytes are what fits them.
+    pub(crate) flash_pf: bool,
+    /// its budgets in bytes (PF_KDA_O, PF_SH_UP; TIDELM_FLASH_PF_O / TIDELM_FLASH_PF_SH in MB, for a sweep)
+    pub(crate) pf_kda_o: usize,
+    pub(crate) pf_sh_up: usize,
     blas: Blas,
     pub w: Weights,
     members: Members,
@@ -424,6 +444,14 @@ pub struct Engine {
     pub(crate) adapt_bg: Option<crate::adapt::AdaptAsync>,
     pub(crate) passes: u64,
     h_ids: tidelm_cuda::PinnedBuffer<i32>,
+    /// Recorded behind a stage()'s host -> device copies. Those copies read the pinned staging
+    /// (h_ids, h_lanes, h_temp, h_rlane, Flash's h_meta) when the stream reaches them, not when they
+    /// are queued, and the decoder's and the MTP layer's passes share the buffers: the next stage()
+    /// waits for this before it writes them. A prompt's chunks are queued with no wait between them,
+    /// so without it a chunk's MTP fill read the ids of the chunk after it whenever the GPU was still
+    /// behind (stage_late counts those; TIDELM_GLM_STAGE_LOG=1 prints it a forward).
+    ev_stage: tidelm_cuda::Event,
+    pub stage_late: usize,
     /// the lane tables' staging ([2][MAX_LANES][4], Act::lanes) and the decoder rows' lanes
     h_lanes: tidelm_cuda::PinnedBuffer<i32>,
     h_rlane: tidelm_cuda::PinnedBuffer<i32>,
@@ -650,6 +678,10 @@ impl Engine {
             sh_open: std::cell::Cell::new(false),
             index_side: std::env::var("TIDELM_GLM_INDEX_SIDE").as_deref() != Ok("0"),
             fat: std::env::var("TIDELM_GLM_FAT").as_deref() != Ok("0"),
+            hc_fused: std::env::var("TIDELM_FLASH_HC_FUSED").as_deref() != Ok("0"),
+            flash_pf: std::env::var("TIDELM_FLASH_PF").as_deref() != Ok("0"),
+            pf_kda_o: std::env::var("TIDELM_FLASH_PF_O").ok().and_then(|v| v.parse::<usize>().ok()).map_or(PF_KDA_O, |m| m << 20),
+            pf_sh_up: std::env::var("TIDELM_FLASH_PF_SH").ok().and_then(|v| v.parse::<usize>().ok()).map_or(PF_SH_UP, |m| m << 20),
             ev_fork2: tidelm_cuda::Event::new()?,
             blas,
             w,
@@ -689,6 +721,8 @@ impl Engine {
             passes: 0,
             ablit,
             h_ids: tidelm_cuda::PinnedBuffer::zeroed(opt_chunk.max(HEAD_ROWS))?,
+            ev_stage: tidelm_cuda::Event::new()?,
+            stage_late: 0,
             h_lanes: tidelm_cuda::PinnedBuffer::zeroed(2 * MAX_LANES * 4)?,
             h_rlane: tidelm_cuda::PinnedBuffer::zeroed(opt_chunk.max(HEAD_ROWS))?,
             lane_miss: DeviceBuffer::zeroed(MAX_LANES * 4)?,
@@ -926,7 +960,12 @@ impl Engine {
     #[allow(clippy::too_many_lines)]
     fn attention(&self, l: usize, t: usize, prefill: bool) -> Result<()> {
         let (cfg, a) = (&self.cfg, &self.act);
-        let Some(lw) = self.w.layers[l].mla() else { return self.attention_flash(l, t, prefill) };
+        let Some(lw) = self.w.layers[l].mla() else {
+            // GLM-5.3-Flash's layers; GLM_ABLIT edits their attention's write as it does GLM-5.3's below
+            // (until 2026-11-13 it edited only their MLP's)
+            self.attention_flash(l, t, prefill)?;
+            return self.ablit_rows(l, np(&a.a), t);
+        };
         let st = self.st.raw();
         let h = cfg.hidden;
         let hl = self.hl;
@@ -1396,6 +1435,12 @@ impl Engine {
             ck(unsafe { glm_unshard(st, at(&a.gs, p * il * 2), (per / 2) as i64, np(&a.hf), n as i32, il as i32, w as i32, 2) },
                "unshard shared")?;
         } else {
+            // One box: the pair's collectives are copies (these two, the output's below, o_proj's f32 ->
+            // bf16 in the attention). Reading each source where it is instead - 3 launches a MoE layer and
+            // 1 an attention layer fewer, 177 a pass, no value moved - measured nothing: GLM-5.3-Flash,
+            // one Spark, in-boot A/B 2026-11-13 (3 ABBA rounds, 2.5K context), 1 / 2 / 4 / 8 rows
+            // +0.1 / +0.2 / +0.4 / -0.2%, the MTP pass -1.2%. The copies are 2-3 us each and run under
+            // the prefetch branch, which uses the memory meanwhile. Not taken.
             unsafe {
                 tidelm_cuda::memcpy_async(np(&a.xdf), np(&a.pair), p * il * 2, tidelm_cuda::ffi::MEMCPY_DEVICE_TO_DEVICE, &self.st)?;
                 tidelm_cuda::memcpy_async(np(&a.hf), hsh, n * il * 2, tidelm_cuda::ffi::MEMCPY_DEVICE_TO_DEVICE, &self.st)?;
@@ -1461,6 +1506,11 @@ impl Engine {
         if groups.is_empty() || groups.len() > MAX_LANES || groups.iter().map(|g| g.1).sum::<usize>() != t {
             return Err(format!("stage: {t} rows in lanes {groups:?}").into());
         }
+        // the last stage's copies have read the staging buffers before this one writes them
+        if !self.ev_stage.done() {
+            self.stage_late += 1;
+            self.ev_stage.synchronize()?;
+        }
         for (d, &x) in self.h_ids.iter_mut().zip(ids) {
             *d = x as i32;
         }
@@ -1501,6 +1551,7 @@ impl Engine {
                                           &self.st)?;
             }
         }
+        self.ev_stage.record(&self.st)?;
         Ok(())
     }
 
@@ -1900,6 +1951,11 @@ const PF_O: usize = 12 << 20;
 const PF_DOWN: usize = 6 << 20;
 const PF_SH_DOWN: usize = 2 << 20;
 const PF_QA: usize = 3 << 20;
+/// GLM-5.3-Flash: a KDA layer's o_proj (33.6 MB) during f_b, g_b and the conv (~25 us before the
+/// chain takes the memory for its state), the shared expert's gate | up (16.8 MB) during the MLP's
+/// mHC site
+pub(crate) const PF_KDA_O: usize = 6 << 20;
+pub(crate) const PF_SH_UP: usize = 3 << 20;
 const PF_KVA: usize = 1 << 20;
 
 /// A decode row's bytes in the split gather: its heads' absorbed queries (bf16 [hl][576]) then
@@ -2176,6 +2232,11 @@ impl Engine {
         end == 0 || self.paged.need(lane, end - 1) <= self.paged.free_chunks()
     }
 
+    /// The chunks `lane` would map to reach `end` positions.
+    pub fn kv_need(&self, lane: usize, end: usize) -> usize {
+        if end == 0 { 0 } else { self.paged.need(lane, end - 1) }
+    }
+
     /// The pool's free and total chunks, and the chunks a lane holds.
     pub fn kv_chunks(&self) -> (usize, usize) {
         (self.paged.free_chunks(), self.paged.total_chunks())
@@ -2285,12 +2346,15 @@ impl Engine {
             let out = self.decode_pass(ids, &[(lane, t, p0)])?;
             self.tokens.extend_from_slice(ids);
             self.pos += t;
+            if mtp && t > 1 {
+                self.mtp_core(&[MtpRows { lane, ids: &ids[1..], hidden: Hidden::Target(0), pos0: p0 }], false)?;
+            }
+            // after the MTP fill: the snapshot holds the MTP layer's ring too, and one taken before the
+            // fill kept that ring without this pass's rows - a restore then built the MTP layer's next
+            // pool from rows 64 positions old (drafts only: the decoder's rings were whole)
             if let Some(p) = want.filter(|&p| p > p0) {
                 // the pass saved its rows (t <= SAVE_ROWS): a replay to p, or the state at its end
                 self.flash_take_snapshot(lane, self.pos, p)?;
-            }
-            if mtp && t > 1 {
-                self.mtp_core(&[MtpRows { lane, ids: &ids[1..], hidden: Hidden::Target(0), pos0: p0 }], false)?;
             }
             return Ok(out);
         }
@@ -2321,9 +2385,6 @@ impl Engine {
             let p0 = self.pos;
             self.tokens.extend_from_slice(part);
             self.pos += n;
-            if let Some(p) = want.filter(|&p| p > p0 && p <= self.pos) {
-                self.flash_take_snapshot(lane, self.pos, p)?;
-            }
             if mtp {
                 let mut fill = ids[c0 + 1..(c0 + n + 1).min(t)].to_vec();
                 if c0 + n == t {
@@ -2333,9 +2394,17 @@ impl Engine {
                     self.mtp_core(&[MtpRows { lane, ids: &fill, hidden: Hidden::Target(0), pos0: p0 }], false)?;
                 }
             }
+            // after the chunk's MTP fill (the decode path above: the MTP layer's ring)
+            if let Some(p) = want.filter(|&p| p > p0 && p <= self.pos) {
+                self.flash_take_snapshot(lane, self.pos, p)?;
+            }
             c0 += n;
         }
         self.st.synchronize()?;
+        if std::env::var("TIDELM_GLM_STAGE_LOG").as_deref() == Ok("1") {
+            eprintln!("stage: rank {} forward of {t} rows from {}: {} staging(s) so far found the last one unread", self.rank,
+                      self.pos - t, self.stage_late);
+        }
         Ok(out)
     }
 
@@ -2479,6 +2548,17 @@ impl Engine {
         Ok(())
     }
 
+    /// What a prompt that shares `keep` positions with `lane`'s sequence can keep of it: `keep` for
+    /// GLM-5.3's positional caches; for GLM-5.3-Flash where KDA's state can go back to - `keep` inside
+    /// the lane's last saved pass, else its snapshot at or before `keep`, else 0 (serve's admission).
+    pub fn reusable(&self, lane: usize, keep: usize) -> usize {
+        if self.fl.is_none() || self.flash_can_rewind(lane, self.lane_pos(lane), keep) {
+            keep
+        } else {
+            self.flash_restore_point(lane, keep)
+        }
+    }
+
     /// Whether set_pos(n) can take the selected lane back to `n` positions: always for GLM-5.3's KV
     /// caches; GLM-5.3-Flash's KDA state only to 0, to where it is, or into its last saved pass.
     pub fn can_rewind(&self, n: usize) -> bool {
@@ -2615,6 +2695,16 @@ impl Engine {
             let boot = self.exlr8_boot_exact;
             return self.bench_knob(name, boot);
         }
+        if name == "hc_fused" {
+            return self.bench_knob(name, std::env::var("TIDELM_FLASH_HC_FUSED").as_deref() != Ok("0"));
+        }
+        if name == "flash_both" {
+            self.bench_knob("hc_fused", std::env::var("TIDELM_FLASH_HC_FUSED").as_deref() != Ok("0"))?;
+            return self.bench_knob("flash_pf", std::env::var("TIDELM_FLASH_PF").as_deref() != Ok("0"));
+        }
+        if name == "flash_pf" {
+            return self.bench_knob(name, std::env::var("TIDELM_FLASH_PF").as_deref() != Ok("0"));
+        }
         if name == "osplit" || name == "qsplit" || name == "rot1" {
             return self.bench_knob(name, name == "osplit");     // the boot's: o_proj wide; q_b and one rotation not
         }
@@ -2638,6 +2728,7 @@ impl Engine {
                 glm_set_pdl(on as i32);
                 exl3m_set_pdl(on as i32);
                 tidelm_kernels::ds41::ds_set_pdl(on as i32);
+                tidelm_kernels::flash::flash_set_pdl(on as i32);
             },
             2 => unsafe {
                 tidelm_kernels::exl3::exl3m_set_evict_first(on as i32);
@@ -2669,6 +2760,13 @@ impl Engine {
                 Some(h) if h.rescue_boot.is_some() => h.rescue = if on { h.rescue_boot } else { None },
                 _ => return Err("bench knob rescue: boot with GLM_HOT_RESCUE (and GLM_HOT_ASYNC=1)".into()),
             },
+            15 => self.hc_fused = on,
+            16 => self.flash_pf = on,
+            // the two together (they share a KDA layer's idle windows: their gains do not add)
+            17 => {
+                self.hc_fused = on;
+                self.flash_pf = on;
+            }
             _ => return Err(format!("bench knob {code}").into()),
         }
         self.graphs_map.clear();

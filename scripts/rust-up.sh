@@ -276,10 +276,13 @@ fi
 # TIDELM_GLM_FAT=0: GLM, prefill's routed experts through the smem tile instead of the fat tile (same bits)
 # TIDELM_GLM_HOT_ORACLE=PATH,MIN: GLM debug (--bench-nll), an earlier run's trace's next-pass misses >= MIN
 # read first - what rescuing the heavy misses is worth (adapt.rs HotOracle)
+# TIDELM_FLASH_HC_FUSED=0: GLM-5.3-Flash, a decode pass's mHC sites as seven launches each instead of two (same bits)
+# TIDELM_FLASH_PF=0: GLM-5.3-Flash, no L2 prefetch of o_proj / the shared gate | up in a KDA layer's idle windows
+# TIDELM_GLM_STAGE_LOG=1: GLM, a line a forward counting the stagings that found the last one's copies still queued
 # TIDELM_GLM_HOT_TRACE: GLM, rank 0 appends every decode pass's routing table and async hot reads to
 # this path (in a mounted directory), for tools/glm_hot_sim.py
 for v in TIDELM_MEM_LOG_MB TIDELM_GRAPH_CACHE TIDELM_STEP_SPLIT TIDELM_GLM_WIDE_DECODE_FROM TIDELM_GLM_ROUND_LOG TIDELM_PDL \
-         TIDELM_L2_PREFETCH TIDELM_GLM_EVICT_FIRST TIDELM_GLM_MLA_HALF TIDELM_GLM_INDEX_SIDE TIDELM_GLM_FAT TIDELM_GLM_HOT_TRACE TIDELM_GLM_VERIFY_PLAN TIDELM_GLM_ACT_PLAN TIDELM_GLM_PREFILL_CHECK TIDELM_GLM_HOT_ORACLE; do [[ -n "${!v:-}" ]] && envs+=("$v=${!v}"); done
+         TIDELM_L2_PREFETCH TIDELM_GLM_EVICT_FIRST TIDELM_GLM_MLA_HALF TIDELM_GLM_INDEX_SIDE TIDELM_GLM_FAT TIDELM_GLM_HOT_TRACE TIDELM_GLM_VERIFY_PLAN TIDELM_GLM_ACT_PLAN TIDELM_GLM_PREFILL_CHECK TIDELM_GLM_HOT_ORACLE TIDELM_FLASH_HC_FUSED TIDELM_FLASH_PF TIDELM_FLASH_PF_O TIDELM_FLASH_PF_SH TIDELM_GLM_STAGE_LOG; do [[ -n "${!v:-}" ]] && envs+=("$v=${!v}"); done
 for e in "${envs[@]}"; do envf+=(-e "$e"); done
 vols=() seen=" "
 for p in "${rw[@]}"; do [[ $seen == *" $p "* ]] && continue; seen+="$p "; vols+=(-v "$p:$p"); done
