@@ -101,3 +101,28 @@ FP8 GEMV (flash_gpu fp8_gemv_bench, cold, best split), 1 / 4 / 8 rows:
 From these, a 1-row pass: ~42 ms of non-expert reads (KDA 21, shared experts 7.6, MLA 6.1, head
 2.6, dense 2.1, router + mHC ~1.3) + ~18 ms of routed experts (3.7 GB) + 1.5 ms KDA state: ~16 tok/s
 before speculation. The small matrices (8-17 MB at 110-154 GB/s) are the GEMV lever left.
+
+## Vision (2026-11-12)
+
+Image parts of chat / messages requests (GLM_VISION=1). The checkpoint's chat template has no image
+form, so the renderer writes `<|begin_of_image|><|image|><|end_of_image|>` where it would write its
+"unable to process" reminder, and `<|image|>` becomes the image's tokens (one a 2 x 2 patch window).
+
+- Preprocessing (tidelm-image glm5next): transformers' Glm5NextImageProcessor bit for bit (torch's
+  int16-weight antialiased bicubic, smart_resize, zero padding, fused normalize) - identical patches
+  for six images from 20 x 10 to 4000 x 3000, RGBA and JPEG included.
+- The tower (flash_vision.rs): each block matches transformers' from the same input to 1-3e-3; over the
+  24 blocks the two drift as transformers' own bf16 tower drifts from its fp32 one (the ViT amplifies
+  bf16 rounding). 78 ms for 1,656 patches, 1.13 s for 14,868.
+- Dynamic load (lend.rs): the tower's 1.13 GB and scratch are lent expert slots for the request - the
+  least-wanted class's last ~150-250 slots leave routing, the tower loads into them, the images encode
+  into a 65 MB buffer reserved at boot, the slots are refilled from the pack before the prefill. Text-only
+  traffic keeps the memory for experts. An encode costs ~1.0-1.1 s for a small image (mostly the load
+  and the refill), 2.3 s for a large one.
+- The prefix stops at the first image (the placeholder id is shared).
+
+Served examples: the check image's shapes and text read exactly; the repo's expert-map screenshot read
+in detail (first token 7.9 s for 3,738 tokens); two images in a request; a second turn answering from
+an image in its history.
+
+Open: keeping the tower lent across consecutive image requests (the load is most of an encode), video.
