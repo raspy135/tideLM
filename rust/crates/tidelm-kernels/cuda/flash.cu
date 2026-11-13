@@ -436,6 +436,37 @@ __global__ void expand_kernel(const int* __restrict__ pools, int64_t ldp, int kp
     }
 }
 
+// ------------------------------------------------------------------ MLP, embedding
+// Glm5NextTextMLP's activation: y = bf16(bf16(silu(min(g, L))) * clamp(u, -L, L)), g and u bf16.
+__global__ void swiglu_limit_kernel(const bf16* __restrict__ g, const bf16* __restrict__ u, int64_t ld, bf16* __restrict__ y,
+                                    int64_t ldy, int n, float lim) {
+    pdl_enter();
+    const int t = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    const float gv = fminf(bf(g[(int64_t)t * ld + c]), lim);
+    const float uv = fminf(fmaxf(bf(u[(int64_t)t * ld + c]), -lim), lim);
+    y[(int64_t)t * ldy + c] = to_bf(rbf(gv / (1.f + expf(-gv))) * uv);
+}
+
+// The BF16 embedding rows of `ids` into `copies` adjacent copies a row (mHC's streams start equal),
+// zero where `pos` (non-null) is 0 (the MTP layer's first position).
+__global__ void embed_kernel(const int* __restrict__ ids, const bf16* __restrict__ table, int H, int copies,
+                             const int* __restrict__ pos, bf16* __restrict__ out) {
+    pdl_enter();
+    const int t = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c * 8 >= H) return;
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (!pos || pos[t] != 0) v = reinterpret_cast<const uint4*>(table + (int64_t)ids[t] * H)[c];
+    for (int k = 0; k < copies; ++k) reinterpret_cast<uint4*>(out + ((int64_t)t * copies + k) * H)[c] = v;
+}
+
+// bf16 [T][n] (rows ldx apart) widened to fp32 [T][ldy] (the indexer's head weights for glm.cu's scores)
+__global__ void widen_kernel(const bf16* __restrict__ x, int64_t ldx, float* __restrict__ y, int64_t ldy, int n) {
+    pdl_enter();
+    const int t = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c < n) y[(int64_t)t * ldy + c] = bf(x[(int64_t)t * ldx + c]);
+}
+
 }  // namespace
 
 extern "C" {
@@ -523,6 +554,24 @@ int flash_expand(void* stream, const void* pools, int64_t ldp, int kp, const voi
     if (ldo < 4 * (int64_t)kp + 3) return (int)cudaErrorInvalidValue;
     pdl_launch(expand_kernel, T, 512, 0, GST, static_cast<const int*>(pools), ldp, kp, static_cast<const int*>(pos),
                static_cast<int*>(out), ldo);
+    GRET;
+}
+
+int flash_swiglu(void* stream, const void* g, const void* u, int64_t ld, void* y, int64_t ldy, int T, int n, float lim) {
+    pdl_launch(swiglu_limit_kernel, dim3((n + 255) / 256, T), 256, 0, GST, static_cast<const bf16*>(g), static_cast<const bf16*>(u),
+               ld, static_cast<bf16*>(y), ldy, n, lim);
+    GRET;
+}
+
+int flash_embed(void* stream, const void* ids, int T, const void* table, int H, int copies, const void* pos, void* out) {
+    if (H % 8) return (int)cudaErrorInvalidValue;
+    pdl_launch(embed_kernel, dim3((H / 8 + 127) / 128, T), 128, 0, GST, static_cast<const int*>(ids), static_cast<const bf16*>(table),
+               H, copies, static_cast<const int*>(pos), static_cast<bf16*>(out));
+    GRET;
+}
+
+int flash_widen(void* stream, const void* x, int64_t ldx, void* y, int64_t ldy, int T, int n) {
+    pdl_launch(widen_kernel, dim3((n + 127) / 128, T), 128, 0, GST, static_cast<const bf16*>(x), ldx, static_cast<float*>(y), ldy, n);
     GRET;
 }
 

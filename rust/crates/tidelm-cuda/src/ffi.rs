@@ -58,6 +58,16 @@ extern "C" {
         kind: c_int,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub fn cudaMemcpy2DAsync(
+        dst: *mut c_void,
+        dpitch: usize,
+        src: *const c_void,
+        spitch: usize,
+        width: usize,
+        height: usize,
+        kind: c_int,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
 
     pub fn cudaStreamCreateWithFlags(stream: *mut cudaStream_t, flags: c_uint) -> cudaError_t;
     pub fn cudaStreamDestroy(stream: cudaStream_t) -> cudaError_t;

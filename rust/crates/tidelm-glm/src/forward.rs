@@ -32,9 +32,13 @@ use tidelm_kernels::exl3::*;
 use tidelm_kernels::glm::*;
 
 use crate::arena::{Arena, Pack};
-use crate::config::GlmConfig;
+use crate::config::{AttnKind, GlmConfig};
+use crate::lin::Lin;
 use crate::weights::{Exl3Mat, Exl3Scratch, Members, Mlp, Weights, DECODE_PF_ROUTED, MAX_ROWS};
 use crate::{ck, Result};
+
+#[path = "flash_fwd.rs"]
+mod flash_fwd;
 
 /// Decode rows a graph or a verify step carries at most (MTP depth 7 + the anchor).
 pub const VERIFY_ROWS: usize = 8;
@@ -121,7 +125,7 @@ impl Options {
              lanes {}\npack_source {}\nablit {}\nenv {}\nflags {}\n",
             sha2::Sha256::digest(&cfg), sha2::Sha256::digest(&exe), self.max_seq, self.chunk, self.slots, self.kv_split,
             self.prefill_reduce_bf16, self.moe_rows, self.lanes, pack.source_sha256, crate::ablit::digest()?,
-            ["TIDELM_GLM_HOT", "TIDELM_GLM_WIDE_DECODE_FROM", "NCCL_PROTO", "TIDELM_GLM_MLA_HALF", "TIDELM_GLM_FAT"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
+            ["TIDELM_GLM_HOT", "TIDELM_GLM_WIDE_DECODE_FROM", "NCCL_PROTO", "TIDELM_GLM_MLA_HALF", "TIDELM_GLM_FAT", "GLM_FLASH_DENSE"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
                 .collect::<Vec<_>>().join(" "), self.guard_extra);
         Ok(s.into_bytes())
     }
@@ -135,34 +139,46 @@ pub struct Pair {
     pub roce: tidelm_comm::roce::Roce,
 }
 
-/// A layer's caches, each `[lanes][lane_rows][row]` (paged: Engine::paged).
+/// A layer's caches, each `[lanes][lane_rows][row]` (paged: Engine::paged). GLM-5.3-Flash's KDA
+/// layers have none (Engine::kv holds None for them); its sparse-attention layers no RoPE key and
+/// their indexer keys a row a pool of 4 positions (the same lane offset: the pool rows of a lane's
+/// part are its first quarter, backed as far as they reach).
 pub(crate) struct LayerKv {
     /// latent FP8 [rows][512] + fp32 [rows][4]
     pub(crate) cq: KvBuf,
     pub(crate) cs: KvBuf,
-    /// RoPE key BF16 [rows][64]
-    pub(crate) cr: KvBuf,
-    /// indexer key FP8 [rows][128] + fp32 [rows] (full layers)
+    /// RoPE key BF16 [rows][64] (GLM-5.3)
+    pub(crate) cr: Option<KvBuf>,
+    /// indexer key FP8 [rows][128] + fp32 [rows] (full layers; GLM-5.3-Flash: a row a pool)
     pub(crate) iq: Option<KvBuf>,
     pub(crate) is: Option<KvBuf>,
     /// split by position across the pair (decoder layers under kv_split)
     pub(crate) split: bool,
     /// a lane's rows: the stride between lanes' parts
     pub(crate) lane_rows: usize,
+    /// (row bytes, positions a row) of each cache, in lane_bases order
+    pub(crate) rows: Vec<(usize, usize)>,
 }
 
-/// A layer cache's row bytes in LayerKv order (cq, cs, cr, iq, is).
+/// A GLM-5.3 layer cache's row bytes in LayerKv order (cq, cs, cr, iq, is).
 pub(crate) const KV_ROW_BYTES: [usize; 5] = [512, 16, 128, 128, 4];
+/// GLM-5.3-Flash's sparse-attention layer: (row bytes, positions a row) of cq, cs, the pooled iq, is.
+pub(crate) const KV_ROWS_FLASH: [(usize, usize); 4] = [(512, 1), (16, 1), (128, 4), (4, 4)];
 
 impl LayerKv {
-    /// The caches' bases for `lane` (bytes into each: lane * lane_rows rows), in KV_ROW_BYTES order.
+    /// The caches' bases for `lane` (bytes into each: lane * lane_rows rows), in `rows` order.
     pub(crate) fn lane_bases(&self, lane: usize) -> Vec<*mut c_void> {
-        let mut v = vec![self.cq.raw(), self.cs.raw(), self.cr.raw()];
+        let mut v = vec![self.cq.raw(), self.cs.raw()];
+        v.extend(self.cr.as_ref().map(|c| c.raw()));
         if let (Some(iq), Some(is)) = (&self.iq, &self.is) {
             v.push(iq.raw());
             v.push(is.raw());
         }
-        v.iter().zip(KV_ROW_BYTES).map(|(&b, rb)| unsafe { (b as *mut u8).add(lane * self.lane_rows * rb) } as *mut c_void).collect()
+        v.iter().zip(&self.rows).map(|(&b, &(rb, _))| unsafe { (b as *mut u8).add(lane * self.lane_rows * rb) } as *mut c_void).collect()
+    }
+
+    pub(crate) fn cr(&self) -> *mut c_void {
+        self.cr.as_ref().map(|c| c.raw()).unwrap_or(std::ptr::null_mut())
     }
 }
 
@@ -357,7 +373,10 @@ pub struct Engine {
     /// mass, missed mass]
     pub demand: DeviceBuffer<f32>,
     pub miss: DeviceBuffer<f64>,
-    pub(crate) kv: Vec<LayerKv>,
+    pub(crate) kv: Vec<Option<LayerKv>>,
+    /// a lane's rows in the decoder's caches and the MTP layer's (the lane tables' offsets)
+    dec_lane_rows: usize,
+    mtp_lane_rows: usize,
     /// every layer cache's chunks (KV_ROW_BYTES order a layer, layers in order)
     pub(crate) paged: PagedKv,
     /// the selected lane (pos, tokens are its) and the others' sequences
@@ -420,6 +439,8 @@ pub struct Engine {
     /// both ranks' candidates of the last sampled pass [world][rows][CROW]
     h_cand: tidelm_cuda::PinnedBuffer<f32>,
     cand_rows: usize,
+    /// GLM-5.3-Flash: KDA's state, the indexer's rings, the pass's lane slots (flash_fwd)
+    fl: Option<flash_fwd::FlashState>,
 }
 
 fn np<T: Copy>(b: &DeviceBuffer<T>) -> *mut c_void {
@@ -451,6 +472,7 @@ impl Engine {
             glm_set_pdl(pdl);
             exl3m_set_pdl(pdl);
             tidelm_kernels::ds41::ds_set_pdl(pdl);
+            tidelm_kernels::flash::flash_set_pdl(pdl);
             tidelm_kernels::exl3::exl3m_set_evict_first(ef);
             tidelm_kernels::glm::glm_set_stream_loads(ef);
             tidelm_kernels::ds41::ds_set_stream_weights(ef);
@@ -516,12 +538,18 @@ impl Engine {
         let mtp_rows = PagedKv::padded_rows(gran, opt.max_seq, &KV_ROW_BYTES);
         let mut specs = vec![];
         let mut pool = 0usize;
+        let layer_rows = |l: usize| -> Vec<(usize, usize)> {
+            match cfg.attn[l] {
+                AttnKind::Kda => vec![],
+                AttnKind::Dsa => KV_ROWS_FLASH.to_vec(),
+                AttnKind::Mla => KV_ROW_BYTES[..if cfg.index_full[l] { 5 } else { 3 }].iter().map(|&rb| (rb, 1)).collect(),
+            }
+        };
         for l in 0..nl {
             let split = opt.kv_split && world > 1 && l < cfg.layers;
             let rows = if split { dec_rows } else { mtp_rows };
-            let n = if cfg.index_full[l] { 5 } else { 3 };
-            for &rb in &KV_ROW_BYTES[..n] {
-                let spec = Spec { ratio: if split { world } else { 1 }, row_bytes: rb };
+            for (rb, per) in layer_rows(l) {
+                let spec = Spec { ratio: if split { world } else { per }, row_bytes: rb };
                 pool += PagedKv::chunks_for(gran, spec, rows, opt.max_seq - 1);
                 specs.push((spec, rows));
             }
@@ -539,23 +567,32 @@ impl Engine {
         let mut i = 0;
         for l in 0..nl {
             let split = opt.kv_split && world > 1 && l < cfg.layers;
-            let full = cfg.index_full[l];
-            let lk = LayerKv {
-                cq: paged.buf(i),
-                cs: paged.buf(i + 1),
-                cr: paged.buf(i + 2),
-                iq: full.then(|| paged.buf(i + 3)),
-                is: full.then(|| paged.buf(i + 4)),
-                split,
-                lane_rows: if split { dec_rows } else { mtp_rows },
+            let rows = layer_rows(l);
+            let lane_rows = if split { dec_rows } else { mtp_rows };
+            let lk = match cfg.attn[l] {
+                AttnKind::Kda => None,
+                AttnKind::Dsa => Some(LayerKv { cq: paged.buf(i), cs: paged.buf(i + 1), cr: None, iq: Some(paged.buf(i + 2)),
+                                                is: Some(paged.buf(i + 3)), split, lane_rows, rows: rows.clone() }),
+                AttnKind::Mla => {
+                    let full = cfg.index_full[l];
+                    Some(LayerKv { cq: paged.buf(i), cs: paged.buf(i + 1), cr: Some(paged.buf(i + 2)), iq: full.then(|| paged.buf(i + 3)),
+                                   is: full.then(|| paged.buf(i + 4)), split, lane_rows, rows: rows.clone() })
+                }
             };
-            i += if full { 5 } else { 3 };
+            i += rows.len();
             kv.push(lk);
         }
         log(&format!("[glm] KV cache {:.2} GB a rank ({} positions{}, {lanes} lane{} sharing them)",
                      (pool * gran) as f64 / 1e9, opt.max_seq, if opt.kv_split { ", split" } else { "" },
                      if lanes > 1 { "s" } else { "" }));
         let act = Act::new(&cfg, &opt, hl, vl, s_loc, n_slots, lanes)?;
+        let fl = if cfg.is_flash() {
+            let f = flash_fwd::FlashState::new(&cfg, &opt, world, lanes)?;
+            log(&format!("[flash] KDA state and rings {:.2} GB ({lanes} lane{})", f.bytes() as f64 / 1e9, if lanes > 1 { "s" } else { "" }));
+            Some(f)
+        } else {
+            None
+        };
         let moe_layers: Vec<usize> = (0..cfg.layers).filter(|&l| !cfg.dense[l]).collect();
         let opt_chunk = opt.chunk;
 
@@ -599,6 +636,8 @@ impl Engine {
             arena,
             mtp_arena,
             kv,
+            dec_lane_rows: dec_rows,
+            mtp_lane_rows: mtp_rows,
             paged,
             lane: 0,
             seqs: (0..lanes).map(|_| Seq::default()).collect(),
@@ -637,6 +676,7 @@ impl Engine {
             cand: DeviceBuffer::new(HEAD_ROWS * CROW)?,
             h_cand: tidelm_cuda::PinnedBuffer::zeroed(world * HEAD_ROWS * CROW)?,
             cand_rows: 0,
+            fl,
         };
         engine.st.synchronize()?;
         Ok(engine)
@@ -743,6 +783,45 @@ impl Engine {
         }
     }
 
+    /// x [rows][ldx] bf16 -> out [rows][n] through a Lin: an EXL3 matrix's decode or prefill path
+    /// (exl3_on), or ds41.cu's FP8 / BF16 GEMV and GEMM (lin::gemm, `part` its split-K partials).
+    #[allow(clippy::too_many_arguments)]
+    fn lin_on(&self, st: &Stream, x3: &Exl3Scratch, part: &DeviceBuffer<f32>, m: &Lin, x: *const c_void, ldx: usize, rows: usize,
+              out: *mut c_void, out_bf16: bool) -> Result<()> {
+        match m {
+            Lin::Exl3(e) => self.exl3_on(st, x3, e, x, ldx, rows, out, out_bf16),
+            _ => crate::lin::gemm(st, part, x, ldx, m, rows, out, !out_bf16, m.n_total()),
+        }
+    }
+
+    /// lin_on on the main stream.
+    fn lin(&self, m: &Lin, x: *const c_void, ldx: usize, rows: usize, out: *mut c_void, out_bf16: bool) -> Result<()> {
+        self.lin_on(&self.st, &self.act.x3s, &self.act.split_part, m, x, ldx, rows, out, out_bf16)
+    }
+
+    /// A Lin's first `budget` bytes into L2 (l2_mat for an EXL3 matrix; a dense one from its start).
+    fn l2_lin(&self, m: &Lin, rows: usize, budget: usize) -> Result<()> {
+        match m {
+            Lin::Exl3(e) => self.l2_mat(e, rows, budget),
+            _ => {
+                let (base, bytes, _) = m.runs(rows);
+                self.l2_runs(base, bytes.min(budget as u64), 0, 1)
+            }
+        }
+    }
+
+    /// The SwiGLU of gate / up halves (`ld` apart a row) -> bf16 [t][n]: GLM-5.3's glm_swiglu, or
+    /// with a limit GLM-5.3-Flash's (gate clamped above, up both sides, silu rounded to bf16).
+    #[allow(clippy::too_many_arguments)]
+    fn swiglu(&self, st: &Stream, g: *const c_void, u: *const c_void, ld: usize, y: *mut c_void, n: usize, t: usize) -> Result<()> {
+        if self.cfg.swiglu_limit.is_finite() {
+            ck(unsafe { tidelm_kernels::flash::flash_swiglu(st.raw(), g, u, ld as i64, y, n as i64, t as i32, n as i32,
+                                                             self.cfg.swiglu_limit) }, "swiglu (limit)")
+        } else {
+            ck(unsafe { glm_swiglu(st.raw(), g, ld as i64, u, ld as i64, y, n as i64, t as i32, n as i32) }, "swiglu")
+        }
+    }
+
     /// y fp32 [rows][n] = x bf16 [rows][k] . W^T, W fp32 [n][k] (F.linear(x.float(), w)), on `st`.
     #[allow(clippy::too_many_arguments)]
     fn linear_f32w_on(&self, st: &Stream, part: *mut c_void, x: *const c_void, ldx: usize, w: &DeviceBuffer<f32>, rows: usize,
@@ -819,12 +898,13 @@ impl Engine {
     // ------------------------------------------------------------------ attention
     #[allow(clippy::too_many_lines)]
     fn attention(&self, l: usize, t: usize, prefill: bool) -> Result<()> {
-        let (cfg, lw, a) = (&self.cfg, &self.w.layers[l], &self.act);
+        let (cfg, a) = (&self.cfg, &self.act);
+        let Some(lw) = self.w.layers[l].mla() else { return self.attention_flash(l, t, prefill) };
         let st = self.st.raw();
         let h = cfg.hidden;
         let hl = self.hl;
         let mtp = cfg.mtp && l == cfg.mtp_layer();
-        let kv = &self.kv[l];
+        let kv = self.kv[l].as_ref().ok_or("attention on a layer without a cache")?;
         let split = kv.split;
         // positions, the cache rows they take (a split layer's own, or the spare row, in the row's
         // lane's part), the last row each may attend (the local bound on a split layer, else the
@@ -850,7 +930,7 @@ impl Engine {
         ck(unsafe { glm_kv_fp8(s2, np(&a.c), 512, rowsb, kv.cq.raw(), kv.cs.raw(), t as i32, 512) }, "latent cache")?;
         ck(unsafe { glm_rope(s2, at(&a.ckv, 512), ldk as i64, 64, np(&a.kr), 64, 64, t as i32, 1, np(&self.w.cos), np(&self.w.sin),
                              posb) }, "rope key")?;
-        ck(unsafe { glm_rows_copy(s2, np(&a.kr), 64, rowsb, kv.cr.raw(), t as i32, 64) }, "rope cache")?;
+        ck(unsafe { glm_rows_copy(s2, np(&a.kr), 64, rowsb, kv.cr(), t as i32, 64) }, "rope cache")?;
         if full {
             let ix = lw.index.as_ref().unwrap();
             if prefill {
@@ -951,7 +1031,7 @@ impl Engine {
             let hh = cfg.heads;
             let (ns, chunk) = decode_split(TOPK, hh, t);
             ck(unsafe { glm_mla(st, MLA_DECODE_MT, np(&a.gs), (nbytes / 2) as i64, (self.qrow / 2) as i64, 576, hl as i32, kv.cq.raw(), kv.cs.raw(),
-                                kv.cr.raw(), 0, np(&a.idx), TOPK as i64, TOPK as i32, 0, bound, t as i32, hh as i32, scale,
+                                kv.cr(), 0, np(&a.idx), TOPK as i64, TOPK as i32, 0, bound, t as i32, hh as i32, scale,
                                 ns as i32, chunk as i32, np(&a.pm), np(&a.pl), np(&a.pacc), std::ptr::null_mut(), 0, 0,
                                 koff) },
                "mla (split)")?;
@@ -969,7 +1049,7 @@ impl Engine {
         } else if decode {
             // the MTP layer (or an unsplit cache): this rank's heads over the whole cache
             let (ns, chunk) = decode_split(TOPK, hl, t);
-            ck(unsafe { glm_mla(st, MLA_DECODE_MT, qbase, 0, qrow as i64, 576, hl as i32, kv.cq.raw(), kv.cs.raw(), kv.cr.raw(), 0,
+            ck(unsafe { glm_mla(st, MLA_DECODE_MT, qbase, 0, qrow as i64, 576, hl as i32, kv.cq.raw(), kv.cs.raw(), kv.cr(), 0,
                                 np(&a.idx), TOPK as i64, TOPK as i32, 1, bound, t as i32, hl as i32, scale, ns as i32, chunk as i32,
                                 np(&a.pm), np(&a.pl), np(&a.pacc), std::ptr::null_mut(), 0, 0, koff) }, "mla")?;
             self.l2_mat(&lw.o, t, PF_O)?;
@@ -1029,7 +1109,7 @@ impl Engine {
                                       R_16BF, (hl * 256) as i64, 256, hl)?;
         }
         self.exl3(&lw.o, np(&a.o), hl * 256, t, np(&a.f32buf), false)?;
-        if let (true, Mlp::Moe { router, .. }) = (decode, &lw.mlp) {
+        if let (true, Mlp::Moe { router, .. }) = (decode, &self.w.layers[l].mlp) {
             // the router's weights during the sum's gather and the norm
             self.l2_runs(router.raw() as u64, (router.len() * 2) as u64, 0, 1)?;
         }
@@ -1055,14 +1135,14 @@ impl Engine {
         let w = self.world;
         match &lw.mlp {
             Mlp::Dense { gate_up, down } => {
-                let n = gate_up.n;
-                self.exl3(gate_up, np(&a.xn), h, t, np(&a.gu), true)?;
-                let (g, u, ld) = if t <= GEMV_ROWS { (np(&a.gu), at(&a.gu, n), 2 * n) } else { (np(&a.gu), at(&a.gu, t * n), n) };
-                ck(unsafe { glm_swiglu(st, g, ld as i64, u, ld as i64, np(&a.dact), n as i64, t as i32, n as i32) }, "swiglu")?;
+                self.lin(gate_up, np(&a.xn), h, t, np(&a.gu), true)?;
+                let (n, uo, ld) = gate_up.gu_layout(t, GEMV_ROWS);
+                self.swiglu(&self.st, np(&a.gu), at(&a.gu, uo), ld, np(&a.dact), n, t)?;
                 self.gather_cols(np(&a.dact), t, n, 2, np(&a.dfull), prefill)?;
-                self.exl3(down, np(&a.dfull), n * w, t, np(&a.shout), false)?;
-                ck(unsafe { glm_moe_out(st, std::ptr::null(), np(&a.shout), np(&a.mout), (t * down.n) as i64) }, "dense out")?;
-                self.gather_cols(np(&a.mout), t, down.n, 2, np(&a.a), prefill)?;
+                self.lin(down, np(&a.dfull), n * w, t, np(&a.shout), false)?;
+                let dn = down.n_total();
+                ck(unsafe { glm_moe_out(st, std::ptr::null(), np(&a.shout), np(&a.mout), (t * dn) as i64) }, "dense out")?;
+                self.gather_cols(np(&a.mout), t, dn, 2, np(&a.a), prefill)?;
                 self.ablit_rows(l, np(&a.a), t)
             }
             Mlp::Moe { .. } => {
@@ -1096,7 +1176,7 @@ impl Engine {
     /// the routed gate/up; moe_rows joins them before the gather (sh_open).
     fn moe_exact(&self, l: usize, r0: usize, n: usize) -> Result<()> {
         let (cfg, a) = (&self.cfg, &self.act);
-        let Mlp::Moe { router, bias, sh_gate_up, .. } = &self.w.layers[l].mlp else {
+        let Mlp::Moe { router, router_bf16, bias, sh_gate_up, .. } = &self.w.layers[l].mlp else {
             return Err("moe_exact on a dense layer".into());
         };
         let (e, h) = (cfg.experts, cfg.hidden);
@@ -1112,17 +1192,24 @@ impl Engine {
         // the bytes (6.3 -> 3.1 MB a layer)
         let splits = if n <= MAX_ROWS { 6 } else { 1 };
         let part = np(&a.split_part);
-        ck(unsafe { ds_linear_f16w(self.st.raw(), at(&a.xn, r0 * h), h as i64, np(router), n as i32, e as i32, h as i32,
-                                   splits as i32, if splits > 1 { part } else { np(&a.logits) }, e as i64, part) },
-           "router f16w")?;
+        if *router_bf16 {
+            // GLM-5.3-Flash's bf16 router: F.linear(x, w) with fp32 sums, fp32 out
+            ck(unsafe { ds_linear_bf16(self.st.raw(), at(&a.xn, r0 * h), h as i64, np(router), n as i32, e as i32, h as i32,
+                                       splits as i32, std::ptr::null_mut(), if splits > 1 { part } else { np(&a.logits) }, e as i64,
+                                       part) }, "router bf16")?;
+        } else {
+            ck(unsafe { ds_linear_f16w(self.st.raw(), at(&a.xn, r0 * h), h as i64, np(router), n as i32, e as i32, h as i32,
+                                       splits as i32, if splits > 1 { part } else { np(&a.logits) }, e as i64, part) },
+               "router f16w")?;
+        }
         if splits > 1 {
             ck(unsafe { ds_splits_reduce(self.st.raw(), part, splits as i32, n as i32, e as i32, std::ptr::null_mut(),
                                          np(&a.logits), e as i64) }, "router reduce")?;
         }
-        ck(unsafe { glm_router(self.st.raw(), np(&a.logits), np(bias), std::ptr::null(), std::ptr::null(), n as i32,
-                               cfg.topk as i32, cfg.routed_scaling, np(&a.eids), np(&a.ew), allowed, hot, std::ptr::null(),
-                               std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut(),
-                               std::ptr::null_mut(), 0, std::ptr::null()) }, "router (exact)")
+        ck(unsafe { glm_router_e(self.st.raw(), np(&a.logits), np(bias), std::ptr::null(), std::ptr::null(), n as i32,
+                                 cfg.topk as i32, cfg.routed_scaling, np(&a.eids), np(&a.ew), allowed, hot, std::ptr::null(),
+                                 std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut(),
+                                 std::ptr::null_mut(), 0, std::ptr::null(), e as i32) }, "router (exact)")
     }
 
     /// Join the shared gate/up moe_exact left running, if it did.
@@ -1140,12 +1227,14 @@ impl Engine {
 
     /// The shared expert's gate/up over `n` rows of x -> its activation, into the pair buffer after
     /// the routed rows (n x topk of them).
-    fn shared_up(&self, sst: &Stream, x3: &Exl3Scratch, sh_gate_up: &Exl3Mat, il: usize, x: *mut c_void, n: usize) -> Result<()> {
+    fn shared_up(&self, sst: &Stream, x3: &Exl3Scratch, sh_gate_up: &Lin, il: usize, x: *mut c_void, n: usize) -> Result<()> {
         let a = &self.act;
-        self.exl3_on(sst, x3, sh_gate_up, x, self.cfg.hidden, n, np(&a.gu), true)?;
+        let part = if std::ptr::eq(sst, &self.st2) { &a.split_part2 } else { &a.split_part };
+        self.lin_on(sst, x3, part, sh_gate_up, x, self.cfg.hidden, n, np(&a.gu), true)?;
         let hsh = at(&a.pair, n * self.cfg.topk * il * 2);
-        let (g, u, ld) = if n <= GEMV_ROWS { (np(&a.gu), at(&a.gu, il), 2 * il) } else { (np(&a.gu), at(&a.gu, n * il), il) };
-        ck(unsafe { glm_swiglu(sst.raw(), g, ld as i64, u, ld as i64, hsh, il as i64, n as i32, il as i32) }, "shared swiglu")
+        let (hn, uo, ld) = sh_gate_up.gu_layout(n, GEMV_ROWS);
+        debug_assert_eq!(hn, il);
+        self.swiglu(sst, np(&a.gu), at(&a.gu, uo), ld, hsh, il, n)
     }
 
     fn allowed_ptr(&self, l: usize) -> *mut c_void {
@@ -1160,12 +1249,12 @@ impl Engine {
         let (e, h) = (cfg.experts, cfg.hidden);
         let mtp = cfg.mtp && l == cfg.mtp_layer();
         let (lut, arena) = if mtp { (np(&self.mtp_lut), self.mtp_arena.as_ref().unwrap()) } else { (at(&self.lut, l * e), &self.arena) };
-        ck(unsafe { glm_router(self.st.raw(), np(&a.logits), np(bias), self.allowed_ptr(l), lut, n as i32, cfg.topk as i32,
-                               cfg.routed_scaling, np(&a.pick), np(&a.wts), std::ptr::null(), std::ptr::null_mut(), np(&a.eids),
-                               np(&a.ew), at(&self.demand, l * e), np(&self.miss), std::ptr::null(),
-                               if mtp { std::ptr::null_mut() } else { np(&self.lane_miss) },
-                               if mtp { std::ptr::null_mut() } else { at(&self.lane_demand, l * e) },
-                               (self.cfg.n_layers() * e) as i64, at(&a.rlane, r0)) }, "router")?;
+        ck(unsafe { glm_router_e(self.st.raw(), np(&a.logits), np(bias), self.allowed_ptr(l), lut, n as i32, cfg.topk as i32,
+                                 cfg.routed_scaling, np(&a.pick), np(&a.wts), std::ptr::null(), std::ptr::null_mut(), np(&a.eids),
+                                 np(&a.ew), at(&self.demand, l * e), np(&self.miss), std::ptr::null(),
+                                 if mtp { std::ptr::null_mut() } else { np(&self.lane_miss) },
+                                 if mtp { std::ptr::null_mut() } else { at(&self.lane_demand, l * e) },
+                                 (self.cfg.n_layers() * e) as i64, at(&a.rlane, r0), e as i32) }, "router")?;
         // the decoder's next layer, whose first weights load while this one's output is gathered
         let next = if mtp || l + 1 >= cfg.layers { None } else { Some(&self.w.layers[l + 1]) };
         self.moe_rows(sh_gate_up, sh_down, arena, at(&a.xn, r0 * h), n, prefill, at(&a.a, r0 * h), next)?;
@@ -1191,7 +1280,7 @@ impl Engine {
     /// One block of MoE rows (routing done: pick / wts): the shared expert and the routed picks,
     /// their intermediates in one gather, the summed hidden columns in another -> out bf16 [n][H].
     #[allow(clippy::too_many_arguments)]
-    fn moe_rows(&self, sh_gate_up: &Exl3Mat, sh_down: &Exl3Mat, arena: &Arena, x: *mut c_void, n: usize, prefill: bool,
+    fn moe_rows(&self, sh_gate_up: &Lin, sh_down: &Lin, arena: &Arena, x: *mut c_void, n: usize, prefill: bool,
                 out: *mut c_void, next: Option<&crate::weights::Layer>) -> Result<()> {
         let (cfg, a) = (&self.cfg, &self.act);
         let st = self.st.raw();
@@ -1244,7 +1333,7 @@ impl Engine {
                 exl3m_prefill_fat_gateup(np(&a.xh0), np(&a.xh1), np(&arena.t1p), np(&arena.t3p), np(&arena.k2g), np(&arena.k2u),
                                          uids, np(&a.ucount), np(&a.members), h as i32, il as i32, p as i32, k as i32, nexp,
                                          arena.cb, arena.max_k2.max(6), arena.pool(6), arena.pool(7), suh2, cfg.moe_inter as i32,
-                                         f32::INFINITY, np(&a.pair), st);
+                                         cfg.swiglu_limit, np(&a.pair), st);
             } else if up_tiled && mixed {
                 exl3m_prefill_smem_cb(np(&a.xh0), np(&a.xh1), np(&arena.t1p), np(&arena.t3p), np(&arena.k2g), np(&arena.k2u),
                                       uids, np(&a.ucount), np(&a.members), np(&a.zup), h as i32, il as i32, p as i32,
@@ -1261,7 +1350,7 @@ impl Engine {
             if !(up_tiled && self.fat) {
                 let suh2 = (arena.pool(5) as *mut u16).add(self.rank * il) as *const c_void;
                 exl3m_gateup(np(&a.zup), np(&a.pick), arena.pool(6), arena.pool(7), suh2, np(&a.pair), n as i32, p as i32, il as i32,
-                             if up_tiled { 1 } else { sk_up }, k as i32, slots, cfg.moe_inter as i32, f32::INFINITY, 1, st);
+                             if up_tiled { 1 } else { sk_up }, k as i32, slots, cfg.moe_inter as i32, cfg.swiglu_limit, 1, st);
             }
         }
         ck(unsafe { tidelm_cuda::ffi::cudaGetLastError() }, "routed up")?;
@@ -1270,7 +1359,7 @@ impl Engine {
             // during the gather: the routed experts' down rows (the critical path), then the shared
             // down's, which then reads L2 beside them
             self.l2_experts(np(&a.pick), p, arena, il * w, dn, PF_DOWN, sk_dn as usize)?;
-            self.l2_mat(sh_down, n, PF_SH_DOWN)?;
+            self.l2_lin(sh_down, n, PF_SH_DOWN)?;
         }
         // one gather: both ranks' [routed xd | shared act]
         let per = p * il * 2 + n * il * 2;
@@ -1290,7 +1379,8 @@ impl Engine {
         if decode {
             self.fork()?;
         }
-        self.exl3_on(sst, x3, sh_down, np(&a.hf), kd, n, np(&a.shout), false)?;
+        let part = if decode { &a.split_part2 } else { &a.split_part };
+        self.lin_on(sst, x3, part, sh_down, np(&a.hf), kd, n, np(&a.shout), false)?;
         unsafe {
             if up_tiled && self.fat {
                 exl3m_prefill_fat(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
@@ -1321,9 +1411,14 @@ impl Engine {
         if decode {
             self.join()?;
             // the next layer's q_a and kv_a during the output's gather and the norms
-            if let Some(nw) = next {
-                self.l2_mat(&nw.q_a, n, PF_QA)?;
-                self.l2_mat(&nw.kv_a, n, PF_KVA)?;
+            match next.map(|nw| &nw.attn) {
+                Some(crate::weights::Attn::Mla(m)) => {
+                    self.l2_mat(&m.q_a, n, PF_QA)?;
+                    self.l2_mat(&m.kv_a, n, PF_KVA)?;
+                }
+                Some(crate::weights::Attn::Kda(k)) => self.l2_lin(&k.proj, n, PF_QA + PF_KVA)?,
+                Some(crate::weights::Attn::Dsa(d)) => self.l2_lin(&d.proj_a, n, PF_QA + PF_KVA)?,
+                None => {}
             }
         }
         ck(unsafe { glm_moe_out(st, np(&a.local), np(&a.shout), np(&a.mout), (n * dn) as i64) }, "moe out")?;
@@ -1350,7 +1445,7 @@ impl Engine {
                     self.h_rlane[r] = lane as i32;
                 }
             }
-            let stride = if mtp { self.kv[self.cfg.mtp_layer()].lane_rows } else { self.kv[0].lane_rows };
+            let stride = if mtp { self.mtp_lane_rows } else { self.dec_lane_rows };
             self.h_lanes[base + 4 * z..base + 4 * z + 4].copy_from_slice(&[row0 as i32, n as i32, pos0 as i32, (lane * stride) as i32]);
             if row0 < HEAD_ROWS {
                 let tt = self.lane_temp[lane];
@@ -1364,6 +1459,9 @@ impl Engine {
             self.mtp_nl = groups.len();
         } else {
             self.pass_nl = groups.len();
+        }
+        if self.fl.is_some() {
+            self.flash_stage_meta(groups, mtp)?;
         }
         unsafe {
             tidelm_cuda::memcpy_async(np(&self.act.tok), self.h_ids.raw(), t * 4, tidelm_cuda::ffi::MEMCPY_HOST_TO_DEVICE, &self.st)?;
@@ -1399,7 +1497,8 @@ impl Engine {
     fn embed(&self, t: usize, mtp: bool, out: *mut c_void, prefill: bool) -> Result<()> {
         let a = &self.act;
         let h = self.cfg.hidden;
-        ck(unsafe { glm_embed(self.st.raw(), np(&a.tok), t as i32, np(&self.w.embed_q), np(&self.w.embed_s),
+        let crate::weights::Embed::Int8 { q: embed_q, s: embed_s } = &self.w.embed else { return self.embed_flash(t, mtp, out) };
+        ck(unsafe { glm_embed(self.st.raw(), np(&a.tok), t as i32, np(embed_q), np(embed_s),
                               (self.rank * self.vl) as i32, self.vl as i32, h as i32,
                               if mtp { np(&a.mpos) } else { std::ptr::null_mut() }, np(&a.f32buf)) }, "embed")?;
         self.allreduce(np(&a.f32buf), t * h, out, prefill)
@@ -1414,6 +1513,9 @@ impl Engine {
     /// Layer l's input norm (adding the previous MLP's output past layer 0), attention, the
     /// residual add and the post-attention norm.
     fn layer_pre(&self, l: usize, t: usize, prefill: bool) -> Result<()> {
+        if self.cfg.hc.is_some() {
+            return self.flash_layer_pre(l, t, prefill);
+        }
         let lw = &self.w.layers[l];
         let a = &self.act;
         self.norm(np(&a.h), l > 0, &lw.ln_in, np(&a.xn), t)?;
@@ -1430,6 +1532,14 @@ impl Engine {
             self.mlp(l, t, prefill)?;
         }
         self.prefetch_join()?;
+        self.final_norm(t)
+    }
+
+    /// The decoder's last MLP output added and the final norm into hn (mHC: the streams' mean).
+    fn final_norm(&self, t: usize) -> Result<()> {
+        if self.cfg.hc.is_some() {
+            return self.flash_final(t);
+        }
         self.norm(np(&self.act.h), true, &self.w.norm, np(&self.act.hn), t)
     }
 
@@ -1467,7 +1577,7 @@ impl Engine {
             }
             return Ok(());
         }
-        self.norm(np(&self.act.h), true, &self.w.norm, np(&self.act.hn), t)?;
+        self.final_norm(t)?;
         self.head_dev(np(&self.act.hn), t, false)?;
         self.prefetch_join()?;
         self.hot_table_copy()
@@ -1493,7 +1603,7 @@ impl Engine {
     fn head_dev(&self, x: *const c_void, t: usize, mtp: bool) -> Result<()> {
         let a = &self.act;
         let st = self.st.raw();
-        self.exl3(&self.w.head, x, self.cfg.hidden, t, np(&a.head), false)?;
+        self.lin(&self.w.head, x, self.cfg.hidden, t, np(&a.head), false)?;
         ck(unsafe { glm_argmax(st, np(&a.head), self.vl as i64, t as i32, self.vl as i32, (self.rank * self.vl) as i32,
                                np(&a.pairs)) }, "argmax")?;
         self.gather(np(&a.pairs), t * 8, at(&a.pairs, 2 * HEAD_ROWS * 2), false)?;
@@ -1603,8 +1713,8 @@ impl Engine {
                                 h as i32, cfg.rms_eps) }, "enorm")?;
         ck(unsafe { glm_rmsnorm(st, hp, h as i64, std::ptr::null(), 0, np(&mx.hnorm), at(&a.ehin, h), (2 * h) as i64, t as i32,
                                 h as i32, cfg.rms_eps) }, "hnorm")?;
-        self.exl3(&mx.eh, np(&a.ehin), 2 * h, t, np(&a.ehout), true)?;
-        self.gather_cols(np(&a.ehout), t, mx.eh.n, 2, np(&a.h), prefill)?;
+        self.lin(&mx.eh, np(&a.ehin), 2 * h, t, np(&a.ehout), true)?;
+        self.gather_cols(np(&a.ehout), t, mx.eh.n_total(), 2, np(&a.h), prefill)?;
         self.norm(np(&a.h), false, &lw.ln_in, np(&a.xn), t)?;
         self.attention(l, t, prefill)?;
         self.norm(np(&a.h), true, &lw.ln_post, np(&a.xn), t)?;
@@ -1796,7 +1906,7 @@ impl Act {
             mbound: DeviceBuffer::zeroed(r)?,
             mkoff: DeviceBuffer::zeroed(r)?,
             rlane: DeviceBuffer::zeroed(r)?,
-            h: z(r * h)?,
+            h: z(r * h * cfg.hc.map(|c| c.mult).unwrap_or(1))?,
             xn: z(r * h)?,
             a: z(r * h)?,
             f32buf: DeviceBuffer::new(r * h)?,
@@ -2118,6 +2228,7 @@ impl Engine {
             let part = &ids[c0..c0 + n];
             self.stage(part, &[(lane, n, self.pos)], false)?;
             self.layers(n, true)?;
+            self.flash_commit(&[(lane, n, self.pos)]);
             self.last_rows = n;
             if next.is_some() {
                 // a part: its rows' cache only
@@ -2174,6 +2285,7 @@ impl Engine {
             self.hot_table_copy()?;
         }
         self.last_rows = t;
+        self.flash_commit(groups);
         let out = self.read_tokens(t)?;
         if t <= MAX_ROWS {
             self.hot_plan(t)?; // wider passes leave no candidates (moe_exact)
@@ -2285,6 +2397,9 @@ impl Engine {
         if n > self.pos {
             return Err(format!("set_pos {n} past lane {lane}'s {}", self.pos).into());
         }
+        if self.fl.is_some() {
+            self.flash_set_pos(lane, self.pos, n)?;
+        }
         self.pos = n;
         self.tokens.truncate(n);
         Ok(())
@@ -2392,9 +2507,11 @@ impl Engine {
             // on: the format's E4M3 rounding; off: the two-instruction one (exl3::CB_MCG_E4M3_FAST)
             12 => self.set_exlr8_round(on),
             // an exlr8 o_proj / q_b (CB_MCG_E4M3) at a wider split-K: measurement only
-            9 => self.w.layers.iter_mut().filter(|l| is_exlr8(l.o.cb))
-                .for_each(|l| l.o.split = if on { crate::weights::SPLIT_O_E4M3 } else { crate::weights::SPLIT_O }),
-            10 => self.w.layers.iter_mut().filter(|l| is_exlr8(l.q_b.cb)).for_each(|l| l.q_b.split = if on { 4 } else { crate::weights::SPLIT_QB }),
+            9 => self.w.layers.iter_mut().filter_map(|l| if let crate::weights::Attn::Mla(m) = &mut l.attn { Some(m) } else { None })
+                .filter(|m| is_exlr8(m.o.cb))
+                .for_each(|m| m.o.split = if on { crate::weights::SPLIT_O_E4M3 } else { crate::weights::SPLIT_O }),
+            10 => self.w.layers.iter_mut().filter_map(|l| if let crate::weights::Attn::Mla(m) = &mut l.attn { Some(m) } else { None })
+                .filter(|m| is_exlr8(m.q_b.cb)).for_each(|m| m.q_b.split = if on { 4 } else { crate::weights::SPLIT_QB }),
             _ => return Err(format!("bench knob {code}").into()),
         }
         self.graphs_map.clear();

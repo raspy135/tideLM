@@ -12,6 +12,7 @@ use tidelm_kernels::glm::*;
 use tidelm_model::Checkpoint;
 
 use crate::config::GlmConfig;
+use crate::lin::Lin;
 use crate::{ck, Result};
 
 /// Decode calls take at most this many rows (exl3_dense.MAX_ROWS); more go the prefill path.
@@ -403,24 +404,23 @@ pub struct Indexer {
 }
 
 pub enum Mlp {
-    /// layers 0-2: gate + up (G = 2, this rank's intermediate columns), down over the whole
+    /// layers 0-2: gate + up (this rank's intermediate columns), down over the whole
     /// intermediate to this rank's hidden columns
-    Dense { gate_up: Exl3Mat, down: Exl3Mat },
-    /// the router (its checkpoint's fp16, computed as the fp32 weight it widens to), its correction
-    /// bias, the shared expert as Dense's halves
-    Moe { router: DeviceBuffer<u16>, bias: DeviceBuffer<f32>, sh_gate_up: Exl3Mat, sh_down: Exl3Mat },
+    Dense { gate_up: Lin, down: Lin },
+    /// the router (GLM-5.3's fp16, computed as the fp32 weight it widens to; GLM-5.3-Flash's
+    /// bf16), its correction bias, the shared expert as Dense's halves
+    Moe { router: DeviceBuffer<u16>, router_bf16: bool, bias: DeviceBuffer<f32>, sh_gate_up: Lin, sh_down: Lin },
 }
 
 pub struct MtpExtra {
     pub enorm: DeviceBuffer<u16>,
     pub hnorm: DeviceBuffer<u16>,
     pub sh_norm: DeviceBuffer<u16>,
-    pub eh: Exl3Mat,
+    pub eh: Lin,
 }
 
-pub struct Layer {
-    pub ln_in: DeviceBuffer<u16>,
-    pub ln_post: DeviceBuffer<u16>,
+/// GLM-5.3's attention: MLA with RoPE, every projection EXL3.
+pub struct MlaW {
     pub q_a: Exl3Mat,
     pub q_norm: DeviceBuffer<u16>,
     pub kv_a: Exl3Mat,
@@ -431,17 +431,100 @@ pub struct Layer {
     pub kvb_s: DeviceBuffer<f32>,
     pub o: Exl3Mat,
     pub index: Option<Indexer>,
+}
+
+/// GLM-5.3-Flash's KDA layer. `proj` rows: this rank's q | k | v (dl = heads x 128 each), f_a and
+/// g_a (128 each, whole), this rank's b (a row a head): KDA_PROJ_OFFSETS.
+pub struct KdaW {
+    pub proj: Lin,
+    /// f_b, g_b [dl][128]: the forget gate's and the output gate's second halves
+    pub f_b: Lin,
+    pub g_b: Lin,
+    /// the short conv's taps, [3 dl][4]: this rank's q channels, then k, then v
+    pub conv: DeviceBuffer<u16>,
+    pub a_log: DeviceBuffer<f32>,
+    pub dt_bias: DeviceBuffer<f32>,
+    pub o_norm: DeviceBuffer<u16>,
+    /// o_proj over this rank's dl columns (summed across ranks)
+    pub o: Lin,
+}
+
+impl KdaW {
+    /// proj's output columns: (q, k, v, f_a, g_a, b, the row's width) for `dl` dims and `hl` heads
+    pub fn offsets(dl: usize, hl: usize) -> [usize; 7] {
+        [0, dl, 2 * dl, 3 * dl, 3 * dl + 128, 3 * dl + 256, 3 * dl + 256 + hl]
+    }
+}
+
+/// GLM-5.3-Flash's sparse-attention layer: MLA without RoPE and the pooled indexer. `proj_a` rows
+/// (from the normed input, whole on every rank): q_a 1536 | kv_a 512 | wk 128 | weights_proj 32 |
+/// the pools' compress gate 128; `proj_b` rows (from q_a's norm): this rank's q_b heads x 256 |
+/// the indexer's wq_b 32 x 128.
+pub struct DsaW {
+    pub proj_a: Lin,
+    pub q_norm: DeviceBuffer<u16>,
+    pub kv_norm: DeviceBuffer<u16>,
+    pub proj_b: Lin,
+    /// kv_b of this rank's heads: FP8 [hl * 512][512], scales [hl * 512][4]
+    pub kvb_q: DeviceBuffer<u8>,
+    pub kvb_s: DeviceBuffer<f32>,
+    pub o: Lin,
+    pub kn_w: DeviceBuffer<u16>,
+    pub kn_b: DeviceBuffer<u16>,
+    /// the pools' absolute position embedding [4][128]
+    pub ape: DeviceBuffer<u16>,
+}
+
+impl DsaW {
+    /// proj_a's output columns: (q_a, kv_a, wk, weights_proj, gate, the row's width)
+    pub const OFFSETS_A: [usize; 6] = [0, 1536, 2048, 2176, 2208, 2336];
+}
+
+pub enum Attn {
+    Mla(MlaW),
+    Kda(KdaW),
+    Dsa(DsaW),
+}
+
+/// A layer's two mHC sites (attention, then MLP): each its mixing weight [24][4 x hidden] (bf16,
+/// the checkpoint's), base [24] and scale [3].
+pub struct HcW {
+    pub attn_fn: Lin,
+    pub attn_base: DeviceBuffer<f32>,
+    pub attn_scale: DeviceBuffer<f32>,
+    pub ffn_fn: Lin,
+    pub ffn_base: DeviceBuffer<f32>,
+    pub ffn_scale: DeviceBuffer<f32>,
+}
+
+pub struct Layer {
+    pub ln_in: DeviceBuffer<u16>,
+    pub ln_post: DeviceBuffer<u16>,
+    pub attn: Attn,
+    pub hc: Option<HcW>,
     pub mlp: Mlp,
     pub mtp: Option<MtpExtra>,
 }
 
+impl Layer {
+    pub fn mla(&self) -> Option<&MlaW> {
+        if let Attn::Mla(m) = &self.attn { Some(m) } else { None }
+    }
+}
+
+/// The embedding table: GLM-5.3's INT8 rows with an fp32 scale per 128 (this rank's vocabulary),
+/// GLM-5.3-Flash's BF16 rows as they are (the whole table on every rank).
+pub enum Embed {
+    Int8 { q: DeviceBuffer<i8>, s: DeviceBuffer<f32> },
+    Bf16(DeviceBuffer<u16>),
+}
+
 pub struct Weights {
     pub layers: Vec<Layer>,
-    pub embed_q: DeviceBuffer<i8>,
-    pub embed_s: DeviceBuffer<f32>,
+    pub embed: Embed,
     pub norm: DeviceBuffer<u16>,
-    pub head: Exl3Mat,
-    /// RoPE tables [max_seq][32] BF16 (cos, sin of p * theta^(-2i/64))
+    pub head: Lin,
+    /// RoPE tables [max_seq][32] BF16 (cos, sin of p * theta^(-2i/64)); empty without RoPE
     pub cos: DeviceBuffer<u16>,
     pub sin: DeviceBuffer<u16>,
     pub bytes: usize,
@@ -450,28 +533,35 @@ pub struct Weights {
 impl Weights {
     /// Every EXL3-layout matrix this rank holds.
     pub fn for_each_mat(&mut self, f: &mut dyn FnMut(&mut Exl3Mat)) {
-        for l in self.layers.iter_mut() {
-            for m in [&mut l.q_a, &mut l.kv_a, &mut l.q_b, &mut l.o] {
-                f(m);
+        let lin = |m: &mut Lin, f: &mut dyn FnMut(&mut Exl3Mat)| {
+            if let Some(x) = m.exl3_mut() {
+                f(x);
             }
-            if let Some(ix) = l.index.as_mut() {
-                f(&mut ix.wq_b);
+        };
+        for l in self.layers.iter_mut() {
+            if let Attn::Mla(a) = &mut l.attn {
+                for m in [&mut a.q_a, &mut a.kv_a, &mut a.q_b, &mut a.o] {
+                    f(m);
+                }
+                if let Some(ix) = a.index.as_mut() {
+                    f(&mut ix.wq_b);
+                }
             }
             match &mut l.mlp {
                 Mlp::Dense { gate_up, down } => {
-                    f(gate_up);
-                    f(down);
+                    lin(gate_up, f);
+                    lin(down, f);
                 }
                 Mlp::Moe { sh_gate_up, sh_down, .. } => {
-                    f(sh_gate_up);
-                    f(sh_down);
+                    lin(sh_gate_up, f);
+                    lin(sh_down, f);
                 }
             }
             if let Some(x) = l.mtp.as_mut() {
-                f(&mut x.eh);
+                lin(&mut x.eh, f);
             }
         }
-        f(&mut self.head);
+        lin(&mut self.head, f);
     }
 }
 
@@ -496,6 +586,9 @@ pub const SPLIT_DOWN: usize = 2;
 pub fn rope_tables(cfg: &GlmConfig, max_seq: usize) -> (Vec<u16>, Vec<u16>) {
     // tp/exl3_model: inv = 1 / theta^(arange(0, 64, 2) / 64) in fp32, f = p * inv (fp32), cos/sin -> bf16
     let half = cfg.rope / 2;
+    if half == 0 {
+        return (vec![0], vec![0]);
+    }
     let inv: Vec<f32> = (0..half).map(|i| 1.0f32 / (cfg.rope_theta as f32).powf((2 * i) as f32 / cfg.rope as f32)).collect();
     let mut cs = vec![0u16; max_seq * half];
     let mut sn = vec![0u16; max_seq * half];
@@ -512,6 +605,9 @@ pub fn rope_tables(cfg: &GlmConfig, max_seq: usize) -> (Vec<u16>, Vec<u16>) {
 impl Weights {
     pub fn load(model_dir: &Path, cfg: &GlmConfig, rank: usize, world: usize, max_seq: usize, st: &Stream,
                 log: &dyn Fn(&str)) -> Result<Self> {
+        if cfg.is_flash() {
+            return crate::flash::load_weights(model_dir, cfg, rank, world, st, log);
+        }
         let ckpt = Checkpoint::open(model_dir)?;
         let ld = Loader { ck: &ckpt, rank, world, st };
         let hl = cfg.heads / world;
@@ -541,16 +637,17 @@ impl Weights {
             let mlp = if cfg.dense[l] {
                 let m = format!("{p}mlp.");
                 Mlp::Dense {
-                    gate_up: ld.exl3(&[&format!("{m}gate_proj"), &format!("{m}up_proj")], SPLIT_UP, Cut::N, None)?,
-                    down: ld.exl3(&[&format!("{m}down_proj")], SPLIT_DOWN, Cut::N, None)?,
+                    gate_up: Lin::Exl3(ld.exl3(&[&format!("{m}gate_proj"), &format!("{m}up_proj")], SPLIT_UP, Cut::N, None)?),
+                    down: Lin::Exl3(ld.exl3(&[&format!("{m}down_proj")], SPLIT_DOWN, Cut::N, None)?),
                 }
             } else {
                 let m = format!("{p}mlp.shared_experts.");
                 Mlp::Moe {
                     router: ld.f16_dev(&format!("{p}mlp.gate.weight"))?,
+                    router_bf16: false,
                     bias: ld.f32_dev(&format!("{p}mlp.gate.e_score_correction_bias"))?,
-                    sh_gate_up: ld.exl3(&[&format!("{m}gate_proj"), &format!("{m}up_proj")], SPLIT_UP, Cut::N, None)?,
-                    sh_down: ld.exl3(&[&format!("{m}down_proj")], SPLIT_DOWN, Cut::N, None)?,
+                    sh_gate_up: Lin::Exl3(ld.exl3(&[&format!("{m}gate_proj"), &format!("{m}up_proj")], SPLIT_UP, Cut::N, None)?),
+                    sh_down: Lin::Exl3(ld.exl3(&[&format!("{m}down_proj")], SPLIT_DOWN, Cut::N, None)?),
                 }
             };
             let mtp = if cfg.mtp && l == cfg.mtp_layer() {
@@ -558,14 +655,12 @@ impl Weights {
                     enorm: ld.bf16(&format!("{p}enorm.weight"))?,
                     hnorm: ld.bf16(&format!("{p}hnorm.weight"))?,
                     sh_norm: ld.bf16(&format!("{p}shared_head.norm.weight"))?,
-                    eh: ld.exl3(&[&format!("{p}eh_proj")], SPLIT_EH, Cut::N, None)?,
+                    eh: Lin::Exl3(ld.exl3(&[&format!("{p}eh_proj")], SPLIT_EH, Cut::N, None)?),
                 })
             } else {
                 None
             };
-            let layer = Layer {
-                ln_in: ld.bf16(&format!("{p}input_layernorm.weight"))?,
-                ln_post: ld.bf16(&format!("{p}post_attention_layernorm.weight"))?,
+            let mla = MlaW {
                 q_a: ld.exl3(&[&format!("{a}q_a_proj")], SPLIT_QA, Cut::None, None)?,
                 q_norm: ld.bf16(&format!("{a}q_a_layernorm.weight"))?,
                 kv_a: ld.exl3(&[&format!("{a}kv_a_proj_with_mqa")], SPLIT_KVA, Cut::None, Some(cfg.kv_lora + cfg.rope))?,
@@ -582,14 +677,19 @@ impl Weights {
                     o
                 },
                 index,
+            };
+            bytes += mla.q_a.bytes() + mla.kv_a.bytes() + mla.q_b.bytes() + mla.o.bytes() + mla.kvb_q.len() + 4 * mla.kvb_s.len();
+            if let Some(ix) = &mla.index {
+                bytes += ix.wq_b.bytes() + 2 * ix.wk.len() + 4 * ix.wp.len();
+            }
+            let layer = Layer {
+                ln_in: ld.bf16(&format!("{p}input_layernorm.weight"))?,
+                ln_post: ld.bf16(&format!("{p}post_attention_layernorm.weight"))?,
+                attn: Attn::Mla(mla),
+                hc: None,
                 mlp,
                 mtp,
             };
-            bytes += layer.q_a.bytes() + layer.kv_a.bytes() + layer.q_b.bytes() + layer.o.bytes() + layer.kvb_q.len()
-                + 4 * layer.kvb_s.len();
-            if let Some(ix) = &layer.index {
-                bytes += ix.wq_b.bytes() + 2 * ix.wk.len() + 4 * ix.wp.len();
-            }
             bytes += match &layer.mlp {
                 Mlp::Dense { gate_up, down } => gate_up.bytes() + down.bytes(),
                 Mlp::Moe { router, sh_gate_up, sh_down, .. } => 2 * router.len() + sh_gate_up.bytes() + sh_down.bytes(),
@@ -603,7 +703,7 @@ impl Weights {
             }
         }
         let (cs, sn) = rope_tables(cfg, max_seq);
-        Ok(Weights { layers, embed_q, embed_s, norm, head, cos: DeviceBuffer::from_slice(&cs)?, sin: DeviceBuffer::from_slice(&sn)?,
-                     bytes })
+        Ok(Weights { layers, embed: Embed::Int8 { q: embed_q, s: embed_s }, norm, head: Lin::Exl3(head),
+                     cos: DeviceBuffer::from_slice(&cs)?, sin: DeviceBuffer::from_slice(&sn)?, bytes })
     }
 }

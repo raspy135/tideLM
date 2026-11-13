@@ -378,6 +378,7 @@ impl Engine {
         let (rank, world) = (self.rank, self.world);
         let mut out = vec![];
         for (l, kv) in self.kv.iter().enumerate() {
+            let Some(kv) = kv else { continue };
             let mtp = self.cfg.mtp && l == self.cfg.mtp_layer();
             let (r0, r1) = if mtp {
                 (start.saturating_sub(1), end.saturating_sub(1))
@@ -390,8 +391,9 @@ impl Engine {
             if r1 <= r0 {
                 continue;
             }
-            for (base, row) in kv.lane_bases(self.lane).into_iter().zip(crate::forward::KV_ROW_BYTES) {
-                out.push((unsafe { (base as *mut u8).add(r0 * row) }, (r1 - r0) * row));
+            for (base, &(row, per)) in kv.lane_bases(self.lane).into_iter().zip(&kv.rows) {
+                let (a, b) = (r0 / per, r1.div_ceil(per));
+                out.push((unsafe { (base as *mut u8).add(a * row) }, (b - a) * row));
             }
         }
         out

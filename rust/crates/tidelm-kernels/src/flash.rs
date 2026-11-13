@@ -35,6 +35,13 @@ extern "C" {
     pub fn flash_ring(stream: CudaStream, k: *const c_void, ldk: i64, g: *const c_void, ldg: i64, ring: *mut c_void,
                       ring_lane: i64, pos: *const c_void, lanes: *const c_void, nl: c_int, meta: *const c_void,
                       t: c_int) -> c_int;
+    /// y = bf16(bf16(silu(min(g, lim))) * clamp(u, -lim, lim)); g, u rows `ld` apart
+    pub fn flash_swiglu(stream: CudaStream, g: *const c_void, u: *const c_void, ld: i64, y: *mut c_void, ldy: i64, t: c_int, n: c_int,
+                        lim: f32) -> c_int;
+    /// BF16 embedding rows into `copies` copies a row, zero where pos (non-null) is 0
+    pub fn flash_embed(stream: CudaStream, ids: *const c_void, t: c_int, table: *const c_void, h: c_int, copies: c_int,
+                       pos: *const c_void, out: *mut c_void) -> c_int;
+    pub fn flash_widen(stream: CudaStream, x: *const c_void, ldx: i64, y: *mut c_void, ldy: i64, t: c_int, n: c_int) -> c_int;
     pub fn flash_expand(stream: CudaStream, pools: *const c_void, ldp: i64, kp: c_int, pos: *const c_void, out: *mut c_void,
                         ldo: i64, t: c_int) -> c_int;
 }
