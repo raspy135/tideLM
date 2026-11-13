@@ -116,13 +116,33 @@ form, so the renderer writes `<|begin_of_image|><|image|><|end_of_image|>` where
   bf16 rounding). 78 ms for 1,656 patches, 1.13 s for 14,868.
 - Dynamic load (lend.rs): the tower's 1.13 GB and scratch are lent expert slots for the request - the
   least-wanted class's last ~150-250 slots leave routing, the tower loads into them, the images encode
-  into a 65 MB buffer reserved at boot, the slots are refilled from the pack before the prefill. Text-only
-  traffic keeps the memory for experts. An encode costs ~1.0-1.1 s for a small image (mostly the load
-  and the refill), 2.3 s for a large one.
-- The prefix stops at the first image (the placeholder id is shared).
+  into the lane's feature buffer (8 KB a token, allocated for the request, freed after its prefill;
+  refused below 6 GiB MemAvailable after it), the slots are refilled from the pack before the prefill.
+  Text-only traffic keeps the memory for experts. An encode costs ~1.0-1.1 s for a small image (mostly
+  the load and the refill), 2.3 s for a large one; 5.4 s for 4000 x 3000 + 1920 x 1080 (10,622 rows).
+- GLM_VISION_MAX_TOKENS (8000, the processor's max_image_tokens) caps an image, not a request. Until
+  2026-11-12 it also sized a boot-time buffer for the whole request, so a chat's second large image
+  (the first one still in its history) failed: "8976 image tokens in a request" in served traffic.
+- Image state is a lane's own: a prompt prefilling in parts beside a decoding lane keeps its features
+  while the other lane starts a request (one shared buffer had let any start, with images or without,
+  clear the spans - the rest of the image rows would have read the placeholder's embedding).
+  Checked: a 29,441-token prompt with its images at the end, the other lane finishing and starting a
+  request during its 53 s prefill: both images read right, the text quoted exactly.
+- The prefix reaches past an image when the lane's sequence holds the same image (position, grid, a
+  128-bit hash of its patches) there; the images before the reused prefix are not encoded again.
 
 Served examples: the check image's shapes and text read exactly; the repo's expert-map screenshot read
 in detail (first token 7.9 s for 3,738 tokens); two images in a request; a second turn answering from
 an image in its history.
 
 Open: keeping the tower lent across consecutive image requests (the load is most of an encode), video.
+
+## Chat follow-ups prefill again (open)
+
+KDA's state goes back only within its last pass, so a prompt reuses a lane's sequence only when it
+extends it to that pass. A chat follow-up does not: the template renders an earlier turn's reasoning
+as `<think></think>` (chat_template.jinja: kept only after the last user message, or with
+clear_thinking false), so the prompt leaves the lane's sequence where the last answer began. In served
+traffic (2026-11-12) follow-ups of 93-107K tokens prefilled whole, 132-155 s each; tool loops, which keep
+the reasoning, reused theirs (91,567 of 91,647 cached). The fix is a KDA (and conv) state snapshot at
+each prompt's end, a few rows back for the MTP refill; the DSA rows are positional and stay.

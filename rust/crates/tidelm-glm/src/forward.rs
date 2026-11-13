@@ -2215,7 +2215,7 @@ impl Engine {
         self.passes += 1;
         self.adapt_install(false)?;
         // a pass over image rows writes them into the stream eagerly: never a captured decode pass
-        let images = self.vis.as_ref().is_some_and(|v| v.lane == lane && !v.spans.is_empty());
+        let images = self.has_image_spans(lane);
         if next.is_none() && !images && (t <= MAX_ROWS || (t <= HEAD_ROWS && self.pos >= self.wide_from)) {
             let p0 = self.pos;
             let out = self.decode_pass(ids, &[(lane, t, p0)])?;
@@ -2412,9 +2412,9 @@ impl Engine {
             self.flash_set_pos(lane, self.pos, n)?;
         }
         if let Some(v) = self.vis.as_mut() {
-            if n <= v.floor[lane] {
-                v.floor[lane] = usize::MAX;
-            }
+            // images from n on are no longer the lane's (one cut through keeps its entry: a prompt's
+            // reuse into it re-encodes it, encode_images)
+            v.lanes[lane].seq.retain(|&(s, _, _)| s < n);
         }
         self.pos = n;
         self.tokens.truncate(n);

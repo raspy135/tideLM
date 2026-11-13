@@ -583,8 +583,10 @@ impl Server {
         let depth = if self.eng.cfg.mtp { self.opt.depth } else { 0 };
         // the lane's sequence's prefix, one token back so the reprefilled row refills its MTP row
         let mut common = prompt.iter().zip(&self.eng.tokens).take_while(|(a, b)| a == b).count().min(prompt.len() - 1);
-        // images share one placeholder id: no prefix past the lane's or the prompt's first image
-        common = common.min(self.eng.image_floor(lane)).min(job.images.first().map_or(usize::MAX, |i| i.start));
+        // images share one placeholder id: no prefix past the first image the prompt and the lane's
+        // sequence do not share (position, grid, patches)
+        let keys: Vec<u128> = job.images.iter().map(crate::flash_image::image_key).collect();
+        common = common.min(self.eng.image_floor(lane, &job.images, &keys));
         // the disk store's deepest saved prefix, when it gains enough over the lane's (not with KDA:
         // the store holds KV rows, not the linear-attention state)
         if let Some(store) = self.store.as_mut().filter(|_| !self.eng.cfg.is_flash()) {
@@ -622,10 +624,12 @@ impl Server {
         let suffix = prompt[keep..].to_vec();
         // the request's images, encoded with the tower in lent expert slots, before the prefill
         if self.eng.vis.is_some() || !job.images.is_empty() {
-            match self.eng.encode_images(lane, &job.images) {
-                Ok(secs) if !job.images.is_empty() => {
-                    (self.log)(&format!("[vision] request {}: {} image(s), {} rows, encoded in {:.2} s", job.id, job.images.len(),
-                                        job.images.iter().map(|i| i.vit_h * i.vit_w / 4).sum::<usize>(), secs));
+            match self.eng.encode_images(lane, &job.images, &keys, keep) {
+                Ok((n, rows, secs)) if !job.images.is_empty() => {
+                    let reused = job.images.len() - n;
+                    let r = if reused > 0 { format!(", {reused} in the reused prefix") } else { String::new() };
+                    (self.log)(&format!("[vision] request {}: {} image(s){r}, {n} encoded ({rows} rows) in {secs:.2} s", job.id,
+                                        job.images.len()));
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -765,6 +769,8 @@ impl Server {
         } else {
             finish
         };
+        // a request cancelled while it prefilled in parts still holds its image features
+        self.eng.clear_image_spans(run.lane);
         self.log_json(serde_json::json!({"tokens": run.g.tokens}));
         let ok = !matches!(finish, Finish::Error(_));
         // the request's own routing by phase (its rows alone, beside another lane too), DS's

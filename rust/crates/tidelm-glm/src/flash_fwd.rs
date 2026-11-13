@@ -335,9 +335,10 @@ impl Engine {
         ck(unsafe { flash_embed(self.st.raw(), np(&a.tok), t as i32, np(table), self.cfg.hidden as i32, copies, pos, out) }, "embed")?;
         // the lane's image rows: the tower's features in every stream (Glm5NextModel's masked_scatter
         // before the streams are copied); only in its own eager prefill passes (forward_local)
-        let Some(v) = self.vis.as_ref().filter(|v| !mtp && v.lane == self.lane && self.pass_nl == 1 && !v.spans.is_empty()) else {
+        let Some(v) = self.vis.as_ref().map(|v| &v.lanes[self.lane]).filter(|v| !mtp && self.pass_nl == 1 && !v.spans.is_empty()) else {
             return Ok(());
         };
+        let Some(feats) = v.feats.as_ref() else { return Err("image spans without features".into()) };
         let h = self.cfg.hidden;
         let (p0, p1) = (self.pos, self.pos + t);
         for &(s, n, row) in &v.spans {
@@ -347,7 +348,7 @@ impl Engine {
             }
             for k in 0..4 {
                 let dst = unsafe { (out as *mut u16).add(((a0 - p0) * 4 + k) * h) } as *mut c_void;
-                let src = at(&v.feats, (row + a0 - s) * h);
+                let src = at(feats, (row + a0 - s) * h);
                 ck(unsafe { tidelm_cuda::ffi::cudaMemcpy2DAsync(dst, 4 * h * 2, src, h * 2, h * 2, a1 - a0,
                                                                tidelm_cuda::ffi::MEMCPY_DEVICE_TO_DEVICE, self.st.raw()) },
                    "image rows")?;

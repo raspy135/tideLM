@@ -140,11 +140,11 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
     if num("--hot", 1.0)? > 0.0 {
         eng.enable_hot(hot_async)?;
     }
-    // GLM-5.3-Flash's image input (GLM_VISION=1): the features' buffer now, the tower on demand
+    // GLM-5.3-Flash's image input (GLM_VISION=1): the tower and a request's features on demand
     if eng.cfg.is_flash() && std::env::var("GLM_VISION").as_deref() == Ok("1") {
         let max: usize = std::env::var("GLM_VISION_MAX_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(8000);
         eng.enable_vision(&model_dir, max)?;
-        log(&format!("[vision] image input on: up to {max} image tokens a request, the tower loaded on demand into lent expert slots"));
+        log(&format!("[vision] image input on: up to {max} tokens an image, the tower loaded on demand into lent expert slots"));
     }
     if rank == 0 {
         if let Some(p) = state_db.parent() {
