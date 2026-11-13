@@ -137,12 +137,57 @@ an image in its history.
 
 Open: keeping the tower lent across consecutive image requests (the load is most of an encode), video.
 
-## Chat follow-ups prefill again (open)
+## Chat follow-ups: the KDA state at the prompt's end (2026-11-12)
 
-KDA's state goes back only within its last pass, so a prompt reuses a lane's sequence only when it
-extends it to that pass. A chat follow-up does not: the template renders an earlier turn's reasoning
-as `<think></think>` (chat_template.jinja: kept only after the last user message, or with
-clear_thinking false), so the prompt leaves the lane's sequence where the last answer began. In served
-traffic (2026-11-12) follow-ups of 93-107K tokens prefilled whole, 132-155 s each; tool loops, which keep
-the reasoning, reused theirs (91,567 of 91,647 cached). The fix is a KDA (and conv) state snapshot at
-each prompt's end, a few rows back for the MTP refill; the DSA rows are positional and stay.
+KDA's state goes back only within its last pass, so until now a prompt reused a lane's sequence
+only when it extended it to that pass. A chat follow-up does not: the template renders an earlier
+turn's reasoning as `<think></think>` (chat_template.jinja: kept only after the last user message,
+or with clear_thinking false), so the prompt leaves the lane's sequence where the last answer began.
+In served traffic follow-ups of 93-107K tokens prefilled whole, 132-155 s each; tool loops, which
+keep the reasoning, reused theirs (91,567 of 91,647 cached).
+
+Now each prompt's prefill snapshots the lane's KDA state, conv rows and sparse-layer rings two rows
+before its end (a chunk's edge there, or a replay of a short pass's saved rows; the DSA rows are
+positional and stay), committed when the lane decodes; a later set_pos to it restores it. Two rows
+back covers a follow-up (it shares the prompt to its end, then the MTP row is refilled) and a
+regenerate. Two snapshot slots a lane (the committed one, the one the prefill is taking: a two-pass
+prefill goes back to the committed one between its passes): 0.3 GB a lane.
+
+glm_run --snap-check (24K-token prompt, residency fixed): the last 40 rows prefilled again from the
+snapshot give the original logits bit for bit; a follow-up from it equals a fresh prefill split at
+the same row bit for bit; a snapshot replayed inside a 10-row decode pass equals the in-pass rollback
+bit for bit. (A fresh prefill in one call differs from one split at that row by 17% in logits, the
+same argmax: the engine's chunk-edge sensitivity, snapshot or not.)
+
+Served (the profile, Open WebUI's shape - history without reasoning, greedy):
+
+| turn | prompt | reused | first token |
+|---|---:|---:|---:|
+| 1 | 24,151 | 0 | 34.5 s |
+| 2, a follow-up (turn 1 reasoned) | 24,268 | 24,149 | 1.19 s |
+| 2 again, a regenerate | 24,268 | 24,266 | 0.39 s |
+| 3, a follow-up | 24,354 | 24,266 | 0.67 s |
+
+Fixed with it: an emptied lane (kv_shrink: after the boot's warm-up, every lane; make_room, when
+the pool is short) dropped its positions but not its KDA state, and set_pos(0) at the same position
+did nothing - so the first prompt on each lane after a boot, and one on a lane the pool emptied,
+started from the old sequence's state. Not measured on the old build; --snap-check now checks that an
+emptied lane prefills as a fresh one does, bit for bit. And rank 1 now rolls KDA back with rank 0
+(its set_pos only truncated: a Flash pair, never run, would have diverged at its first rejected draft).
+
+## Residency and MTP depth (2026-11-12)
+
+GLM_SLOTS 9000 -> 9700: 8,345 experts resident (69.0%, was 64.1%), the box at 7.6 GiB MemAvailable
+idle, 7.25 after bench.py (GLM-5.3's profiles: 6.5-7.2; the KV pool is allocated whole at boot).
+
+MTP depth, bench.py (temperature 0.6, seed 42, a warm-up and 3 runs), one boot an arm from the same
+state file, 9700 slots:
+
+| | prose tok/s | code tok/s | tokens a step, prose / code |
+|---|---:|---:|---:|
+| depth 3, no gate (the profile until now) | 20.27 (20.15-20.57) | 28.40 (27.67-28.64) | 2.17 / 3.17 |
+| depth 7, calibrated gate 0.36 (GLM-5.3's) | **22.12** (22.07-22.28) | 28.15 (27.83-28.17) | 2.01 / 2.96 |
+| depth 5, calibrated gate 0.36 | 21.51 (21.41-22.34) | 27.81 (26.99-28.41) | 1.96 / 2.91 |
+
+Depth 7 with the gate is the profile's now: prose +9.1%, code within its spread. Fewer tokens a step
+in cheaper rounds - the gate leaves out the rows that would be rejected.
