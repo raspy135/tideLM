@@ -1,0 +1,27 @@
+engine up in 54.0s; serving glm-5.3-flash on 0.0.0.0:8000 (GLM, depth 7, calibrated gate 0.36)
+boot: routing history /home/you/tidelm-rust-state/flash-4bpw/state.npz 
+[flash] draft head: 57344 of 154880 ids listed (235 MB; GLM_DRAFT_VOCAB=all for none)
+[flash] dense weights (fp8): layer 8 (4.0 GB, 11 s)
+[flash] dense weights (fp8): layer 17 (5.5 GB, 16 s)
+[flash] dense weights (fp8): layer 26 (6.9 GB, 21 s)
+[flash] dense weights (fp8): layer 35 (8.4 GB, 26 s)
+[flash] dense weights (fp8): layer 44 (9.9 GB, 32 s)
+[glm] dense weights 10.08 GB a rank in 32 s
+[glm] 7282 routed experts resident (91.9 GB; 4/4/4 x7282) in 9 s
+[glm] KV cache 2.24 GB a rank (327680 positions a lane, 327680 over 2 lanes)
+[flash] KDA state and rings 1.48 GB (2 lanes)
+boot: DS-rule routing history /home/you/tidelm-rust-state/flash-4bpw/state.ds-history.npz (24 folds)
+boot: warm-up 8.1 s
+engine up in 54.0s; serving glm-5.3-flash on 0.0.0.0:8000 (GLM, depth 7, calibrated gate 0.36)
+request 1, GLM: 1.90 drafted / 1.07 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 12.9% (prompt 40.3%, decode 11.9%; by score 9.4%), hot reads 1488 (kept 1487, 122 inline, 0.60 s waited), swaps 1792 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 1, drafts over the listed vocabulary in 495 of 495 rounds
+request 2, GLM: 1.67 drafted / 1.03 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 4.5% (prompt 16.1%, decode 4.0%; by score 2.9%), hot reads 238 (kept 238, 14 inline, 0.35 s waited), swaps 341 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0, drafts over the listed vocabulary in 505 of 505 rounds
+request 3, GLM: 1.58 drafted / 1.02 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 4.5% (prompt 16.6%, decode 4.0%; by score 3.0%), hot reads 242 (kept 242, 6 inline, 0.33 s waited), swaps 156 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0, drafts over the listed vocabulary in 507 of 507 rounds
+request 4, GLM: 1.56 drafted / 0.99 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 4.7% (prompt 17.0%, decode 4.2%; by score 3.1%), hot reads 273 (kept 273, 8 inline, 0.33 s waited), swaps 110 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0, drafts over the listed vocabulary in 515 of 515 rounds
+request 5, GLM: 2.36 drafted / 1.93 accepted a round, copy rounds 4 (0 long, 11 accepted), miss rate 22.1% (prompt 33.9%, decode 21.4%; by score 16.9%), hot reads 2323 (kept 2321, 96 inline, 1.03 s waited), swaps 583 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0, drafts over the listed vocabulary in 297 of 345 rounds
+request 6, GLM: 2.18 drafted / 1.77 accepted a round, copy rounds 1 (0 long, 1 accepted), miss rate 14.7% (prompt 21.6%, decode 14.3%; by score 10.0%), hot reads 836 (kept 837, 42 inline, 0.46 s waited), swaps 212 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0, drafts over the listed vocabulary in 364 of 368 rounds
+request 7, GLM: 2.23 drafted / 1.76 accepted a round, copy rounds 6 (0 long, 17 accepted), miss rate 13.6% (prompt 20.5%, decode 13.3%; by score 9.4%), hot reads 816 (kept 817, 37 inline, 0.44 s waited), swaps 214 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0, drafts over the listed vocabulary in 342 of 365 rounds
+request 8, GLM: 2.29 drafted / 1.95 accepted a round, copy rounds 2 (0 long, 2 accepted), miss rate 12.9% (prompt 20.0%, decode 12.5%; by score 9.0%), hot reads 767 (kept 762, 33 inline, 0.44 s waited), swaps 160 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0, drafts over the listed vocabulary in 301 of 345 rounds
+request 9, GLM: 1.76 drafted / 1.39 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 47.2% (prompt 48.0%, decode 23.0%; by score 47.9%), hot reads 717 (kept 712, 19 inline, 0.21 s waited), swaps 768 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0, drafts over the listed vocabulary in 94 of 102 rounds
+request 10, GLM: 1.92 drafted / 1.28 accepted a round, copy rounds 1 (1 long, 0 accepted), miss rate 25.3% (prompt 25.4%, decode 21.7%; by score 22.5%), hot reads 460 (kept 461, 17 inline, 0.16 s waited), swaps 512 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0, drafts over the listed vocabulary in 56 of 75 rounds
+request 11, GLM: 1.72 drafted / 1.34 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 8.8% (prompt 8.5%, decode 23.4%; by score 7.2%), hot reads 538 (kept 539, 21 inline, 0.20 s waited), swaps 512 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0, drafts over the listed vocabulary in 56 of 71 rounds
+request 12, GLM: 1.90 drafted / 1.46 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 5.5% (prompt 5.0%, decode 23.7%; by score 4.5%), hot reads 746 (kept 739, 41 inline, 0.27 s waited), swaps 437 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0, drafts over the listed vocabulary in 75 of 81 rounds

@@ -1,0 +1,13 @@
+note: server serves 'glm-5.3-flash', using that
+== tp2-prose: workload=prose isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=54 ttft=    364.4 ms  tpot=  28.39 ms  decode= 35.23 tok/s  out=1024 (length)
+          accept_len=1.998046875  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=54 ttft=    364.1 ms  tpot=  26.88 ms  decode= 37.20 tok/s  out=1024 (length)
+          accept_len=2.07085020242915  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=54 ttft=    356.2 ms  tpot=  27.60 ms  decode= 36.23 tok/s  out=1024 (length)
+          accept_len=2.0177514792899407  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=54 ttft=    384.3 ms  tpot=  27.19 ms  decode= 36.77 tok/s  out=1024 (length)
+          accept_len=1.990272373540856  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=364.0753 ms  tpot=27.1931 ms  decode=36.774 tok/s
+  -> ENGINE  accept_len=2.0178  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /home/you/tidelm-rust-state/flash-4bpw/readme-20261114/tp2/prose.json

@@ -483,3 +483,61 @@ the 20261112 run's 22.58 and 27.56 (results/rust-glm53-flash-35-tp1-20261113: th
 Found with it: `--bench-width`'s MTP draft pass scores a row with no finite logit (its kept hidden is
 not a decode's) - its draft is argmax's "none", list or no list. It times the pass; the id mapping
 now passes that value through instead of indexing with it.
+
+## The 4 bpw checkpoint (2026-11-13): behind on one box by the numbers, shipped and recommended all the same
+
+Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold (rev 76c0b517) is the 3.5 bpw release with every
+routed expert at 4 bits: routed experts 152.6 GB for 133.3 (12.6 MB a record for 11.0 on average),
+the rest the same BF16. The packer and the engine take it as it is - `tools/glm_fetch_dense.py`,
+`tools/glm_pack_exl3.py --world 1 --repo` (156.3 GB, 33 min at 78 MB/s), `--from-pack` for the
+pair's halves (78.3 GB a rank) - and the routing history carries over (the router is not the
+experts'). One class of slot (4/4/4), which 3.5's MTP layer and ten of its layers already used.
+
+Both arms on the head box, the host build of main, the local profiles (rescue 0.4, async hot
+reads, the listed draft vocabulary), one frozen copy of the served routing history, differing in
+the pack and the dense directory only. `results/rust-glm53-flash-40-20261113/`.
+
+| one box (`GLM_SLOTS=9700`, 91.9 GB of experts) | 3.5 bpw | 4 bpw |
+|---|---:|---:|
+| routed experts resident | 8,341 (69.0%) | 7,282 (60.2%) |
+| held-out NLL (`--bench-nll`, quick + eval, 57,315 tokens) | 1.7510 | 1.7592 (+0.0082 +- 0.0027 paired; coding +0.0080, general +0.0085; no blown windows) |
+| its misses (by score), hot reads | 7.15% (4.80%), 20,958 | 11.51% (7.83%), 36,747 |
+| bench.py prose / code, tok/s | 23.43 / 27.48 | 22.17 / 26.97 (-5.4% / -1.8%) |
+| random 8K first token | 12.08 s | 12.00 s |
+| decode picks missed, prose / code | 2.0-2.2% / 7.2-9.1% | 4.0-4.2% / 12.5-14.3% |
+
+On one box the wider experts lose by these numbers: nine points of residency cost more than a bit
+a weight buys, in NLL and in prose speed (code's -1.8% is inside the 3-5% bench.py's medians move
+between boots).
+
+| two boxes (every expert resident, 2M-position pool) | 3.5 bpw | 4 bpw |
+|---|---:|---:|
+| expert memory a rank, device memory | 66.8 GB, 86.9 GiB | 76.5 GB (`GLM_SLOTS=16400`), 95.87 GiB |
+| bench.py prose / code, tok/s | 38.62 / 47.98 | 36.81 / 46.80 (-4.7% / -2.5%) |
+| random 8K first token | 7.45 s | 7.56 s |
+
+On two boxes it fits with the context unchanged and costs 2.5-5% of the decode speed. What it
+buys was not measured here (no NLL run on the pair); the 3.5 bpw card's own comparison, every
+expert loaded, against BF16: KL 0.0021 for 0.0034 on long sessions and 0.0029 for 0.0049 on
+coding with thinking on, 0.261 for 0.312 with it off.
+
+Along the way: today's host build and the released binary (e676437) give the same NLL on
+heldout_quick to every digit (1.9125, paired difference 0.0000, the same 4,584 hot reads), so the
+day's decode changes are bit-neutral under teacher forcing. The rescue A/B's dumps of the morning
+(1.7169 / 1.7121) are from a boot with other settings than this profile (11.4% missed there, 7.2%
+here on the same state file and text): its numbers pair with each other, not with these.
+
+Shipped 2026-11-14 (`configs/glm53-flash-40-tp1.env.example`, `configs/glm53-flash-40-tp2.env.example`)
+and marked recommended in the README, by the author's choice after an evening of serving 4 bpw on
+one box: its answers read as the smarter of the two. That is a judgment from use, against the
+one-box table above and not from a newer measurement - no answers were scored (the pass-rate
+harness of 2026-11-12 was not run on these two), and the held-out NLL on one box says 3.5 bpw by
+0.008 nats. Whoever picks this up: the open question is whether a fully computed 4-bit expert on
+the picks that are resident outweighs four more points of picks substituted, on answers rather than
+on NLL; a pass-rate run of both from one routing history would settle it.
+
+The README's rows are a rerun with the shipped profiles on the serving image (main at 62c26f8),
+the one-box boot from a copy of the served history: prose 22.11, code 26.36 tok/s, random 8K first
+token 12.12 s, decode picks missed 3.7-4.5% (prose) and 12.5-14.5% (code)
+(`results/rust-glm53-flash-40-tp1-20261114/`); the pair 36.77 / 46.56 tok/s and 7.58 s
+(`results/rust-glm53-flash-40-tp2-20261114/`).

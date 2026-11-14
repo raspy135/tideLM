@@ -1,0 +1,3 @@
+arm                          tokens     NLL       paired diff   coding  general   top-1 median 250-window blown windows
+nll35.nll                     57315  1.7510                                      62.62%
+nll40.nll                     57315  1.7592   +0.0082 +- 0.0027  +0.0080  +0.0085  62.53%           +0.0069      0 / 0     

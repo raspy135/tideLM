@@ -1,0 +1,13 @@
+note: server serves 'glm-5.3-flash', using that
+== tp2-code: workload=code isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=67 ttft=    290.7 ms  tpot=  20.87 ms  decode= 47.91 tok/s  out=1024 (length)
+          accept_len=2.9145299145299144  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=67 ttft=    289.1 ms  tpot=  22.20 ms  decode= 45.05 tok/s  out=1024 (length)
+          accept_len=2.657142857142857  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=67 ttft=    289.0 ms  tpot=  20.73 ms  decode= 48.25 tok/s  out=1024 (length)
+          accept_len=2.9145299145299144  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=67 ttft=    287.8 ms  tpot=  20.84 ms  decode= 47.98 tok/s  out=1024 (length)
+          accept_len=2.939655172413793  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=289.0287 ms  tpot=20.8406 ms  decode=47.9833 tok/s
+  -> ENGINE  accept_len=2.9145  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /home/you/tidelm-rust-state/flash-4bpw/b35t2-code.json

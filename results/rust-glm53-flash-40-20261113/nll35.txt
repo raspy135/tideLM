@@ -1,0 +1,5 @@
+[glm] 8341 routed experts resident (91.9 GB; 3/3/4 x6374, 4/4/4 x1967) in 9 s
+bench-nll: coding: 30435 tokens, NLL 1.6008 (sd 2.562), top-1 66.32%
+bench-nll: general: 26880 tokens, NLL 1.9210 (sd 2.616), top-1 58.43%
+bench-nll: all: 57315 tokens, NLL 1.7510, 1084 s, 0 rows with NaN
+bench-nll: scored passes 7220: miss 7.15% (by score 4.80%), hot reads 20958 (2.90 a pass, 0.366 a token; 205 unkept, 1030 inline rescues, 70.77 s waited)

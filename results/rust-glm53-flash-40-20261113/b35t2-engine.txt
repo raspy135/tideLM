@@ -1,0 +1,26 @@
+engine up in 43.0s; serving glm-5.3-flash on 0.0.0.0:8000 (GLM, depth 7, calibrated gate 0.36)
+boot: routing history /home/you/tidelm-rust-state/glm-flash-history-v0.npz 
+[flash] dense weights (fp8): layer 8 (2.5 GB, 9 s)
+[flash] dense weights (fp8): layer 17 (3.3 GB, 13 s)
+[flash] dense weights (fp8): layer 26 (4.1 GB, 17 s)
+[flash] dense weights (fp8): layer 35 (4.9 GB, 21 s)
+[flash] dense weights (fp8): layer 44 (5.7 GB, 26 s)
+[glm] dense weights 5.76 GB a rank in 26 s
+[glm] 12096 routed experts resident (66.8 GB; 3/3/4 x9216, 4/4/4 x2880) in 7 s
+[glm] KV cache 14.42 GB a rank (1048576 positions a lane, 2097152 over 2 lanes)
+[flash] KDA state and rings 0.74 GB (2 lanes)
+boot: DS-rule routing history /home/you/tidelm-rust-state/flash-4bpw/state-tp2.ds-history.npz (24 folds)
+boot: warm-up 5.0 s
+engine up in 43.0s; serving glm-5.3-flash on 0.0.0.0:8000 (GLM, depth 7, calibrated gate 0.36)
+request 1, GLM: 2.04 drafted / 1.15 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 0.0% (prompt 0.0%, decode 0.0%; by score 0.0%), hot reads 0 (kept 0, 0 inline, 0.00 s waited), swaps 0 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0
+request 2, GLM: 1.75 drafted / 1.05 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 0.0% (prompt 0.0%, decode 0.0%; by score 0.0%), hot reads 0 (kept 0, 0 inline, 0.00 s waited), swaps 0 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0
+request 3, GLM: 1.59 drafted / 1.01 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 0.0% (prompt 0.0%, decode 0.0%; by score 0.0%), hot reads 0 (kept 0, 0 inline, 0.00 s waited), swaps 0 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0
+request 4, GLM: 1.55 drafted / 1.01 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 0.0% (prompt 0.0%, decode 0.0%; by score 0.0%), hot reads 0 (kept 0, 0 inline, 0.00 s waited), swaps 0 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0
+request 5, GLM: 2.33 drafted / 1.91 accepted a round, copy rounds 3 (0 long, 3 accepted), miss rate 0.0% (prompt 0.0%, decode 0.0%; by score 0.0%), hot reads 0 (kept 0, 0 inline, 0.00 s waited), swaps 0 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0
+request 6, GLM: 2.15 drafted / 1.66 accepted a round, copy rounds 2 (0 long, 3 accepted), miss rate 0.0% (prompt 0.0%, decode 0.0%; by score 0.0%), hot reads 0 (kept 0, 0 inline, 0.00 s waited), swaps 0 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0
+request 7, GLM: 2.27 drafted / 1.92 accepted a round, copy rounds 1 (0 long, 0 accepted), miss rate 0.0% (prompt 0.0%, decode 0.0%; by score 0.0%), hot reads 0 (kept 0, 0 inline, 0.00 s waited), swaps 0 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0
+request 8, GLM: 2.36 drafted / 1.94 accepted a round, copy rounds 1 (0 long, 0 accepted), miss rate 0.0% (prompt 0.0%, decode 0.0%; by score 0.0%), hot reads 0 (kept 0, 0 inline, 0.00 s waited), swaps 0 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0
+request 9, GLM: 1.50 drafted / 0.98 accepted a round, copy rounds 1 (1 long, 4 accepted), miss rate 0.0% (prompt 0.0%, decode 0.0%; by score 0.0%), hot reads 0 (kept 0, 0 inline, 0.00 s waited), swaps 0 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0
+request 10, GLM: 1.46 drafted / 0.98 accepted a round, copy rounds 1 (1 long, 3 accepted), miss rate 0.0% (prompt 0.0%, decode 0.0%; by score 0.0%), hot reads 0 (kept 0, 0 inline, 0.00 s waited), swaps 0 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0
+request 11, GLM: 2.23 drafted / 1.89 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 0.0% (prompt 0.0%, decode 0.0%; by score 0.0%), hot reads 0 (kept 0, 0 inline, 0.00 s waited), swaps 0 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0
+request 12, GLM: 1.34 drafted / 0.91 accepted a round, copy rounds 1 (1 long, 4 accepted), miss rate 0.0% (prompt 0.0%, decode 0.0%; by score 0.0%), hot reads 0 (kept 0, 0 inline, 0.00 s waited), swaps 0 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0

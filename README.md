@@ -11,9 +11,11 @@ tide — so the engine gets better the more you use it.
 | --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
 | `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | 2 | native MXFP4 | 10,000 / 15,360 (65.1%) | 1M (2 lanes, 1.5M shared) | **33.5 tok/s** | **51.8 tok/s** | 4.3 s |
 | `glm53-exlr8` | GLM-5.3 | 2 | exlr8 `bit260` (2.6 bpw: 2-3 bits a projection) | 14,124 / 19,200 (73.6%) | 320K (2 lanes) | **22.3 tok/s** | **28.2 tok/s** | 17.9 s |
-| `glm53-exlr8-home` | GLM-5.3 | 2 | exlr8 `home` (3.25 bpw: 3 or 4 bits an expert) | 11,430 / 19,200 (59.5%) | 320K (2 lanes) | **20.4 tok/s** | **23.9 tok/s** | 17.2 s |
+| `glm53-exlr8-home`<br>**Recommended** | GLM-5.3 | 2 | exlr8 `home` (3.25 bpw: 3 or 4 bits an expert) | 11,430 / 19,200 (59.5%) | 320K (2 lanes) | **20.4 tok/s** | **23.9 tok/s** | 17.2 s |
 | `glm53-flash-35-tp1` | GLM-5.3-Flash | **1** | EXL3 3.5 bpw (3 or 4 bits a projection) | 8,345 / 12,096 (69.0%) | 320K (2 lanes) | **23.3 tok/s** | **28.9 tok/s** | 12.0 s |
 | `glm53-flash-35-tp2` | GLM-5.3-Flash | 2 | EXL3 3.5 bpw (3 or 4 bits a projection) | 12,096 / 12,096 (100%) | 1M (2 lanes, 2M shared) | **37.3 tok/s** | **49.1 tok/s** | 7.5 s |
+| `glm53-flash-40-tp1`<br>**Recommended** | GLM-5.3-Flash | **1** | EXL3 4 bpw (4 bits a projection) | 7,282 / 12,096 (60.2%) | 320K (2 lanes) | **22.1 tok/s** | **26.4 tok/s** | 12.1 s |
+| `glm53-flash-40-tp2`<br>**Recommended** | GLM-5.3-Flash | 2 | EXL3 4 bpw (4 bits a projection) | 12,096 / 12,096 (100%) | 1M (2 lanes, 2M shared) | **36.8 tok/s** | **46.6 tok/s** | 7.6 s |
 
 *Medians of three `bench/bench.py` runs after a warmup, 1,024 tokens at temperature 0.6 (raw runs:
 [DeepSeek](results/rust-ds41-20261028-pdl/README.md), [GLM-5.3](results/rust-glm53-exlr8-20261111/README.md),
@@ -21,7 +23,14 @@ tide — so the engine gets better the more you use it.
 GLM-5.3-Flash [on one Spark](results/rust-glm53-flash-35-tp1-20261113/README.md), with its listed
 draft vocabulary, a day after `home` - its 8K first token, which that run does not move, from
 [the day before](results/rust-glm53-flash-35-tp1-20261112/README.md) - and
-[on two](results/rust-glm53-flash-35-tp2-20261112/README.md), the same day as `home`).*
+[on two](results/rust-glm53-flash-35-tp2-20261112/README.md), the same day as `home`; its 4 bpw
+[on one Spark](results/rust-glm53-flash-40-tp1-20261114/README.md) and
+[on two](results/rust-glm53-flash-40-tp2-20261114/README.md), 2026-11-14).*
+
+**Recommended** marks the checkpoint the author serves and would pick for each model: GLM-5.3's
+`home` and GLM-5.3-Flash's 4 bpw. It is a judgment from daily use - their answers read better - and
+not a measurement: the rows show both are the slower choice, and the one quality number taken on
+one box goes the other way for Flash (below).
 
 GLM-5.3 is served from the `bit260` profile of
 [kindlingai/glm-5.3-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4). Against
@@ -47,6 +56,15 @@ loaded into lent expert slots for the request. The two-Spark profile holds every
 about 1.7 times as fast; it is the option, not tuned - at two boxes the model fits whole, and engines
 built for that case serve it. What the one-box profile's substituted experts cost in answers against
 a fully resident 3.5 bpw is not measured here ([GLM-5.3-Flash](docs/glm-flash.md)).
+
+Its [EXL3 4 bpw](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold) is the same
+checkpoint with every routed expert at 4 bits, and the profiles are the 3.5 bpw ones with its files.
+Two Sparks hold it whole with the context unchanged, 1-5% slower. On one Spark the larger records
+leave 7,282 experts resident where 3.5 bpw keeps 8,341 in the same memory: measured against it from
+one routing history, it decodes 2-5% slower and scores 0.008 nats worse on held-out text
+(1.7592 against 1.7510, +- 0.0027), so by that number the residency lost costs more than the bit
+gained. The author serves it on one Spark all the same and finds it the smarter of the two; answers
+were not scored ([the 4 bpw checkpoint](docs/glm-flash.md#the-4-bpw-checkpoint-2026-11-13-behind-on-one-box-by-the-numbers-shipped-and-recommended-all-the-same)).
 
 Adaptive expert loading also allows flexible memory configuration.
 Memory for expert resident and context length are the big levers. You can run other services
@@ -100,11 +118,11 @@ thinking and reasoning-effort control through an OpenAI-compatible API.
 
 You need two DGX Sparks connected by a working RoCE link, Docker with NVIDIA GPU support,
 passwordless SSH from the head (rank 0) to the worker, and the weights on local NVMe at the same
-path on both nodes - or, for `glm53-flash-35-tp1`, one Spark with Docker. Clone this repository to the same absolute path on both nodes. The
+path on both nodes - or, for a one-Spark profile (`glm53-flash-35-tp1`, `glm53-flash-40-tp1`), one Spark with Docker. Clone this repository to the same absolute path on both nodes. The
 [install guide](docs/install.md) has each step in full: disk per profile, copying between the
 nodes, the GLM packs.
 
-There are five profiles, and each is set up on its own below. One image runs them all, one
+There are seven profiles, and each is set up on its own below. One image runs them all, one
 profile serves at a time (each fills both boxes, or the head), and switching between profiles that
 are set up is one `scripts/tide.sh start`.
 
@@ -112,9 +130,11 @@ are set up is one `scripts/tide.sh start`.
 | --- | --- | ---: | ---: |
 | [`ds41-mxfp4`](#deepseek-v41-flash-ds41-mxfp4) | DeepSeek-V4.1-Flash-1017 | 510 GB | |
 | [`glm53-exlr8`](#glm-53-exlr8-bit260-glm53-exlr8) | GLM-5.3, exlr8 `bit260` | 142 GB | 246 GB |
-| [`glm53-exlr8-home`](#glm-53-exlr8-home-glm53-exlr8-home) | GLM-5.3, exlr8 `home` | 172 GB | 308 GB |
+| [`glm53-exlr8-home`](#glm-53-exlr8-home-glm53-exlr8-home) | GLM-5.3, exlr8 `home` - **recommended** | 172 GB | 308 GB |
 | [`glm53-flash-35-tp1`](#glm-53-flash-on-one-spark-glm53-flash-35-tp1) | GLM-5.3-Flash, EXL3 3.5 bpw, one Spark | 157 GB (one node) | |
 | [`glm53-flash-35-tp2`](#glm-53-flash-on-two-sparks-glm53-flash-35-tp2) | GLM-5.3-Flash, EXL3 3.5 bpw | 88 GB | 137 GB |
+| [`glm53-flash-40-tp1`](#glm-53-flash-4-bpw-glm53-flash-40-tp1-glm53-flash-40-tp2) | GLM-5.3-Flash, EXL3 4 bpw, one Spark - **recommended** | 176 GB (one node) | |
+| [`glm53-flash-40-tp2`](#glm-53-flash-4-bpw-glm53-flash-40-tp1-glm53-flash-40-tp2) | GLM-5.3-Flash, EXL3 4 bpw - **recommended** | 98 GB | 156 GB |
 
 ### DeepSeek-V4.1-Flash (`ds41-mxfp4`)
 
@@ -342,6 +362,43 @@ The one-box pack can go afterwards, unless the one-Spark profile stays set up.
 scripts/tide.sh build .env.glm53-flash-35-tp2     # builds the image and ships it to the worker
 scripts/tide.sh start .env.glm53-flash-35-tp2
 ```
+
+### GLM-5.3-Flash 4 bpw (`glm53-flash-40-tp1`, `glm53-flash-40-tp2`)
+
+Mia's AI Lab's [EXL3 4 bpw](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold): the
+3.5 bpw checkpoint with every routed expert at 4 bits. It is the two sections above with its own
+repository, file names and profiles; nothing else differs, and the bundled routing history is the
+same one (it is the router's, not the experts').
+
+**One Spark** (`glm53-flash-40-tp1`):
+
+```bash
+cp configs/glm53-flash-40-tp1.env.example .env.glm53-flash-40
+python3 tools/glm_fetch_dense.py --repo Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold \
+    --revision 76c0b5173166d2795dd48860f45d8224817f894c --out <dense dir>       # 19 GB
+uv run --no-project --with numpy python tools/glm_pack_exl3.py --world 1 --resume --verify 64 \
+    --repo Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold --revision 76c0b5173166d2795dd48860f45d8224817f894c \
+    --out <packs dir>/glm-flash-40-r0of1.bin                                      # 156 GB
+scripts/tide.sh build --local-only .env.glm53-flash-40
+scripts/tide.sh start .env.glm53-flash-40
+```
+
+**Two Sparks** (`glm53-flash-40-tp2`), from the one-Spark setup's weights on the head (78 GB a rank):
+
+```bash
+cp configs/glm53-flash-40-tp2.env.example .env.glm53-flash-40-tp2
+rsync -a <dense dir>/ <worker>:<dense dir>/
+uv run --no-project --with numpy python tools/glm_pack_exl3.py --from-pack <packs dir>/glm-flash-40-r0of1.bin \
+    --world 2 --rank 1 --out <packs dir>/glm-flash-40-r1of2.bin --verify 32
+rsync -a <packs dir>/glm-flash-40-r1of2.bin <worker>:<packs dir>/ && rm <packs dir>/glm-flash-40-r1of2.bin
+uv run --no-project --with numpy python tools/glm_pack_exl3.py --from-pack <packs dir>/glm-flash-40-r0of1.bin \
+    --world 2 --rank 0 --out <packs dir>/glm-flash-40-r0of2.bin --verify 32
+scripts/tide.sh build .env.glm53-flash-40-tp2
+scripts/tide.sh start .env.glm53-flash-40-tp2
+```
+
+Coming from 3.5 bpw, your learned routing history carries over: copy `glm-flash-stats.npz` to the
+name the new profile's `RUST_GLM_STATE_DB` gives before the first start.
 
 ### Running it
 
