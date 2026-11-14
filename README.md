@@ -487,7 +487,7 @@ with what each setting measured.
 
 | DeepSeek | GLM-5.3 | What it controls |
 | --- | --- | --- |
-| `RUST_BUDGET=9950` | `GLM_SLOTS=12400` | How many experts stay resident (GLM: expert memory a rank, in 3-bit experts' worth, 7.1 MB each - a budget, not a count: 14,361 of `bit260`'s, whose records are smaller). Fewer, more memory for context. |
+| `RUST_BUDGET=10000` | `GLM_SLOTS=12400` | How many experts stay resident (GLM: expert memory a rank, in 3-bit experts' worth, 7.1 MB each - a budget, not a count: 14,361 of `bit260`'s, whose records are smaller). Fewer, more memory for context. |
 | `MAX_SEQ=1048576`, `RUST_KV_TOKENS=1572864` | `GLM_MAX_SEQ=327680` | Context, generated tokens included (DeepSeek: the most one lane reaches, out of a pool of `RUST_KV_TOKENS` the lanes share). Less context, more experts. |
 | `DSV41_ADAPT_SENSITIVITY=high` | `GLM_ADAPT=1`, `GLM_ADAPT_EVERY=200` | How fast the resident set follows new traffic. |
 | `RUST_ADAPT_DB` | `RUST_GLM_STATE_DB` | The learned history, under `~/tidelm-rust-state`. With none yet, the first boot starts from the bundled one in `profiles/`. |
