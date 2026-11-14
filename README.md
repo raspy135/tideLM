@@ -80,8 +80,11 @@ experts. TideLM decides which share, keeps deciding, and cheaply covers the rest
      ([measurements](docs/hot-reads.md)). Both lanes share the ring: every lane's misses feed
      one plan, at no decode cost (41.2 vs 40.6 tok/s for two requests at once).
    - GLM-5.3 (`GLM_HOT`): a layer's heaviest miss (≥ 0.2 of the routing weight, at most 16 a
-     step, paced over the layers) is read before that layer's MoE runs, computed exactly, and
-     kept resident in place of the coldest expert.
+     step, paced over the layers) is read into the slot of the coldest expert while the next
+     round drafts, and serves from the round after (`GLM_HOT_ASYNC=1`, the example profiles'). A
+     miss carrying ≥ 0.4 is not left to the next round: it is read before its layer's MoE runs
+     and computed exactly (`GLM_HOT_RESCUE`). `GLM_HOT_ASYNC=0` reads every one that way, for
+     about 5% of the decode speed.
 4. **Two Sparks as one.** Both boxes hold half of every resident expert and run tensor-parallel
    over RoCE; a boot-time guard refuses to start if the two ranks disagree on any setting that
    changes the numbers.
@@ -485,7 +488,7 @@ with what each setting measured.
 | DeepSeek | GLM-5.3 | What it controls |
 | --- | --- | --- |
 | `RUST_BUDGET=9950` | `GLM_SLOTS=12400` | How many experts stay resident (GLM: expert memory a rank, in 3-bit experts' worth, 7.1 MB each - a budget, not a count: 14,361 of `bit260`'s, whose records are smaller). Fewer, more memory for context. |
-| `MAX_SEQ=1048576`, `RUST_KV_TOKENS=1572864` | `GLM_MAX_SEQ=262144` | Context, generated tokens included (DeepSeek: the most one lane reaches, out of a pool of `RUST_KV_TOKENS` the lanes share). Less context, more experts. |
+| `MAX_SEQ=1048576`, `RUST_KV_TOKENS=1572864` | `GLM_MAX_SEQ=327680` | Context, generated tokens included (DeepSeek: the most one lane reaches, out of a pool of `RUST_KV_TOKENS` the lanes share). Less context, more experts. |
 | `DSV41_ADAPT_SENSITIVITY=high` | `GLM_ADAPT=1`, `GLM_ADAPT_EVERY=200` | How fast the resident set follows new traffic. |
 | `RUST_ADAPT_DB` | `RUST_GLM_STATE_DB` | The learned history, under `~/tidelm-rust-state`. With none yet, the first boot starts from the bundled one in `profiles/`. |
 | `DSV41_HOT_READS=1`, `DSV41_HOT_ASYNC=1`, `DSV41_HOT_RING=64` | `GLM_HOT=1`, `GLM_HOT_KEEP=32` | Hot reads (above). The ring's slots are on top of `RUST_BUDGET`, 9.4 MB a rank each (0.56 GiB at 64): a bigger ring needs a smaller budget. |

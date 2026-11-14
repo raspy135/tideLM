@@ -140,8 +140,10 @@ DS measurements: -6% to -16% tok/s). Prediction's real margins at this budget ar
    **On in the profiles all the same (2026-11-13), the author's choice from serving with it**:
    `GLM_HOT_RESCUE=0.4` in the three GLM-5.3 examples and the Flash TP=1 one, against the gate
    above - Flash failed its NLL half and GLM-5.3 has not run it. `scripts/rust-up.sh` passes it
-   only beside async hot reads, so the GLM-5.3 examples, which ship `GLM_HOT_ASYNC=0`, get it
-   when that is turned on. The A/B on the pair is still owed.
+   only beside async hot reads. The GLM-5.3 examples shipped `GLM_HOT_ASYNC=0` until the same
+   day and now ship 1 (what the README's rows were measured with), so a new GLM-5.3 install
+   runs rescue. The A/B on the pair is still owed, and the README's GLM-5.3 rows are async
+   without rescue.
 
    `RUST_ARGS="--bench-nll corpus/heldout_quick.jsonl ..."` runs one arm (RUST_ARGS is the
    launcher's passthrough for both ranks).
