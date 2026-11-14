@@ -78,7 +78,8 @@ ro=() rw=("$STATE")
 #   RUST_GLM_PREFIX_DIR=~/tidelm-rust-state/glm-prefix   the disk prefix store
 #   RUST_GLM_STATE_DB=~/tidelm-rust-state/glm-stats-rust.npz   the routing history the engine
 #       writes (read at boot when present, else GLM_STATS_DB: the Python server's db.pt is
-#       written by its container as root and is never touched)
+#       written by its container as root and is never touched; a GLM-5.3 profile naming none
+#       starts from the image's profiles/glm53-experts-v2.npz)
 # ---------------------------------------------------------------------------------------
 if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
     MODEL_DIR=$GLM_MODEL_DIR
@@ -99,7 +100,7 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
     pack=${pack/#\/packs/${GLM_EXL3_DIR:-/packs}}
     db=${GLM_STATS_DB:-}
     db=${db/#\/app/$ROOT}
-    if [[ -n "$db" && -f "$db" ]]; then ro+=("$(dirname "$db")"); else db=/app/profiles/glm53-experts-v1.pt; fi
+    if [[ -n "$db" && -f "$db" ]]; then ro+=("$(dirname "$db")"); else db=/app/profiles/glm53-experts-v2.npz; fi
     state=${RUST_GLM_STATE_DB:-$STATE/glm-stats-rust.npz}
     ro+=("$MODEL_DIR" "$(dirname "${pack//\{rank\}/0}")") rw+=("$(dirname "$state")")
     depth=${GLM_MTP_DEPTH:-3}

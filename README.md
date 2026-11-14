@@ -389,7 +389,10 @@ scripts/tide.sh start .env.glm53-flash-35
 The boot log then reads `boot: routing history /app/profiles/...` (the seed) instead of your state
 file, and the first requests are slower while adaptation catches up. Moving the old file back
 restores it. GLM-5.3-Flash installs from before 2026-11-13 name seed v0 in their profile: set
-`GLM_STATS_DB=/app/profiles/glm53-flash-history-v1.npz` and update the image first.
+`GLM_STATS_DB=/app/profiles/glm53-flash-history-v1.npz` and update the image first. GLM-5.3's
+profiles name no seed: the launcher picks the current one (`profiles/glm53-experts-v2.npz` since
+2026-11-13, [what it is](docs/adaptive-experts.md#glm-53)), so there the `mv` of your profile's
+`RUST_GLM_STATE_DB` and a restart are the whole reset.
 
 ## Abliterated overlay (DeepSeek V4.1)
 

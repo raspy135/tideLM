@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "captured_at": "2026-11-13T16:52:40-08:00",
+  "model": "GLM-5.3",
+  "layers": 79,
+  "experts_per_layer": 256,
+  "tokens": 47979,
+  "source": "the development pair's state file (RUST_GLM_STATE_DB of the exlr8 home profile, which continues the exlr8 and EXL3 profiles' file) on 2026-11-13, copied byte for byte: seed v1 (2,339,364 tokens, see its .json) and everything the pair has routed on top of it since 2026-10-19 - the author's chat and coding-agent traffic (Open WebUI, Pi harness) and the benchmark and evaluation runs made against the serving pair. Every (layer, expert) entry is at least v1's. The mass of a routed layer is 46.5M-50.8M, 9.1-9.4x v1's; the Rust engine adds about 2.7 a layer per routed row (one 265-row request measured), so roughly 18 million rows: every prompt token and every decode verify row, rejected drafts included. tokens is the engine's counter since its last boot (it restarts at 0 each boot), not the history's size.",
+  "contents": "Aggregate router mass per (layer, expert) and a token count only; no prompts, responses, KV, or model weights.",
+  "sha256": "2171f6fb2743903d1786a261b70a4261549bd7c1531cd1f09d03bf9ec5d06e66"
+}

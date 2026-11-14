@@ -182,3 +182,29 @@ routing; GLM_STATS_DB missing at boot in both arms):
 | bundled seed | 0.093 | 9.9% | 1,058 | 93.3% |
 
 One prompt set; top-1 differs by 2 of 900 positions, within noise.
+
+**Seed v2 (2026-11-13, the Rust engine).** `profiles/glm53-experts-v2.npz` is the development
+pair's state file (`RUST_GLM_STATE_DB`) copied byte for byte: v1 and everything the pair routed
+on top of it in the four weeks since, roughly 18 million rows against v1's 2.3 million tokens
+(the `.json` has the source and checksum; still router mass and a counter, no text).
+`scripts/rust-up.sh` starts a GLM-5.3 profile with no state file from it. An install that
+already has a state file keeps it: that file began as v1 and holds the install's own traffic,
+and v2 is read only after [a reset](../README.md#resetting-the-routing-history). The Python
+engine (`GLM_STATS_SEED`) still starts from v1: its loader reads `torch.save` files.
+
+Checked offline, not on a fresh boot: the boot placement alone (the floor of 16 a layer, then
+by mass; unit cost an expert), scored on the routing the pair recorded on 2026-11-12/13 (about
+330K rows), which the first history did not see:
+
+| history placed from | routing weight outside the boot residents, 11,407 | 12,000 |
+| --- | ---: | ---: |
+| seed v1 | 35.0% | 32.2% |
+| the pair's history to 2026-11-11 (v2 less those two days) | 32.6% | 29.8% |
+| v2 itself (those days in sample) | 32.4% | 29.6% |
+
+The held-out days are the same author's traffic, so this says the longer history predicts more
+of *that* routing, not anyone's; adaptation and hot reads then cut the miss a request sees (15%
+to 23% in decode on the serving pair). v2 weighs nine times v1, so a new install's own traffic
+moves its boot placement nine times more slowly; within a session, adaptation follows its own
+decayed demand as before. Not scaled down, for v1's reason: how much a seed should weigh against
+a new user's first traffic has not been measured.
