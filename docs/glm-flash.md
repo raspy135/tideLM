@@ -281,7 +281,8 @@ again with TIDELM_GLM_MLA_HALF=0 (decode attention's split partials in fp32: num
 the hot reads diverge from it the same way). NLL 1.7127, +0.0006 +- 0.0012 paired (coding +0.0012,
 general -0.0001, median window +0.0005), miss 11.46% (7.16%), 1,038 s. Rescue's +0.0048 (coding
 +0.0120) is 8x that: the loss is its own. Shipped at 0.4 for the hour this took (2c7df05), then
-back to off. Cause not found; next to look at: the same harness with GLM_HOT_RESCUE=1.0 (the
+back to off, and on again the same day by the author's choice with every other async profile
+(docs/hot-predict.md) - no new measurement behind that. Cause not found; next to look at: the same harness with GLM_HOT_RESCUE=1.0 (the
 segment path with no rescue read - whether the per-segment graphs alone differ from the whole
 pass on Flash), then whether keeping rescued experts over the queued victims costs the code
 texts their residents.

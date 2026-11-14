@@ -125,8 +125,16 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
     [[ -n "${GLM_HOT_VICTIM:-}" ]] && args+=(--hot-victim "$GLM_HOT_VICTIM")
     # GLM_HOT_RESCUE=TH (GLM_HOT_ASYNC=1): a missed pick with share >= TH read into the transient
     # slot before its layer's MoE, inline in the pass (the catastrophic first occurrence; the
-    # pass pays the segment structure - measure the arm before shipping it; unset: off)
-    [[ -n "${GLM_HOT_RESCUE:-}" ]] && args+=(--hot-rescue "$GLM_HOT_RESCUE")
+    # pass pays the segment structure; unset or 0: off). The profiles set it whatever their hot
+    # reads are, so it is passed only beside async ones: the engine refuses it otherwise, and
+    # sync hot reads already read a layer's heaviest miss in the pass that missed it.
+    if [[ -n "${GLM_HOT_RESCUE:-}" && "$GLM_HOT_RESCUE" != 0 ]]; then
+        if [[ "${GLM_HOT:-0}" == 1 && "${GLM_HOT_ASYNC:-0}" == 1 ]]; then
+            args+=(--hot-rescue "$GLM_HOT_RESCUE")
+        else
+            echo "--- GLM_HOT_RESCUE=$GLM_HOT_RESCUE not applied: it rides on async hot reads (GLM_HOT=1, GLM_HOT_ASYNC=1)"
+        fi
+    fi
     [[ "${GLM_GRAPHS:-1}" == 1 ]] && args+=(--graphs)
     # GLM_EXLR8_ROUND=exact|fast: an exlr8 pack's (tools/glm_pack_exlr8.py) and exlr8 dense matrices'
     # (tools/glm_exlr8_dense.py) codebook rounded to E4M3 as the format defines it, or in two
