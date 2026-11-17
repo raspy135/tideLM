@@ -418,6 +418,14 @@ the head. `TIDE_ENGINE=python` still starts the Python containers, from a profil
 their settings (the examples as of `a6ec917`), and a profile the Rust engine does not serve
 (MXFP4 GLM experts, FP4 KV) goes to them with a note.
 
+`http://<head>:8000/expert-map` shows the residency as it is now, for every profile: a row a layer
+and a cell an expert - resident, being read from disk, in DeepSeek's hot-read ring, or not loaded -
+with the cells that changed in the last few seconds outlined. Its second view colours each expert by
+how much the routing history uses it, so the ones in demand and not in memory stand out, and either
+view can order a layer's cells by use. The page reads `GET /v1/expert-map` (JSON, behind the API key
+when one is set) once a second while it is open; the engine answers from host data between its steps
+and does nothing for it when no page is asking.
+
 ### Updating
 
 ```bash

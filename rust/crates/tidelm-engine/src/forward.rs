@@ -2920,6 +2920,36 @@ impl Engine {
         Some((0..self.n_layers).map(|l| (0..e).map(|x| set.lut_host[l * (e + 1) + x] >= 0).collect()).collect())
     }
 
+    /// The residency as the expert map shows it (crate::expert_map): the host LUT's residents, the
+    /// hot ring's live experts and its reads in flight. `mass`: the routing history's, [layer][expert].
+    pub fn expert_map(&self, mass: Option<&[f64]>) -> Option<crate::expert_map::ExpertMap> {
+        use crate::expert_map::{ExpertMap, HOT, LOADING, RESIDENT};
+        let set = &self.resident.as_ref()?.experts;
+        let (nl, e) = (self.n_layers, set.n_experts);
+        let mut state = vec![0u8; nl * e];
+        for l in 0..nl {
+            for x in 0..e {
+                if set.lut_host[l * (e + 1) + x] >= 0 {
+                    state[l * e + x] = RESIDENT;
+                }
+            }
+        }
+        let mut counters = vec![];
+        let mut spare = 0;
+        if let Some(hot) = &self.hot {
+            for &(l, x) in hot.ring.live.keys() {
+                state[l * e + x] = HOT;
+            }
+            for &(l, x) in hot.ring.pending.keys() {
+                state[l * e + x] = LOADING;
+            }
+            spare = hot.cfg.ring;
+            counters.push(("hot reads", hot.stats.reads as f64));
+        }
+        Some(ExpertMap { layers: (0..nl).collect(), experts: e, state, demand: mass.filter(|m| m.len() == nl * e).map(|m| m.to_vec()),
+                         slots: set.owner.len(), spare, world: if self.is_paired() { 2 } else { 1 }, busy: false, counters })
+    }
+
     /// Residency moves between steps: each `[from_layer, from_expert, to_layer, to_expert]`
     /// gives a resident expert's arena slot to an absent one (global_residency's swap pairs:
     /// a layer may hand its slot to another), read from NVMe into it; then the slot LUT and

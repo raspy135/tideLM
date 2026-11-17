@@ -919,6 +919,16 @@ impl Scheduler {
         self.cancelled.push(id);
     }
 
+    /// The engine's residency now (crate::expert_map), None without resident experts: read
+    /// between steps, on the engine thread.
+    pub fn expert_map(&self, engine: &Engine) -> Option<crate::expert_map::ExpertMap> {
+        let mut m = engine.expert_map(self.adapt.as_ref().map(|a| a.mass()))?;
+        m.busy = !self.idle();
+        m.counters.push(("adaptation passes", self.stats.adapt_passes as f64));
+        m.counters.push(("experts moved", self.stats.adapt_moves as f64));
+        Some(m)
+    }
+
     pub fn idle(&self) -> bool {
         self.queue.is_empty() && self.parked.is_empty() && self.slots.iter().all(|s| s.is_none())
     }

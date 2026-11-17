@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Expert map</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb;
+  --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --hair: #e1e0d9; --axis: #c3c2b7;
+  --absent: #e6e5df;
+  --resident: #2a78d6; --hot: #eb6834; --loading: #1baf7a;
+  --seq-res-0: #cde2fb; --seq-res-1: #2a78d6; --seq-res-2: #0d366b;
+  --seq-abs-0: #fbe3d6; --seq-abs-1: #eb6834; --seq-abs-2: #7a2c0d;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19;
+    --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+    --hair: #2c2c2a; --axis: #383835;
+    --absent: #2a2a28;
+    --resident: #3987e5; --hot: #d95926; --loading: #199e70;
+    --seq-res-0: #0d366b; --seq-res-1: #3987e5; --seq-res-2: #cde2fb;
+    --seq-abs-0: #5a200a; --seq-abs-1: #d95926; --seq-abs-2: #fbd9c7;
+  }
+}
+* { box-sizing: border-box; }
+html { background: var(--page); }
+body { margin: 0 auto; max-width: 1500px; padding: 20px 24px 40px; color: var(--ink); background: var(--page);
+       font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+h1 { font-size: 20px; font-weight: 600; margin: 0; }
+h2 { font-size: 14px; font-weight: 600; margin: 28px 0 8px; }
+p { margin: 4px 0; color: var(--ink-2); max-width: 80ch; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; }
+#what { color: var(--ink-2); }
+#status { margin-left: auto; color: var(--ink-2); }
+#status.bad { color: var(--ink); font-weight: 600; }
+
+#stats { display: flex; flex-wrap: wrap; gap: 6px 36px; margin: 18px 0 4px; padding: 0; }
+#stats div { min-width: 0; }
+#stats dt { color: var(--ink-2); font-size: 12px; }
+#stats dd { margin: 0; font-size: 20px; }
+#stats dd small { font-size: 13px; color: var(--ink-2); }
+#note { min-height: 1.45em; }
+
+#controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 22px; margin: 18px 0 10px; }
+fieldset { border: 0; margin: 0; padding: 0; display: flex; align-items: center; gap: 6px; }
+legend { float: left; padding: 0; margin-right: 8px; color: var(--ink-2); }
+.seg { display: inline-flex; }
+.seg label { position: relative; }
+.seg input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
+.seg span { display: block; padding: 4px 11px; border: 1px solid var(--axis); margin-left: -1px; background: var(--surface); }
+.seg label:first-child span { border-radius: 4px 0 0 4px; margin-left: 0; }
+.seg label:last-child span { border-radius: 0 4px 4px 0; }
+.seg input:checked + span { background: var(--ink); color: var(--page); border-color: var(--ink); }
+.seg input:focus-visible + span { outline: 2px solid var(--resident); outline-offset: 2px; }
+.seg input:disabled + span { color: var(--muted); }
+button { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--axis); border-radius: 4px; padding: 4px 11px; cursor: pointer; }
+button:focus-visible, canvas:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--resident); outline-offset: 2px; }
+
+#key { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 14px 0; }
+#key input { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--axis); border-radius: 4px; padding: 4px 8px; width: 28ch; }
+
+#legend { display: flex; flex-wrap: wrap; gap: 4px 18px; color: var(--ink-2); font-size: 13px; margin: 0 0 8px; padding: 0; list-style: none; }
+#legend li { display: flex; align-items: center; gap: 6px; }
+#legend i { width: 11px; height: 11px; display: inline-block; }
+#legend .ramp { width: 72px; }
+#legend .ring { background: none; outline: 1.5px solid var(--ink); outline-offset: -1.5px; }
+
+#plot { position: relative; display: inline-block; max-width: 100%; vertical-align: top; background: var(--surface); border: 1px solid var(--hair); padding: 10px 12px 12px; overflow-x: auto; }
+canvas { display: block; }
+#cursor { position: absolute; pointer-events: none; outline: 1.5px solid var(--ink); display: none; }
+#tip { position: absolute; pointer-events: none; display: none; z-index: 2; background: var(--surface); color: var(--ink);
+       border: 1px solid var(--axis); padding: 6px 9px; font-size: 13px; white-space: nowrap; box-shadow: 0 1px 4px rgba(0,0,0,.18); }
+#tip b { font-weight: 600; }
+#tip span { color: var(--ink-2); }
+
+#log { margin: 0; padding: 0; list-style: none; font-variant-numeric: tabular-nums; color: var(--ink-2); }
+#log li { padding: 2px 0; }
+#log time { color: var(--ink); margin-right: 10px; }
+details { margin-top: 28px; }
+summary { cursor: pointer; font-weight: 600; }
+table { border-collapse: collapse; margin-top: 8px; font-variant-numeric: tabular-nums; }
+th, td { text-align: right; padding: 3px 18px 3px 0; border-bottom: 1px solid var(--hair); font-weight: 400; }
+th { color: var(--ink-2); font-size: 12px; }
+th:first-child, td:first-child { text-align: left; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Expert map</h1>
+  <span id="what"></span>
+  <span id="status" role="status">Connecting…</span>
+</header>
+<p>Which routed experts are in memory right now. Each row is a layer and each cell an expert; the engine moves experts in and out as your traffic changes.</p>
+
+<form id="key" hidden>
+  <label for="keyin">This server wants an API key to show its data:</label>
+  <input id="keyin" type="password" autocomplete="off">
+  <button>Use key</button>
+</form>
+
+<dl id="stats"></dl>
+<p id="note"></p>
+
+<div id="controls">
+  <fieldset>
+    <legend>Show</legend>
+    <div class="seg">
+      <label><input type="radio" name="view" value="state" checked><span>What is loaded</span></label>
+      <label><input type="radio" name="view" value="demand"><span>How much each is used</span></label>
+    </div>
+  </fieldset>
+  <fieldset>
+    <legend>Order cells by</legend>
+    <div class="seg">
+      <label><input type="radio" name="order" value="index" checked><span>Expert number</span></label>
+      <label><input type="radio" name="order" value="demand"><span>Most used first</span></label>
+    </div>
+  </fieldset>
+  <button id="pause" type="button" aria-pressed="false">Pause</button>
+</div>
+
+<ul id="legend"></ul>
+<div id="plot">
+  <canvas id="map" tabindex="0" aria-label="Expert map: one row a layer, one cell an expert. Arrow keys move between cells; the table below has the same counts."></canvas>
+  <div id="cursor"></div>
+  <div id="tip"></div>
+</div>
+
+<h2>Recent changes</h2>
+<ul id="log"><li id="nolog">Nothing has moved since this page opened.</li></ul>
+
+<details>
+  <summary>Layers as a table</summary>
+  <table>
+    <thead><tr><th>Layer</th><th>Resident</th><th>Of the layer</th><th>In hot ring</th><th>Being read</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</details>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const fmt = n => Number(n).toLocaleString("en-US");
+const STATE_TEXT = ["not loaded", "resident", "in the hot-read ring", "being read from disk"];
+const POLL_MS = 1000, RECENT_MS = 4000, LOG_MAX = 40;
+
+let data = null;          // the last snapshot
+let prev = null;          // its states, flat, for the diff
+let changed = new Map();  // cell index -> time it last changed
+let order = [];           // per row: column -> expert
+let geom = null;
+let paused = false, timer = null, key = "";
+let hover = null;         // {row, col}
+try { key = sessionStorage.getItem("tidelm-key") || ""; } catch (e) {}
+
+const view = () => document.querySelector("input[name=view]:checked").value;
+const ordering = () => document.querySelector("input[name=order]:checked").value;
+
+function hex(c) { return [1, 3, 5].map(i => parseInt(c.slice(i, i + 2), 16)); }
+function ramp(stops) {  // 36 steps through three stops
+  const s = stops.map(hex), out = [];
+  for (let i = 0; i < 36; i++) {
+    const t = i / 35 * 2, seg = t < 1 ? 0 : 1, f = t - seg, a = s[seg], b = s[seg + 1];
+    out.push("rgb(" + a.map((v, k) => Math.round(v + (b[k] - v) * f)).join(",") + ")");
+  }
+  return out;
+}
+let colors = null;
+function readColors() {
+  colors = {
+    state: [css("--absent"), css("--resident"), css("--hot"), css("--loading")],
+    res: ramp([css("--seq-res-0"), css("--seq-res-1"), css("--seq-res-2")]),
+    abs: ramp([css("--seq-abs-0"), css("--seq-abs-1"), css("--seq-abs-2")]),
+    ink: css("--ink"), ink2: css("--ink-2"), muted: css("--muted"), axis: css("--axis"), hair: css("--hair"), absent: css("--absent"),
+  };
+}
+
+function legend() {
+  const ul = $("legend"), d = data;
+  ul.textContent = "";
+  const item = (style, text, cls) => {
+    const li = document.createElement("li"), i = document.createElement("i");
+    if (cls) i.className = cls;
+    if (style) i.style.background = style;
+    li.append(i, document.createTextNode(text));
+    ul.append(li);
+  };
+  if (view() === "state" || !d.demand) {
+    item(colors.state[1], "Resident");
+    if (d.counts.hot || d.engine === "deepseek") item(colors.state[2], "In the hot-read ring");
+    item(colors.state[3], "Being read from disk");
+    item(colors.state[0], "Not loaded");
+  } else {
+    const g = r => "linear-gradient(to right," + [0, 8, 17, 26, 35].map(i => r[i]).join(",") + ")";
+    item(g(colors.res), "Resident: rarely used → the layer's most used", "ramp");
+    item(g(colors.abs), "Not loaded: rarely used → most used", "ramp");
+    item(colors.absent, "Never used");
+  }
+  item("", "Changed in the last few seconds", "ring");
+}
+
+function layout() {
+  const d = data, E = d.experts_per_layer, R = d.layers.length;
+  const left = 34, right = 118, avail = Math.max(320, document.body.clientWidth - 48 - 26 - left - right);
+  const cw = Math.max(2, Math.min(9, Math.floor(avail / E)));
+  const rh = Math.max(12, Math.min(18, Math.floor(760 / R)));
+  const top = 18;
+  geom = { left, right, top, cw, rh, gap: cw >= 4 ? 1 : 0, rgap: 2, w: left + cw * E + right, h: top + rh * R, E, R };
+  const c = $("map"), dpr = window.devicePixelRatio || 1;
+  c.style.width = geom.w + "px"; c.style.height = geom.h + "px";
+  c.width = Math.round(geom.w * dpr); c.height = Math.round(geom.h * dpr);
+}
+
+function reorder() {
+  const d = data, E = d.experts_per_layer, byDemand = ordering() === "demand" && d.demand;
+  order = d.layers.map((_, r) => {
+    const idx = Array.from({ length: E }, (_, i) => i);
+    if (byDemand) {
+      const row = d.demand[r];
+      idx.sort((a, b) => row.charCodeAt(b) - row.charCodeAt(a) || a - b);  // digits sort before letters: base 36 in order
+    }
+    return idx;
+  });
+}
+const level = (r, e) => data.demand ? parseInt(data.demand[r][e], 36) : 0;
+
+function draw() {
+  if (!data) return;
+  const d = data, g = geom, c = $("map"), x = c.getContext("2d"), dpr = window.devicePixelRatio || 1, now = Date.now();
+  x.setTransform(dpr, 0, 0, dpr, 0, 0);
+  x.clearRect(0, 0, g.w, g.h);
+  const demandView = view() === "demand" && d.demand;
+  x.font = "11px system-ui, sans-serif"; x.textBaseline = "middle";
+  // column ticks: only meaningful in expert order
+  x.fillStyle = colors.muted; x.textAlign = "center";
+  if (ordering() === "index" || !d.demand) {
+    for (let e = 0; e < g.E; e += 64) x.fillText(String(e), g.left + e * g.cw + g.cw / 2, 8);
+  } else {
+    x.textAlign = "left"; x.fillText("most used", g.left, 8);
+    x.textAlign = "right"; x.fillText("least used", g.left + g.E * g.cw, 8);
+  }
+  const maxRes = Math.max(1, ...d.resident_per_layer);
+  const recent = [];
+  for (let r = 0; r < g.R; r++) {
+    const y = g.top + r * g.rh, h = g.rh - g.rgap, st = d.states[r], ord = order[r];
+    for (let col = 0; col < g.E; col++) {
+      const e = ord[col], s = st.charCodeAt(e) - 48;
+      let fill;
+      if (demandView) {
+        const v = level(r, e);
+        fill = v === 0 && s === 0 ? colors.absent : (s === 0 ? colors.abs : colors.res)[v];
+      } else {
+        fill = colors.state[s];
+      }
+      x.fillStyle = fill;
+      x.fillRect(g.left + col * g.cw, y, g.cw - g.gap, h);
+      const t = changed.get(r * g.E + e);
+      if (t && now - t < RECENT_MS) recent.push([col, y, h]);
+    }
+    x.fillStyle = colors.ink2; x.textAlign = "right";
+    x.fillText(String(d.layers[r]), g.left - 7, y + h / 2);
+    // the layer's residents: a number and a thin bar
+    const n = d.resident_per_layer[r], bx = g.left + g.E * g.cw + 10;
+    x.fillStyle = colors.hair; x.fillRect(bx, y + h / 2 - 1.5, 52, 3);
+    x.fillStyle = colors.state[1]; x.fillRect(bx, y + h / 2 - 1.5, 52 * n / maxRes, 3);
+    x.fillStyle = colors.ink2; x.textAlign = "left";
+    x.fillText(String(n), bx + 58, y + h / 2);
+  }
+  x.strokeStyle = colors.ink; x.lineWidth = 1.5;
+  for (const [col, y, h] of recent) x.strokeRect(g.left + col * g.cw - 0.75, y - 0.75, g.cw - g.gap + 1.5, h + 1.5);
+  x.fillStyle = colors.muted; x.textAlign = "left";
+  x.fillText("resident", g.left + g.E * g.cw + 10, 8);
+}
+
+function stats() {
+  const d = data, c = d.counts, dl = $("stats");
+  dl.textContent = "";
+  const add = (label, value, small) => {
+    const div = document.createElement("div"), dt = document.createElement("dt"), dd = document.createElement("dd");
+    dt.textContent = label; dd.textContent = value;
+    if (small) { const s = document.createElement("small"); s.textContent = " " + small; dd.append(s); }
+    div.append(dt, dd); dl.append(div);
+  };
+  add("Resident", fmt(c.resident), "of " + fmt(d.total_experts) + " (" + (100 * c.resident / d.total_experts).toFixed(1) + "%)");
+  if (c.hot || d.engine === "deepseek") add("In the hot-read ring", fmt(c.hot), d.spare_slots ? "of " + fmt(d.spare_slots) : "");
+  add("Being read now", fmt(c.loading));
+  add("Memory slots", fmt(d.arena_slots));
+  for (const [k, v] of Object.entries(d.counters || {})) add(k[0].toUpperCase() + k.slice(1) + " since start", fmt(v));
+  $("what").textContent = d.model + " · " + (d.sparks > 1 ? d.sparks + " Sparks" : "one Spark");
+  const notes = [];
+  if (c.not_loaded === 0 && c.loading === 0) notes.push("Every expert is in memory, so nothing is read from disk while serving.");
+  if (d.sparks > 1) notes.push("Each Spark holds its part of every resident expert; the two always agree.");
+  if (!d.demand) notes.push("This engine keeps no routing history, so there is no usage to show.");
+  $("note").textContent = notes.join(" ");
+  for (const i of document.querySelectorAll("input[name=view][value=demand], input[name=order][value=demand]")) i.disabled = !d.demand;
+  if (!d.demand) for (const i of document.querySelectorAll("input[name=view][value=state], input[name=order][value=index]")) i.checked = true;
+}
+
+function table() {
+  const d = data, E = d.experts_per_layer, tb = $("rows");
+  tb.textContent = "";
+  d.layers.forEach((l, r) => {
+    const tr = document.createElement("tr"), st = d.states[r];
+    let hot = 0, loading = 0;
+    for (let e = 0; e < E; e++) { const s = st.charCodeAt(e) - 48; hot += s === 2; loading += s === 3; }
+    const n = d.resident_per_layer[r];
+    for (const v of [l, fmt(n), (100 * n / E).toFixed(0) + "%", hot, loading]) {
+      const td = document.createElement("td"); td.textContent = v; tr.append(td);
+    }
+    tb.append(tr);
+  });
+}
+
+function diff() {
+  const d = data, E = d.experts_per_layer, flat = d.states.join(""), now = Date.now();
+  if (prev && prev.length === flat.length) {
+    let loaded = 0, dropped = 0, reading = 0;
+    const layers = new Set();
+    for (let i = 0; i < flat.length; i++) {
+      const a = prev.charCodeAt(i) - 48, b = flat.charCodeAt(i) - 48;
+      if (a === b) continue;
+      changed.set(i, now);
+      layers.add(d.layers[Math.floor(i / E)]);
+      if (b === 0) dropped++; else if (b === 3) reading++; else if (a === 0 || a === 3) loaded++;
+    }
+    if (loaded || dropped || reading) {
+      const parts = [];
+      if (loaded) parts.push(fmt(loaded) + " loaded");
+      if (reading) parts.push(fmt(reading) + " started reading");
+      if (dropped) parts.push(fmt(dropped) + " dropped");
+      const ls = [...layers].sort((a, b) => a - b);
+      const where = ls.length > 8 ? ls.length + " layers" : "layer" + (ls.length > 1 ? "s " : " ") + ls.join(", ");
+      const li = document.createElement("li"), t = document.createElement("time");
+      t.textContent = new Date(now).toLocaleTimeString("en-GB");
+      li.append(t, document.createTextNode(parts.join(", ") + " in " + where));
+      $("nolog")?.remove();
+      $("log").prepend(li);
+      while ($("log").children.length > LOG_MAX) $("log").lastChild.remove();
+    }
+  }
+  for (const [i, t] of changed) if (now - t > RECENT_MS) changed.delete(i);
+  prev = flat;
+}
+
+function status(text, bad) { const s = $("status"); s.textContent = text; s.className = bad ? "bad" : ""; }
+
+async function poll() {
+  if (paused || document.hidden) return;
+  try {
+    const r = await fetch("/v1/expert-map", { headers: key ? { Authorization: "Bearer " + key } : {}, cache: "no-store" });
+    if (r.status === 401) { $("key").hidden = false; status("Waiting for an API key", true); return; }
+    $("key").hidden = true;
+    if (!r.ok) {
+      let msg = "The engine answered " + r.status;
+      try { msg = (await r.json()).error.message; } catch (e) {}
+      status(msg[0].toUpperCase() + msg.slice(1), true);
+      return;
+    }
+    const first = !data, d = await r.json(), shape = data && (data.experts_per_layer !== d.experts_per_layer || data.layers.length !== d.layers.length);
+    data = d;
+    if (shape) { prev = null; changed.clear(); }
+    diff();
+    if (first || shape) { layout(); }
+    reorder(); legend(); stats(); table(); draw();
+    const at = new Date(d.sampled_at * 1000).toLocaleTimeString("en-GB");
+    status(d.stale ? "Engine is mid-step; map from " + at : (d.busy ? "Serving a request" : "Idle") + " · updated " + at, false);
+  } catch (e) {
+    status("No answer from the server; retrying", true);
+  }
+}
+
+function cellAt(ev) {
+  const g = geom, b = $("map").getBoundingClientRect(), px = ev.clientX - b.left, py = ev.clientY - b.top;
+  const col = Math.floor((px - g.left) / g.cw), row = Math.floor((py - g.top) / g.rh);
+  return col >= 0 && col < g.E && row >= 0 && row < g.R ? { row, col } : null;
+}
+function showTip() {
+  const tip = $("tip"), cur = $("cursor");
+  if (!hover || !data) { tip.style.display = cur.style.display = "none"; return; }
+  const g = geom, d = data, e = order[hover.row][hover.col], s = d.states[hover.row].charCodeAt(e) - 48;
+  const c = $("map"), ox = c.offsetLeft, oy = c.offsetTop;
+  const cx = ox + g.left + hover.col * g.cw, cy = oy + g.top + hover.row * g.rh;
+  cur.style.display = "block";
+  cur.style.left = cx - 1 + "px"; cur.style.top = cy - 1 + "px";
+  cur.style.width = g.cw - g.gap + 2 + "px"; cur.style.height = g.rh - g.rgap + 2 + "px";
+  tip.textContent = "";
+  const b = document.createElement("b"); b.textContent = STATE_TEXT[s][0].toUpperCase() + STATE_TEXT[s].slice(1);
+  const where = document.createElement("span"); where.textContent = "Layer " + d.layers[hover.row] + ", expert " + e;
+  tip.append(b, document.createElement("br"), where);
+  if (d.demand) {
+    const v = level(hover.row, e), use = document.createElement("span");
+    use.textContent = v === 0 ? "Never used so far" : "Used " + Math.max(1, Math.round(100 * (v / 35) ** 2)) + "% as much as the layer's most used";
+    tip.append(document.createElement("br"), use);
+  }
+  tip.style.display = "block";
+  const plot = $("plot"), tw = tip.offsetWidth, th = tip.offsetHeight;
+  let tx = cx + g.cw + 10, ty = cy + g.rh + 8;
+  if (tx + tw > plot.scrollLeft + plot.clientWidth - 4) tx = cx - tw - 10;
+  if (ty + th > plot.clientHeight - 4) ty = cy - th - 8;
+  tip.style.left = Math.max(4, tx) + "px"; tip.style.top = Math.max(4, ty) + "px";
+}
+
+$("map").addEventListener("pointermove", ev => { hover = cellAt(ev); showTip(); });
+$("map").addEventListener("pointerleave", () => { hover = null; showTip(); });
+$("map").addEventListener("blur", () => { hover = null; showTip(); });
+$("map").addEventListener("keydown", ev => {
+  const step = { ArrowLeft: [0, -1], ArrowRight: [0, 1], ArrowUp: [-1, 0], ArrowDown: [1, 0] }[ev.key];
+  if (!step || !geom) return;
+  ev.preventDefault();
+  hover = hover || { row: 0, col: 0 };
+  hover = { row: Math.max(0, Math.min(geom.R - 1, hover.row + step[0])), col: Math.max(0, Math.min(geom.E - 1, hover.col + step[1])) };
+  showTip();
+});
+for (const i of document.querySelectorAll("input[name=view], input[name=order]")) {
+  i.addEventListener("change", () => {
+    // the choice lives in the address, so a reload or a bookmark keeps it
+    history.replaceState(null, "", "#view=" + view() + "&order=" + ordering());
+    if (data) { reorder(); legend(); draw(); showTip(); }
+  });
+}
+for (const [k, v] of new URLSearchParams(location.hash.slice(1))) {
+  const i = document.querySelector('input[name="' + (k === "order" ? "order" : "view") + '"][value="' + (v === "demand" ? "demand" : k === "order" ? "index" : "state") + '"]');
+  if (i && (k === "view" || k === "order")) i.checked = true;
+}
+$("pause").addEventListener("click", () => {
+  paused = !paused;
+  $("pause").textContent = paused ? "Resume" : "Pause";
+  $("pause").setAttribute("aria-pressed", String(paused));
+  if (paused) status("Paused", false); else poll();
+});
+$("key").addEventListener("submit", ev => {
+  ev.preventDefault();
+  key = $("keyin").value.trim();
+  try { sessionStorage.setItem("tidelm-key", key); } catch (e) {}
+  poll();
+});
+window.addEventListener("resize", () => { if (data) { layout(); draw(); showTip(); } });
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { readColors(); if (data) { legend(); draw(); } });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(); });
+
+readColors();
+poll();
+timer = setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>

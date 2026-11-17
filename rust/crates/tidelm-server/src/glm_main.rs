@@ -330,6 +330,7 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         memo: anthropic::ReasoningMemo::default(),
         api_keys: crate::api_keys(),
         convlog: crate::convlog::Log::from_env(),
+        map_last: Default::default(),
     });
     let addr = format!("{}:{}", arg(args, "--host").unwrap_or_else(|| "0.0.0.0".into()),
                        arg(args, "--port").unwrap_or_else(|| "8000".into()));
@@ -358,19 +359,30 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
 /// round of every decoding lane a turn), cancels and new requests taken between turns. An engine
 /// error is fatal: a pair that failed one call cannot go on.
 fn engine_loop(mut srv: Server, rx: mpsc::Receiver<Cmd>) -> tidelm_engine::Result<()> {
-    loop {
-        if !srv.busy() {
+    let apply = |srv: &mut Server, c: Cmd| match c {
+        Cmd::Submit(j) => srv.submit(j),
+        Cmd::Cancel(id) => srv.cancel(id),
+        // host data, read here between turns: nothing reaches the device or rank 1
+        Cmd::Map(to) => {
+            let _ = to.send(Some(srv.eng.expert_map(srv.busy())));
+        }
+    };
+    'serve: loop {
+        // an idle engine answers the expert map without taking a turn
+        while !srv.busy() {
             match rx.recv() {
-                Ok(Cmd::Submit(j)) => srv.submit(j),
-                Ok(Cmd::Cancel(id)) => srv.cancel(id),
-                Err(_) => break,
+                Ok(c) => {
+                    let work = !matches!(c, Cmd::Map(_));
+                    apply(&mut srv, c);
+                    if work {
+                        break;
+                    }
+                }
+                Err(_) => break 'serve,
             }
         }
         while let Ok(c) = rx.try_recv() {
-            match c {
-                Cmd::Submit(j) => srv.submit(j),
-                Cmd::Cancel(id) => srv.cancel(id),
-            }
+            apply(&mut srv, c);
         }
         match srv.step() {
             Ok(done) => {

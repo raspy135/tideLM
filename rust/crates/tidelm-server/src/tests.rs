@@ -70,6 +70,7 @@ fn serve_with(text: Text, family: Family, eos: u32, max_seq: usize, api_keys: Ve
         memo: ReasoningMemo::default(),
         api_keys,
         convlog,
+        map_last: Default::default(),
     });
     let e = engine.clone();
     std::thread::spawn(move || {
@@ -78,6 +79,13 @@ fn serve_with(text: Text, family: Family, eos: u32, max_seq: usize, api_keys: Ve
                 Cmd::Submit(job) => job,
                 Cmd::Cancel(id) => {
                     e.cancels.lock().unwrap().push(id);
+                    continue;
+                }
+                Cmd::Map(to) => {
+                    let _ = to.send(Some(tidelm_engine::expert_map::ExpertMap {
+                        layers: vec![1, 2], experts: 3, state: vec![1, 0, 3, 2, 1, 1], demand: Some(vec![4.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+                        slots: 5, spare: 1, world: 2, busy: true, counters: vec![("hot reads", 7.0)],
+                    }));
                     continue;
                 }
             };
@@ -95,6 +103,7 @@ fn serve_with(text: Text, family: Family, eos: u32, max_seq: usize, api_keys: Ve
                         cancelled = id == job.id;
                     }
                     Ok(Cmd::Submit(_)) => panic!("the fake engine takes one job at a time"),
+                    Ok(Cmd::Map(_)) => {}
                     Err(_) => {}
                 }
             }
@@ -703,4 +712,26 @@ fn ds_conversation_log() {
     let s = &rows[1];
     assert!(s["messages"][0]["content"].as_str().unwrap().contains("[REDACTED hf_]"));
     assert!(s["prompt_ids"].is_null() && s["token_ids"].is_null());
+}
+
+#[test]
+fn expert_map_route() {
+    // the page is a static file, open; its data wants the key and is the engine's snapshot
+    let Some((addr, _engine, _ctx)) = glm_keyed(vec!["k1".into()]) else { return };
+    let (status, ctype, body) = request(&addr, "GET", "/expert-map", "", "");
+    assert_eq!(status, 200);
+    assert!(ctype.starts_with("text/html"), "{ctype}");
+    assert!(body.contains("/v1/expert-map"));
+    assert_eq!(request(&addr, "GET", "/v1/expert-map", "", "").0, 401);
+    let (status, _, body) = request(&addr, "GET", "/v1/expert-map", "Authorization: Bearer k1\r\n", "");
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["states"], json!(["103", "211"]));
+    assert_eq!(v["demand"], json!(["zi0", "000"]));
+    assert_eq!(v["layers"], json!([1, 2]));
+    assert_eq!(v["counts"], json!({"not_loaded": 1, "resident": 3, "hot": 1, "loading": 1}));
+    assert_eq!(v["resident_per_layer"], json!([1, 2]));
+    assert_eq!((v["sparks"].as_u64(), v["arena_slots"].as_u64(), v["busy"].as_bool(), v["stale"].as_bool()), (Some(2), Some(5), Some(true), Some(false)));
+    assert_eq!(v["counters"]["hot reads"], json!(7.0));
+    assert_eq!(v["engine"], json!("glm"));
 }

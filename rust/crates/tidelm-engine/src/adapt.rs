@@ -187,6 +187,11 @@ impl Adapt {
 
     /// The history to its file (rank 0, after every request). A failure is reported, not
     /// fatal: serving does not depend on it.
+    /// The history's mass, [layer * experts + e] (the expert map's demand).
+    pub fn mass(&self) -> &[f64] {
+        &self.mass
+    }
+
     pub fn save(&self) {
         let Some(path) = &self.db else { return };
         let mut m = BTreeMap::new();

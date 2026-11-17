@@ -10,7 +10,8 @@
 //! Routes: GET /health, GET /v1/models, POST /v1/chat/completions (streamed or not, with
 //! usage), POST /v1/debug/prompt (the rendered prompt and its ids, no engine work - what
 //! bench/bench.py's token_len calls), POST /v1/messages and /v1/messages/count_tokens (the
-//! Anthropic API, anthropic.rs), and for GLM POST /v1/completions. Requests run through the
+//! Anthropic API, anthropic.rs), GET /expert-map and /v1/expert-map (the residency now,
+//! expert_map.rs), and for GLM POST /v1/completions. Requests run through the
 //! engine's continuous-batching scheduler, one lane each; with --world 2, rank 1 follows rank
 //! 0's engine calls and serves nothing. Ctx::family picks the chat format and response rules:
 //! DeepSeek V4.1 (api.rs, server/app.py's) or GLM-5.3 (glm.rs, server/muse_app.py's).
@@ -21,6 +22,7 @@
 mod anthropic;
 mod api;
 mod convlog;
+mod expert_map;
 mod glm_main;
 mod glm;
 mod http;
@@ -50,6 +52,8 @@ fn arg(args: &[String], name: &str) -> Option<String> {
 pub enum Cmd {
     Submit(Job),
     Cancel(u64),
+    /// the residency now, for /v1/expert-map (None: an engine without resident experts)
+    Map(mpsc::Sender<Option<tidelm_engine::expert_map::ExpertMap>>),
 }
 
 /// Everything a connection thread needs.
@@ -74,6 +78,8 @@ pub struct Ctx {
     pub api_keys: Vec<String>,
     /// DSV41_DREAM=1: every finished completion appended for dreaming (convlog.rs); None: off
     pub convlog: Option<convlog::Log>,
+    /// /v1/expert-map's last answer, sent again (as stale) while the engine is inside a step
+    pub map_last: std::sync::Mutex<Option<serde_json::Value>>,
 }
 
 /// TIDELM_API_KEY: the keys clients authenticate with, comma-separated (unset or empty: the
@@ -405,6 +411,7 @@ fn main() -> tidelm_engine::Result<()> {
         memo: anthropic::ReasoningMemo::default(),
         api_keys: api_keys(),
         convlog: convlog::Log::from_env(),
+        map_last: Default::default(),
     });
     let addr = format!("{}:{}", arg(&args, "--host").unwrap_or_else(|| "0.0.0.0".into()),
                        arg(&args, "--port").unwrap_or_else(|| "8000".into()));
@@ -487,7 +494,7 @@ fn bench_width(engine: &mut Engine, path: &str) -> tidelm_engine::Result<()> {
 /// the channel while there is none. An engine error is fatal - a pair that failed one call
 /// cannot continue in step.
 fn engine_loop(mut engine: Engine, mut sched: Scheduler, rx: mpsc::Receiver<Cmd>) -> tidelm_engine::Result<()> {
-    let apply = |sched: &mut Scheduler, cmd: Cmd| match cmd {
+    let apply = |sched: &mut Scheduler, engine: &Engine, cmd: Cmd| match cmd {
         Cmd::Submit(job) => {
             let id = job.id;
             if let Err(e) = sched.submit(job) {
@@ -495,16 +502,27 @@ fn engine_loop(mut engine: Engine, mut sched: Scheduler, rx: mpsc::Receiver<Cmd>
             }
         }
         Cmd::Cancel(id) => sched.cancel(id),
+        // host data, read here between steps: nothing reaches the device or rank 1
+        Cmd::Map(to) => {
+            let _ = to.send(sched.expert_map(engine));
+        }
     };
-    loop {
-        if sched.idle() {
+    'serve: loop {
+        // an idle engine answers the expert map without taking a step
+        while sched.idle() {
             match rx.recv() {
-                Ok(cmd) => apply(&mut sched, cmd),
-                Err(_) => break,
+                Ok(cmd) => {
+                    let work = !matches!(cmd, Cmd::Map(_));
+                    apply(&mut sched, &engine, cmd);
+                    if work {
+                        break;
+                    }
+                }
+                Err(_) => break 'serve,
             }
         }
         while let Ok(cmd) = rx.try_recv() {
-            apply(&mut sched, cmd);
+            apply(&mut sched, &engine, cmd);
         }
         if let Err(e) = sched.step(&mut engine) {
             eprintln!("engine step failed: {e}");

@@ -30,9 +30,10 @@ impl ApiError {
     }
 }
 
-/// The routes answered without a key: the health check.
+/// The routes answered without a key: the health check, and the expert map's page (a static file;
+/// its data, /v1/expert-map, wants the key, which the page asks for).
 fn open_route(method: &str, path: &str) -> bool {
-    matches!((method, path), ("GET", "/health" | ""))
+    matches!((method, path), ("GET", "/health" | "" | "/expert-map"))
 }
 
 /// One request; with `api_keys`, one that carries none of them is refused before its body is read.
@@ -95,6 +96,13 @@ pub fn send_json(stream: &mut TcpStream, status: u16, v: &serde_json::Value) -> 
     stream.flush()
 }
 
+pub fn send_html(stream: &mut TcpStream, body: &str) -> std::io::Result<()> {
+    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+           body.len())?;
+    stream.write_all(body.as_bytes())?;
+    stream.flush()
+}
+
 pub fn send_error(stream: &mut TcpStream, e: &ApiError) -> std::io::Result<()> {
     let kind = if e.status >= 500 { "server_error" } else { "invalid_request_error" };
     send_json(stream, e.status, &serde_json::json!({
@@ -141,6 +149,8 @@ pub fn serve(mut stream: TcpStream, ctx: &Ctx) {
         return;
     }
     let res = match (req.method.as_str(), path) {
+        ("GET", "/expert-map") => send_html(&mut stream, crate::expert_map::PAGE).map_err(Into::into),
+        ("GET", "/v1/expert-map") => crate::expert_map::serve(&mut stream, ctx),
         (m, p) if open_route(m, p) => send_json(&mut stream, 200, &serde_json::json!({"status": "ok", "engine": "tidelm-rust"})).map_err(Into::into),
         ("GET", "/v1/models") => send_json(&mut stream, 200, &serde_json::json!({
             "object": "list",

@@ -487,6 +487,50 @@ impl Engine {
         self.push_lut()
     }
 
+    /// The residency as the expert map shows it (tidelm_engine::expert_map), on rank 0: the
+    /// decoder's MoE layers by the host LUT, with the reads in flight (async hot reads, a background
+    /// adaptation's newcomers), and the routing history's mass (the saved one, else the decayed
+    /// demand). Host data only: nothing here touches the device or rank 1. The MTP layer, whose
+    /// experts are all resident in their own arena, is left out.
+    pub fn expert_map(&self, busy: bool) -> tidelm_engine::expert_map::ExpertMap {
+        use tidelm_engine::expert_map::{ExpertMap, LOADING, RESIDENT};
+        let e = self.cfg.experts;
+        let layers: Vec<usize> = self.moe_layers().to_vec();
+        let mut state = Vec::with_capacity(layers.len() * e);
+        for &l in &layers {
+            state.extend(self.lut_h[l * e..(l + 1) * e].iter().map(|&s| if s >= 0 { RESIDENT } else { 0 }));
+        }
+        let mut mark = |l: usize, x: usize| {
+            if let Ok(r) = layers.binary_search(&l) {
+                state[r * e + x] = LOADING;
+            }
+        };
+        if let Some(a) = self.hot.as_ref().and_then(|h| h.asynch.as_ref()) {
+            for &(_, l, x, _) in &a.pending {
+                mark(l, x);
+            }
+        }
+        if let Some(a) = &self.adapt_bg {
+            for &(_, l, x, _) in &a.pending {
+                mark(l, x);
+            }
+        }
+        let mass = self.res.db_mass.as_deref().unwrap_or(&self.res.score);
+        let demand = (mass.len() >= self.cfg.layers * e).then(|| layers.iter().flat_map(|&l| mass[l * e..(l + 1) * e].iter().copied()).collect());
+        let s = &self.res.stats;
+        let mut counters = vec![("experts moved", s.swaps as f64)];
+        if self.hot.is_some() {
+            counters.push(("hot reads", s.hot_reads as f64));
+            counters.push(("hot reads kept", s.hot_kept as f64));
+            counters.push(("inline rescues", s.hot_rescue as f64));
+        }
+        if s.preload > 0 {
+            counters.push(("preloaded", s.preload as f64));
+        }
+        ExpertMap { layers, experts: e, state, demand, slots: self.res.owner.len(), spare: self.hot.is_some() as usize, world: self.world, busy,
+                    counters }
+    }
+
     pub(crate) fn push_lut(&mut self) -> Result<()> {
         for (a, &s) in self.allowed_h.iter_mut().zip(&self.lut_h) {
             *a = (s >= 0) as u8;

@@ -6,6 +6,7 @@
 //! - `forward`: the forward pass on the ds41 and native FP4 kernels
 //! - `adapt`: adaptive expert residency (the demand history and the swap planner)
 //! - `ablit`: the abliteration overlay (layers 10-35 attn.wo_b from a sidecar file)
+//! - `expert_map`: a moment of the residency, for the server's /expert-map page
 
 pub mod ablit;
 pub mod adapt;
@@ -13,6 +14,7 @@ pub mod config;
 pub mod copy;
 pub mod decode;
 pub mod draft_vocab;
+pub mod expert_map;
 pub mod forward;
 pub mod hot;
 pub mod kv;
