@@ -1,0 +1,12 @@
+== tp2-prose: workload=prose isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=60 ttft=    517.6 ms  tpot=  34.11 ms  decode= 29.32 tok/s  out=1024 (length)
+          accept_len=1.7729636048526862  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=60 ttft=    512.6 ms  tpot=  33.83 ms  decode= 29.56 tok/s  out=1024 (length)
+          accept_len=1.7078464106844742  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=60 ttft=    519.9 ms  tpot=  34.00 ms  decode= 29.41 tok/s  out=1024 (length)
+          accept_len=1.690909090909091  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=60 ttft=    501.6 ms  tpot=  35.11 ms  decode= 28.49 tok/s  out=1024 (length)
+          accept_len=1.6084905660377358  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=512.5513 ms  tpot=33.9999 ms  decode=29.4119 tok/s
+  -> ENGINE  accept_len=1.6909  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote results/rust-inkling2-40-tp2-20261116-512k/prose.json
