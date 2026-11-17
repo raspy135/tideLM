@@ -16,6 +16,7 @@ tide — so the engine gets better the more you use it.
 | `glm53-flash-35-tp2` | GLM-5.3-Flash | 2 | EXL3 3.5 bpw (3 or 4 bits a projection) | 12,096 / 12,096 (100%) | 1M (2 lanes, 2M shared) | **37.3 tok/s** | **49.1 tok/s** | 7.5 s |
 | `glm53-flash-40-tp1`<br>**Recommended** | GLM-5.3-Flash | **1** | EXL3 4 bpw (4 bits a projection) | 7,282 / 12,096 (60.2%) | 320K (2 lanes) | **22.1 tok/s** | **26.4 tok/s** | 12.1 s |
 | `glm53-flash-40-tp2`<br>**Recommended** | GLM-5.3-Flash | 2 | EXL3 4 bpw (4 bits a projection) | 12,096 / 12,096 (100%) | 1M (2 lanes, 2M shared) | **36.8 tok/s** | **46.6 tok/s** | 7.6 s |
+| `inkling2-small-40-tp2` | Inkling-2-Small | 2 | EXL3 4 bpw (4 bits a projection) | 11,967 / 18,432 (64.9%) | 512K (3 lanes) | **29.4 tok/s** | **42.3 tok/s** | 7.6 s |
 
 *Medians of three `bench/bench.py` runs after a warmup, 1,024 tokens at temperature 0.6 (raw runs:
 [DeepSeek](results/rust-ds41-20261028-pdl/README.md), [GLM-5.3](results/rust-glm53-exlr8-20261111/README.md),
@@ -25,7 +26,8 @@ draft vocabulary, a day after `home` - its 8K first token, which that run does n
 [the day before](results/rust-glm53-flash-35-tp1-20261112/README.md) - and
 [on two](results/rust-glm53-flash-35-tp2-20261112/README.md), the same day as `home`; its 4 bpw
 [on one Spark](results/rust-glm53-flash-40-tp1-20261114/README.md) and
-[on two](results/rust-glm53-flash-40-tp2-20261114/README.md), 2026-11-14).*
+[on two](results/rust-glm53-flash-40-tp2-20261114/README.md), 2026-11-14; Inkling-2-Small
+[on two](results/rust-inkling2-40-tp2-20261116-512k/README.md), 2026-11-16).*
 
 **Recommended** marks the checkpoint the author serves and would pick for each model: GLM-5.3's
 `home` and GLM-5.3-Flash's 4 bpw. It is a judgment from daily use - their answers read better - and
@@ -65,6 +67,16 @@ one routing history, it decodes 2-5% slower and scores 0.008 nats worse on held-
 (1.7592 against 1.7510, +- 0.0027), so by that number the residency lost costs more than the bit
 gained. The author serves it on one Spark all the same and finds it the smarter of the two; answers
 were not scored ([the 4 bpw checkpoint](docs/glm-flash.md#the-4-bpw-checkpoint-2026-11-13-behind-on-one-box-by-the-numbers-shipped-and-recommended-all-the-same)).
+
+Inkling-2-Small (Thinking Machines, 594B total, 17B active) is served from 0xSero's
+[EXL3 4 bpw](https://huggingface.co/0xSero/Inkling-2-Small-EXL3-4bpw) on two Sparks: its 18,432
+routed experts at 4 bits are 293 GB for a pair that holds about 190, so 64.9% stay resident, placed
+from a routing history the bundled seed starts (its top 64.9% carry 93% of the routing weight). The
+rest is the GLM engine's: non-expert weights in FP8, the 8 full-attention layers' keys and values in
+FP8 (held-out NLL +0.0014 +- 0.0011 against BF16), image input, the model's own DSpark drafter (7
+drafts a round) on the worker, and three lanes, so an agent's long conversation keeps its lane beside
+two chats. What the substituted experts cost in answers against the whole model is not measured here
+([Inkling-2-Small](docs/inkling.md)).
 
 Adaptive expert loading also allows flexible memory configuration.
 Memory for expert resident and context length are the big levers. You can run other services
@@ -108,11 +120,12 @@ experts. TideLM decides which share, keeps deciding, and cheaply covers the rest
    changes the numbers.
 
 Around that core: speculative decoding with each model's own drafter (DeepSeek's DSpark heads,
-GLM's MTP layer, both with a dynamic draft depth), prompt caching in RAM and on disk, FP8 KV caches
-split across the ranks (GLM), DeepSeek's context caches paged out of one pool the lanes share (one
-lane can run to 1M while another holds less; when the pool runs short the newest request waits on
-disk and resumes exactly, [details](docs/paged-kv.md)), image input (DeepSeek), tool calls,
-thinking and reasoning-effort control through an OpenAI-compatible API.
+GLM's MTP layer, both with a dynamic draft depth, and Inkling's DSpark drafter), prompt caching in
+RAM and on disk, FP8 KV caches split across the ranks (GLM), DeepSeek's context caches paged out of
+one pool the lanes share (one lane can run to 1M while another holds less; when the pool runs short
+the newest request waits on disk and resumes exactly, [details](docs/paged-kv.md)), image input
+(DeepSeek, GLM-5.3-Flash on one Spark, Inkling-2-Small), tool calls, thinking and reasoning-effort
+control through an OpenAI-compatible API.
 
 ## Quick start
 
@@ -122,7 +135,7 @@ path on both nodes - or, for a one-Spark profile (`glm53-flash-35-tp1`, `glm53-f
 [install guide](docs/install.md) has each step in full: disk per profile, copying between the
 nodes, the GLM packs.
 
-There are seven profiles, and each is set up on its own below. One image runs them all, one
+There are eight profiles, and each is set up on its own below. One image runs them all, one
 profile serves at a time (each fills both boxes, or the head), and switching between profiles that
 are set up is one `scripts/tide.sh start`.
 
@@ -135,6 +148,7 @@ are set up is one `scripts/tide.sh start`.
 | [`glm53-flash-35-tp2`](#glm-53-flash-on-two-sparks-glm53-flash-35-tp2) | GLM-5.3-Flash, EXL3 3.5 bpw | 88 GB | 137 GB |
 | [`glm53-flash-40-tp1`](#glm-53-flash-4-bpw-glm53-flash-40-tp1-glm53-flash-40-tp2) | GLM-5.3-Flash, EXL3 4 bpw, one Spark - **recommended** | 176 GB (one node) | |
 | [`glm53-flash-40-tp2`](#glm-53-flash-4-bpw-glm53-flash-40-tp1-glm53-flash-40-tp2) | GLM-5.3-Flash, EXL3 4 bpw - **recommended** | 98 GB | 156 GB |
+| [`inkling2-small-40-tp2`](#inkling-2-small-inkling2-small-40-tp2) | Inkling-2-Small, EXL3 4 bpw | 165 GB | 294 GB |
 
 ### DeepSeek-V4.1-Flash (`ds41-mxfp4`)
 
@@ -400,6 +414,42 @@ scripts/tide.sh start .env.glm53-flash-40-tp2
 Coming from 3.5 bpw, your learned routing history carries over: copy `glm-flash-stats.npz` to the
 name the new profile's `RUST_GLM_STATE_DB` gives before the first start.
 
+### Inkling-2-Small (`inkling2-small-40-tp2`)
+
+0xSero's [EXL3 4 bpw](https://huggingface.co/0xSero/Inkling-2-Small-EXL3-4bpw) of
+[Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small): every routed expert at 4
+bits, everything else the source's BF16. Two Sparks. The head mirrors the whole repository (312 GB;
+`tools/hf_mirror.py` needs only the standard library, resumes, and holds tens of MB, so it can run
+beside a serving engine); the experts are repacked a rank, and the rest - the non-expert shards, the
+drafter (`mtp.safetensors`), the tokenizer - becomes a 17 GB folder of hard links into the mirror:
+
+```bash
+cp configs/inkling2-small-40-tp2.env.example .env.inkling2-40-tp2
+python3 tools/hf_mirror.py --repo 0xSero/Inkling-2-Small-EXL3-4bpw \
+    --revision 996dc404c1feb3abd5330af8a3c52270ffe0008d --out <mirror dir>             # 312 GB
+python3 tools/hf_mirror.py --repo 0xSero/Inkling-2-Small-EXL3-4bpw \
+    --revision 996dc404c1feb3abd5330af8a3c52270ffe0008d --out <mirror dir> --verify    # sha256 of every file
+mkdir -p <dense dir>                        # GLM_MODEL_DIR; on the mirror's disk (else cp for ln)
+ln <mirror dir>/{model-nonexpert-*.safetensors,mtp.safetensors,config.json,chat_template.jinja} <dense dir>/
+ln <mirror dir>/{tokenizer.json,tokenizer_config.json,special_tokens_map.json} <dense dir>/
+python3 -c 'import json, sys; ix = json.load(open(sys.argv[1])); ix["weight_map"] = {k: v for k, v in
+    ix["weight_map"].items() if v.startswith("model-nonexpert-")}; json.dump(ix, open(sys.argv[2], "w"), indent=2)' \
+    <mirror dir>/model.safetensors.index.json <dense dir>/model.safetensors.index.json
+rsync -a <dense dir>/ <worker>:<dense dir>/
+uv run --no-project --with numpy python tools/glm_pack_exl3.py --mirror <mirror dir> \
+    --world 2 --rank 1 --verify 64 --out <packs dir>/inkling2-40-r1of2.bin           # 147 GB a rank
+rsync -a <packs dir>/inkling2-40-r1of2.bin <worker>:<packs dir>/ && rm <packs dir>/inkling2-40-r1of2.bin
+uv run --no-project --with numpy python tools/glm_pack_exl3.py --mirror <mirror dir> \
+    --world 2 --rank 0 --verify 64 --out <packs dir>/inkling2-40-r0of2.bin
+scripts/tide.sh build .env.inkling2-40-tp2
+scripts/tide.sh start .env.inkling2-40-tp2
+```
+
+The mirror can go once both packs are written: the folder's hard links keep its files. The first
+boot places its experts from the bundled seed (`profiles/inkling2-history-v1.npz`, a day and a night
+of the development pair's traffic, [what it is](profiles/inkling2-history-v1.json)); from then on the
+engine's own history (`RUST_GLM_STATE_DB`) takes over.
+
 ### Running it
 
 ```bash
@@ -408,13 +458,13 @@ scripts/tide.sh logs -f                  # its log (--rank 1: the worker's)
 scripts/tide.sh stop
 ```
 
-The model follows from the profile (`GLM_MODEL_DIR` → GLM-5.3 or GLM-5.3-Flash, by its config;
-`MODEL_DIR` → DeepSeek), and the Rust engine serves all three; the profiles carry only the settings
-it reads. It serves the OpenAI API with tool calls (and images: DeepSeek, GLM-5.3-Flash on one
-Spark) and the Anthropic route for Claude Code. It is up 15 s (DeepSeek) to 40-60 s (GLM-5.3,
-GLM-5.3-Flash) after the previous one has stopped; the first requests after a boot are slower while
-adaptation catches up with your traffic. One profile serves at a time: each fills both boxes, or
-the head. `TIDE_ENGINE=python` still starts the Python containers, from a profile with
+The model follows from the profile (`GLM_MODEL_DIR` → GLM-5.3, GLM-5.3-Flash or Inkling-2-Small,
+by its config; `MODEL_DIR` → DeepSeek), and the Rust engine serves all four; the profiles carry only
+the settings it reads. It serves the OpenAI API with tool calls (and images: DeepSeek, GLM-5.3-Flash
+on one Spark, Inkling-2-Small) and the Anthropic route for Claude Code. It is up 15 s (DeepSeek) to
+40-60 s (GLM-5.3, GLM-5.3-Flash, Inkling-2-Small) after the previous one has stopped; the first
+requests after a boot are slower while adaptation catches up with your traffic. One profile serves
+at a time: each fills both boxes, or the head. `TIDE_ENGINE=python` still starts the Python containers, from a profile with
 their settings (the examples as of `a6ec917`), and a profile the Rust engine does not serve
 (MXFP4 GLM experts, FP4 KV) goes to them with a note.
 
@@ -460,7 +510,8 @@ restores it. GLM-5.3-Flash installs from before 2026-11-13 name seed v0 in their
 `GLM_STATS_DB=/app/profiles/glm53-flash-history-v1.npz` and update the image first. GLM-5.3's
 profiles name no seed: the launcher picks the current one (`profiles/glm53-experts-v2.npz` since
 2026-11-13, [what it is](docs/adaptive-experts.md#glm-53)), so there the `mv` of your profile's
-`RUST_GLM_STATE_DB` and a restart are the whole reset.
+`RUST_GLM_STATE_DB` and a restart are the whole reset. Inkling-2-Small's profile names its seed
+(`profiles/inkling2-history-v1.npz`) and its state file (`inkling2-40-tp2-stats.npz` in the example).
 
 ## Abliterated overlay (DeepSeek V4.1)
 
@@ -532,7 +583,7 @@ and top-1 60.22 -> 59.95% (measured on the EXL3 profile; not yet on `glm53-exlr8
 ## Use
 
 - API: `http://<head>:8000/v1` (OpenAI-compatible chat completions, streaming included). Model
-  names: `deepseek` and `glm-5.3` (`SERVED_MODEL_NAME`).
+  names: `deepseek`, `glm-5.3`, `glm-5.3-flash` and `inkling-2-small` (`SERVED_MODEL_NAME`).
 - Authentication: with `API_KEY=<key>` in the profile (several: comma-separated), every route but
   `/health` wants the key, as OpenAI clients send it (`Authorization: Bearer <key>`) or Anthropic's
   (`x-api-key: <key>`; Claude Code's `ANTHROPIC_API_KEY`, or `ANTHROPIC_AUTH_TOKEN` as a Bearer
@@ -569,7 +620,8 @@ with what each setting measured.
 - [Install guide](docs/install.md): each setup step in full
 - [Hot reads: design and measurements](docs/hot-reads.md)
 - [Adaptive expert loading](docs/adaptive-experts.md), [GLM-5.3 engine plan](docs/glm53-plan.md),
-  [exlr8 on the pair](docs/exlr8.md)
+  [exlr8 on the pair](docs/exlr8.md), [GLM-5.3-Flash](docs/glm-flash.md),
+  [Inkling-2-Small](docs/inkling.md) and [its drafter](docs/inkling-dspark.md)
 - [Results](RESULTS.md), [TP memory](docs/tp-memory.md), [packed KV](docs/packed-kv.md),
   [speculative decoding](docs/decode-dynamic-depth.md), [decode dashboard](docs/decode-probe.md)
 
@@ -590,6 +642,7 @@ reuses its runtime, kernels and server.
 The RoCE all-gather is ported from [TensorFold](https://github.com/ashhart/TensorFold), which
 adapted b12x's; the EXL3 expert kernels port TensorFold's ExLlamaV3-derived device code. Models:
 DeepSeek-V4.1-Flash by DeepSeek, GLM-5.3 by Z.ai, the MXFP4 GLM checkpoint by AMD (Quark), the
-EXL3 GLM checkpoints by bertholomus and Mia's AI Lab, the exlr8 GLM release by KindlingAI. Full attributions and licences: [CREDITS.md](CREDITS.md).
+EXL3 GLM checkpoints by bertholomus and Mia's AI Lab, the exlr8 GLM release by KindlingAI,
+Inkling-2-Small by Thinking Machines and its EXL3 checkpoint by 0xSero. Full attributions and licences: [CREDITS.md](CREDITS.md).
 
 Repository code is [MIT-licensed](LICENSE). Model use is governed by each checkpoint's own license.

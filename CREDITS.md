@@ -37,6 +37,21 @@ profile.
 The GLM engine (`engine/glm/`) began as the Muse Spark Open experiment (`engine/muse/`), whose
 TP2 runtime, checkpoint readers and server it still builds on.
 
+## Inkling-2-Small
+
+**[Thinking Machines](https://huggingface.co/thinkingmachines/Inkling-2-Small)** -- Inkling-2-Small
+(594B total, 17B active, `inkling2`): the architecture (sliding-window and full attention with short
+convolutions and a block attention residual, 384-expert MoE, the vision tower, the DSpark drafter in
+`mtp.safetensors`), the weights, the tokenizer and chat template the server renders with. Apache-2.0.
+**[0xSero](https://huggingface.co/0xSero/Inkling-2-Small-EXL3-4bpw)** -- the EXL3 4.0 bpw checkpoint
+(mcg codebook, every expert at 4 bits, everything else the source's) that `tools/glm_pack_exl3.py`
+repacks per rank, and [inkling2-exl3](https://github.com/0xSero/inkling2-exl3), an engine for it.
+
+The engine's forward follows Hugging Face transformers' `modeling_inkling2.py` (main branch, 2026-11-16)
+and its drafter SGLang's DSpark (branch `inkling-2-small-support`, `ea3742849fa4`); both Apache-2.0.
+`tools/inkling_ref.py`, `tools/inkling_draft_ref.py` and `tools/inkling_vision_ref.py` transcribe them in
+plain PyTorch for the parity checks ([Inkling-2-Small](docs/inkling.md), [its drafter](docs/inkling-dspark.md)).
+
 ## Where the techniques come from
 
 Both of the load-bearing ideas here were built and measured in earlier recipes of mine on
