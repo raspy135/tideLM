@@ -6,9 +6,11 @@ random 8K 256). Profile `configs/inkling2-small-40-tp2.env.example` (`profile.en
 Inkling-2-Small EXL3 4bpw (rev 996dc404), FP8 non-expert weights, 11,865 routed experts resident a
 rank (64.4%, `GLM_SLOTS=15800`), 320K context over three lanes, adaptation and async hot reads on,
 the DSpark drafter (7 drafts a round, the calibrated gate 0.36, its listed vocabulary) on rank 1, the
-vision tower on rank 1. Host build of main at 5c19a81 plus the uncommitted work of 2026-11-16
-evening (fused decode attention, image prompts in the prefix store, time-shared prefill, the
-drafter's listed vocabulary); booted from the development pair's state file, not the bundled seed.
+vision tower on rank 1. Host build of main at 5c19a81 plus the evening's work later committed as
+b4bfb08, without its merged small kernels (fused decode attention, image prompts in the prefix
+store, time-shared prefill, the drafter's listed vocabulary); booted from the development pair's
+state file, not the bundled seed. `../rust-inkling2-40-tp2-20261116-merged/` is the same protocol on
+b4bfb08.
 The engine served these twelve requests and nothing else (`engine.txt`).
 
 | Workload | tok/s (runs) | Median | tokens a step |
