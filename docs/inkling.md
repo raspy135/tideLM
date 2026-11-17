@@ -120,9 +120,9 @@ the MoE, residency, hot reads, lanes, graphs and serving code are the same code.
 - Routing: a history of 116K prefilled tokens of `corpus/sources` puts 94.6% of the routed weight in
   the top 65.2% of the experts (86.5% in 48.8%, 73.5% in 32.6%). GLM-5.3's top 59% hold 72%.
   That was seed v0; the bundled seed is now v1 (profiles/inkling2-history-v1.json), the development
-  pair's state file after a day of serving on top of v0 (chat and agent traffic with screenshots,
-  generated answers in 16 languages, the benches): 19.2x v0's mass, about 2.2M tokens' worth, its top
-  64.9% holding 93.0% - flatter than a prefilled corpus, as decode traffic is.
+  pair's state file after a day and a night of serving on top of v0 (chat and agent traffic with
+  screenshots, generated answers in 16 languages, the benches): 22.1x v0's mass, about 2.6M tokens'
+  worth, its top 64.9% holding 93.0% - flatter than a prefilled corpus, as decode traffic is.
 - Held-out NLL, `corpus/heldout_quick.jsonl` as raw text (12,617 tokens): 1.1567 with BF16 dense
   weights, 1.1587 with FP8 (+0.0020 +- 0.0014 paired); coding 0.95 / top-1 76.4%, general 1.64 / 59.7%;
   2.38% of the routed weight missed, 1.13 hot reads a pass.

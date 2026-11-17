@@ -8,7 +8,7 @@ store). Host build of 061eaa9 (the FP8 key / value cache, GLM_INK_KV=fp8), profi
 (64.9%, `GLM_SLOTS=15935`), a 512K context (524,288 positions over three lanes, 4.43 GB a rank),
 adaptation and async hot reads on, the DSpark drafter with its listed vocabulary and the vision tower
 on rank 1, the merged small kernels on. The routing history is the development pair's state file
-(seed v1 is that file, copied an hour later).
+(seed v1 is that file the next morning, after a night more of the author's traffic).
 
 | Workload | tok/s (runs) | Median | tokens a step | the merged run (BF16 cache, 320K, 11,865) |
 | --- | --- | ---: | ---: | ---: |

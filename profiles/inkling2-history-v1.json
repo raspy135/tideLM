@@ -1,11 +1,11 @@
 {
   "version": 1,
-  "captured_at": "2026-11-16T23:15:00-08:00",
+  "captured_at": "2026-11-17T07:25:03-08:00",
   "model": "Inkling-2-Small (inkling2), 0xSero/Inkling-2-Small-EXL3-4bpw rev 996dc404",
   "layers": 48,
   "experts_per_layer": 384,
-  "tokens": 88573,
-  "source": "the development pair's state file (RUST_GLM_STATE_DB of configs/inkling2-small-40-tp2.env.example) on 2026-11-16, copied byte for byte: seed v0 (116,164 prefilled tokens of corpus/sources, see its .json) and everything the pair routed on top of it that day - the author's chat and coding-agent traffic (Open WebUI, Pi harness; text and screenshots), 44 generated answers across 16 languages and code (the drafter vocabulary's collection), and the benchmark, NLL and bring-up runs made against the serving pair. Every (layer, expert) entry is at least v0's. Its total mass is 19.2x v0's: about 2.2M tokens' worth at v0's mass a token (every prompt token and decode verify row, rejected drafts included). The top 64.9% of experts hold 93.0% of the routed weight (v0: 94.5%). tokens is the engine's counter since its last boot (it restarts at 0 each boot), not the history's size.",
+  "tokens": 430652,
+  "source": "the development pair's state file (RUST_GLM_STATE_DB of configs/inkling2-small-40-tp2.env.example) on 2026-11-17 07:25, copied byte for byte: seed v0 (116,164 prefilled tokens of corpus/sources, see its .json) and everything the pair routed on top of it over a day and a night - the author's chat and coding-agent traffic (Open WebUI, Pi harness; text and screenshots), 44 generated answers across 16 languages and code (the drafter vocabulary's collection), and the benchmark, NLL and bring-up runs made against the serving pair. Every (layer, expert) entry is at least v0's. Its total mass is 22.1x v0's: about 2.6M tokens' worth at v0's mass a token (every prompt token and decode verify row, rejected drafts included). The top 64.9% of experts hold 93.0% of the routed weight (v0: 94.5%). tokens is the engine's counter since its last boot (it restarts at 0 each boot), not the history's size.",
   "contents": "Aggregate router mass per (layer, expert) and a token count only; no prompts, responses, KV, or model weights.",
-  "sha256": "a2d17e9dc90e3e8bebc8ff9b796cc8750ccc740f2afc2ba1a24a3746f43de9d3"
+  "sha256": "7deb8644b09e923e1c58d34bf927604112bd63b0928b9442f6a9e7bb622d97bb"
 }
