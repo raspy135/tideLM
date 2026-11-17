@@ -1,0 +1,12 @@
+== tp2-code: workload=code isl=n/a osl=1024 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=76 ttft=    840.5 ms  tpot=  25.35 ms  decode= 39.45 tok/s  out=1024 (length)
+          accept_len=2.589873417721519  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=76 ttft=    557.8 ms  tpot=  26.84 ms  decode= 37.25 tok/s  out=1024 (length)
+          accept_len=2.298876404494382  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=76 ttft=    515.2 ms  tpot=  24.86 ms  decode= 40.22 tok/s  out=1024 (length)
+          accept_len=2.6163682864450126  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=76 ttft=    526.7 ms  tpot=  24.42 ms  decode= 40.95 tok/s  out=1024 (length)
+          accept_len=2.671018276762402  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=526.7204 ms  tpot=24.865 ms  decode=40.2172 tok/s
+  -> ENGINE  accept_len=2.6164  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote results/rust-inkling2-40-tp2-20261116-merged/code.json

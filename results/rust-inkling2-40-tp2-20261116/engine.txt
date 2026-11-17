@@ -1,0 +1,24 @@
+request 2: prompt 60, prefill 60 in 0.72 s (84 tok/s), decode 1024 in 36.06 s (28.37 tok/s, 1.81 a step), length
+request 2, GLM: 1.47 drafted / 0.81 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 9.8% (prompt 19.5%, decode 9.4%; by score 7.3%), hot reads 1111 (kept 1111, 74 inline, 0.08 s waited), swaps 1792 (0.00 s waited),
+request 3: prompt 60, prefill 60 in 0.74 s (81 tok/s), decode 1024 in 36.29 s (28.19 tok/s, 1.74 a step), length
+request 3, GLM: 1.25 drafted / 0.74 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 1.1% (prompt 3.6%, decode 1.0%; by score 0.7%), hot reads 98 (kept 98, 4 inline, 0.05 s waited), swaps 1613 (0.00 s waited), prelo
+request 4: prompt 60 (8 cached), prefill 52 in 0.38 s (137 tok/s), decode 1024 in 36.54 s (27.99 tok/s, 1.68 a step), length
+request 4, GLM: 1.06 drafted / 0.68 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 0.5% (prompt 2.1%, decode 0.4%; by score 0.3%), hot reads 24 (kept 24, 5 inline, 0.00 s waited), swaps 326 (0.00 s waited), preloa
+request 5: prompt 60, prefill 60 in 0.41 s (148 tok/s), decode 1024 in 36.95 s (27.69 tok/s, 1.63 a step), length
+request 5, GLM: 0.96 drafted / 0.63 accepted a round, copy rounds 1 (1 long, 0 accepted), miss rate 0.5% (prompt 3.0%, decode 0.4%; by score 0.3%), hot reads 24 (kept 24, 1 inline, 0.02 s waited), swaps 331 (0.00 s waited), preloa
+request 6: prompt 76, prefill 76 in 0.72 s (105 tok/s), decode 1024 in 29.80 s (34.33 tok/s, 2.25 a step), length
+request 6, GLM: 1.68 drafted / 1.25 accepted a round, copy rounds 5 (3 long, 5 accepted), miss rate 8.4% (prompt 22.0%, decode 7.5%; by score 6.8%), hot reads 937 (kept 937, 41 inline, 0.11 s waited), swaps 1517 (0.00 s waited), p
+request 7: prompt 76, prefill 76 in 0.39 s (193 tok/s), decode 1024 in 28.06 s (36.46 tok/s, 2.39 a step), length
+request 7, GLM: 1.68 drafted / 1.39 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 3.3% (prompt 6.2%, decode 3.1%; by score 2.1%), hot reads 157 (kept 157, 8 inline, 0.02 s waited), swaps 397 (0.00 s waited), prel
+request 8: prompt 76, prefill 76 in 0.39 s (197 tok/s), decode 1024 in 30.50 s (33.54 tok/s, 2.10 a step), length
+request 8, GLM: 1.38 drafted / 1.11 accepted a round, copy rounds 1 (0 long, 0 accepted), miss rate 2.6% (prompt 5.8%, decode 2.4%; by score 1.7%), hot reads 114 (kept 114, 5 inline, 0.03 s waited), swaps 307 (0.00 s waited), prel
+request 9: prompt 76, prefill 76 in 0.39 s (195 tok/s), decode 1024 in 26.64 s (38.40 tok/s, 2.58 a step), length
+request 9, GLM: 1.93 drafted / 1.58 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 2.3% (prompt 5.5%, decode 2.1%; by score 1.4%), hot reads 92 (kept 92, 5 inline, 0.01 s waited), swaps 281 (0.00 s waited), preloa
+request 10: prompt 8173, prefill 8173 in 7.84 s (1043 tok/s), decode 256 in 9.94 s (25.65 tok/s, 1.52 a step), length
+request 10, GLM: 0.60 drafted / 0.52 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 38.7% (prompt 39.7%, decode 7.7%; by score 38.8%), hot reads 168 (kept 166, 3 inline, 0.01 s waited), swaps 768 (0.00 s waited), 
+request 11: prompt 8184, prefill 8184 in 7.80 s (1049 tok/s), decode 256 in 10.53 s (24.22 tok/s, 1.51 a step), length
+request 11, GLM: 0.88 drafted / 0.51 accepted a round, copy rounds 1 (1 long, 2 accepted), miss rate 4.3% (prompt 4.3%, decode 5.3%; by score 2.8%), hot reads 70 (kept 72, 3 inline, 0.00 s waited), swaps 768 (0.00 s waited), prelo
+request 12: prompt 8167, prefill 8167 in 7.83 s (1043 tok/s), decode 256 in 11.08 s (23.01 tok/s, 1.31 a step), length
+request 12, GLM: 0.35 drafted / 0.31 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 0.8% (prompt 0.7%, decode 4.2%; by score 0.5%), hot reads 87 (kept 85, 0 inline, 0.00 s waited), swaps 509 (0.00 s waited), prelo
+request 13: prompt 8176, prefill 8176 in 7.63 s (1072 tok/s), decode 162 in 6.32 s (25.47 tok/s, 1.56 a step), stop
+request 13, GLM: 0.72 drafted / 0.56 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 0.4% (prompt 0.4%, decode 4.0%; by score 0.3%), hot reads 56 (kept 58, 1 inline, 0.01 s waited), swaps 133 (0.00 s waited), prelo

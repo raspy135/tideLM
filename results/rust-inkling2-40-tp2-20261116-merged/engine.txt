@@ -1,0 +1,31 @@
+request 1: prompt 60, prefill 60 in 0.71 s (84 tok/s), decode 1024 in 35.45 s (28.86 tok/s, 1.74 a step), length
+request 1, GLM: 1.39 drafted / 0.74 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 10.4% (prompt 25.8%, decode 9.7%; by score 7.7%), hot reads 1111 (kept 1109, 82 inline, 0.11 s waited), swaps 1792 (0.00 s waited), preload 
+request 2: prompt 60, prefill 60 in 0.74 s (82 tok/s), decode 1024 in 34.39 s (29.75 tok/s, 1.69 a step), length
+request 2, GLM: 1.05 drafted / 0.69 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 1.1% (prompt 5.5%, decode 0.9%; by score 0.7%), hot reads 52 (kept 52, 5 inline, 0.01 s waited), swaps 1792 (0.00 s waited), preload 0 (0 MB
+request 3: prompt 60, prefill 60 in 0.43 s (140 tok/s), decode 1024 in 34.64 s (29.54 tok/s, 1.69 a step), length
+request 3, GLM: 1.08 drafted / 0.69 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 0.6% (prompt 2.6%, decode 0.5%; by score 0.4%), hot reads 51 (kept 51, 4 inline, 0.01 s waited), swaps 480 (0.00 s waited), preload 0 (0 MB,
+request 4: prompt 60, prefill 60 in 0.40 s (152 tok/s), decode 1024 in 34.67 s (29.50 tok/s, 1.69 a step), length
+request 4, GLM: 1.08 drafted / 0.69 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 0.5% (prompt 2.6%, decode 0.4%; by score 0.3%), hot reads 34 (kept 34, 2 inline, 0.01 s waited), swaps 317 (0.00 s waited), preload 0 (0 MB,
+request 5: prompt 76, prefill 76 in 0.71 s (107 tok/s), decode 1024 in 26.06 s (39.25 tok/s, 2.59 a step), length
+request 5, GLM: 1.97 drafted / 1.59 accepted a round, copy rounds 1 (1 long, 1 accepted), miss rate 8.3% (prompt 20.9%, decode 7.4%; by score 6.6%), hot reads 925 (kept 918, 47 inline, 0.10 s waited), swaps 1469 (0.00 s waited), preload 0 (
+request 6: prompt 76, prefill 76 in 0.41 s (187 tok/s), decode 1024 in 27.61 s (37.05 tok/s, 2.30 a step), length
+request 6, GLM: 1.59 drafted / 1.30 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 3.7% (prompt 6.3%, decode 3.5%; by score 2.4%), hot reads 217 (kept 223, 9 inline, 0.04 s waited), swaps 441 (0.00 s waited), preload 0 (0 M
+request 7: prompt 76, prefill 76 in 0.38 s (201 tok/s), decode 1024 in 25.57 s (40.01 tok/s, 2.62 a step), length
+request 7, GLM: 2.00 drafted / 1.62 accepted a round, copy rounds 1 (0 long, 1 accepted), miss rate 2.7% (prompt 6.0%, decode 2.5%; by score 1.7%), hot reads 146 (kept 143, 5 inline, 0.03 s waited), swaps 302 (0.00 s waited), preload 0 (0 M
+request 8: prompt 76, prefill 76 in 0.39 s (194 tok/s), decode 1024 in 25.11 s (40.74 tok/s, 2.67 a step), length
+request 8, GLM: 2.12 drafted / 1.67 accepted a round, copy rounds 2 (0 long, 3 accepted), miss rate 2.4% (prompt 5.6%, decode 2.2%; by score 1.5%), hot reads 84 (kept 87, 4 inline, 0.04 s waited), swaps 295 (0.00 s waited), preload 0 (0 MB,
+request 9: prompt 8173 (8171 cached), prefill 2 in 0.16 s (13 tok/s), decode 256 in 8.84 s (28.84 tok/s, 1.59 a step), length
+request 9, GLM: 0.69 drafted / 0.60 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 7.6% (prompt 35.4%, decode 7.4%; by score 6.2%), hot reads 199 (kept 196, 6 inline, 0.04 s waited), swaps 179 (0.00 s waited), preload 0 (0 
+request 10: prompt 8184 (8182 cached), prefill 2 in 0.14 s (15 tok/s), decode 256 in 8.81 s (28.94 tok/s, 1.61 a step), length
+request 10, GLM: 0.77 drafted / 0.62 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 3.0% (prompt 29.8%, decode 2.8%; by score 2.1%), hot reads 46 (kept 48, 0 inline, 0.03 s waited), swaps 150 (0.00 s waited), preload 0 (0 M
+request 11: prompt 8167 (8165 cached), prefill 2 in 0.14 s (15 tok/s), decode 256 in 9.14 s (27.91 tok/s, 1.53 a step), length
+request 11, GLM: 0.69 drafted / 0.53 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 2.2% (prompt 28.0%, decode 2.0%; by score 1.5%), hot reads 37 (kept 38, 0 inline, 0.02 s waited), swaps 124 (0.00 s waited), preload 0 (0 M
+request 12: prompt 8176 (8174 cached), prefill 2 in 0.13 s (15 tok/s), decode 256 in 9.19 s (27.76 tok/s, 1.58 a step), length
+request 12, GLM: 0.80 drafted / 0.58 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 3.6% (prompt 27.7%, decode 3.4%; by score 2.7%), hot reads 75 (kept 74, 0 inline, 0.02 s waited), swaps 180 (0.00 s waited), preload 0 (0 M
+request 13: prompt 8175, prefill 8175 in 7.60 s (1076 tok/s), decode 256 in 9.03 s (28.25 tok/s, 1.66 a step), length
+request 13, GLM: 0.96 drafted / 0.66 accepted a round, copy rounds 1 (1 long, 0 accepted), miss rate 20.7% (prompt 21.4%, decode 2.1%; by score 16.4%), hot reads 28 (kept 29, 0 inline, 0.00 s waited), swaps 768 (0.00 s waited), preload 0 (0
+request 14: prompt 8164, prefill 8164 in 7.62 s (1072 tok/s), decode 256 in 9.57 s (26.65 tok/s, 1.51 a step), length
+request 14, GLM: 0.66 drafted / 0.51 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 2.0% (prompt 2.0%, decode 1.7%; by score 1.2%), hot reads 19 (kept 19, 0 inline, 0.00 s waited), swaps 768 (0.00 s waited), preload 0 (0 MB
+request 15: prompt 8178, prefill 8178 in 7.56 s (1082 tok/s), decode 256 in 8.81 s (28.94 tok/s, 1.69 a step), length
+request 15, GLM: 0.93 drafted / 0.70 accepted a round, copy rounds 1 (1 long, 0 accepted), miss rate 0.5% (prompt 0.4%, decode 1.8%; by score 0.3%), hot reads 15 (kept 15, 0 inline, 0.00 s waited), swaps 304 (0.00 s waited), preload 0 (0 MB
+request 16: prompt 8176, prefill 8176 in 7.44 s (1098 tok/s), decode 256 in 9.08 s (28.08 tok/s, 1.62 a step), length

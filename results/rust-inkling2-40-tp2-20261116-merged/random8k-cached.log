@@ -1,0 +1,12 @@
+== tp2-random: workload=random isl=8192 osl=256 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=8173 ttft=    297.2 ms  tpot=  34.17 ms  decode= 29.27 tok/s  out=256 (length)
+          accept_len=1.59375  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=8184 ttft=    269.8 ms  tpot=  34.06 ms  decode= 29.36 tok/s  out=256 (length)
+          accept_len=1.6139240506329113  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=8167 ttft=    268.4 ms  tpot=  35.36 ms  decode= 28.28 tok/s  out=256 (length)
+          accept_len=1.526946107784431  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=8176 ttft=    265.1 ms  tpot=  35.53 ms  decode= 28.14 tok/s  out=256 (length)
+          accept_len=1.5838509316770186  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=268.4167 ms  tpot=35.358 ms  decode=28.2821 tok/s
+  -> ENGINE  accept_len=1.5839  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote results/rust-inkling2-40-tp2-20261116-merged/random8k.json
