@@ -1,5 +1,5 @@
-//! The checkpoint's config.json as engine/glm/config.py reads it: GLM-5.3 (`glm_moe_dsa`) or
-//! GLM-5.3-Flash (`glm5_next`, its `text_config`).
+//! The checkpoint's config.json as engine/glm/config.py reads it: GLM-5.3 (`glm_moe_dsa`),
+//! GLM-5.3-Flash (`glm5_next`, its `text_config`) or Inkling 2 (`inkling2`, its `text_config`).
 
 use std::path::Path;
 
@@ -13,6 +13,10 @@ pub enum Arch {
     /// GLM-5.3-Flash: KDA linear attention on most layers, MLA + DSA without RoPE on every 4th,
     /// mHC hyper-connections, EXL3 routed experts and BF16 everything else
     Flash,
+    /// Inkling 2: grouped-query attention with a relative bias and a sink (a 1,024-token window on
+    /// most layers, the whole context on every 6th), short convolutions, the block attention
+    /// residual, EXL3 routed experts with no shared expert, BF16 everything else
+    Inkling2,
 }
 
 /// A layer's attention.
@@ -24,6 +28,11 @@ pub enum AttnKind {
     Kda,
     /// GLM-5.3-Flash's deepseek_sparse_attention: MLA without RoPE, the indexer over 4:1 key pools
     Dsa,
+    /// Inkling 2's sliding-window layer: keys p - window + 1 ..= p
+    Swa,
+    /// Inkling 2's full-attention layer: every earlier key, q / k / v each from its own mix of the
+    /// block states, k and v through the dynamic short convolution
+    Full,
 }
 
 /// mHC (hyper-connections, DeepSeek-V4's): the residual is `mult` streams.
@@ -40,6 +49,38 @@ pub struct KdaCfg {
     pub heads: usize,
     pub dim: usize,
     pub lower: f32,
+}
+
+/// Inkling 2's shapes and constants (modeling_inkling2.py's names in the comments).
+#[derive(Clone, Copy, Debug)]
+pub struct InkCfg {
+    /// key / value heads (num_key_value_heads); a query head's is head * kv_heads / heads
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    /// a head's relative state (d_rel): mixed with rel_logits_proj into a bias per backward distance
+    pub d_rel: usize,
+    /// sliding_window_size: a Swa row's keys, itself included; also its relative bias's extent
+    pub window: usize,
+    /// rel_extent: distances a Full row's relative bias covers (zero past it)
+    pub rel_extent: usize,
+    /// the short convolutions' taps (sconv_kernel_size)
+    pub conv: usize,
+    /// n_layers_per_attn_res_block: a layer l with l % block == 0 saves its input as a block state
+    /// and restarts the residual from its attention output
+    pub block: usize,
+    /// qk_l2_clip_threshold, rel_l2_clip_threshold
+    pub qk_clip: f32,
+    pub rel_clip: f32,
+    /// mlp_gate_softcap, mlp_up_softcap: c * tanh(x / c) on the SwiGLU's linear gate factor and up
+    pub gate_cap: f32,
+    pub up_cap: f32,
+    /// final_logit_softcapping
+    pub logit_cap: f32,
+    /// Full layers scale q and the relative state by 1 + alpha * ln(max((p + 1) / floor, 1))
+    pub log_floor: f32,
+    pub log_alpha: f32,
+    /// unpadded_vocab_size: the head's rows that are tokens (the rest are never emitted)
+    pub real_vocab: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -77,6 +118,7 @@ pub struct GlmConfig {
     pub dense: Vec<bool>,
     pub hc: Option<Hc>,
     pub kda: Option<KdaCfg>,
+    pub ink: Option<InkCfg>,
     pub mtp: bool,
     pub eos: Vec<u32>,
     pub head_bits: usize,
@@ -89,7 +131,8 @@ impl GlmConfig {
         match top.get("model_type").and_then(|v| v.as_str()) {
             Some("glm_moe_dsa") => Self::load_glm53(&top),
             Some("glm5_next") => Self::load_flash(&top),
-            t => Err(format!("config.json: model_type {t:?}, not glm_moe_dsa or glm5_next").into()),
+            Some("inkling2") => Self::load_inkling2(&top),
+            t => Err(format!("config.json: model_type {t:?}, not glm_moe_dsa, glm5_next or inkling2").into()),
         }
     }
 
@@ -150,6 +193,7 @@ impl GlmConfig {
             dense,
             hc: None,
             kda: None,
+            ink: None,
             mtp,
             eos: eos(raw),
             head_bits: q.get("head_bits").and_then(|v| v.as_u64()).unwrap_or(6) as usize,
@@ -254,6 +298,7 @@ impl GlmConfig {
             dense,
             hc: Some(Hc { mult: 4, iters: u("hc_sinkhorn_iters")?, eps: f("hc_eps").unwrap_or(1e-6) as f32 }),
             kda: Some(kda),
+            ink: None,
             mtp,
             eos: eos(raw),
             head_bits: 16,
@@ -269,6 +314,110 @@ impl GlmConfig {
         }
         if c.topk > 8 || c.index_topk % c.index_pool != 0 {
             return Err("config.json: top-k past 8, or an index top-k that is not whole pools".into());
+        }
+        Ok(c)
+    }
+
+    /// Inkling 2: config.json's text_config (the vision tower is not served; the DSpark drafter of
+    /// mtp_config is not ported, so `mtp` is false and decoding is plain), the EXL3 quantization at
+    /// the top level (the routed experts only, as GLM-5.3-Flash's).
+    fn load_inkling2(top: &serde_json::Value) -> Result<Self> {
+        let raw = top.get("text_config").ok_or("config.json: inkling2 without text_config")?;
+        let u = |k: &str| -> Result<usize> {
+            raw.get(k).and_then(|v| v.as_u64()).map(|v| v as usize).ok_or_else(|| format!("config.json: no {k}").into())
+        };
+        let f = |k: &str| -> Result<f32> {
+            raw.get(k).and_then(|v| v.as_f64()).map(|v| v as f32).ok_or_else(|| format!("config.json: no {k}").into())
+        };
+        let layers = u("num_hidden_layers")?;
+        let local = raw.get("local_layer_ids").and_then(|v| v.as_array()).ok_or("config.json: no local_layer_ids")?;
+        let mut attn = vec![AttnKind::Full; layers];
+        for v in local {
+            let l = v.as_u64().map(|v| v as usize).filter(|&l| l < layers).ok_or("config.json: a local_layer_ids entry past the layers")?;
+            attn[l] = AttnKind::Swa;
+        }
+        let q = top.get("quantization_config").ok_or("config.json: no quantization_config (an EXL3 checkpoint)")?;
+        if q.get("quant_method").and_then(|v| v.as_str()) != Some("exl3")
+            || !matches!(q.get("codebook").and_then(|v| v.as_str()), Some("mcg") | Some("mul1"))
+        {
+            return Err("config.json: the routed experts must be EXL3 (mcg or mul1); the official NVFP4 / MXFP8 experts are not read".into());
+        }
+        // the router: sigmoid scores, the bias in the selection only (the reference's defaults; the
+        // checkpoint's config does not name a scoring function)
+        if raw.get("scoring_func").and_then(|v| v.as_str()).unwrap_or("sigmoid") != "sigmoid"
+            || raw.get("n_shared_experts").and_then(|v| v.as_u64()).unwrap_or(0) != 0
+            || !raw.get("use_gate_bias").and_then(|v| v.as_bool()).unwrap_or(false)
+        {
+            return Err("config.json: Inkling 2 routing other than sigmoid with a selection bias and no shared expert".into());
+        }
+        let ink = InkCfg {
+            kv_heads: u("num_key_value_heads")?,
+            head_dim: u("head_dim")?,
+            d_rel: u("d_rel")?,
+            window: u("sliding_window_size")?,
+            rel_extent: u("rel_extent")?,
+            conv: u("sconv_kernel_size")?,
+            block: u("n_layers_per_attn_res_block")?,
+            qk_clip: f("qk_l2_clip_threshold")?,
+            rel_clip: f("rel_l2_clip_threshold")?,
+            gate_cap: f("mlp_gate_softcap")?,
+            up_cap: f("mlp_up_softcap")?,
+            logit_cap: f("final_logit_softcapping")?,
+            log_floor: f("log_scaling_n_floor")?,
+            log_alpha: f("log_scaling_alpha")?,
+            real_vocab: u("unpadded_vocab_size")?,
+        };
+        let c = GlmConfig {
+            arch: Arch::Inkling2,
+            hidden: u("hidden_size")?,
+            layers,
+            heads: u("num_attention_heads")?,
+            q_lora: 0,
+            kv_lora: 0,
+            nope: 0,
+            rope: 0,
+            v_dim: 0,
+            index_heads: 0,
+            index_dim: 0,
+            index_topk: 0,
+            index_pool: 1,
+            experts: u("n_routed_experts")?,
+            topk: u("num_experts_per_tok")?,
+            moe_inter: u("intermediate_size")?,
+            inter: 0,
+            vocab: u("vocab_size")?,
+            rms_eps: f("rms_norm_eps")?,
+            rope_theta: 0.0,
+            routed_scaling: f("route_scale")?,
+            swiglu_limit: f32::INFINITY,
+            attn,
+            index_full: vec![false; layers],
+            dense: vec![false; layers],
+            hc: None,
+            kda: None,
+            ink: Some(ink),
+            mtp: false,
+            eos: eos(top),
+            head_bits: 16,
+            mtp_bits: 4,
+        };
+        // what the kernels are built for
+        let want = [(c.hidden, 4608, "hidden"), (c.heads, 48, "heads"), (ink.kv_heads, 8, "key/value heads"),
+                    (ink.head_dim, 128, "head dim"), (ink.d_rel, 16, "d_rel"), (ink.window, 1024, "window"),
+                    (ink.rel_extent, 1024, "rel_extent"), (ink.conv, 4, "conv taps"), (c.experts, 384, "experts"),
+                    (c.moe_inter, 2304, "expert intermediate"),
+                    (ink.gate_cap.to_bits() as usize, 4f32.to_bits() as usize, "gate softcap (bits)"),
+                    (ink.up_cap.to_bits() as usize, 25f32.to_bits() as usize, "up softcap (bits)"),
+                    (u("swa_num_attention_heads")?, c.heads, "window layers' heads"),
+                    (u("swa_num_key_value_heads")?, ink.kv_heads, "window layers' key/value heads"),
+                    (u("swa_head_dim")?, ink.head_dim, "window layers' head dim")];
+        for (got, w, what) in want {
+            if got != w {
+                return Err(format!("config.json: {what} {got}, the kernels take {w}").into());
+            }
+        }
+        if c.topk > 8 || ink.block == 0 || ink.real_vocab > c.vocab || c.attn[0] != AttnKind::Swa {
+            return Err("config.json: top-k past 8, no residual block size, a vocabulary past the head, or a full-attention layer 0".into());
         }
         Ok(c)
     }
@@ -293,6 +442,22 @@ impl GlmConfig {
 
     pub fn is_flash(&self) -> bool {
         self.arch == Arch::Flash
+    }
+
+    pub fn is_inkling(&self) -> bool {
+        self.arch == Arch::Inkling2
+    }
+
+    /// Inkling 2: the block states a layer's attention input mixes with its own input (the inputs
+    /// of the earlier layers l' with l' % block == 0); its MLP input sees one more when l itself
+    /// is such a layer.
+    pub fn ink_blocks_before(&self, l: usize) -> usize {
+        self.ink.map_or(0, |k| l.div_ceil(k.block))
+    }
+
+    /// Inkling 2: the block states in all (the final mix's count).
+    pub fn ink_blocks(&self) -> usize {
+        self.ink_blocks_before(self.layers)
     }
 
     /// The decoder's KDA layers, in order (their state's layer index is their place here).
@@ -338,7 +503,7 @@ mod tests {
 
     #[test]
     fn both_families_parse() {
-        let flash = Path::new("/home/ryan/models/GLM-5.3-Flash-3.5bpw-dense");
+        let flash = Path::new("/home/ryan/models/GLM-5.3-Flash-4bpw-dense");
         if flash.join("config.json").exists() {
             let c = GlmConfig::load(flash).unwrap();
             assert_eq!(c.arch, Arch::Flash);
@@ -350,6 +515,22 @@ mod tests {
             assert_eq!(c.attend_max(), 2051);
             assert_eq!(c.swiglu_limit, 10.0);
             assert_eq!(c.eos, vec![154820, 154827, 154829]);
+        }
+        let ink = Path::new("/home/ryan/models/Inkling-2-Small-EXL3-4bpw");
+        if ink.join("config.json").exists() {
+            let c = GlmConfig::load(ink).unwrap();
+            let k = c.ink.unwrap();
+            assert_eq!(c.arch, Arch::Inkling2);
+            assert_eq!((c.layers, c.n_layers(), c.hidden, c.experts, c.moe_inter, c.heads), (48, 48, 4608, 384, 2304, 48));
+            assert_eq!(c.attn.iter().filter(|&&a| a == AttnKind::Full).count(), 8);
+            assert!((0..48).all(|l| (c.attn[l] == AttnKind::Full) == (l % 6 == 5)));
+            assert!(!c.mtp && c.dense.iter().all(|&d| !d) && c.hc.is_none());
+            assert_eq!((k.kv_heads, k.window, k.block, k.real_vocab), (8, 1024, 6, 200058));
+            assert_eq!((c.routed_scaling, k.gate_cap, k.up_cap, k.logit_cap), (8.0, 4.0, 25.0, 30.0));
+            assert_eq!(c.eos, vec![200006]);
+            // layer 0 mixes nothing, layers 1..=6 one saved state, the final mix all eight
+            assert_eq!((c.ink_blocks_before(0), c.ink_blocks_before(1), c.ink_blocks_before(6), c.ink_blocks_before(7)), (0, 1, 1, 2));
+            assert_eq!(c.ink_blocks(), 8);
         }
         let glm = Path::new("/home/ryan/models/GLM-5.3-dense-exlr8");
         if glm.join("config.json").exists() {

@@ -256,3 +256,84 @@ extern "C" int ds_vit_unfold(void* stream, const void* x, int nh, int nw, int C,
         static_cast<const __nv_bfloat16*>(x), nh, nw, C, static_cast<__nv_bfloat16*>(out));
     return static_cast<int>(cudaGetLastError());
 }
+
+// ---------------------------------------------------------------------------------------------
+// Inkling 2's tower (transformers' Inkling2VisionModel: a 23-layer bf16 ViT with a class token,
+// LayerNorm and LayerScale; tidelm-glm's inkling_vision.rs). Its attention, RoPE and plain
+// epilogues are the kernels above; these two are what they lack.
+
+namespace {
+
+__device__ __forceinline__ float ink_warp_sum(float v) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
+    return v;
+}
+
+// nn.LayerNorm over rows of n with weight and bias: fp32 statistics (biased variance), one
+// rounding of (x - mean) * rstd * w + b to bf16, as PyTorch's CUDA layer_norm does a bf16 row.
+// A block of 256 a row; out may be x (a thread writes only the elements it read).
+__global__ void __launch_bounds__(256) ink_vit_ln_kernel(const __nv_bfloat16* x, const __nv_bfloat16* __restrict__ w,
+                                                         const __nv_bfloat16* __restrict__ b, __nv_bfloat16* out, int n,
+                                                         float eps) {
+    __shared__ float red[8];
+    const int64_t r = blockIdx.x;
+    const __nv_bfloat16* xr = x + r * n;
+    float s = 0.f;
+    for (int i = threadIdx.x; i < n; i += 256) s += bf(xr[i]);
+    s = ink_warp_sum(s);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = s;
+    __syncthreads();
+    float tot = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) tot += red[i];
+    const float mean = tot / n;
+    __syncthreads();
+    float d2 = 0.f;
+    for (int i = threadIdx.x; i < n; i += 256) {
+        const float d = bf(xr[i]) - mean;
+        d2 += d * d;
+    }
+    d2 = ink_warp_sum(d2);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = d2;
+    __syncthreads();
+    float var = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) var += red[i];
+    const float rstd = rsqrtf(var / n + eps);
+    for (int i = threadIdx.x; i < n; i += 256) out[r * n + i] = to_bf((bf(xr[i]) - mean) * rstd * bf(w[i]) + bf(b[i]));
+}
+
+// A Linear's epilogue under LayerScale (x = x + gamma * f(x)): t = bf16(y + bias), then
+// bf16(gamma * t), then bf16(residual + that) - the three roundings of the bf16 module; out may
+// be residual.
+__global__ void ink_vit_ls_epilogue_kernel(const float* __restrict__ y, const __nv_bfloat16* __restrict__ bias,
+                                           const __nv_bfloat16* __restrict__ gamma, const __nv_bfloat16* residual,
+                                           __nv_bfloat16* out, int M, int Ncols) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)M * Ncols) return;
+    const int n = i % Ncols;
+    const float t = bf(to_bf(__fadd_rn(y[i], bf(bias[n]))));
+    const float g = bf(to_bf(__fmul_rn(bf(gamma[n]), t)));
+    out[i] = to_bf(__fadd_rn(bf(residual[i]), g));
+}
+
+}  // namespace
+
+extern "C" int ink_vit_ln(void* stream, const void* x, const void* w, const void* b, void* out, int M, int n, float eps) {
+    if (M < 1 || n < 1) return cudaErrorInvalidValue;
+    ink_vit_ln_kernel<<<(unsigned)M, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16*>(x), static_cast<const __nv_bfloat16*>(w), static_cast<const __nv_bfloat16*>(b),
+        static_cast<__nv_bfloat16*>(out), n, eps);
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int ink_vit_ls_epilogue(void* stream, const void* y, const void* bias, const void* gamma, const void* residual,
+                                   void* out, int M, int N) {
+    if (!bias || !gamma || !residual) return cudaErrorInvalidValue;
+    const int64_t total = (int64_t)M * N;
+    ink_vit_ls_epilogue_kernel<<<(unsigned)((total + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const float*>(y), static_cast<const __nv_bfloat16*>(bias), static_cast<const __nv_bfloat16*>(gamma),
+        static_cast<const __nv_bfloat16*>(residual), static_cast<__nv_bfloat16*>(out), M, N);
+    return static_cast<int>(cudaGetLastError());
+}

@@ -26,7 +26,8 @@ use crate::{Cmd, Ctx};
 pub enum Family {
     /// DeepSeek V4.1: the checkpoint's encoder and server/app.py's rules (this module)
     Ds,
-    /// GLM-5.3: chat_template.jinja (tidelm_text::glm) and server/muse_app.py's rules (glm.rs)
+    /// GLM-5.3 and GLM-5.3-Flash: chat_template.jinja (tidelm_text::glm) and server/muse_app.py's
+    /// rules (glm.rs); Inkling 2: the same routes over its own template (tidelm_text::inkling)
     Glm(crate::glm::GlmSettings),
 }
 
@@ -35,7 +36,7 @@ impl Family {
     /// test), else DeepSeek.
     pub fn load(model_dir: &Path, text: &Text) -> Result<Family, tidelm_text::Error> {
         let cfg: Value = serde_json::from_slice(&std::fs::read(model_dir.join("config.json"))?)?;
-        Ok(if matches!(cfg["model_type"].as_str(), Some("glm_moe_dsa") | Some("glm5_next")) {
+        Ok(if matches!(cfg["model_type"].as_str(), Some("glm_moe_dsa") | Some("glm5_next") | Some("inkling2")) {
             Family::Glm(crate::glm::GlmSettings::load(model_dir, text)?)
         } else {
             Family::Ds

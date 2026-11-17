@@ -682,7 +682,8 @@ impl Server {
             self.eng.set_sampling(Some(want))?;
             self.sampling[lane] = Some(want);
         }
-        let depth = if self.eng.cfg.mtp { self.opt.depth } else { 0 };
+        // drafting: GLM's MTP layer, or Inkling 2's DSpark drafter (7 drafts a round at most)
+        let depth = if self.eng.cfg.mtp { self.opt.depth } else if self.eng.has_drafter() { self.opt.depth.min(7) } else { 0 };
         // the lane's sequence's prefix, one token back so the reprefilled row refills its MTP row
         let mut common = prompt.iter().zip(&self.eng.tokens).take_while(|(a, b)| a == b).count().min(prompt.len() - 1);
         // images share one placeholder id: no prefix past the first image the prompt and the lane's
@@ -691,8 +692,14 @@ impl Server {
         common = common.min(self.eng.image_floor(lane, &job.images, &keys));
         // the disk store's deepest saved prefix, when it gains enough over the lane's (not with KDA:
         // the store holds KV rows, not the linear-attention state)
+        // Inkling 2: a restore ends at a saved segment's end with the rings as they were there, so the
+        // prefill goes on from exactly that position
+        let mut restored = false;
         if let Some(store) = self.store.as_mut().filter(|_| !self.eng.cfg.is_flash()) {
-            if let Some((chain, end)) = store.plan_restore(&prompt, common) {
+            // a prompt with images restores only what lies before its first one: a segment is its
+            // tokens' hash, which cannot tell one image from another (and none is saved with images)
+            let upto = job.images.iter().map(|im| im.start).min().unwrap_or(prompt.len()).min(prompt.len());
+            if let Some((chain, end)) = store.plan_restore(&prompt[..upto], common) {
                 let c: Vec<(u64, usize, usize, String)> = chain.iter().map(|s| (s.id, s.start, s.end, s.hash.clone())).collect();
                 let ids: Vec<u64> = chain.iter().map(|s| s.id).collect();
                 let bad = chain.last().unwrap().id;
@@ -706,6 +713,7 @@ impl Server {
                     (self.log)(&format!("[prefix] restored [{common}, {end}) from {} segment(s) in {:.2} s", ids.len(),
                                         t0.elapsed().as_secs_f64()));
                     common = end;
+                    restored = self.eng.cfg.is_inkling();
                 } else {
                     // a segment some rank could not read: forget it (and what extends it)
                     let store = self.store.as_mut().unwrap();
@@ -717,7 +725,7 @@ impl Server {
                 }
             }
         }
-        let keep = common.saturating_sub(1);
+        let keep = if restored { common } else { common.saturating_sub(1) };
         // KDA's state goes back within its last pass, or to the lane's snapshot near its last prompt's
         // end (a chat's follow-up: the template drops the last answer's reasoning, so the prompt leaves
         // the lane's sequence where that answer began; a regenerate); anything else prefills again
@@ -968,11 +976,25 @@ impl Server {
         if self.eng.tokens.len() < prompt.len() || self.eng.tokens[..prompt.len()] != *prompt {
             return Ok(());
         }
+        if self.eng.lane_has_images(self.eng.lane) {
+            return Ok(());
+        }
+        // Inkling 2: a segment ends where the lane's snapshot is (near the prompt's end: its tail is
+        // that snapshot); no snapshot inside the prompt, nothing to save
+        let prompt = if self.eng.cfg.is_inkling() {
+            match self.eng.ink_snapshot_pos(self.eng.lane).filter(|&p| p <= prompt.len()) {
+                Some(p) => &prompt[..p],
+                None => return Ok(()),
+            }
+        } else {
+            prompt
+        };
         if crate::prefix::free_bytes(&store.dir) < 10_000_000_000 {
             return Ok(());
         }
         let bpp = self.eng.bytes_per_position();
-        let Some((seg, evict)) = store.plan_save(prompt, bpp) else { return Ok(()) };
+        let Some((mut seg, evict)) = store.plan_save(prompt, bpp) else { return Ok(()) };
+        seg.bytes += self.eng.seg_tail_bytes();
         let t0 = Instant::now();
         if self.eng.disk_save(seg.id, seg.start, seg.end, &seg.hash, &evict)? {
             store.drop_segments(&evict);
@@ -1128,7 +1150,35 @@ impl Server {
         }
         // drafting: the first MTP pass carries every non-plain lane's anchor (a copy lane's for its
         // cache row alone), the next ones the lanes whose chain goes on
-        let mtp_lanes: Vec<usize> = (0..blocks.len()).filter(|&k| !blocks[k].plain).collect();
+        // Inkling 2: one block pass of the DSpark drafter a lane gives its 7 drafts at once (greedy:
+        // q is a point mass, as a copy's), kept while the gate holds; no MTP layer, no chain of passes
+        let dspark = self.eng.has_drafter();
+        if dspark {
+            for k in 0..blocks.len() {
+                if blocks[k].plain || blocks[k].copy {
+                    continue;
+                }
+                let (lane, anchor) = (runs[blocks[k].i].lane, runs[blocks[k].i].anchor);
+                let (toks, probs) = self.eng.ink_draft(lane, anchor, blocks[k].p)?;
+                let b = &mut blocks[k];
+                for step in 0..toks.len().min(b.dmax) {
+                    let pk = probs[step] as f64;
+                    b.conf *= pk;
+                    let keep_it = match self.cal.as_mut() {
+                        Some(c) => c.keep(step, b.conf),
+                        None => b.conf >= opt.dyn_gate,
+                    };
+                    if !keep_it {
+                        break;
+                    }
+                    b.pending.push((step, b.conf));
+                    b.pks.push(pk);
+                    b.drafts.push(toks[step]);
+                    b.qs.push(None);
+                }
+            }
+        }
+        let mtp_lanes: Vec<usize> = if dspark { vec![] } else { (0..blocks.len()).filter(|&k| !blocks[k].plain).collect() };
         if !mtp_lanes.is_empty() {
             let logits = mtp_lanes.iter().any(|&k| !blocks[k].copy);
             if self.eng.has_draft_list() {
@@ -1344,7 +1394,7 @@ impl Server {
                 self.eng.set_pos(b.p + 1 + acc[k].1)?;
             }
         }
-        let fills: Vec<MtpRows> = blocks.iter().enumerate().filter(|(k, b)| !b.plain && acc[*k].1 > 0).map(|(k, b)| {
+        let fills: Vec<MtpRows> = blocks.iter().enumerate().filter(|(k, b)| !dspark && !b.plain && acc[*k].1 > 0).map(|(k, b)| {
             MtpRows { lane: runs[b.i].lane, ids: &b.drafts[..acc[k].1], hidden: Hidden::Target(acc[k].0), pos0: b.p }
         }).collect();
         if fills.iter().map(|f| f.ids.len()).sum::<usize>() <= MAX_ROWS || fills.len() == 1 {

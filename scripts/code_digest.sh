@@ -10,7 +10,7 @@
 # --rust: the Rust engine's instead, the sources the image's tidelm-server is built from (rust/
 # less its target/ - the pages it compiles in among them, as /expert-map's -, the CUDA/C++ files its
 # build scripts compile from tools/ and engine/, and the draft vocabulary it compiles in), and the
-# routing history rust-up.sh starts a fresh GLM-5.3
+# routing histories rust-up.sh starts a fresh GLM-5.3 or Inkling 2
 # install from by its path in the image (profiles/, not compiled in: an image without it would
 # fail that first boot);
 # dual-build.sh stamps it as tidelm.rust_sha and rust-up.sh compares it the same way.
@@ -27,7 +27,7 @@ if [[ $rust == 1 ]]; then
            -o -name '*.cpp' -o -name '*.h' -o -name '*.toml' -o -name Cargo.lock -o -name '*.html' \) -print0
       printf '%s\0' tools/roce/roce.cu tools/roce/roce_common.h tools/fp4_moe_cuda.cu tools/exl3_moe_cuda.cu \
              engine/engram_gather.cpp engine/draft_vocab_ranking_v1.txt engine/glm_draft_vocab_ranking_v1.txt \
-             profiles/glm53-experts-v2.npz; } \
+             profiles/glm53-experts-v2.npz profiles/inkling2-history-v0.npz; } \
         | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16
     exit 0
 fi

@@ -21,6 +21,8 @@ pub mod ds41;
 pub mod exl3;
 pub mod flash;
 pub mod glm;
+pub mod inkling;
+pub mod inkling_draft;
 pub mod vision;
 
 use std::os::raw::{c_int, c_void};

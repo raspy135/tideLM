@@ -9,6 +9,7 @@
 
 pub mod chat;
 pub mod glm;
+pub mod inkling;
 
 use std::collections::HashMap;
 use std::path::Path;

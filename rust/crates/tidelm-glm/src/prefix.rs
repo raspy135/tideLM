@@ -64,6 +64,9 @@ pub struct Index {
 }
 
 pub struct Store {
+    /// a restore ends at a saved segment's end, never inside one: a model with state beside its
+    /// positional rows (Inkling 2's rings) has that state at segment ends only
+    pub whole_only: bool,
     /// this rank's directory: <root>/<namespace>/rank-<r>
     pub dir: PathBuf,
     pub budget: u64,
@@ -83,7 +86,7 @@ impl Store {
         mkdir_private(&root.join(ns))?;
         let dir = root.join(ns).join(format!("rank-{rank}"));
         mkdir_private(&dir)?;
-        let mut s = Store { dir, budget, min_gain, index: Index::default() };
+        let mut s = Store { whole_only: false, dir, budget, min_gain, index: Index::default() };
         if rank == 0 {
             s.load_index();
         }
@@ -182,7 +185,7 @@ impl Store {
         let base = full.as_ref().map(|s| s.end).unwrap_or(0);
         let mut best: Option<(Segment, usize)> = None;
         for c in self.index.segs.values() {
-            if c.parent != full.as_ref().map(|s| s.id) || c.start != base {
+            if self.whole_only || c.parent != full.as_ref().map(|s| s.id) || c.start != base {
                 continue;
             }
             let Some(toks) = self.read_tokens(c.id) else { continue };
@@ -415,7 +418,12 @@ impl Engine {
     /// Write this rank's rows of [start, end) to `path` (O_DIRECT, staged in 64 MB pieces).
     fn seg_write(&mut self, path: &Path, start: usize, end: usize, hash: &str) -> Result<()> {
         self.ensure_stage()?;
-        let ranges = self.seg_ranges(start, end);
+        let mut ranges = self.seg_ranges(start, end);
+        if self.cfg.is_inkling() {
+            // Inkling 2: the rows are the full-attention layers'; the window layers' rings and the
+            // convolutions' inputs as they were at `end` follow them (the lane's snapshot there)
+            ranges.extend(self.ink_tail_save(end)?);
+        }
         let sizes: Vec<usize> = ranges.iter().map(|r| r.1).collect();
         let mut f = open_direct_write(path)?;
         let stage = self.stage.as_mut().unwrap();
@@ -458,7 +466,11 @@ impl Engine {
     /// missing or is not the segment it should be.
     fn seg_read(&mut self, path: &Path, start: usize, end: usize, hash: &str) -> Result<bool> {
         self.ensure_stage()?;
-        let ranges = self.seg_ranges(start, end);
+        let mut ranges = self.seg_ranges(start, end);
+        if self.cfg.is_inkling() {
+            // every segment of a chain brings its tail; the last one read is the chain's end's
+            ranges.extend(self.ink_tail_load());
+        }
         let Ok(mut f) = open_direct_read(path) else { return Ok(false) };
         let stage = self.stage.as_mut().unwrap();
         if f.read_exact(&mut stage[..ALIGN]).is_err() {
@@ -591,6 +603,9 @@ impl Engine {
         let ok = self.pair_status(ok)?;
         if ok {
             self.pos = n;
+            if self.cfg.is_inkling() {
+                self.ink_after_disk_load(n)?;
+            }
         }
         Ok(ok)
     }

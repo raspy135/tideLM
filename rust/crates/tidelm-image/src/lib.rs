@@ -10,6 +10,8 @@
 
 use sha2::{Digest, Sha256};
 
+pub mod inkling2;
+
 /// The checkpoint's vision_* settings the preprocessing reads.
 #[derive(Clone, Copy, Debug)]
 pub struct Plan {

@@ -8,6 +8,12 @@
 //! remembers the images its sequence holds (position, rows, the patches' key), so a follow-up
 //! turn whose prompt extends the sequence reuses the prefix past an image it shares instead of
 //! prefilling (and encoding) again from the first image.
+//!
+//! Inkling 2's images take the same lane bookkeeping with another tower (inkling_vision), which
+//! is resident and lives on the pair's last rank only: that rank has the memory to spare (rank 0
+//! runs the server and binds the expert budget), and one encode means both ranks splice the same
+//! bits. Rank 0 sends the patches with the request (OP_INK_IMAGES), the last rank encodes them,
+//! and a gather gives every rank the features.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -20,6 +26,8 @@ use crate::forward::Engine;
 use crate::Result;
 
 pub const ROW: usize = 4096;
+/// Rank 0 -> the other ranks: a lane's images for its coming prefill (none: its spans cleared).
+pub(crate) const OP_INK_IMAGES: u32 = 40;
 
 /// MemAvailable an image request's features must leave: memguard stops the server below 4 GiB.
 /// (/proc/meminfo, not cudaMemGetInfo: on the Spark's shared memory that reports about MemFree,
@@ -50,6 +58,8 @@ pub struct VisionState {
     pub lanes: Vec<LaneImages>,
     pub images: usize,
     pub secs: f64,
+    /// Inkling 2: the tower, on the rank that encodes (the pair's last; None on the others)
+    pub ink: Option<crate::inkling_vision::OwnedInkVision>,
 }
 
 /// An image's rows in the prompt (one a 2 x 2 patch window).
@@ -97,11 +107,16 @@ impl Engine {
     /// Image input on (GLM_VISION=1): images of at most `max_tokens` rows; their features are
     /// allocated a request.
     pub fn enable_vision(&mut self, dir: &Path, max_tokens: usize) -> Result<()> {
-        if !self.cfg.is_flash() || self.world != 1 {
-            return Err("vision: GLM-5.3-Flash on one box only".into());
-        }
+        let ink = if self.cfg.is_inkling() {
+            crate::inkling_vision::check_config(dir)?;
+            if self.rank + 1 == self.world { Some(crate::inkling_vision::OwnedInkVision::open(dir, &self.st, max_tokens)?) } else { None }
+        } else if !self.cfg.is_flash() || self.world != 1 {
+            return Err("vision: GLM-5.3-Flash on one box, or Inkling 2".into());
+        } else {
+            None
+        };
         let lanes = (0..self.lanes()).map(|_| LaneImages::default()).collect();
-        self.vis = Some(VisionState { dir: dir.to_path_buf(), max_tokens, lanes, images: 0, secs: 0.0 });
+        self.vis = Some(VisionState { dir: dir.to_path_buf(), max_tokens, lanes, images: 0, secs: 0.0, ink });
         Ok(())
     }
 
@@ -117,6 +132,9 @@ impl Engine {
     /// lane's spans. The tower borrows expert slots and gives them back here. Ok: (images
     /// encoded, their rows, seconds).
     pub fn encode_images(&mut self, lane: usize, images: &[ImageIn], keys: &[u128], keep: usize) -> Result<(usize, usize, f64)> {
+        if self.vis.is_some() && self.cfg.is_inkling() {
+            return self.encode_images_ink(lane, images, keys, keep);
+        }
         let Some(v) = self.vis.as_mut() else {
             return if images.is_empty() { Ok((0, 0, 0.0)) } else { Err("image inputs on a server without GLM_VISION".into()) };
         };
@@ -175,17 +193,125 @@ impl Engine {
         Ok((todo.len(), total, secs))
     }
 
+    /// Whether the lane's sequence holds images. The disk prefix store names a segment by its
+    /// tokens, and every image is the same placeholder id: such a sequence is not saved.
+    pub fn lane_has_images(&self, lane: usize) -> bool {
+        self.vis.as_ref().is_some_and(|v| !v.lanes[lane].seq.is_empty())
+    }
+
     /// Whether the lane's coming prefill has image rows.
     pub fn has_image_spans(&self, lane: usize) -> bool {
         self.vis.as_ref().is_some_and(|v| !v.lanes[lane].spans.is_empty())
     }
 
-    /// The lane's prompt has prefilled (or its request ended): its spans and features are done with.
+    /// The lane's prompt has prefilled (or its request ended): its spans and features are done with
+    /// (Inkling 2 on the pair: on every rank, or a later pass would splice them on one side only).
     pub fn clear_image_spans(&mut self, lane: usize) {
+        let had = self.vis.as_ref().is_some_and(|v| !v.lanes[lane].spans.is_empty() || v.lanes[lane].feats.is_some());
+        if had && self.cfg.is_inkling() {
+            if let Err(e) = self.mirror_msg(|m| {
+                m.u32(OP_INK_IMAGES).u32(lane as u32).u32(0);
+            }) {
+                eprintln!("[vision] clearing lane {lane}'s images on the pair: {e}");
+            }
+        }
         if let Some(v) = self.vis.as_mut() {
             v.lanes[lane].spans.clear();
             v.lanes[lane].feats = None;
         }
+    }
+
+    /// encode_images for Inkling 2: rank 0's bookkeeping, then every rank's part (ink_images_local).
+    fn encode_images_ink(&mut self, lane: usize, images: &[ImageIn], keys: &[u128], keep: usize) -> Result<(usize, usize, f64)> {
+        let h = self.cfg.hidden;
+        let v = self.vis.as_mut().unwrap();
+        let max = v.max_tokens;
+        let li = &mut v.lanes[lane];
+        // the sequence keeps the images wholly before `keep` (image_floor matched them)
+        li.seq.retain(|&(s, n, _)| s + n <= keep);
+        let todo: Vec<usize> = (0..images.len()).filter(|&i| images[i].start + image_rows(&images[i]) > keep).collect();
+        if let Some(im) = todo.iter().map(|&i| &images[i]).find(|im| image_rows(im) > max || im.vit_h % 2 != 0 || im.vit_w % 2 != 0) {
+            return Err(format!("an image of {} tokens ({} x {} patches): GLM_VISION_MAX_TOKENS is {max}", image_rows(im), im.vit_h,
+                               im.vit_w).into());
+        }
+        let total: usize = todo.iter().map(|&i| image_rows(&images[i])).sum();
+        // the features on this rank, and the gather's copy of every rank's while it runs
+        let need = total * h * 2 * (1 + self.world);
+        if let Some(free) = mem_available().filter(|&f| total > 0 && f < need + FEATS_MARGIN) {
+            return Err(format!("{total} image tokens need {} MB of features: {} MB available, {} MB kept free", need >> 20,
+                               free >> 20, FEATS_MARGIN >> 20).into());
+        }
+        let t0 = Instant::now();
+        let list: Vec<(usize, usize, usize, &[u16])> = todo.iter()
+            .map(|&i| (images[i].start, images[i].vit_h / 2, images[i].vit_w / 2, &images[i].patches[..])).collect();
+        self.mirror_msg(|m| {
+            m.u32(OP_INK_IMAGES).u32(lane as u32).u32(list.len() as u32);
+            for &(start, rows, cols, patches) in &list {
+                // two bf16 values a word (an image's values are an even count: 4 x 1200 a token)
+                let words: Vec<u32> = patches.chunks_exact(2).map(|c| c[0] as u32 | (c[1] as u32) << 16).collect();
+                m.u32(start as u32).u32(rows as u32).u32(cols as u32).u32s(&words);
+            }
+        })?;
+        self.ink_images_local(lane, &list)?;
+        let secs = t0.elapsed().as_secs_f64();
+        let v = self.vis.as_mut().unwrap();
+        v.lanes[lane].seq.extend(todo.iter().map(|&i| (images[i].start, image_rows(&images[i]), keys[i])));
+        v.images += todo.len();
+        v.secs += secs;
+        Ok((todo.len(), total, secs))
+    }
+
+    /// A lane's images (first position, token rows, token columns, patches) for its coming prefill,
+    /// on this rank: its spans, and their features [tokens][hidden] - encoded here when this rank has
+    /// the tower, the encoding rank's through a gather otherwise. None: the lane's spans cleared.
+    pub(crate) fn ink_images_local(&mut self, lane: usize, list: &[(usize, usize, usize, &[u16])]) -> Result<()> {
+        let h = self.cfg.hidden;
+        {
+            let v = self.vis.as_mut().ok_or("images on an engine without GLM_VISION")?;
+            v.lanes[lane].spans.clear();
+            v.lanes[lane].feats = None;
+        }
+        if list.is_empty() {
+            return Ok(());
+        }
+        let total: usize = list.iter().map(|x| x.1 * x.2).sum();
+        let feats = DeviceBuffer::<u16>::zeroed(total * h)?;
+        let (mut spans, mut row) = (vec![], 0usize);
+        for &(start, rows, cols, patches) in list {
+            if let Some(t) = self.vis.as_ref().and_then(|v| v.ink.as_ref()) {
+                t.tower.encode(&self.st, patches, rows, cols, feats.ptr_at(row * h))?;
+            }
+            spans.push((start, rows * cols, row));
+            row += rows * cols;
+        }
+        if self.world > 1 {
+            // every rank's buffer side by side (the others' are zeros): the last rank's is the features
+            let nb = total * h * 2;
+            let all = DeviceBuffer::<u8>::new(self.world * nb)?;
+            self.gather(feats.raw(), nb, all.raw(), true)?;
+            unsafe {
+                tidelm_cuda::memcpy_async(feats.raw(), all.ptr_at((self.world - 1) * nb), nb, tidelm_cuda::ffi::MEMCPY_DEVICE_TO_DEVICE,
+                                          &self.st)?;
+            }
+            self.st.synchronize()?;
+        }
+        let li = &mut self.vis.as_mut().unwrap().lanes[lane];
+        li.spans = spans;
+        li.feats = Some(feats);
+        Ok(())
+    }
+
+    /// Rank 1's side of OP_INK_IMAGES.
+    pub(crate) fn follow_ink_images(&mut self, r: &mut tidelm_comm::Reader) -> Result<()> {
+        let (lane, n) = (r.u32()? as usize, r.u32()? as usize);
+        let mut own = vec![];
+        for _ in 0..n {
+            let (start, rows, cols) = (r.u32()? as usize, r.u32()? as usize, r.u32()? as usize);
+            let patches: Vec<u16> = r.u32s()?.into_iter().flat_map(|w| [w as u16, (w >> 16) as u16]).collect();
+            own.push((start, rows, cols, patches));
+        }
+        let list: Vec<(usize, usize, usize, &[u16])> = own.iter().map(|x| (x.0, x.1, x.2, &x.3[..])).collect();
+        self.ink_images_local(lane, &list)
     }
 }
 

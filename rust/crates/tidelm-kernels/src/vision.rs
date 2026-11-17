@@ -25,4 +25,14 @@ extern "C" {
     /// The aligner's 3x3 unfold of x [nh * nw][c]: out [ceil(nh/3) * ceil(nw/3)][c * 9]
     /// (channel-major, zero past the grid).
     pub fn ds_vit_unfold(stream: CudaStream, x: *const c_void, nh: c_int, nw: c_int, c: c_int, out: *mut c_void) -> c_int;
+
+    /// Inkling 2's tower. out [m][n] = bf16(LayerNorm(x; w, b, eps)): fp32 statistics, biased
+    /// variance, one rounding; out may be x.
+    pub fn ink_vit_ln(stream: CudaStream, x: *const c_void, w: *const c_void, b: *const c_void, out: *mut c_void, m: c_int,
+                      n: c_int, eps: f32) -> c_int;
+
+    /// A Linear's epilogue under LayerScale: out = bf16(residual + bf16(gamma * bf16(y + bias))); y f32
+    /// [m][n]; bias, gamma [n]; residual [m][n], may be out. None may be null.
+    pub fn ink_vit_ls_epilogue(stream: CudaStream, y: *const c_void, bias: *const c_void, gamma: *const c_void,
+                               residual: *const c_void, out: *mut c_void, m: c_int, n: c_int) -> c_int;
 }

@@ -278,6 +278,7 @@ pub fn load_weights(model_dir: &Path, cfg: &GlmConfig, rank: usize, world: usize
                 })
             }
             crate::config::AttnKind::Mla => return Err("GLM-5.3-Flash with an MLA (RoPE) layer".into()),
+            crate::config::AttnKind::Swa | crate::config::AttnKind::Full => return Err("GLM-5.3-Flash with an Inkling 2 layer".into()),
         };
         let hc = if mtp {
             None
@@ -343,7 +344,7 @@ fn layer_bytes(l: &Layer) -> usize {
     let mut b = match &l.attn {
         Attn::Kda(k) => k.proj.bytes() + k.f_b.bytes() + k.g_b.bytes() + k.o.bytes() + 2 * k.conv.len(),
         Attn::Dsa(s) => s.proj_a.bytes() + s.proj_b.bytes() + s.o.bytes() + s.kvb_q.len() + 4 * s.kvb_s.len(),
-        Attn::Mla(_) => 0,
+        Attn::Mla(_) | Attn::Ink(_) => 0,
     };
     if let Some(hc) = &l.hc {
         b += hc.attn_fn.bytes() + hc.ffn_fn.bytes();
@@ -351,6 +352,7 @@ fn layer_bytes(l: &Layer) -> usize {
     b += match &l.mlp {
         Mlp::Dense { gate_up, down } => gate_up.bytes() + down.bytes(),
         Mlp::Moe { router, sh_gate_up, sh_down, .. } => 2 * router.len() + sh_gate_up.bytes() + sh_down.bytes(),
+        Mlp::Routed { router, .. } => 2 * router.len(),
     };
     if let Some(m) = &l.mtp {
         b += m.eh.bytes();

@@ -71,8 +71,8 @@ fn main() -> Result<()> {
         let msg = pair.as_mut().ok_or("rank 1 needs the pair")?.ctl.recv()?;
         tidelm_comm::Reader::new(&msg).u32s()?.into_iter().map(|v| (v as usize / e, v as usize % e)).collect()
     };
-    if let Ok(prefix) = std::env::var("TIDELM_FLASH_DUMP") {
-        // the residents, for tools/flash_ref.py to route over the same experts
+    if let Ok(prefix) = std::env::var("TIDELM_FLASH_DUMP").or_else(|_| std::env::var("TIDELM_INK_DUMP")) {
+        // the residents, for tools/flash_ref.py (tools/inkling_ref.py) to route over the same experts
         let v: Vec<[usize; 2]> = residents.iter().map(|&(l, x)| [l, x]).collect();
         std::fs::write(format!("{prefix}.residents.json"), serde_json::to_string(&v)?)?;
     }
@@ -112,7 +112,11 @@ fn main() -> Result<()> {
     }
     let prompt = arg(&args, "--prompt").unwrap_or_else(|| "Write a short poem about the sea.".into());
     let msgs = vec![serde_json::json!({"role": "user", "content": prompt})];
-    let rendered = tidelm_text::glm::render(&msgs, None, Some("low"))?;
+    let rendered = if eng.cfg.is_inkling() {
+        tidelm_text::inkling::render(&msgs, None, Some("low"))?
+    } else {
+        tidelm_text::glm::render(&msgs, None, Some("low"))?
+    };
     let mut ids = text.encode(&rendered)?;
     if let Some(n) = arg(&args, "--random-prompt").map(|v| v.parse::<usize>()).transpose()? {
         // bench.py's random workload: n tokens drawn uniformly from a fixed seed

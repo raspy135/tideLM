@@ -1,0 +1,11 @@
+{
+  "version": 0,
+  "captured_at": "2026-11-16T14:49:00-08:00",
+  "model": "Inkling-2-Small (inkling2), 0xSero/Inkling-2-Small-EXL3-4bpw rev 996dc404",
+  "layers": 48,
+  "experts_per_layer": 384,
+  "tokens": 116164,
+  "source": "the development pair's state file (RUST_GLM_STATE_DB) after this repository's corpus/sources (code, documentation and prose, 51 documents of about 2,300 tokens) was prefilled through /v1/completions from a uniform placement, the engine adapting its residents as it went (2026-11-16). No chat traffic: a first history to boot from, which the engine's own replaces as it serves.",
+  "contents": "Aggregate router mass per (layer, expert) and a token count only; no prompts, responses, KV, or model weights.",
+  "sha256": "433860123ef8dba1e0efafd9c89d6a8422731b2729a8154a1c8c1e48ffda57a7"
+}

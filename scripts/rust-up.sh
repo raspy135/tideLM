@@ -84,11 +84,19 @@ ro=() rw=("$STATE")
 if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
     MODEL_DIR=$GLM_MODEL_DIR
     want() { [[ "${!1:-$2}" == "$3" ]] || err "the Rust GLM engine runs $1=$3 only (profile: ${!1:-$2})"; }
-    want GLM_KV bf16 fp8
+    # Inkling 2 (model_type inkling2) on the same engine: its key / value caches are bf16, its head and
+    # embedding the checkpoint's own, so GLM-5.3's format switches do not apply to it
+    ink=0
+    grep -Eq '"model_type" *: *"inkling2"' "$MODEL_DIR/config.json" 2> /dev/null && ink=1
     want GLM_EXPERT_FORMAT mxfp4 exl3
-    want GLM_HEAD exl3 exl3
-    want GLM_KVB_FP8 0 1
-    want GLM_EMBED_8BIT "" int8
+    if [[ $ink == 1 ]]; then
+        want GLM_KV_SPLIT 0 0
+    else
+        want GLM_KV bf16 fp8
+        want GLM_HEAD exl3 exl3
+        want GLM_KVB_FP8 0 1
+        want GLM_EMBED_8BIT "" int8
+    fi
     want GLM_MISS substitute substitute
     want GLM_PF 0 0
     want GLM_INDEX_BUCKETS 0 0
@@ -100,8 +108,15 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
     pack=${pack/#\/packs/${GLM_EXL3_DIR:-/packs}}
     db=${GLM_STATS_DB:-}
     db=${db/#\/app/$ROOT}
-    if [[ -n "$db" && -f "$db" ]]; then ro+=("$(dirname "$db")"); else db=/app/profiles/glm53-experts-v2.npz; fi
     state=${RUST_GLM_STATE_DB:-$STATE/glm-stats-rust.npz}
+    if [[ -n "$db" && -f "$db" ]]; then
+        ro+=("$(dirname "$db")")
+    elif [[ $ink == 1 ]]; then
+        # Inkling 2's own seed (GLM-5.3's is another model's, and another shape)
+        db=/app/profiles/inkling2-history-v0.npz
+    else
+        db=/app/profiles/glm53-experts-v2.npz
+    fi
     ro+=("$MODEL_DIR" "$(dirname "${pack//\{rank\}/0}")") rw+=("$(dirname "$state")")
     depth=${GLM_MTP_DEPTH:-3}
     [[ "${GLM_MTP:-1}" == 0 ]] && depth=0
@@ -156,6 +171,14 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
     # GLM-5.3-Flash's non-expert weights: fp8 (32 x 32 block scales, the default) or bf16 (the
     # checkpoint's); it moves values, so the boot guard hashes it
     [[ -n "${GLM_FLASH_DENSE:-}" ]] && envs+=(GLM_FLASH_DENSE="$GLM_FLASH_DENSE")
+    # the sampler's defaults when a request names none (unset: generation_config.json's, else 1)
+    [[ -n "${GLM_TEMPERATURE:-}" ]] && envs+=(GLM_TEMPERATURE="$GLM_TEMPERATURE")
+    [[ -n "${GLM_TOP_P:-}" ]] && envs+=(GLM_TOP_P="$GLM_TOP_P")
+    # Inkling 2's DSpark drafter is on with GLM_MTP=1 (its depth is at most 7); GLM_INK_DRAFT=0 keeps
+    # the other drafters (copy, lookup) without it
+    [[ -n "${GLM_INK_DRAFT:-}" ]] && envs+=(GLM_INK_DRAFT="$GLM_INK_DRAFT")
+    # Inkling 2's likewise (GLM_INK_DENSE=fp8|bf16)
+    [[ -n "${GLM_INK_DENSE:-}" ]] && envs+=(GLM_INK_DENSE="$GLM_INK_DENSE")
     # GLM-5.3-Flash on one box: the MTP draft passes score a listed vocabulary (unset: the built-in
     # ranking's first GLM_DRAFT_VOCAB_ROWS ids; all: every id; a host path: another ranking file)
     if [[ -n "${GLM_DRAFT_VOCAB:-}" ]]; then

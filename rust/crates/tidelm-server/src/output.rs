@@ -11,6 +11,7 @@
 use serde_json::{json, Value};
 use tidelm_text::chat::{parse_completion, parse_tool_calls_tolerant, EOS, THINK_END, TOOL_CALLS_START};
 use tidelm_text::glm::{Channel, GlmIds, GlmParser};
+use tidelm_text::inkling::{InklingIds, InklingParser};
 use tidelm_text::Text;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,6 +233,64 @@ pub struct GlmAnswer {
 impl GlmAnswer {
     pub fn new(ids: &GlmIds) -> Self {
         GlmAnswer { parser: GlmParser::new(ids), stop: ids.stop.clone(), ended: false, n: 0 }
+    }
+}
+
+/// Inkling 2: tidelm_text::inkling's message router on the ids (thinking, text and tool-call
+/// messages the model writes itself), the stream cut after the first stop id.
+pub struct InklingAnswer {
+    parser: InklingParser,
+    stop: Vec<u32>,
+    ended: bool,
+    n: usize,
+}
+
+impl InklingAnswer {
+    pub fn new(ids: &InklingIds) -> Self {
+        InklingAnswer { parser: InklingParser::new(ids), stop: ids.stop.clone(), ended: false, n: 0 }
+    }
+}
+
+impl Answer for InklingAnswer {
+    fn feed(&mut self, text: &Text, toks: &[u32]) -> Vec<(Phase, String)> {
+        let mut out = Vec::new();
+        for &t in toks {
+            if self.ended {
+                break;
+            }
+            self.n += 1;
+            out.extend(self.parser.feed(text, t).into_iter().map(|(c, s)| (phase(c), s)));
+            self.ended = self.stop.contains(&t);
+        }
+        out
+    }
+
+    fn finish(&mut self, text: &Text) -> Vec<(Phase, String)> {
+        self.parser.finish(text).into_iter().map(|(c, s)| (phase(c), s)).collect()
+    }
+
+    fn ended(&self) -> bool {
+        self.ended
+    }
+
+    fn tokens(&self) -> usize {
+        self.n
+    }
+
+    fn reasoning(&self) -> &str {
+        &self.parser.reasoning
+    }
+
+    fn content(&self) -> &str {
+        &self.parser.content
+    }
+
+    fn tool_calls(&mut self, text: &Text, tools: Option<&Value>) -> (Vec<Value>, String) {
+        let calls = self.parser.tool_calls(text, tools).into_iter()
+            .map(|(name, arguments)| json!({"id": format!("call_{}", hex24()), "type": "function",
+                                            "function": {"name": name, "arguments": arguments}}))
+            .collect();
+        (calls, String::new())
     }
 }
 

@@ -410,6 +410,28 @@ pub enum Mlp {
     /// the router (GLM-5.3's fp16, computed as the fp32 weight it widens to; GLM-5.3-Flash's
     /// bf16), its correction bias, the shared expert as Dense's halves
     Moe { router: DeviceBuffer<u16>, router_bf16: bool, bias: DeviceBuffer<f32>, sh_gate_up: Lin, sh_down: Lin },
+    /// Inkling 2's MoE: the router (bf16) and its selection bias, no shared expert
+    Routed { router: DeviceBuffer<u16>, bias: DeviceBuffer<f32> },
+}
+
+/// A MoE layer's router and, where the model has one, its shared expert.
+pub struct MoeRef<'a> {
+    pub router: &'a DeviceBuffer<u16>,
+    pub router_bf16: bool,
+    pub bias: &'a DeviceBuffer<f32>,
+    pub shared: Option<(&'a Lin, &'a Lin)>,
+}
+
+impl Mlp {
+    pub fn moe(&self) -> Option<MoeRef<'_>> {
+        match self {
+            Mlp::Dense { .. } => None,
+            Mlp::Moe { router, router_bf16, bias, sh_gate_up, sh_down } => {
+                Some(MoeRef { router, router_bf16: *router_bf16, bias, shared: Some((sh_gate_up, sh_down)) })
+            }
+            Mlp::Routed { router, bias } => Some(MoeRef { router, router_bf16: true, bias, shared: None }),
+        }
+    }
 }
 
 pub struct MtpExtra {
@@ -480,10 +502,58 @@ impl DsaW {
     pub const OFFSETS_A: [usize; 6] = [0, 1536, 2048, 2176, 2208, 2336];
 }
 
+/// Inkling 2's attention (inkling.rs loads it, forward's inkling_fwd runs it). `hl` query heads and
+/// `kl` = hl / 6 key / value heads on this rank, 128 dims each, a relative state of 16 a query head.
+///
+/// A window layer projects everything from one normed input: `proj` rows q | k | v | r | gate |
+/// sink. A full-attention layer has an input each for q, k and v: `proj` rows q | r | gate | sink
+/// from the first, `proj_k` rows k | the key convolution's per-token taps (kl x 4) from the second,
+/// `proj_v` the same for the values from the third. The sink's hl rows and the taps' kl x 4 are
+/// padded with zero rows to whole 32-row blocks (the FP8 scales').
+pub struct InkW {
+    pub proj: Lin,
+    pub proj_k: Option<Lin>,
+    pub proj_v: Option<Lin>,
+    pub off: InkOff,
+    /// o_proj over this rank's hl x 128 columns (summed across ranks)
+    pub o: Lin,
+    /// q_l2_clip.scale [hl][128], rel_l2_clip.scale [hl][16]
+    pub q_scale: DeviceBuffer<u16>,
+    pub r_scale: DeviceBuffer<u16>,
+    /// rel_logits_proj.proj transposed: [rel_extent][16], a distance's 16 values together
+    pub proj_t: DeviceBuffer<u16>,
+    /// the key / value convolutions' taps over this rank's kl x 128 channels: [c][4] in conv1d's
+    /// order (window layers), [4][c] by lag (full layers: static_w)
+    pub k_conv: DeviceBuffer<u16>,
+    pub v_conv: DeviceBuffer<u16>,
+    /// the attention output's and the MoE output's convolutions [H][4]
+    pub attn_conv: DeviceBuffer<u16>,
+    pub mlp_conv: DeviceBuffer<u16>,
+    /// the block attention residual's queries (fp32): the attention input's [1 or 3][H] (none on
+    /// layer 0, which mixes nothing), the MoE input's [H]
+    pub q_attn: Option<DeviceBuffer<f32>>,
+    pub q_mlp: DeviceBuffer<f32>,
+}
+
+/// Row offsets in InkW's projections (elements of a row of their outputs).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InkOff {
+    pub q: usize,
+    pub r: usize,
+    pub gate: usize,
+    pub sink: usize,
+    /// window layers: k and v in `proj`; full layers: 0 in proj_k / proj_v
+    pub k: usize,
+    pub v: usize,
+    /// full layers: the taps in proj_k / proj_v
+    pub taps: usize,
+}
+
 pub enum Attn {
     Mla(MlaW),
     Kda(KdaW),
     Dsa(DsaW),
+    Ink(InkW),
 }
 
 /// A layer's two mHC sites (attention, then MLP): each its mixing weight [24][4 x hidden] (bf16,
@@ -509,6 +579,10 @@ pub struct Layer {
 impl Layer {
     pub fn mla(&self) -> Option<&MlaW> {
         if let Attn::Mla(m) = &self.attn { Some(m) } else { None }
+    }
+
+    pub fn ink(&self) -> Option<&InkW> {
+        if let Attn::Ink(m) = &self.attn { Some(m) } else { None }
     }
 }
 
@@ -567,6 +641,7 @@ impl Weights {
                     lin(sh_gate_up, f);
                     lin(sh_down, f);
                 }
+                Mlp::Routed { .. } => {}
             }
             if let Some(x) = l.mtp.as_mut() {
                 lin(&mut x.eh, f);
@@ -618,6 +693,9 @@ impl Weights {
                 log: &dyn Fn(&str)) -> Result<Self> {
         if cfg.is_flash() {
             return crate::flash::load_weights(model_dir, cfg, rank, world, st, log);
+        }
+        if cfg.is_inkling() {
+            return crate::inkling::load_weights(model_dir, cfg, rank, world, st, log);
         }
         let ckpt = Checkpoint::open(model_dir)?;
         let ld = Loader { ck: &ckpt, rank, world, st };
@@ -704,6 +782,7 @@ impl Weights {
             bytes += match &layer.mlp {
                 Mlp::Dense { gate_up, down } => gate_up.bytes() + down.bytes(),
                 Mlp::Moe { router, sh_gate_up, sh_down, .. } => 2 * router.len() + sh_gate_up.bytes() + sh_down.bytes(),
+                Mlp::Routed { router, .. } => 2 * router.len(),
             };
             if let Some(m) = &layer.mtp {
                 bytes += m.eh.bytes();

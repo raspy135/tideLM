@@ -30,7 +30,7 @@ use crate::{anthropic, arg, http, Cmd, Ctx, Family};
 pub fn is_glm(model_dir: &std::path::Path) -> bool {
     std::fs::read(model_dir.join("config.json")).ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .is_some_and(|c| matches!(c["model_type"].as_str(), Some("glm_moe_dsa") | Some("glm5_next")))
+        .is_some_and(|c| matches!(c["model_type"].as_str(), Some("glm_moe_dsa") | Some("glm5_next") | Some("inkling2")))
 }
 
 pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
@@ -158,6 +158,23 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         eng.enable_vision(&model_dir, max)?;
         log(&format!("[vision] image input on: up to {max} tokens an image, the tower loaded on demand into lent expert slots"));
     }
+    // Inkling 2's drafter (--depth > 0; GLM_INK_DRAFT=0 keeps decoding plain): on the pair's last rank
+    if eng.cfg.is_inkling() && num("--depth", 7.0)? > 0.0 && std::env::var("GLM_INK_DRAFT").as_deref() != Ok("0") {
+        let bytes = eng.enable_drafter(&model_dir, tidelm_glm::inkling::dense_fp8()?)?;
+        if rank + 1 == world {
+            eprintln!("[draft] DSpark drafter on rank {rank}: {:.2} GB (7 drafts a round, a block pass each)", bytes as f64 / 1e9);
+        }
+    }
+    // Inkling 2's (GLM_VISION=1): its tower resident on the pair's last rank, the features gathered
+    // to the others (both ranks: rank 1 holds the tower or the spans)
+    if eng.cfg.is_inkling() && std::env::var("GLM_VISION").as_deref() == Ok("1") {
+        let max: usize = std::env::var("GLM_VISION_MAX_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(4096);
+        eng.enable_vision(&model_dir, max)?;
+        if rank + 1 == world {
+            eprintln!("[vision] image input on: up to {max} tokens an image (40 x 40 px each), the tower resident on rank {rank} ({:.2} GB)",
+                      tidelm_glm::inkling_vision::bytes_for(max) as f64 / 1e9);
+        }
+    }
     if rank == 0 {
         if let Some(p) = state_db.parent() {
             std::fs::create_dir_all(p)?;
@@ -189,10 +206,13 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
     // (serve.rs start()). Until 2026-11-13 GLM_PREFIX_DISK=1 there still built the store and saved every
     // request's rows at its end (up to --prefix-disk-gb of disk, the engine thread held for each write).
     let prefix_disk = arg(args, "--prefix-disk").map(PathBuf::from);
-    if prefix_disk.is_some() && eng.cfg.is_flash() && rank == 0 {
+    // Inkling 2's segments end with its rings' state (a prompt-end snapshot: prefix.rs seg_write), so
+    // its store restores whole segments
+    let positional = !eng.cfg.is_flash();
+    if prefix_disk.is_some() && !positional && rank == 0 {
         eprintln!("boot: GLM_PREFIX_DISK is not used for GLM-5.3-Flash (the store holds no KDA state): off");
     }
-    if let Some(root) = prefix_disk.filter(|_| !eng.cfg.is_flash()) {
+    if let Some(root) = prefix_disk.filter(|_| positional) {
         use sha2::Digest;
         let cfg_bytes = std::fs::read(model_dir.join("config.json"))?;
         let key = format!("glm-rust-kv v1 {:x} {} {} {} {}", sha2::Sha256::digest(&cfg_bytes), eng.pack.source_sha256,
@@ -206,12 +226,19 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         } else {
             key
         };
+        // Inkling 2's dense format changes every row
+        let key = if eng.cfg.is_inkling() {
+            format!("{key} ink dense {}", if tidelm_glm::inkling::dense_fp8()? { "fp8" } else { "bf16" })
+        } else {
+            key
+        };
         // GLM_ABLIT changes every row past its first edited layer: its own namespace (stock: unchanged)
         let ablit = tidelm_glm::ablit::digest()?;
         let key = if ablit.is_empty() { key } else { format!("{key} ablit {ablit}") };
         let ns = format!("{:x}", sha2::Sha256::digest(key.as_bytes()))[..16].to_string();
         let gb = num("--prefix-disk-gb", 20.0)?;
-        let st = tidelm_glm::prefix::Store::open(&root, &ns, rank, (gb * 1e9) as u64, num("--prefix-min", 256.0)? as usize)?;
+        let mut st = tidelm_glm::prefix::Store::open(&root, &ns, rank, (gb * 1e9) as u64, num("--prefix-min", 256.0)? as usize)?;
+        st.whole_only = eng.cfg.is_inkling();
         eng.prefix_dir = Some(st.dir.clone());
         if rank == 0 {
             eprintln!("boot: prefix store {} ({} segments, {gb} GB)", st.dir.display(), st.index.segs.len());
@@ -231,7 +258,7 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
     // (<state db>.ds-history.npz): sharing GLM-5.3's name, its first save replaced GLM-5.3's history
     // (another shape, so opened empty) with its own (2026-11-12)
     if let Some(p) = srv.eng.res.db_path.clone() {
-        let path = if srv.eng.cfg.is_flash() {
+        let path = if srv.eng.cfg.is_flash() || srv.eng.cfg.is_inkling() {
             p.with_extension("ds-history.npz")
         } else {
             p.with_file_name("glm-ds-history.npz")
@@ -310,7 +337,7 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
     let text = Text::load(&model_dir)?;
     let family = Family::load(&model_dir, &text)?;
     let (eos, think_end) = match &family {
-        Family::Glm(g) => (g.ids.stop[0], Some(g.ids.think_end)),
+        Family::Glm(g) => (g.stop()[0], g.think_end()),
         Family::Ds => return Err("not a GLM checkpoint".into()),
     };
     let max_seq = srv.eng.opt.max_seq;

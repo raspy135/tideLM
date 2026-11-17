@@ -1514,7 +1514,7 @@ __global__ void rot_in_shared_kernel(const TIN* __restrict__ x, int x_stride, co
 }
 
 // Program (member row, 128-block of the width): splits summed in order, rotated, * svh, SwiGLU (act_mode 1 =
-// fp32, 0 = TensorFold's bf16 rounding points), then Xd = fp16((act * suh_d) @ H).
+// fp32, 0 = TensorFold's bf16 rounding points, 2 = Inkling 2's softcaps), then Xd = fp16((act * suh_d) @ H).
 __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
                                        const half* __restrict__ svh_g, const half* __restrict__ svh_u,
                                        const half* __restrict__ suh_d, half* __restrict__ xd, int P, int N, int SK,
@@ -1547,6 +1547,13 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
             float uu = fminf(fmaxf(bf16r(uv[j] * HAD_SCALE * __half2float(svh_u[(size_t)e * N + n + j])), -limit),
                              limit);
             act = bf16r(bf16r(gg / (1.f + expf(-gg))) * uu);
+        } else if (act_mode == 2) {
+            // Inkling 2's softcapped SwiGLU (Inkling2SoftcappedSwiGLU): the sigmoid sees the raw gate,
+            // the caps (mlp_gate_softcap 4, mlp_up_softcap 25: the config guard checks them) bound the
+            // linear gate factor and up. `limit` is not read.
+            const float g = gv[j] * HAD_SCALE * __half2float(svh_g[(size_t)e * N + n + j]);
+            const float u = uv[j] * HAD_SCALE * __half2float(svh_u[(size_t)e * N + n + j]);
+            act = (4.f * tanhf(g * 0.25f)) * (1.f / (1.f + expf(-g))) * (25.f * tanhf(u * 0.04f));
         } else {
             // explicit roundings (no fma contraction across expf's inlined tail), so the fused
             // epilogue of prefill_fat_kernel computes the same bits

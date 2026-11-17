@@ -39,6 +39,8 @@ use crate::{ck, Result};
 
 #[path = "flash_fwd.rs"]
 mod flash_fwd;
+#[path = "inkling_fwd.rs"]
+mod inkling_fwd;
 
 /// Decode rows a graph or a verify step carries at most (MTP depth 7 + the anchor).
 pub const VERIFY_ROWS: usize = 8;
@@ -130,7 +132,7 @@ impl Options {
              lanes {}\nkv_tokens {}\npack_source {}\nablit {}\nenv {}\nflags {}\n",
             sha2::Sha256::digest(&cfg), sha2::Sha256::digest(&exe), self.max_seq, self.chunk, self.slots, self.kv_split,
             self.prefill_reduce_bf16, self.moe_rows, self.lanes, self.kv_tokens, pack.source_sha256, crate::ablit::digest()?,
-            ["TIDELM_GLM_HOT", "TIDELM_GLM_WIDE_DECODE_FROM", "NCCL_PROTO", "TIDELM_GLM_MLA_HALF", "TIDELM_GLM_FAT", "GLM_FLASH_DENSE", "TIDELM_FLASH_HC_FUSED"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
+            ["TIDELM_GLM_HOT", "TIDELM_GLM_WIDE_DECODE_FROM", "NCCL_PROTO", "TIDELM_GLM_MLA_HALF", "TIDELM_GLM_FAT", "GLM_FLASH_DENSE", "TIDELM_FLASH_HC_FUSED", "GLM_INK_DENSE"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
                 .collect::<Vec<_>>().join(" "), self.guard_extra);
         Ok(s.into_bytes())
     }
@@ -484,6 +486,9 @@ pub struct Engine {
     draft_pass: bool,
     /// GLM-5.3-Flash: KDA's state, the indexer's rings, the pass's lane slots (flash_fwd)
     fl: Option<flash_fwd::FlashState>,
+    /// Inkling 2: the convolutions' and window layers' rings, the snapshots, the pass's lanes
+    /// (inkling_fwd)
+    ink: Option<inkling_fwd::InkState>,
     /// GLM-5.3-Flash's image input (flash_image; None: off)
     pub vis: Option<crate::flash_image::VisionState>,
 }
@@ -504,6 +509,10 @@ impl Engine {
             // GLM-5.3-Flash's sparse attention reads a whole cache on each rank
             return Err("GLM-5.3-Flash on the pair: the KV split is GLM-5.3's only (GLM_KV_SPLIT=0)".into());
         }
+        if cfg.is_inkling() && opt.kv_split {
+            // Inkling 2's ranks each hold their own key / value heads' rows for every position
+            return Err("Inkling 2: the KV split by position is GLM-5.3's only (GLM_KV_SPLIT=0)".into());
+        }
         // programmatic dependent launch for every kernel of glm.cu, the EXL3 file and the ds41.cu ones
         // GLM calls (each starts with griddepcontrol.wait): the next kernel launches while this one
         // drains. Bit-identical; TIDELM_PDL=0 turns it off
@@ -523,6 +532,7 @@ impl Engine {
             exl3m_set_pdl(pdl);
             tidelm_kernels::ds41::ds_set_pdl(pdl);
             tidelm_kernels::flash::flash_set_pdl(pdl);
+            tidelm_kernels::inkling::ink_set_pdl(pdl);
             tidelm_kernels::exl3::exl3m_set_evict_first(ef);
             tidelm_kernels::glm::glm_set_stream_loads(ef);
             tidelm_kernels::ds41::ds_set_stream_weights(ef);
@@ -584,14 +594,18 @@ impl Engine {
         // memory the unpaged caches took, to within a chunk a cache): lanes share it.
         let lanes = opt.lanes.clamp(1, MAX_LANES);
         let gran = PagedKv::gran()?;
-        let dec_rows = PagedKv::padded_rows(gran, s_loc + 1, &KV_ROW_BYTES);
-        let mtp_rows = PagedKv::padded_rows(gran, opt.max_seq, &KV_ROW_BYTES);
+        // Inkling 2: a full-attention layer's row is this rank's key / value heads' K | V (bf16)
+        let ink_row = cfg.ink.map_or(0, |k| k.kv_heads / world * 2 * k.head_dim * 2);
+        let widths: Vec<usize> = if cfg.is_inkling() { vec![ink_row] } else { KV_ROW_BYTES.to_vec() };
+        let dec_rows = PagedKv::padded_rows(gran, s_loc + 1, &widths);
+        let mtp_rows = PagedKv::padded_rows(gran, opt.max_seq, &widths);
         let dec_lane_rows = if opt.kv_split && world > 1 { dec_rows } else { mtp_rows };
         let mut specs = vec![];
         let mut pool = 0usize;
         let layer_rows = |l: usize| -> Vec<(usize, usize)> {
             match cfg.attn[l] {
-                AttnKind::Kda => vec![],
+                AttnKind::Kda | AttnKind::Swa => vec![],
+                AttnKind::Full => vec![(ink_row, 1)],
                 AttnKind::Dsa => KV_ROWS_FLASH.to_vec(),
                 AttnKind::Mla => KV_ROW_BYTES[..if cfg.index_full[l] { 5 } else { 3 }].iter().map(|&rb| (rb, 1)).collect(),
             }
@@ -626,7 +640,10 @@ impl Engine {
             let rows = layer_rows(l);
             let lane_rows = if split { dec_rows } else { mtp_rows };
             let lk = match cfg.attn[l] {
-                AttnKind::Kda => None,
+                AttnKind::Kda | AttnKind::Swa => None,
+                // one cache (cq; cs names it again: this layer's kernels read cq alone)
+                AttnKind::Full => Some(LayerKv { cq: paged.buf(i), cs: paged.buf(i), cr: None, iq: None, is: None, split, lane_rows,
+                                                 rows: rows.clone() }),
                 AttnKind::Dsa => Some(LayerKv { cq: paged.buf(i), cs: paged.buf(i + 1), cr: None, iq: Some(paged.buf(i + 2)),
                                                 is: Some(paged.buf(i + 3)), split, lane_rows, rows: rows.clone() }),
                 AttnKind::Mla => {
@@ -646,6 +663,14 @@ impl Engine {
             let f = flash_fwd::FlashState::new(&cfg, &opt, world, lanes)?;
             log(&format!("[flash] KDA state and rings {:.2} GB ({lanes} lane{})", f.bytes() as f64 / 1e9, if lanes > 1 { "s" } else { "" }));
             Some(f)
+        } else {
+            None
+        };
+        let ink = if cfg.is_inkling() {
+            let s = inkling_fwd::InkState::new(&cfg, &opt, world, lanes, model_dir, &st)?;
+            log(&format!("[inkling] rings, snapshots and scratch {:.2} GB ({lanes} lane{})", s.bytes() as f64 / 1e9,
+                         if lanes > 1 { "s" } else { "" }));
+            Some(s)
         } else {
             None
         };
@@ -748,6 +773,7 @@ impl Engine {
             draft_on: true,
             draft_pass: true,
             fl,
+            ink,
             vis: None,
         };
         engine.st.synchronize()?;
@@ -775,7 +801,7 @@ impl Engine {
     // ------------------------------------------------------------------ collectives
     /// out [world][nbytes] <- every rank's `nbytes` at `local`. `big`: an eager prefill-sized
     /// one through NCCL (the RoCE gather is built for decode's latency).
-    fn gather(&self, local: *const c_void, nbytes: usize, out: *mut c_void, big: bool) -> Result<()> {
+    pub(crate) fn gather(&self, local: *const c_void, nbytes: usize, out: *mut c_void, big: bool) -> Result<()> {
         match &self.pair {
             None => unsafe {
                 tidelm_cuda::memcpy_async(out, local, nbytes, tidelm_cuda::ffi::MEMCPY_DEVICE_TO_DEVICE, &self.st)?;
@@ -1222,7 +1248,7 @@ impl Engine {
                 self.gather_cols(np(&a.mout), t, dn, 2, np(&a.a), prefill)?;
                 self.ablit_rows(l, np(&a.a), t)
             }
-            Mlp::Moe { .. } => {
+            Mlp::Moe { .. } | Mlp::Routed { .. } => {
                 // rows in sub-chunks: the routed scratch is sized for moe_rows
                 let sub = if prefill { self.opt.moe_rows } else { t };
                 let mut r0 = 0;
@@ -1253,12 +1279,11 @@ impl Engine {
     /// the routed gate/up; moe_rows joins them before the gather (sh_open).
     fn moe_exact(&self, l: usize, r0: usize, n: usize) -> Result<()> {
         let (cfg, a) = (&self.cfg, &self.act);
-        let Mlp::Moe { router, router_bf16, bias, sh_gate_up, .. } = &self.w.layers[l].mlp else {
-            return Err("moe_exact on a dense layer".into());
-        };
+        let Some(moe) = self.w.layers[l].mlp.moe() else { return Err("moe_exact on a dense layer".into()) };
+        let (router, router_bf16, bias) = (moe.router, moe.router_bf16, moe.bias);
         let (e, h) = (cfg.experts, cfg.hidden);
         let decode = n * cfg.topk <= 64;
-        if decode {
+        if let (true, Some((sh_gate_up, _))) = (decode, moe.shared) {
             self.fork()?;
             self.shared_up(&self.st2, &a.x3s2, sh_gate_up, self.arena_of(l).inter_l, at(&a.xn, r0 * h), n)?;
             self.sh_open.set(true);
@@ -1269,8 +1294,8 @@ impl Engine {
         // the bytes (6.3 -> 3.1 MB a layer)
         let splits = if n <= MAX_ROWS { 6 } else { 1 };
         let part = np(&a.split_part);
-        if *router_bf16 {
-            // GLM-5.3-Flash's bf16 router: F.linear(x, w) with fp32 sums, fp32 out
+        if router_bf16 {
+            // GLM-5.3-Flash's (and Inkling 2's) bf16 router: F.linear(x, w) with fp32 sums, fp32 out
             ck(unsafe { ds_linear_bf16(self.st.raw(), at(&a.xn, r0 * h), h as i64, np(router), n as i32, e as i32, h as i32,
                                        splits as i32, std::ptr::null_mut(), if splits > 1 { part } else { np(&a.logits) }, e as i64,
                                        part) }, "router bf16")?;
@@ -1322,7 +1347,8 @@ impl Engine {
     /// experts over rows [r0, r0 + n) of xn -> the same rows of a.
     fn moe_rest(&self, l: usize, r0: usize, n: usize, prefill: bool) -> Result<()> {
         let (cfg, a) = (&self.cfg, &self.act);
-        let Mlp::Moe { bias, sh_gate_up, sh_down, .. } = &self.w.layers[l].mlp else { return Err("moe on a dense layer".into()) };
+        let Some(moe) = self.w.layers[l].mlp.moe() else { return Err("moe on a dense layer".into()) };
+        let bias = moe.bias;
         let (e, h) = (cfg.experts, cfg.hidden);
         let mtp = cfg.mtp && l == cfg.mtp_layer();
         let (lut, arena) = if mtp { (np(&self.mtp_lut), self.mtp_arena.as_ref().unwrap()) } else { (at(&self.lut, l * e), &self.arena) };
@@ -1334,7 +1360,7 @@ impl Engine {
                                  (self.cfg.n_layers() * e) as i64, at(&a.rlane, r0), e as i32) }, "router")?;
         // the decoder's next layer, whose first weights load while this one's output is gathered
         let next = if mtp || l + 1 >= cfg.layers { None } else { Some(&self.w.layers[l + 1]) };
-        self.moe_rows(sh_gate_up, sh_down, arena, at(&a.xn, r0 * h), n, prefill, at(&a.a, r0 * h), next)?;
+        self.moe_rows(moe.shared, arena, at(&a.xn, r0 * h), n, prefill, at(&a.a, r0 * h), next)?;
         self.ablit_rows(l, at(&a.a, r0 * h), n)
     }
 
@@ -1354,10 +1380,11 @@ impl Engine {
         if n == 1 { (4, 2) } else { (2, 1) }
     }
 
-    /// One block of MoE rows (routing done: pick / wts): the shared expert and the routed picks,
-    /// their intermediates in one gather, the summed hidden columns in another -> out bf16 [n][H].
+    /// One block of MoE rows (routing done: pick / wts): the shared expert (`shared`: its gate | up
+    /// and down; Inkling 2 has none) and the routed picks, their intermediates in one gather, the
+    /// summed hidden columns in another -> out bf16 [n][H].
     #[allow(clippy::too_many_arguments)]
-    fn moe_rows(&self, sh_gate_up: &Lin, sh_down: &Lin, arena: &Arena, x: *mut c_void, n: usize, prefill: bool,
+    fn moe_rows(&self, shared_x: Option<(&Lin, &Lin)>, arena: &Arena, x: *mut c_void, n: usize, prefill: bool,
                 out: *mut c_void, next: Option<&crate::weights::Layer>) -> Result<()> {
         let (cfg, a) = (&self.cfg, &self.act);
         let st = self.st.raw();
@@ -1371,9 +1398,12 @@ impl Engine {
         // (decode rows: already, beside the router chain: moe_exact)
         let decode = p <= 64;
         let (sst, x3) = if decode { (&self.st2, &a.x3s2) } else { (&self.st, &a.x3s) };
-        if !decode {
+        if let (false, Some((sh_gate_up, _))) = (decode, shared_x) {
             self.shared_up(sst, x3, sh_gate_up, il, x, n)?;
         }
+        // Inkling 2's softcapped SwiGLU is exl3m_gateup's act_mode 2: its prefill takes the fat tile
+        // without the fused epilogue (which is the plain SwiGLU's)
+        let soft = cfg.is_inkling();
         let hsh = at(&a.pair, p * il * 2);
         // routed: grouping, rotation, gate/up, the down projection's input rotation
         let slots = arena.slots as i32;
@@ -1404,7 +1434,11 @@ impl Engine {
                 exl3m_rot_in(x, h as i32, np(&a.pick), arena.pool(3), arena.pool(4), np(&a.xh0), np(&a.xh1), n as i32, h as i32,
                              k as i32, slots, 1, st);
             }
-            if up_tiled && self.fat {
+            if up_tiled && self.fat && soft {
+                exl3m_prefill_fat(np(&a.xh0), np(&a.xh1), np(&arena.t1p), np(&arena.t3p), np(&arena.k2g), np(&arena.k2u), uids,
+                                  np(&a.ucount), np(&a.members), np(&a.zup), h as i32, il as i32, p as i32, k as i32, nexp, 2,
+                                  arena.cb, arena.max_k2.max(6), st);
+            } else if up_tiled && self.fat {
                 // the fat tile with the epilogue fused: xd straight into the pair buffer
                 let suh2 = (arena.pool(5) as *mut u16).add(self.rank * il) as *const c_void;
                 exl3m_prefill_fat_gateup(np(&a.xh0), np(&a.xh1), np(&arena.t1p), np(&arena.t3p), np(&arena.k2g), np(&arena.k2u),
@@ -1424,10 +1458,11 @@ impl Engine {
                               np(&a.ucount), np(&a.members), np(&a.zup), h as i32, il as i32, p as i32, sk_up, maxm, k as i32,
                               nexp, 2, 8, 4, if decode { DECODE_PF_ROUTED } else { 2 }, 2, 10, arena.cb, st);
             }
-            if !(up_tiled && self.fat) {
+            if !(up_tiled && self.fat && !soft) {
                 let suh2 = (arena.pool(5) as *mut u16).add(self.rank * il) as *const c_void;
                 exl3m_gateup(np(&a.zup), np(&a.pick), arena.pool(6), arena.pool(7), suh2, np(&a.pair), n as i32, p as i32, il as i32,
-                             if up_tiled { 1 } else { sk_up }, k as i32, slots, cfg.moe_inter as i32, cfg.swiglu_limit, 1, st);
+                             if up_tiled { 1 } else { sk_up }, k as i32, slots, cfg.moe_inter as i32, cfg.swiglu_limit,
+                             if soft { 2 } else { 1 }, st);
             }
         }
         ck(unsafe { tidelm_cuda::ffi::cudaGetLastError() }, "routed up")?;
@@ -1436,15 +1471,19 @@ impl Engine {
             // during the gather: the routed experts' down rows (the critical path), then the shared
             // down's, which then reads L2 beside them
             self.l2_experts(np(&a.pick), p, arena, il * w, dn, PF_DOWN, sk_dn as usize)?;
-            self.l2_lin(sh_down, n, PF_SH_DOWN)?;
+            if let Some((_, sh_down)) = shared_x {
+                self.l2_lin(sh_down, n, PF_SH_DOWN)?;
+            }
         }
         // one gather: both ranks' [routed xd | shared act]
-        let per = p * il * 2 + n * il * 2;
+        let per = p * il * 2 + if shared_x.is_some() { n * il * 2 } else { 0 };
         if w > 1 {
             self.gather(np(&a.pair), per, np(&a.gs), prefill)?;
             ck(unsafe { glm_unshard(st, np(&a.gs), (per / 2) as i64, np(&a.xdf), p as i32, il as i32, w as i32, 2) }, "unshard xd")?;
-            ck(unsafe { glm_unshard(st, at(&a.gs, p * il * 2), (per / 2) as i64, np(&a.hf), n as i32, il as i32, w as i32, 2) },
-               "unshard shared")?;
+            if shared_x.is_some() {
+                ck(unsafe { glm_unshard(st, at(&a.gs, p * il * 2), (per / 2) as i64, np(&a.hf), n as i32, il as i32, w as i32, 2) },
+                   "unshard shared")?;
+            }
         } else {
             // One box: the pair's collectives are copies (these two, the output's below, o_proj's f32 ->
             // bf16 in the attention). Reading each source where it is instead - 3 launches a MoE layer and
@@ -1454,16 +1493,21 @@ impl Engine {
             // the prefetch branch, which uses the memory meanwhile. Not taken.
             unsafe {
                 tidelm_cuda::memcpy_async(np(&a.xdf), np(&a.pair), p * il * 2, tidelm_cuda::ffi::MEMCPY_DEVICE_TO_DEVICE, &self.st)?;
-                tidelm_cuda::memcpy_async(np(&a.hf), hsh, n * il * 2, tidelm_cuda::ffi::MEMCPY_DEVICE_TO_DEVICE, &self.st)?;
+                if shared_x.is_some() {
+                    tidelm_cuda::memcpy_async(np(&a.hf), hsh, n * il * 2, tidelm_cuda::ffi::MEMCPY_DEVICE_TO_DEVICE, &self.st)?;
+                }
             }
         }
         // routed down + the weighted combine over picks; the shared down (side stream); summed, gathered
         let kd = il * w;
-        if decode {
+        let side = decode && shared_x.is_some();
+        if side {
             self.fork()?;
         }
         let part = if decode { &a.split_part2 } else { &a.split_part };
-        self.lin_on(sst, x3, part, sh_down, np(&a.hf), kd, n, np(&a.shout), false)?;
+        if let Some((_, sh_down)) = shared_x {
+            self.lin_on(sst, x3, part, sh_down, np(&a.hf), kd, n, np(&a.shout), false)?;
+        }
         unsafe {
             if up_tiled && self.fat {
                 exl3m_prefill_fat(np(&a.xdf), np(&a.xdf), np(&arena.t2p), np(&arena.t2p), np(&arena.k2d), np(&arena.k2d),
@@ -1491,8 +1535,10 @@ impl Engine {
             }
         }
         ck(unsafe { tidelm_cuda::ffi::cudaGetLastError() }, "routed down")?;
-        if decode {
+        if side {
             self.join()?;
+        }
+        if decode {
             // the next layer's q_a and kv_a during the output's gather and the norms
             match next.map(|nw| &nw.attn) {
                 Some(crate::weights::Attn::Mla(m)) => {
@@ -1501,10 +1547,16 @@ impl Engine {
                 }
                 Some(crate::weights::Attn::Kda(k)) => self.l2_lin(&k.proj, n, PF_QA + PF_KVA)?,
                 Some(crate::weights::Attn::Dsa(d)) => self.l2_lin(&d.proj_a, n, PF_QA + PF_KVA)?,
+                Some(crate::weights::Attn::Ink(k)) => self.l2_lin(&k.proj, n, PF_QA + PF_KVA)?,
                 None => {}
             }
         }
-        ck(unsafe { glm_moe_out(st, np(&a.local), np(&a.shout), np(&a.mout), (n * dn) as i64) }, "moe out")?;
+        if shared_x.is_some() {
+            ck(unsafe { glm_moe_out(st, np(&a.local), np(&a.shout), np(&a.mout), (n * dn) as i64) }, "moe out")?;
+        } else {
+            // no shared expert: bf16 of the routed sum alone (the kernel's first operand is optional)
+            ck(unsafe { glm_moe_out(st, std::ptr::null(), np(&a.local), np(&a.mout), (n * dn) as i64) }, "moe out")?;
+        }
         self.gather_cols(np(&a.mout), n, dn, 2, out, prefill)
     }
 
@@ -1551,6 +1603,9 @@ impl Engine {
         if self.fl.is_some() {
             self.flash_stage_meta(groups, mtp)?;
         }
+        if self.ink.is_some() {
+            self.ink_stage_meta(groups, mtp)?;
+        }
         unsafe {
             tidelm_cuda::memcpy_async(np(&self.act.tok), self.h_ids.raw(), t * 4, tidelm_cuda::ffi::MEMCPY_HOST_TO_DEVICE, &self.st)?;
             tidelm_cuda::memcpy_async(at(&self.act.lanes, base), (self.h_lanes.raw() as *mut i32).add(base) as *const c_void,
@@ -1586,6 +1641,9 @@ impl Engine {
     fn embed(&self, t: usize, mtp: bool, out: *mut c_void, prefill: bool) -> Result<()> {
         let a = &self.act;
         let h = self.cfg.hidden;
+        if self.ink.is_some() {
+            return self.embed_ink(t, out);
+        }
         let crate::weights::Embed::Int8 { q: embed_q, s: embed_s } = &self.w.embed else { return self.embed_flash(t, mtp, out) };
         ck(unsafe { glm_embed(self.st.raw(), np(&a.tok), t as i32, np(embed_q), np(embed_s),
                               (self.rank * self.vl) as i32, self.vl as i32, h as i32,
@@ -1604,6 +1662,9 @@ impl Engine {
     fn layer_pre(&self, l: usize, t: usize, prefill: bool) -> Result<()> {
         if self.cfg.hc.is_some() {
             return self.flash_layer_pre(l, t, prefill);
+        }
+        if self.ink.is_some() {
+            return self.ink_layer_pre(l, t, prefill);
         }
         let lw = &self.w.layers[l];
         let a = &self.act;
@@ -1628,6 +1689,9 @@ impl Engine {
     fn final_norm(&self, t: usize) -> Result<()> {
         if self.cfg.hc.is_some() {
             return self.flash_final(t);
+        }
+        if self.ink.is_some() {
+            return self.ink_final(t);
         }
         self.norm(np(&self.act.h), true, &self.w.norm, np(&self.act.hn), t)
     }
@@ -1730,6 +1794,10 @@ impl Engine {
             None => (&self.w.head, self.vl, self.rank * self.vl),
         };
         self.lin(head, x, self.cfg.hidden, t, np(&a.head), false)?;
+        if self.ink.is_some() {
+            // Inkling 2's logits: softcapped, the head's padding rows never
+            self.ink_logits_fix(np(&a.head), vl, t)?;
+        }
         ck(unsafe { glm_argmax(st, np(&a.head), vl as i64, t as i32, vl as i32, off as i32, np(&a.pairs)) }, "argmax")?;
         self.gather(np(&a.pairs), t * 8, at(&a.pairs, 2 * HEAD_ROWS * 2), false)?;
         ck(unsafe { glm_argmax_combine(st, at(&a.pairs, 2 * HEAD_ROWS * 2), self.world as i32, t as i32, np(&a.out_tok)) },
@@ -2052,7 +2120,10 @@ impl Act {
         let pd = p.max(VERIFY_ROWS * cfg.topk);
         let nb = (unsafe { ds_route_blocks(p as i32, slots as i32, 64) }).max(1) as usize;
         let ms = opt.max_seq;
-        let z = |n: usize| -> Result<DeviceBuffer<u16>> { Ok(DeviceBuffer::new(n)?) };
+        let z = |n: usize| -> Result<DeviceBuffer<u16>> { Ok(DeviceBuffer::new(n.max(1))?) };
+        // MLA's and the indexer's buffers (the split cache's gathers are sized by the context): one
+        // element each on Inkling 2, which has neither
+        let ml = if cfg.is_inkling() { 0 } else { 1 };
         let pair_bytes = pd * il * 2 + mr * il * 2;
         let gs_bytes = [
             2 * r * h * 2,                  // a gathered bf16 [rows][H] (dense layer intermediates, MLP outputs)
@@ -2093,26 +2164,26 @@ impl Act {
             c: z(r * 512)?,
             kr: z(r * 64)?,
             qb: z(r * hl * 256)?,
-            qf: z(r * hl * 576)?,
+            qf: z(ml * r * hl * 576)?,
             qsend: DeviceBuffer::zeroed(d * qrow_bytes(hl))?,
             qi: z(r * 4096)?,
             ki: z(r * 128)?,
             iw: DeviceBuffer::new(r * 32)?,
-            scores: DeviceBuffer::new(SCORE_VALUES.max(d * ms).max(d * s_loc))?,
-            idx: DeviceBuffer::new(r * TOPK)?,
-            olat: z(r * hl * 512)?,
+            scores: DeviceBuffer::new(SCORE_VALUES.max(ml * d * ms).max(ml * d * s_loc))?,
+            idx: DeviceBuffer::new((ml * r * TOPK).max(1))?,
+            olat: z(ml * r * hl * 512)?,
             o: z(r * hl * 256)?,
             pm: DeviceBuffer::new(d * cfg.heads * 16)?,
             pl: DeviceBuffer::new(d * cfg.heads * 16)?,
-            pacc: DeviceBuffer::new(d * cfg.heads * 16 * 512)?,
+            pacc: DeviceBuffer::new((ml * d * cfg.heads * 16 * 512).max(1))?,
             own_o: DeviceBuffer::new(d * hl * 512)?,
             own_l: DeviceBuffer::new(d * hl)?,
             send2: DeviceBuffer::new(d * row2_bytes(hl))?,
-            gcq: DeviceBuffer::new(world * s_loc * 512 + 512)?,
-            gcs: DeviceBuffer::new(world * s_loc * 4 + 4)?,
-            gcr: z(world * s_loc * 64 + 64)?,
-            giq: DeviceBuffer::new(world * s_loc * 128 + 128)?,
-            gis: DeviceBuffer::new(world * s_loc + 1)?,
+            gcq: DeviceBuffer::new(ml * world * s_loc * 512 + 512)?,
+            gcs: DeviceBuffer::new(ml * world * s_loc * 4 + 4)?,
+            gcr: z(ml * world * s_loc * 64 + 64)?,
+            giq: DeviceBuffer::new(ml * world * s_loc * 128 + 128)?,
+            gis: DeviceBuffer::new(ml * world * s_loc + 1)?,
             kvb_bf: z(hl * 448 * 512)?,
             split_part: DeviceBuffer::new(8 * d * cfg.experts.max(4096))?,
             logits: DeviceBuffer::new(mr.max(d) * cfg.experts)?,
@@ -2398,9 +2469,9 @@ impl Engine {
         // a pass over image rows writes them into the stream eagerly: never a captured decode pass
         let images = self.has_image_spans(lane);
         // the lane's snapshot (want_snapshot): taken where this forward reaches its position
-        let want = self.fl.as_ref().and_then(|fl| fl.snap_want[lane]).filter(|&p| p >= self.pos && p <= self.pos + t);
+        let want = self.rec_snap_want(lane).filter(|&p| p >= self.pos && p <= self.pos + t);
         if want == Some(self.pos) {
-            self.flash_take_snapshot(lane, self.pos, self.pos)?;
+            self.rec_take_snapshot(lane, self.pos, self.pos)?;
         }
         if next.is_none() && !images && (t <= MAX_ROWS || (t <= HEAD_ROWS && self.pos >= self.wide_from)) {
             let p0 = self.pos;
@@ -2415,7 +2486,7 @@ impl Engine {
             // pool from rows 64 positions old (drafts only: the decoder's rings were whole)
             if let Some(p) = want.filter(|&p| p > p0) {
                 // the pass saved its rows (t <= SAVE_ROWS): a replay to p, or the state at its end
-                self.flash_take_snapshot(lane, self.pos, p)?;
+                self.rec_take_snapshot(lane, self.pos, p)?;
             }
             return Ok(out);
         }
@@ -2457,7 +2528,7 @@ impl Engine {
             }
             // after the chunk's MTP fill (the decode path above: the MTP layer's ring)
             if let Some(p) = want.filter(|&p| p > p0 && p <= self.pos) {
-                self.flash_take_snapshot(lane, self.pos, p)?;
+                self.rec_take_snapshot(lane, self.pos, p)?;
             }
             c0 += n;
         }
@@ -2613,30 +2684,30 @@ impl Engine {
     /// GLM-5.3's positional caches; for GLM-5.3-Flash where KDA's state can go back to - `keep` inside
     /// the lane's last saved pass, else its snapshot at or before `keep`, else 0 (serve's admission).
     pub fn reusable(&self, lane: usize, keep: usize) -> usize {
-        if self.fl.is_none() || self.flash_can_rewind(lane, self.lane_pos(lane), keep) {
+        if !self.rec() || self.rec_can_rewind(lane, self.lane_pos(lane), keep) {
             keep
         } else {
-            self.flash_restore_point(lane, keep)
+            self.rec_restore_point(lane, keep)
         }
     }
 
     /// Whether set_pos(n) can take the selected lane back to `n` positions: always for GLM-5.3's KV
     /// caches; GLM-5.3-Flash's KDA state only to 0, to where it is, or into its last saved pass.
     pub fn can_rewind(&self, n: usize) -> bool {
-        self.fl.is_none() || self.flash_can_rewind(self.lane, self.pos, n)
+        !self.rec() || self.rec_can_rewind(self.lane, self.pos, n)
     }
 
     /// The furthest position at most `keep` the lane's sequence can go back to when `keep`
     /// itself is out of reach: its KDA snapshot's, else 0 (GLM-5.3: `keep`).
     pub fn restore_point(&self, lane: usize, keep: usize) -> usize {
-        if self.fl.is_none() { keep } else { self.flash_restore_point(lane, keep) }
+        if !self.rec() { keep } else { self.rec_restore_point(lane, keep) }
     }
 
     /// GLM-5.3-Flash: the selected lane's next forward snapshots its KDA state at position `p`
     /// (a prompt's end: Engine docs in flash_fwd), committed by commit_snapshot. Both ranks: it
     /// splits the prefill at `p`.
     pub fn want_snapshot(&mut self, p: usize) -> Result<()> {
-        if self.fl.is_none() || p == 0 {
+        if !self.rec() || p == 0 {
             return Ok(());
         }
         let lane = self.lane;
@@ -2651,17 +2722,51 @@ impl Engine {
         if let Some(fl) = self.fl.as_mut() {
             fl.snap_want[lane] = Some(p);
         }
+        if let Some(s) = self.ink.as_mut() {
+            s.snap_want[lane] = Some(p);
+        }
+    }
+
+    /// Whether lanes carry recurrent state beside their positional caches (GLM-5.3-Flash's KDA
+    /// state, Inkling 2's rings): a set_pos reaches only where that state can go back to.
+    fn rec(&self) -> bool {
+        self.fl.is_some() || self.ink.is_some()
+    }
+
+    fn rec_can_rewind(&self, lane: usize, pos: usize, n: usize) -> bool {
+        if self.ink.is_some() { self.ink_can_rewind(lane, pos, n) } else { self.flash_can_rewind(lane, pos, n) }
+    }
+
+    fn rec_restore_point(&self, lane: usize, keep: usize) -> usize {
+        if self.ink.is_some() { self.ink_restore_point(lane, keep) } else { self.flash_restore_point(lane, keep) }
+    }
+
+    fn rec_snap_want(&self, lane: usize) -> Option<usize> {
+        match (&self.fl, &self.ink) {
+            (Some(fl), _) => fl.snap_want[lane],
+            (_, Some(s)) => s.snap_want[lane],
+            _ => None,
+        }
+    }
+
+    fn rec_take_snapshot(&mut self, lane: usize, pos: usize, p: usize) -> Result<()> {
+        if self.ink.is_some() { self.ink_take_snapshot(lane, pos, p) } else { self.flash_take_snapshot(lane, pos, p) }
+    }
+
+    fn rec_commit_snapshot(&mut self, lane: usize) {
+        self.flash_commit_snapshot(lane);
+        self.ink_commit_snapshot(lane);
     }
 
     /// The lane decodes: the snapshot its prompt's prefill took is the one a later prompt restores.
     pub fn commit_snapshot(&mut self, lane: usize) -> Result<()> {
-        if self.fl.is_none() {
+        if !self.rec() {
             return Ok(());
         }
         self.mirror(|m| {
             m.u32(OP_SNAP_COMMIT).u32(lane as u32);
         })?;
-        self.flash_commit_snapshot(lane);
+        self.rec_commit_snapshot(lane);
         Ok(())
     }
 
@@ -2682,6 +2787,9 @@ impl Engine {
         }
         if self.fl.is_some() {
             self.flash_set_pos(lane, self.pos, n)?;
+        }
+        if self.ink.is_some() {
+            self.ink_set_pos(lane, self.pos, n)?;
         }
         if let Some(v) = self.vis.as_mut() {
             // images from n on are no longer the lane's (one cut through keeps its entry: a prompt's
@@ -2910,7 +3018,7 @@ impl Engine {
                 }
                 OP_SNAP_COMMIT => {
                     let lane = r.u32()? as usize;
-                    self.flash_commit_snapshot(lane);
+                    self.rec_commit_snapshot(lane);
                 }
                 OP_KV_SHRINK => {
                     let (lane, n) = (r.u32()? as usize, r.u32()? as usize);
@@ -2927,6 +3035,8 @@ impl Engine {
                 crate::adapt::OP_ADAPT => self.follow_adapt(&mut r)?,
                 crate::adapt::OP_ADAPT_BG => self.follow_adapt_bg(&mut r)?,
                 op @ (crate::prefix::OP_DISK_SAVE | crate::prefix::OP_DISK_LOAD) => self.follow_disk(op, &mut r)?,
+                crate::flash_image::OP_INK_IMAGES => self.follow_ink_images(&mut r)?,
+                inkling_fwd::OP_INK_DRAFT => self.follow_ink_draft(&mut r)?,
                 crate::adapt::OP_BG => self.follow_bg(&mut r)?,
                 OP_BENCH_KNOB => {
                     let (code, on) = (r.u32()?, r.u32()? != 0);

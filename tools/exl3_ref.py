@@ -320,6 +320,7 @@ def write_pack(path: str, bits_map: dict[int, float], rank: int, world: int, cod
         else:
             f.write(head)
             f.truncate(data0)                            # zero-fill the header padding
+        dirty = 0
         for (key, tensors), meta in _ordered(records_iter, records):
             parts = []
             shapes = record_shapes(meta["bits"], rank, world)
@@ -333,6 +334,14 @@ def write_pack(path: str, bits_map: dict[int, float], rank: int, world: int, cod
             f.seek(data0 + meta["off"])
             f.write(blob)
             end = max(end, data0 + meta["off"] + meta["nbytes"])
+            # written through and out of the page cache every 256 MB: a pack is as large as the
+            # box's memory, and its dirty pages otherwise count against whatever runs beside it
+            dirty += len(blob)
+            if dirty >= 256 << 20:
+                f.flush()
+                os.fsync(f.fileno())
+                os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+                dirty = 0
         f.truncate(_align_up(end))
     return path
 

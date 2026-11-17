@@ -1889,6 +1889,7 @@ int glm_router_e(void* stream, const void* logits, const void* bias, const void*
     };
     if (E == 256) go(router_kernel<256>, 256);
     else if (E == 288) go(router_kernel<288>, 288);
+    else if (E == 384) go(router_kernel<384>, 384);   // Inkling 2
     else return (int)cudaErrorInvalidValue;
     GRET;
 }

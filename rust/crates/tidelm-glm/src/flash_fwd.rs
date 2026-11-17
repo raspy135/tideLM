@@ -494,6 +494,7 @@ impl Engine {
         match &self.w.layers[l].mlp {
             crate::weights::Mlp::Moe { sh_gate_up, .. } => self.l2_lin(sh_gate_up, t, self.pf_sh_up),
             crate::weights::Mlp::Dense { gate_up, .. } => self.l2_lin(gate_up, t, self.pf_sh_up),
+            crate::weights::Mlp::Routed { .. } => Ok(()),
         }
     }
 
@@ -545,7 +546,7 @@ impl Engine {
         match &self.w.layers[l].attn {
             Attn::Kda(k) => self.attention_kda(l, k, t, prefill),
             Attn::Dsa(d) => self.attention_dsa(l, d, t, prefill),
-            Attn::Mla(_) => unreachable!(),
+            Attn::Mla(_) | Attn::Ink(_) => unreachable!(),
         }
     }
 

@@ -177,7 +177,7 @@ fn glm_keyed(api_keys: Vec<String>) -> Option<(String, Arc<Engine>, Arc<Ctx>)> {
     let text = Text::load(&d).unwrap();
     let ids = GlmIds::load(&d, &text).unwrap();
     let eos = ids.stop[0];
-    let g = GlmSettings { ids, default_effort: "low".into(), default_max_tokens: 4096, temperature: 1.0, top_p: 1.0, vision: None };
+    let g = GlmSettings { ids: crate::glm::Fmt::Glm(ids), default_effort: "low".into(), default_max_tokens: 4096, temperature: 1.0, top_p: 1.0, vision: None };
     Some(serve(text, Family::Glm(g), eos, 65536, api_keys))
 }
 
@@ -639,7 +639,7 @@ fn glm_conversation_log() {
     let text = Text::load(&d).unwrap();
     let ids = GlmIds::load(&d, &text).unwrap();
     let eos = ids.stop[0];
-    let g = GlmSettings { ids, default_effort: "low".into(), default_max_tokens: 4096, temperature: 1.0, top_p: 1.0, vision: None };
+    let g = GlmSettings { ids: crate::glm::Fmt::Glm(ids), default_effort: "low".into(), default_max_tokens: 4096, temperature: 1.0, top_p: 1.0, vision: None };
     let (addr, engine, ctx) = serve_with(text, Family::Glm(g), eos, 65536, vec![], Some(crate::convlog::Log::new(tmp.clone())));
     *engine.answer.lock().unwrap() = ctx.text.encode("Let me think.</think>Hello!<|user|>never seen").unwrap();
     let body = json!({"messages": [{"role": "user", "content": "Hi"}], "x_debug": true});

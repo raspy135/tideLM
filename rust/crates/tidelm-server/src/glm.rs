@@ -28,23 +28,31 @@ use tidelm_engine::forward::Sampling;
 use tidelm_text::chat::py_json;
 use tidelm_engine::vision::ImageIn;
 use tidelm_text::glm::{render, render_vision, truthy, GlmIds, IMAGES};
+use tidelm_text::inkling::{self, InklingIds};
 use tidelm_text::Text;
 
 use crate::anthropic::{Prep, Prepared, Room};
 use crate::api::{body_json, submit, Failure, Request};
 use crate::http::{send_json, start_events, ApiError};
-use crate::output::{hex24, Answer, GlmAnswer, Phase};
+use crate::output::{hex24, Answer, GlmAnswer, InklingAnswer, Phase};
 use crate::{Cmd, Ctx};
+
+/// The chat format a checkpoint of this server speaks: its template's and its parser's ids.
+pub enum Fmt {
+    /// GLM-5.3 and GLM-5.3-Flash: `<think>`, `</think>`, `<tool_call>`, `</tool_call>` and the stop ids
+    Glm(GlmIds),
+    /// Inkling 2: its message and content tokens (tidelm_text::inkling)
+    Ink(InklingIds),
+}
 
 /// What a GLM server needs beyond the tokenizer: the parser's ids and muse_app's defaults.
 pub struct GlmSettings {
-    /// `<think>`, `</think>`, `<tool_call>`, `</tool_call>` and the stop ids
-    pub ids: GlmIds,
+    pub ids: Fmt,
     /// GLM_REASONING_EFFORT (muse_app's default "medium", which the template renders as Max)
     pub default_effort: String,
     /// GLM_DEFAULT_MAX_TOKENS (4096)
     pub default_max_tokens: i64,
-    /// generation_config.json's temperature and top_p (1.0 when absent)
+    /// GLM_TEMPERATURE / GLM_TOP_P, else generation_config.json's temperature and top_p, else 1.0
     pub temperature: f64,
     pub top_p: f64,
     /// GLM-5.3-Flash with GLM_VISION=1: images are shown to the model (else the template's reminder)
@@ -59,11 +67,57 @@ pub struct VisionSet {
 }
 
 impl GlmSettings {
+    /// The ids that end an answer.
+    pub fn stop(&self) -> &[u32] {
+        match &self.ids {
+            Fmt::Glm(i) => &i.stop,
+            Fmt::Ink(i) => &i.stop,
+        }
+    }
+
+    /// `</think>` (GLM; Inkling 2's reasoning is a message of its own, with no closing id).
+    pub fn think_end(&self) -> Option<u32> {
+        match &self.ids {
+            Fmt::Glm(i) => Some(i.think_end),
+            Fmt::Ink(_) => None,
+        }
+    }
+
+    /// A fresh router for one answer's ids.
+    pub fn answer(&self) -> Box<dyn Answer> {
+        match &self.ids {
+            Fmt::Glm(i) => Box::new(GlmAnswer::new(i)),
+            Fmt::Ink(i) => Box::new(InklingAnswer::new(i)),
+        }
+    }
+
+    /// The conversation log's family name.
+    pub fn family(&self) -> &'static str {
+        match &self.ids {
+            Fmt::Glm(_) => "glm",
+            Fmt::Ink(_) => "inkling",
+        }
+    }
+
     pub fn load(model_dir: &Path, text: &Text) -> Result<Self, tidelm_text::Error> {
-        let ids = GlmIds::load(model_dir, text)?;
+        let top: Value = serde_json::from_slice(&std::fs::read(model_dir.join("config.json"))?)?;
+        let ids = if top["model_type"].as_str() == Some("inkling2") {
+            Fmt::Ink(InklingIds::load(model_dir, text)?)
+        } else {
+            Fmt::Glm(GlmIds::load(model_dir, text)?)
+        };
         let path = model_dir.join("generation_config.json");
         let gen: Value = if path.exists() { serde_json::from_slice(&std::fs::read(path)?)? } else { Value::Null };
-        let f = |k: &str| gen.get(k).and_then(|v| v.as_f64()).unwrap_or(1.0);
+        // GLM_TEMPERATURE / GLM_TOP_P (a profile's choice) before generation_config.json's, else 1.0:
+        // Inkling 2 ships no generation_config, and a top_p of 1 samples the whole vocabulary (and
+        // reads the full row back each token: the candidates cannot prove a nucleus that has no cut)
+        let f = |k: &str| -> Result<f64, tidelm_text::Error> {
+            let var = format!("GLM_{}", k.to_uppercase());
+            match std::env::var(&var) {
+                Ok(v) if !v.trim().is_empty() => Ok(v.trim().parse::<f64>().map_err(|_| format!("{var}={v}: not a number"))?),
+                _ => Ok(gen.get(k).and_then(|v| v.as_f64()).unwrap_or(1.0)),
+            }
+        };
         Ok(GlmSettings {
             ids,
             default_effort: std::env::var("GLM_REASONING_EFFORT").unwrap_or_else(|_| "medium".into()),
@@ -71,16 +125,23 @@ impl GlmSettings {
                 Ok(v) => v.parse().map_err(|_| format!("GLM_DEFAULT_MAX_TOKENS={v}: not an integer"))?,
                 Err(_) => 4096,
             },
-            temperature: f("temperature"),
-            top_p: f("top_p"),
+            temperature: f("temperature")?,
+            top_p: f("top_p")?,
             vision: {
                 let cfg: Value = serde_json::from_slice(&std::fs::read(model_dir.join("config.json"))?)?;
-                if cfg["model_type"].as_str() == Some("glm5_next") && std::env::var("GLM_VISION").as_deref() == Ok("1") {
+                let on = std::env::var("GLM_VISION").as_deref() == Ok("1");
+                // the placeholder a template writes for an image, and the default cap on its tokens
+                let kind = match cfg["model_type"].as_str() {
+                    Some("glm5_next") => Some(("<|image|>", 8000)),
+                    Some("inkling2") => Some((inkling::IMAGE_PLACEHOLDER, 4096)),
+                    _ => None,
+                };
+                if let (true, Some((token, default))) = (on, kind) {
                     let max_tokens = match std::env::var("GLM_VISION_MAX_TOKENS") {
                         Ok(v) => v.parse().map_err(|_| format!("GLM_VISION_MAX_TOKENS={v}: not an integer"))?,
-                        Err(_) => 8000,
+                        Err(_) => default,
                     };
-                    let image_id = text.tokenizer.token_to_id("<|image|>").ok_or("the tokenizer has no <|image|> token")?;
+                    let image_id = text.tokenizer.token_to_id(token).ok_or_else(|| format!("the tokenizer has no {token} token"))?;
                     Some(VisionSet { max_tokens, image_id })
                 } else {
                     None
@@ -194,7 +255,66 @@ fn prompt(body: &Value, ctx: &Ctx, effort: Option<&str>, g: &GlmSettings) -> Res
         Some(Value::Array(a)) => a,
         Some(_) => return Err(ApiError::bad("`messages` must be a list", Some("messages"))),
     };
+    if matches!(g.ids, Fmt::Ink(_)) {
+        // Inkling 2's template takes the effort as a name or as a number in [0, 0.99]
+        let ev = request_effort(body).cloned().unwrap_or_else(|| json!(g.default_effort));
+        return ink_prompt(msgs, body.get("tools"), &ev, ctx, g);
+    }
     with_images(msgs, body.get("tools"), effort, ctx, g)
+}
+
+/// Inkling 2's prompt: tidelm_text::inkling's template over the messages (string tool arguments
+/// parsed first, as the template asks of its caller). Image parts are refused: the vision tower is
+/// not served, and the template has no text stand-in for them.
+fn ink_prompt(msgs: &[Value], tools: Option<&Value>, effort: &Value, ctx: &Ctx, g: &GlmSettings)
+              -> Result<(String, Vec<u32>, Vec<ImageIn>), ApiError> {
+    // OpenAI clients send `developer` for what was `system`; the template has no such role (it raises),
+    // and its system messages may sit anywhere in the conversation, so fold it in as the DeepSeek path does
+    let msgs: Vec<Value> = msgs.iter().map(|m| {
+        let mut m = m.clone();
+        if m.get("role").and_then(|r| r.as_str()) == Some("developer") {
+            m["role"] = Value::String("system".into());
+        }
+        m
+    }).collect();
+    let msgs = &msgs[..];
+    let text = inkling::render_with_effort(&inkling::prepare(msgs), tools.filter(|t| !t.is_null()), Some(effort))
+        .map_err(|e| ApiError::bad(format!("cannot render messages: {e}"), Some("messages")))?;
+    let ids = encode(ctx, &text)?;
+    // the image parts in prompt order (the template writes one placeholder each, in a message of its own)
+    let parts: Vec<Value> = msgs.iter().filter_map(|m| m.get("content").and_then(|c| c.as_array()))
+        .flat_map(|c| c.iter())
+        .filter(|p| p.get("type").and_then(|t| t.as_str()).is_some_and(|t| inkling::IMAGES.contains(&t)))
+        .filter_map(|p| p.as_object().map(image_record)).collect();
+    if parts.is_empty() {
+        return Ok((text, ids, vec![]));
+    }
+    let Some(v) = g.vision.as_ref() else {
+        return Err(ApiError::bad("image input is off on this server (GLM_VISION=1 turns it on)", Some("messages")));
+    };
+    let found = ids.iter().filter(|&&t| t == v.image_id).count();
+    if found != parts.len() {
+        return Err(ApiError::bad(format!("{found} image placeholders for {} images (is {} typed in the text?)", parts.len(),
+                                         inkling::IMAGE_PLACEHOLDER), Some("messages")));
+    }
+    // each placeholder becomes the image's tokens (one a 40 x 40 px cell), the images go with the ids
+    let mut prepared = vec![];
+    for rec in &parts {
+        let bytes = crate::vision::load_bytes(rec).map_err(|e| ApiError::bad(e, Some("messages")))?;
+        prepared.push(tidelm_image::inkling2::prepare(&bytes, v.max_tokens).map_err(|e| ApiError::bad(e, Some("messages")))?);
+    }
+    let (mut out, mut images, mut k) = (Vec::with_capacity(ids.len()), vec![], 0);
+    for &t in &ids {
+        if t != v.image_id {
+            out.push(t);
+            continue;
+        }
+        let p = &mut prepared[k];
+        k += 1;
+        images.push(ImageIn { start: out.len(), vit_h: p.gh(), vit_w: p.gw(), patches: std::mem::take(&mut p.patches) });
+        out.extend(std::iter::repeat(v.image_id).take(p.tokens()));
+    }
+    Ok((text, out, images))
 }
 
 /// An image part's record for vision::load_bytes: OpenAI's image_url (an object or a URL),
@@ -255,7 +375,7 @@ fn request(prompt: Vec<u32>, images: Vec<ImageIn>, p: &Params, g: &GlmSettings) 
         max_tokens: p.max_tokens,
         sampling: Sampling { temperature: p.temperature, top_p: p.top_p },
         seed: p.seed,
-        stop: g.ids.stop.clone(),
+        stop: g.stop().to_vec(),
         copy_draft: p.copy_draft,
     }
 }
@@ -306,12 +426,16 @@ pub fn completions(stream: &mut TcpStream, body: &[u8], ctx: &Ctx, g: &GlmSettin
 /// params from the Anthropic body
 pub fn anthropic_prepare(req: &Value, msgs: &[Value], tools: Vec<Value>, ctx: &Ctx, g: &GlmSettings, count: bool) -> Result<Prep, ApiError> {
     let tools = Value::Array(tools);
-    let (_, ids, images) = with_images(msgs, Some(&tools), Some(&g.default_effort), ctx, g)?;
+    let (_, ids, images) = if matches!(g.ids, Fmt::Ink(_)) {
+        ink_prompt(msgs, Some(&tools), &json!(g.default_effort), ctx, g)?
+    } else {
+        with_images(msgs, Some(&tools), Some(&g.default_effort), ctx, g)?
+    };
     if count {
         return Ok(Prep::Count(ids.len()));
     }
     let p = params(req, g)?;
-    Ok(Prep::Run(Prepared { request: request(ids, images, &p, g), answer: Box::new(GlmAnswer::new(&g.ids)), room: Room::Glm, tools }))
+    Ok(Prep::Run(Prepared { request: request(ids, images, &p, g), answer: g.answer(), room: Room::Glm, tools }))
 }
 
 fn now() -> u64 {
@@ -411,7 +535,7 @@ fn run(stream: &mut TcpStream, ctx: &Ctx, g: &GlmSettings, req: Request, tools: 
     let debug = body.is_some_and(|b| b.get("x_debug").is_some_and(truthy));
     let n_prompt = req.prompt.len();
     let prompt_ids = if debug || (chat && ctx.convlog.is_some()) { req.prompt.clone() } else { Vec::new() };
-    let mut answer = GlmAnswer::new(&g.ids);
+    let mut answer = g.answer();
     // the answer's ids, through the stop id (/v1/completions' text)
     let mut ids = Vec::new();
     let mut first = None;
@@ -505,11 +629,11 @@ fn run(stream: &mut TcpStream, ctx: &Ctx, g: &GlmSettings, req: Request, tools: 
     }
     let usage = json!({"prompt_tokens": n_prompt, "completion_tokens": n, "total_tokens": n_prompt + n, "muse": st});
     let (calls, _) = answer.tool_calls(&ctx.text, tools);
-    let reason = finish_reason(&calls, &answer, &finish);
+    let reason = finish_reason(&calls, answer.as_ref(), &finish);
     if let (Some(log), Some(b)) = (&ctx.convlog, body) {
         // GLM's thinking is the template's: whether this answer reasoned
         log.record(&crate::convlog::Turn {
-            body: b, model: &ctx.model, family: "glm", thinking: !answer.reasoning().is_empty(),
+            body: b, model: &ctx.model, family: g.family(), thinking: !answer.reasoning().is_empty(),
             effort: json!(template_effort(b, g)), reasoning: answer.reasoning(), content: answer.content(),
             tool_calls: &calls, finish_reason: reason, prompt_ids: &prompt_ids, token_ids: &ids,
         });

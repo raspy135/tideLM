@@ -1,14 +1,16 @@
 """Offline packer: a GLM checkpoint's EXL3 routed experts -> one aligned file per rank (GLM_EXPERT_FORMAT=exl3).
 
 Reads `<prefix>{L}.mlp.experts.{E}.{gate,up,down}_proj.{trellis,suh,svh,<codebook>}` (prefix
-`model.layers.` for GLM-5.3, `model.language_model.layers.` for GLM-5.3-Flash) and writes each
+`model.layers.` for GLM-5.3, `model.language_model.layers.` for GLM-5.3-Flash, `model.llm.layers.`
+for Inkling 2) and writes each
 expert's TP-output rank slice with tools/exl3_ref.py's pack writer -- the same record layout and
 4096-aligned O_DIRECT records as the V4.1 pack, at the checkpoint's own dims (GLM-5.3: 6,144
 hidden, 2,048 intermediate, 256 experts a layer; GLM-5.3-Flash: 4,096, 2,048, 288). gate/up keep
 this rank's share of the intermediate columns, down this rank's share of the hidden columns, as
 engine/glm/tp.py splits the MXFP4 experts; at --world 1 a record is the whole expert. Sources:
 
-  --source DIR    a checkpoint on disk;
+  --source DIR    a checkpoint on disk (needs the safetensors package);
+  --mirror DIR    the same, read by this file's own header parsing (stdlib + numpy);
   --repo ID       a checkpoint on the Hub, read by HTTP range requests: one request an expert, no
                   shard lands on disk (a one-Spark setup needs the pack's bytes, not the 156 GB
                   checkpoint beside it). Same pack bytes and source identity as --source on a
@@ -43,6 +45,7 @@ import random
 import re
 import struct
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -64,6 +67,12 @@ def check_quant(q: dict, where: str) -> str:
     if str(q.get("quant_method", "")).lower() != "exl3" or codebook not in ("mul1", "mcg"):
         raise SystemExit(f"{where}: not an EXL3 mul1 / mcg checkpoint ({q})")
     return codebook
+
+
+def moe_inter(cfg: dict) -> int:
+    """A routed expert's intermediate width: GLM's moe_intermediate_size; Inkling 2's text_config has
+    no dense MLP and calls it intermediate_size."""
+    return int(cfg["moe_intermediate_size"] if "moe_intermediate_size" in cfg else cfg["intermediate_size"])
 
 
 def expert_names(weight_map) -> tuple[str, list[int], int]:
@@ -114,7 +123,7 @@ class GlmExl3Source:
             q.update({k: v for k, v in json.load(open(qpath)).items() if k in ("quant_method", "codebook")})
         self.codebook = check_quant(q, model_dir)
         self.marker = {"mul1": R.MUL1_MUL, "mcg": R.MCG_MUL}[self.codebook]
-        self.hidden, self.inter = int(cfg["hidden_size"]), int(cfg["moe_intermediate_size"])
+        self.hidden, self.inter = int(cfg["hidden_size"]), moe_inter(cfg)
         self.prefix, self.layers, n = expert_names(self.map)
         self.n_experts = int(cfg["n_routed_experts"])
         assert n == self.n_experts, (n, self.n_experts)
@@ -171,7 +180,7 @@ class HubSource(GlmExl3Source):
                       if k in ("quant_method", "codebook")})
         self.codebook = check_quant(q, self.where)
         self.marker = {"mul1": R.MUL1_MUL, "mcg": R.MCG_MUL}[self.codebook]
-        self.hidden, self.inter = int(cfg["hidden_size"]), int(cfg["moe_intermediate_size"])
+        self.hidden, self.inter = int(cfg["hidden_size"]), moe_inter(cfg)
         self.prefix, self.layers, n = expert_names(self.map)
         self.n_experts = int(cfg["n_routed_experts"])
         assert n == self.n_experts, (n, self.n_experts)
@@ -268,6 +277,35 @@ class HubSource(GlmExl3Source):
         return out
 
 
+class MirrorSource(HubSource):
+    """A download of a checkpoint (tools/hf_mirror.py, `hf download`), read as HubSource reads the Hub
+    - the shards' headers parsed here, an expert in one pread - so it needs no safetensors package
+    and writes the same pack with the same identity. Every read is dropped from the page cache: a
+    300 GB checkpoint goes through beside a serving engine without filling it."""
+
+    def __init__(self, model_dir: str):
+        self.dir = model_dir
+        self._fds: dict[str, int] = {}
+        self._lock = threading.Lock()
+        super().__init__("local", "mirror")
+        self.where = model_dir
+
+    def get_url(self, url: str, rng: tuple[int, int] | None = None, final: list | None = None) -> bytes:
+        name = url[len(self.base):]
+        with self._lock:
+            fd = self._fds.get(name)
+            if fd is None:
+                fd = self._fds[name] = os.open(os.path.join(self.dir, name), os.O_RDONLY)
+        off, n = (rng[0], rng[1] - rng[0]) if rng else (0, os.fstat(fd).st_size)
+        data = os.pread(fd, n, off)
+        if len(data) != n:
+            raise OSError(f"{name}: short read {len(data)} of {n}")
+        os.posix_fadvise(fd, off, n, os.POSIX_FADV_DONTNEED)
+        if final is not None:
+            final.append(url)
+        return data
+
+
 class PackSource:
     """A --world 1 pack, re-sliced into a rank of a larger world."""
 
@@ -320,6 +358,7 @@ def main(argv=None) -> int:
     src_g = ap.add_mutually_exclusive_group(required=True)
     src_g.add_argument("--source", help="a checkpoint directory")
     src_g.add_argument("--repo", help="a Hub repo, read by range requests")
+    src_g.add_argument("--mirror", help="a download of the checkpoint, read without the safetensors package")
     src_g.add_argument("--from-pack", help="a --world 1 pack to re-slice")
     ap.add_argument("--revision", default="main", help="with --repo: a branch, tag or commit")
     ap.add_argument("--out", required=True)
@@ -335,6 +374,8 @@ def main(argv=None) -> int:
         src = GlmExl3Source(a.source)
     elif a.repo:
         src = HubSource(a.repo, a.revision)
+    elif a.mirror:
+        src = MirrorSource(a.mirror)
     else:
         src = PackSource(a.from_pack)
     layers = [int(L) for L in a.layers.split(",")] if a.layers else src.layers
