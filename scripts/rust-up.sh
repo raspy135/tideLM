@@ -177,6 +177,8 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
     # Inkling 2's DSpark drafter is on with GLM_MTP=1 (its depth is at most 7); GLM_INK_DRAFT=0 keeps
     # the other drafters (copy, lookup) without it
     [[ -n "${GLM_INK_DRAFT:-}" ]] && envs+=(GLM_INK_DRAFT="$GLM_INK_DRAFT")
+    # TIDELM_INK_PF_FLASH=0: full layers' prefill attention through cuBLAS instead of the fused kernel
+    [[ -n "${TIDELM_INK_PF_FLASH:-}" ]] && envs+=(TIDELM_INK_PF_FLASH="$TIDELM_INK_PF_FLASH")
     # Inkling 2's likewise (GLM_INK_DENSE=fp8|bf16)
     [[ -n "${GLM_INK_DENSE:-}" ]] && envs+=(GLM_INK_DENSE="$GLM_INK_DENSE")
     # GLM-5.3-Flash on one box: the MTP draft passes score a listed vocabulary (unset: the built-in

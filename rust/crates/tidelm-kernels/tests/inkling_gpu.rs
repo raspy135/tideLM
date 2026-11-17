@@ -457,6 +457,75 @@ fn decode_attention_matches_the_reference_and_prefill_matches_decode() {
     }
 }
 
+#[test]
+fn fused_prefill_attention_matches_the_reference() {
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(0xf1a5_4);
+    let kl = 2usize;
+    let rowk = kl * 2 * D;
+    // (window, first position, rows): a full layer from the sequence's start (every key in the bias's
+    // band, rows not a multiple of 16), one past the band, a window layer's rows over keys from lo
+    for (window, p0, t) in [(0usize, 0usize, 37usize), (0, 2500, 21), (0, 1100, 64), (1024, 5000, 40)] {
+        let a = Attn::new(&mut rng, kl, t, p0, 1024);
+        let hl = a.hl;
+        let (_, _, goff, soff) = a.offs();
+        let n_pos = p0 + t;
+        let all = rng.bf16_vec(n_pos * rowk, 1.0);
+        let lo_key = if window > 0 { (p0 + 1).saturating_sub(window) } else { 0 };
+        let kv = dev(&all[lo_key * rowk..]);
+        let qc = rng.bf16_vec(t * hl * D, 2.0);
+        let rc = rng.bf16_vec(t * hl * REL, 1.0);
+        let (proj, proj_t, qcd, rcd) = (dev(&a.proj), dev(&a.proj_t), dev(&qc), dev(&rc));
+        let o = DeviceBuffer::<u16>::zeroed(t * hl * D).unwrap();
+        unsafe {
+            ok(ink_pf_flash(st.raw(), p(&qcd), p(&rcd), p(&proj_t), 1024, p(&kv), rowk as i64, lo_key as i32, p(&proj), a.ldp as i64,
+                            soff as i32, goff as i32, hl as i32, kl as i32, t as i32, p0 as i32, window as i32, p(&o)));
+        }
+        let allf = fl(&all);
+        let want = a.reference(&fl(&qc), &fl(&rc), &|pos| allf[pos * rowk..(pos + 1) * rowk].to_vec(), window);
+        let got = fl(&o.download().unwrap());
+        let e = rel_err(&got, &want);
+        let worst = (0..t * hl).map(|i| rel_err(&got[i * D..][..D], &want[i * D..][..D])).fold(0f32, f32::max);
+        eprintln!("fused prefill attention window {window} p0 {p0} rows {t}: rel err {e:.2e}, worst (row, head) {worst:.2e}");
+        assert!(e < 1e-2 && worst < 3e-2, "fused prefill attention window {window} p0 {p0}: rel err {e}, worst {worst}");
+    }
+}
+
+/// TIDELM_INK_FLASH_BENCH=1: the fused prefill attention's time for a 2048-row chunk of one rank's
+/// 24 heads (kl 4) deep in a context, the case that took the cuBLAS path tens of seconds a turn.
+#[test]
+fn fused_prefill_attention_time() {
+    if std::env::var("TIDELM_INK_FLASH_BENCH").as_deref() != Ok("1") {
+        return;
+    }
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(0xbe_7c);
+    let kl = 4usize;
+    let rowk = kl * 2 * D;
+    for (p0, t) in [(16384usize, 2048usize), (65536, 2048), (150000, 2048), (150000, 2284)] {
+        let a = Attn::new(&mut rng, kl, t, p0, 1024);
+        let hl = a.hl;
+        let (_, _, goff, soff) = a.offs();
+        let kv = dev(&rng.bf16_vec((p0 + t) * rowk, 1.0));
+        let (qcd, rcd) = (dev(&rng.bf16_vec(t * hl * D, 2.0)), dev(&rng.bf16_vec(t * hl * REL, 1.0)));
+        let (proj, proj_t) = (dev(&a.proj), dev(&a.proj_t));
+        let o = DeviceBuffer::<u16>::zeroed(t * hl * D).unwrap();
+        let run = || unsafe {
+            ok(ink_pf_flash(st.raw(), p(&qcd), p(&rcd), p(&proj_t), 1024, p(&kv), rowk as i64, 0, p(&proj), a.ldp as i64, soff as i32,
+                            goff as i32, hl as i32, kl as i32, t as i32, p0 as i32, 0, p(&o)));
+        };
+        run();
+        let t0 = std::time::Instant::now();
+        for _ in 0..3 {
+            run();
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / 3.0;
+        let flops = 4.0 * t as f64 * (p0 as f64 + t as f64 / 2.0) * D as f64 * hl as f64;
+        eprintln!("fused prefill attention: {t} rows at {p0}: {ms:.1} ms a layer ({:.1} TFLOP/s; 8 full layers {:.2} s)", flops / ms / 1e9,
+                  8.0 * ms / 1e3);
+    }
+}
+
 // ------------------------------------------------------------------ snapshots, logits
 #[test]
 fn ring_copy_round_trips_across_the_wrap() {

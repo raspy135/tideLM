@@ -123,6 +123,12 @@ the MoE, residency, hot reads, lanes, graphs and serving code are the same code.
   and graphs (two chat requests; not the README protocol).
 - Uniform placement (no history) at 49% resident: 51% missed, and the model loops from the first
   sentence. The placement, not the engine: a history fixes it.
+- Prefill deep in a context (the pair, live traffic): full layers' attention through cuBLAS ran
+  39-65 tok/s for a turn's ~2,000 new tokens at 118-163K (40-60 s a turn) and stalled the other
+  lane's decode to 3-4 tok/s meanwhile; its row blocks were sized to the score buffer, a few rows,
+  each re-reading every key for each head. `ink_pf_flash` (fused, tensor cores) instead: 2,427
+  tokens at 110K in 4.45 s (546 tok/s), a fresh 60K prompt at 895 tok/s (292 before), and 1.4-2.4 s
+  for the 8 layers of a 2,300-row turn at 150K in the kernel's own timing (11-24 TFLOP/s).
 
 ## Open
 
@@ -131,7 +137,9 @@ above), a history from chat traffic (tools/routing_session.py: decode routing, w
 never sees), sampled drafts (the
 reference draws its drafts at the request's temperature and verifies against that distribution: more
 accepted than a greedy draft's), the drafter's global window and a TP=2 split of it against one rank's,
-measured; FP8 key / value caches, prefill tuning (the fused expert epilogue,
-batched GEMMs), the tower against transformers' own classes once a release has them (the reference
+measured; decode attention past ~100K (the verify rows each read every key: about +33 ms a step at 140K
+against 20K; a lane's rows could share one read, as the drafter's attention does), FP8 key / value
+caches, prefill tuning (the fused expert epilogue, batched GEMMs, the window layers' attention, the
+fused kernel's loads), the tower against transformers' own classes once a release has them (the reference
 here is a transcription, with RoPE theta 10000 and exact GELU taken from the config class's defaults),
 image prompts in the disk store (their key would need the images' hashes).

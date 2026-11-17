@@ -61,6 +61,13 @@ extern "C" {
     /// o [t][hl][128] rows r0 .. = bf16(ov [hl][rb][128] * sigmoid(gate)).
     pub fn ink_pf_gate(stream: CudaStream, ov: *const c_void, proj: *const c_void, ldp: i64, goff: c_int, hl: c_int, r0: c_int,
                        rb: c_int, o: *mut c_void) -> c_int;
+    /// The fused prefill attention (flash, tensor cores) of rows 0 .. t of one lane at positions p0 ..:
+    /// keys lo_key .. each row's position (window > 0: its last `window`), kv the row of key lo_key
+    /// in [keys][kl][K | V] rows rowk elements apart; bias, sink and gate as ink_attn_combine's, o
+    /// [t][hl][128]. What ink_pf_softmax + the two GEMMs + ink_pf_gate compute, without the scores.
+    pub fn ink_pf_flash(stream: CudaStream, qc: *const c_void, rc: *const c_void, proj_t: *const c_void, rel_extent: c_int,
+                        kv: *const c_void, rowk: i64, lo_key: c_int, proj: *const c_void, ldp: i64, soff: c_int, goff: c_int,
+                        hl: c_int, kl: c_int, t: c_int, p0: c_int, window: c_int, o: *mut c_void) -> c_int;
     /// Positions p0 .. p0 + n of a lane's rings (`ring`: the lane's part of the first layer's ring
     /// [r][row] bf16, `ring_ls` elements a layer) into lin [layers][n][row] (`lin_ls` a layer), or
     /// back (to_ring): a snapshot and its restore.

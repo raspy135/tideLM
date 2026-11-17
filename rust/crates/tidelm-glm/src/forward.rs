@@ -132,7 +132,7 @@ impl Options {
              lanes {}\nkv_tokens {}\npack_source {}\nablit {}\nenv {}\nflags {}\n",
             sha2::Sha256::digest(&cfg), sha2::Sha256::digest(&exe), self.max_seq, self.chunk, self.slots, self.kv_split,
             self.prefill_reduce_bf16, self.moe_rows, self.lanes, self.kv_tokens, pack.source_sha256, crate::ablit::digest()?,
-            ["TIDELM_GLM_HOT", "TIDELM_GLM_WIDE_DECODE_FROM", "NCCL_PROTO", "TIDELM_GLM_MLA_HALF", "TIDELM_GLM_FAT", "GLM_FLASH_DENSE", "TIDELM_FLASH_HC_FUSED", "GLM_INK_DENSE"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
+            ["TIDELM_GLM_HOT", "TIDELM_GLM_WIDE_DECODE_FROM", "NCCL_PROTO", "TIDELM_GLM_MLA_HALF", "TIDELM_GLM_FAT", "GLM_FLASH_DENSE", "TIDELM_FLASH_HC_FUSED", "GLM_INK_DENSE", "TIDELM_INK_PF_FLASH"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
                 .collect::<Vec<_>>().join(" "), self.guard_extra);
         Ok(s.into_bytes())
     }

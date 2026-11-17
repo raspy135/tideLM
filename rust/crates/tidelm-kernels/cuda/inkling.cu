@@ -444,6 +444,205 @@ __global__ void ink_pf_gate_kernel(const bf16* __restrict__ ov, const bf16* __re
     o[((int64_t)t * hl + hq) * kD + d] = to_bf(bf(ov[((int64_t)hq * rb + i) * kD + d]) / (1.f + expf(-gate)));
 }
 
+// ------------------------------------------------------------------ attention, prefill rows, fused
+// The prefill attention of rows that see many keys (a full layer deep in a context), in one pass
+// over the keys: flash attention with tensor cores, after vision.cu's vit_attn_kernel. A block takes
+// 16 rows x the 6 query heads of one key / value head (96 (row, head) pairs, a warp's 16 each), so
+// each 64-key tile of K and V (transposed) is read from memory once for all of them; nothing of the
+// [rows][keys] scores is written. Per pair: score = q.k / sqrt(128) + r . projT[p - j] (p - j <
+// rel_extent), keys lo_key + window-limited .. p (causal), the sink as one more logit with a zero
+// value, then o = bf16(bf16(sum / total) * sigmoid(gate)) - ink_attn_combine's rounding. P is rounded
+// to bf16 for the P.V products, the sums are fp32 (the cuBLAS path rounds the normalized weights
+// instead: the two agree to bf16 rounding). kv: key lo_key's row of [keys][kl][K 128 | V 128] rows
+// rowk elements apart. Grid (ceil(t / 16), kl), 192 threads.
+constexpr int kFR = 16;                 // rows a block
+constexpr int kFP = kFR * kG;           // (row, head) pairs a block: 6 warps x 16
+constexpr int kFK = 64;                 // keys a tile
+constexpr int kFPad = 8;                // smem row padding (bf16): conflict-free fragments
+
+__device__ __forceinline__ uint32_t ink_pack_bf16(float lo, float hi) {
+    const __nv_bfloat162 p = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast<const uint32_t*>(&p);
+}
+
+__device__ __forceinline__ void ink_mma_bf16(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__global__ void __launch_bounds__(kFP * 2) ink_pf_flash_kernel(const bf16* __restrict__ qc, const bf16* __restrict__ rc,
+                                                              const bf16* __restrict__ projT, int rel_extent,
+                                                              const bf16* __restrict__ kv, int64_t rowk, int lo_key,
+                                                              const bf16* __restrict__ proj, int64_t ldp, int soff, int goff,
+                                                              int hl, int t, int p0, int window, bf16* __restrict__ o) {
+    pdl_enter();
+    __shared__ __align__(16) bf16 ks[kFK][kD + kFPad];
+    __shared__ __align__(16) bf16 vt[kD][kFK + kFPad];
+    __shared__ float rs[kFP][kRel];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, r = lane >> 2, q = lane & 3;
+    const int g = blockIdx.y, t0 = blockIdx.x * kFR;
+    const int nrow = min(kFR, t - t0);
+    constexpr float kLog2e = 1.4426950408889634f;
+    const float scale2 = rsqrtf((float)kD) * kLog2e;
+    // pair m = row * 6 + head: this thread's two (rows r and r + 8 of its warp's 16)
+    const int ma = warp * 16 + r, mb = ma + 8;
+    const int ta = t0 + ma / kG, tb = t0 + mb / kG;
+    const int ha = g * kG + ma % kG, hb = g * kG + mb % kG;
+    const bool va = ma / kG < nrow, vb = mb / kG < nrow;
+    const int pa = p0 + ta, pb = p0 + tb;
+    const int la = window > 0 ? max(lo_key, pa - window + 1) : lo_key, lb = window > 0 ? max(lo_key, pb - window + 1) : lo_key;
+    for (int u = threadIdx.x; u < kFP * kRel; u += blockDim.x) {
+        const int m = u / kRel, c = u % kRel, tt = t0 + m / kG;
+        rs[m][c] = m / kG < nrow ? bf(rc[((int64_t)tt * hl + g * kG + m % kG) * kRel + c]) : 0.f;
+    }
+    uint32_t qa[kD / 16][4];
+#pragma unroll
+    for (int st = 0; st < kD / 16; ++st) {
+        const int d = st * 16 + q * 2;
+        auto ld32 = [&](bool v, int tt, int hh, int dd) -> uint32_t {
+            return v ? *reinterpret_cast<const uint32_t*>(qc + ((int64_t)tt * hl + hh) * kD + dd) : 0u;
+        };
+        qa[st][0] = ld32(va, ta, ha, d);
+        qa[st][1] = ld32(vb, tb, hb, d);
+        qa[st][2] = ld32(va, ta, ha, d + 8);
+        qa[st][3] = ld32(vb, tb, hb, d + 8);
+    }
+    float acc[kD / 8][4];
+#pragma unroll
+    for (int i = 0; i < kD / 8; ++i) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
+    // the block's keys: from the first row's window start to its last row's position
+    const int pfirst = p0 + t0, plast = p0 + t0 + nrow - 1;
+    const int kbeg = window > 0 ? max(lo_key, pfirst - window + 1) : lo_key;
+    for (int k0 = kbeg; k0 <= plast; k0 += kFK) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < kFK * (kD / 8); i += blockDim.x) {
+            const int row = i / (kD / 8), c = (i % (kD / 8)) * 8, key = k0 + row;
+            uint4 kk = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
+            if (key <= plast) {
+                const bf16* src = kv + (int64_t)(key - lo_key) * rowk + g * 2 * kD;
+                kk = *reinterpret_cast<const uint4*>(src + c);
+                vv = *reinterpret_cast<const uint4*>(src + kD + c);
+            }
+            *reinterpret_cast<uint4*>(&ks[row][c]) = kk;
+            const bf16* ve = reinterpret_cast<const bf16*>(&vv);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) vt[c + j][row] = ve[j];
+        }
+        __syncthreads();
+        float s[kFK / 8][4];
+#pragma unroll
+        for (int nb = 0; nb < kFK / 8; ++nb) {
+            s[nb][0] = s[nb][1] = s[nb][2] = s[nb][3] = 0.f;
+#pragma unroll
+            for (int st = 0; st < kD / 16; ++st) {
+                const uint32_t b0 = *reinterpret_cast<const uint32_t*>(&ks[nb * 8 + r][st * 16 + q * 2]);
+                const uint32_t b1 = *reinterpret_cast<const uint32_t*>(&ks[nb * 8 + r][st * 16 + q * 2 + 8]);
+                ink_mma_bf16(s[nb], qa[st], b0, b1);
+            }
+        }
+        // scale, the relative bias near the diagonal, the mask; log2 units from here
+        const bool band = k0 + kFK - 1 > pfirst - rel_extent;
+#pragma unroll
+        for (int nb = 0; nb < kFK / 8; ++nb)
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int key = k0 + nb * 8 + q * 2 + (j & 1);
+                const bool hi = j >= 2;
+                const int p = hi ? pb : pa, lo = hi ? lb : la;
+                const bool ok = (hi ? vb : va) && key >= lo && key <= p;
+                float v = s[nb][j] * scale2;
+                if (band && ok && p - key < rel_extent) {
+                    const bf16* pj = projT + (int64_t)(p - key) * kRel;
+                    const float* rv = rs[hi ? mb : ma];
+                    float b = 0.f;
+#pragma unroll
+                    for (int c = 0; c < kRel; ++c) b = fmaf(rv[c], bf(pj[c]), b);
+                    v = fmaf(b, kLog2e, v);
+                }
+                s[nb][j] = ok ? v : -INFINITY;
+            }
+        float mx0 = m0, mx1 = m1;
+#pragma unroll
+        for (int nb = 0; nb < kFK / 8; ++nb) {
+            mx0 = fmaxf(mx0, fmaxf(s[nb][0], s[nb][1]));
+            mx1 = fmaxf(mx1, fmaxf(s[nb][2], s[nb][3]));
+        }
+#pragma unroll
+        for (int off = 1; off < 4; off <<= 1) {
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, off));
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, off));
+        }
+        // a pair with no key yet keeps a finite reference (exp2 of -inf - it is 0)
+        const float b0 = mx0 > -INFINITY ? mx0 : 0.f, b1 = mx1 > -INFINITY ? mx1 : 0.f;
+        const float c0 = exp2f(m0 - b0), c1 = exp2f(m1 - b1);
+        m0 = mx0;
+        m1 = mx1;
+        l0 *= c0;
+        l1 *= c1;
+#pragma unroll
+        for (int db = 0; db < kD / 8; ++db) {
+            acc[db][0] *= c0;
+            acc[db][1] *= c0;
+            acc[db][2] *= c1;
+            acc[db][3] *= c1;
+        }
+        uint32_t pa_[kFK / 16][4];
+#pragma unroll
+        for (int nb = 0; nb < kFK / 8; ++nb) {
+            const float e0 = exp2f(s[nb][0] - b0), e1 = exp2f(s[nb][1] - b0);
+            const float e2 = exp2f(s[nb][2] - b1), e3 = exp2f(s[nb][3] - b1);
+            l0 += e0 + e1;
+            l1 += e2 + e3;
+            pa_[nb >> 1][(nb & 1) * 2] = ink_pack_bf16(e0, e1);
+            pa_[nb >> 1][(nb & 1) * 2 + 1] = ink_pack_bf16(e2, e3);
+        }
+#pragma unroll
+        for (int db = 0; db < kD / 8; ++db)
+#pragma unroll
+            for (int st = 0; st < kFK / 16; ++st) {
+                const uint32_t v0 = *reinterpret_cast<const uint32_t*>(&vt[db * 8 + r][st * 16 + q * 2]);
+                const uint32_t v1 = *reinterpret_cast<const uint32_t*>(&vt[db * 8 + r][st * 16 + q * 2 + 8]);
+                ink_mma_bf16(acc[db], pa_[st], v0, v1);
+            }
+    }
+#pragma unroll
+    for (int off = 1; off < 4; off <<= 1) {
+        l0 += __shfl_xor_sync(0xffffffffu, l0, off);
+        l1 += __shfl_xor_sync(0xffffffffu, l1, off);
+    }
+    // the sink: one more logit, a zero value
+    float fa = 0.f, fb = 0.f;
+    if (va) {
+        const float sk = bf(proj[(int64_t)ta * ldp + soff + ha]) * kLog2e, mm = fmaxf(m0, sk);
+        const float f = exp2f(m0 - mm);
+        fa = f / (l0 * f + exp2f(sk - mm));
+    }
+    if (vb) {
+        const float sk = bf(proj[(int64_t)tb * ldp + soff + hb]) * kLog2e, mm = fmaxf(m1, sk);
+        const float f = exp2f(m1 - mm);
+        fb = f / (l1 * f + exp2f(sk - mm));
+    }
+#pragma unroll
+    for (int db = 0; db < kD / 8; ++db) {
+        const int d = db * 8 + q * 2;
+        if (va) {
+            const bf16* gt = proj + (int64_t)ta * ldp + goff + ha * kD + d;
+            bf16* out = o + ((int64_t)ta * hl + ha) * kD + d;
+            out[0] = to_bf(rbf(acc[db][0] * fa) / (1.f + expf(-bf(gt[0]))));
+            out[1] = to_bf(rbf(acc[db][1] * fa) / (1.f + expf(-bf(gt[1]))));
+        }
+        if (vb) {
+            const bf16* gt = proj + (int64_t)tb * ldp + goff + hb * kD + d;
+            bf16* out = o + ((int64_t)tb * hl + hb) * kD + d;
+            out[0] = to_bf(rbf(acc[db][2] * fb) / (1.f + expf(-bf(gt[0]))));
+            out[1] = to_bf(rbf(acc[db][3] * fb) / (1.f + expf(-bf(gt[1]))));
+        }
+    }
+}
+
 // ------------------------------------------------------------------ snapshots
 // Positions p0 .. p0 + n of a lane's rings ([layers][...][R][row], `ring` at the lane's part of
 // layer 0, `ring_ls` elements a layer) into lin [layers][n][row] (`lin_ls` a layer), or back
@@ -535,6 +734,15 @@ int ink_pf_softmax(void* stream, const void* sc, const void* rc, const void* pro
                    int soff, int hl, int r0, int rb, int s, int lo, int p0, int window, void* w) {
     pdl_launch(ink_pf_softmax_kernel, dim3((rb + 7) / 8, hl), dim3(256), 0, GST, (const float*)sc, (const bf16*)rc,
                (const bf16*)proj_t, rel_extent, (const bf16*)proj, ldp, soff, hl, r0, rb, s, lo, p0, window, (bf16*)w);
+    GRET;
+}
+
+int ink_pf_flash(void* stream, const void* qc, const void* rc, const void* proj_t, int rel_extent, const void* kv, int64_t rowk,
+                 int lo_key, const void* proj, int64_t ldp, int soff, int goff, int hl, int kl, int t, int p0, int window, void* o) {
+    if (hl != kl * kG || t <= 0) return t < 0;
+    pdl_launch(ink_pf_flash_kernel, dim3((t + kFR - 1) / kFR, kl), dim3(kFP * 2), 0, GST, (const bf16*)qc, (const bf16*)rc,
+               (const bf16*)proj_t, rel_extent, (const bf16*)kv, rowk, lo_key, (const bf16*)proj, ldp, soff, goff, hl, t, p0, window,
+               (bf16*)o);
     GRET;
 }
 

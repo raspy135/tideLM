@@ -37,6 +37,12 @@ const DRAFT_GLOBAL_RING: usize = 16384;
 pub(crate) const OP_INK_DRAFT: u32 = 41;
 /// A draft round's result: 7 tokens (i32) then their probabilities (fp32).
 const DRAFT_OUT: usize = 7 * 8;
+/// TIDELM_INK_PF_FLASH (default on): full layers' prefill attention through ink_pf_flash.
+fn pf_flash() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TIDELM_INK_PF_FLASH").as_deref() != Ok("0"))
+}
+
 /// Key splits of a decode row's attention: the window layers' 1,024 keys, the full layers' context.
 const NS_WINDOW: usize = 4;
 const NS_FULL: usize = 64;
@@ -698,6 +704,17 @@ impl Engine {
         let rowk = kl * 2 * d;
         let p0 = self.pos;
         let off = w.off;
+        // a full layer: the fused kernel over the lane's flat cache. The cuBLAS path below sized its
+        // row blocks to the score buffer, a few rows deep in a context, and read every key again for
+        // each block and head: 2,300 rows at 150K took 40-60 s a turn on the pair (2026-11-16), the
+        // fused kernel 1.4-2.4 s for the 8 layers (fused_prefill_attention_time). TIDELM_INK_PF_FLASH=0
+        // keeps the cuBLAS path (boot-guarded: the two round differently).
+        if window == 0 && ring == 0 && pf_flash() {
+            let kv = unsafe { (cache as *mut u16).add(self.lane * self.dec_lane_rows * rowk) as *const c_void };
+            return ck(unsafe { ink_pf_flash(st, np(&ia.qc), np(&ia.rc), np(&w.proj_t), extent as i32, kv, rowk as i64, 0, np(&ia.proj),
+                                            ldp as i64, off.sink as i32, off.gate as i32, hl as i32, kl as i32, t as i32, p0 as i32, 0,
+                                            np(&a.o)) }, "prefill attention");
+        }
         let budget = a.scores.len().min(ia.wp.len());
         // rows a block: its scores [hl][rb][keys] fit the buffers (keys: the block's rows and the
         // window before them, or every position up to the block's last)
