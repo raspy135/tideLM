@@ -13,14 +13,16 @@ tide — so the engine gets better the more you use it.
 | `glm53-exlr8-home` | GLM-5.3 | 2 | exlr8 `home` (3.25 bpw: 3 or 4 bits an expert) | 11,430 / 19,200 (59.5%) | 320K (2 lanes) | **20.4 tok/s** | **23.9 tok/s** | 17.2 s |
 | `glm53-flash-40-tp1` | GLM-5.3-Flash | **1** | EXL3 4 bpw (4 bits a projection) | 7,282 / 12,096 (60.2%) | 320K (2 lanes) | **22.1 tok/s** | **26.4 tok/s** | 12.1 s |
 | `glm53-flash-40-tp2` | GLM-5.3-Flash | 2 | EXL3 4 bpw (4 bits a projection) | 12,096 / 12,096 (100%) | 1M (2 lanes, 2M shared) | **36.8 tok/s** | **46.6 tok/s** | 7.6 s |
-| `inkling2-small-40-tp2` | Inkling-2-Small | 2 | EXL3 4 bpw (4 bits a projection) | 11,967 / 18,432 (64.9%) | 512K (3 lanes) | **29.4 tok/s** | **42.3 tok/s** | 7.6 s |
+| `inkling2-small-40-tp2` | Inkling-2-Small | 2 | EXL3 4 bpw (4 bits a projection) | 11,865 / 18,432 (64.4%) | 768K (3 lanes) | **29.4 tok/s** | **42.3 tok/s** | 7.6 s |
 
 *Medians of three `bench/bench.py` runs after a warmup, 1,024 tokens at temperature 0.6, each on
 the build of its day (raw runs: [DeepSeek](results/rust-ds41-20261028-pdl/README.md), 2026-10-28;
 [GLM-5.3 `home`](results/rust-glm53-exlr8-home-20261112/README.md), 2026-11-12; GLM-5.3-Flash
 [on one Spark](results/rust-glm53-flash-40-tp1-20261114/README.md) and
 [on two](results/rust-glm53-flash-40-tp2-20261114/README.md), 2026-11-14;
-[Inkling-2-Small](results/rust-inkling2-40-tp2-20261116-512k/README.md), 2026-11-16).*
+[Inkling-2-Small](results/rust-inkling2-40-tp2-20261116-512k/README.md), 2026-11-16, at a 512K context
+with 11,967 experts resident: the profile has served 768K with 102 fewer since 2026-11-17, not
+measured again).*
 
 GLM-5.3 is served from the `home` profile (3.25 bpw: 3 or 4 bits an expert) of
 [kindlingai/glm-5.3-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4). The
@@ -47,12 +49,12 @@ author finds 4 bpw the smarter of the two all the same, and answers were not sco
 
 Inkling-2-Small (Thinking Machines, 594B total, 17B active) is served from 0xSero's
 [EXL3 4 bpw](https://huggingface.co/0xSero/Inkling-2-Small-EXL3-4bpw) on two Sparks: its 18,432
-routed experts at 4 bits are 293 GB for a pair that holds about 190, so 64.9% stay resident, placed
-from a routing history the bundled seed starts (its top 64.9% carry 93% of the routing weight). The
+routed experts at 4 bits are 293 GB for a pair that holds about 190, so 64.4% stay resident, placed
+from a routing history the bundled seed starts (its top 64.4% carry 92.7% of the routing weight). The
 rest is the GLM engine's: non-expert weights in FP8, the 8 full-attention layers' keys and values in
-FP8 (held-out NLL +0.0014 +- 0.0011 against BF16), image input, the model's own DSpark drafter (7
-drafts a round) on the worker, and three lanes, so an agent's long conversation keeps its lane beside
-two chats. What the substituted experts cost in answers against the whole model is not measured here
+FP8 (held-out NLL +0.0014 +- 0.0011 against BF16) for a 768K context (the model's own limit is 1M),
+image input, the model's own DSpark drafter (7 drafts a round) on the worker, and three lanes, so an
+agent's long conversation keeps its lane beside two chats. What the substituted experts cost in answers against the whole model is not measured here
 ([Inkling-2-Small](docs/inkling.md)).
 
 Adaptive expert loading also allows flexible memory configuration.
