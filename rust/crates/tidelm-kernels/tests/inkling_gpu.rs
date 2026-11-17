@@ -88,6 +88,47 @@ fn rel_err(got: &[f32], want: &[f32]) -> f32 {
     (d / n.max(1e-30)).sqrt() as f32
 }
 
+// ------------------------------------------------------------------ fp8 cache rows
+/// e4m3 (bias 7, 3 mantissa bits, 448 the largest finite) and its encoding to nearest, ties to the
+/// even code, saturating: cuda_fp8.h's __NV_SATFINITE conversion.
+fn e4m3_dec(c: u8) -> f32 {
+    let (e, m) = ((c >> 3) & 0xf, (c & 7) as f32);
+    let v = if e == 0 { m / 8.0 * 2f32.powi(-6) } else { (1.0 + m / 8.0) * 2f32.powi(e as i32 - 7) };
+    if c & 0x80 != 0 { -v } else { v }
+}
+fn e4m3_enc(v: f32) -> u8 {
+    let a = v.abs().min(448.0);
+    let (mut lo, mut hi) = (0u8, 0x7eu8);
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if e4m3_dec(mid) <= a { lo = mid } else { hi = mid }
+    }
+    let (dl, dh) = (a - e4m3_dec(lo), e4m3_dec(hi) - a);
+    let c = if dl < dh || (dl == dh && lo % 2 == 0) { lo } else { hi };
+    c | if v < 0.0 && c != 0 { 0x80 } else { 0 }
+}
+/// bf16 cache rows [n][kl][K 128 | V 128] as the engine's FP8 rows (codes, then [kl][2] fp32 scales:
+/// a head's amax / 448), and the values a reader sees (code x scale, to bf16) in the bf16 layout.
+fn fp8_rows(rows: &[u16], kl: usize) -> (Vec<u8>, Vec<f32>) {
+    let (rk, rb) = (kl * 2 * D, kl * 2 * D + kl * 8);
+    let n = rows.len() / rk;
+    let (mut out, mut deq) = (vec![0u8; n * rb], vec![0f32; n * rk]);
+    for r in 0..n {
+        for h in 0..kl * 2 {
+            let v = fl(&rows[r * rk + h * D..][..D]);
+            let amax = v.iter().fold(0f32, |m, x| m.max(x.abs()));
+            let sc = if amax > 0.0 { amax / 448.0 } else { 1.0 };
+            for d in 0..D {
+                let c = e4m3_enc(v[d] / sc);
+                out[r * rb + h * D + d] = c;
+                deq[r * rk + h * D + d] = bf(e4m3_dec(c) * sc);
+            }
+            out[r * rb + kl * 2 * D + h * 4..][..4].copy_from_slice(&sc.to_le_bytes());
+        }
+    }
+    (out, deq)
+}
+
 /// A pass's tables: one lane group (`lane`, rows 0.., first position p0, cache-row offset koff).
 fn tables(lane: usize, rows: usize, p0: usize, koff: usize) -> (DeviceBuffer<i32>, DeviceBuffer<i32>) {
     (dev(&[0i32, rows as i32, p0 as i32, koff as i32]), dev(&[lane as i32, 0, 0, 0]))
@@ -338,7 +379,22 @@ fn heads_scale_clip_and_fill_the_cache() {
         unsafe {
             ok(ink_heads(st.raw(), p(&dev(&a.proj)), a.ldp as i64, qoff as i32, roff as i32, p(&dev(&qs)), p(&dev(&rs)), p(&dev(&kx)),
                          p(&dev(&vx)), hl as i32, kl as i32, qclip, rclip, eps, alpha, 128_000.0, p(&lt), 1, p(&meta), ringp as i32,
-                         lane_rows as i64, t as i32, p(&qc), p(&rc), p(&cache)));
+                         lane_rows as i64, t as i32, p(&qc), p(&rc), p(&cache), 0));
+        }
+        // a flat (full layer's) cache in FP8 too: the same rows' codes and scales, exactly the host's
+        // encoding of the bf16 rows the bf16 run wrote
+        if flat {
+            let rb = kl * 2 * D + kl * 8;
+            let c8 = DeviceBuffer::<u8>::zeroed((700 + p0 + t) * rb).unwrap();
+            unsafe {
+                ok(ink_heads(st.raw(), p(&dev(&a.proj)), a.ldp as i64, qoff as i32, roff as i32, p(&dev(&qs)), p(&dev(&rs)), p(&dev(&kx)),
+                             p(&dev(&vx)), hl as i32, kl as i32, qclip, rclip, eps, alpha, 128_000.0, p(&lt), 1, p(&meta), 0, 0, t as i32,
+                             p(&qc), p(&rc), p(&c8), 1));
+            }
+            let (got, bfc) = (c8.download().unwrap(), cache.download().unwrap());
+            let (want, _) = fp8_rows(&bfc[(koff + p0) * rowk..(koff + p0 + t) * rowk], kl);
+            assert_eq!(&got[(koff + p0) * rb..(koff + p0 + t) * rb], &want[..], "heads: the fp8 rows");
+            eprintln!("heads fp8: {} rows' codes and scales as the host encodes them", t);
         }
         let (pf, qsf, rsf, kf, vf) = (fl(&a.proj), fl(&qs), fl(&rs), fl(&kx), fl(&vx));
         let clip = |v: &[f32], thr: f32| -> Vec<f32> {
@@ -418,7 +474,7 @@ fn decode_attention_matches_the_reference_and_prefill_matches_decode() {
         let o = DeviceBuffer::<u16>::zeroed(t * hl * D).unwrap();
         unsafe {
             ok(ink_attn_part(st.raw(), p(&qcd), p(&rcd), p(&proj_t), 1024, p(&cache), ring as i32, ring as i64, window as i32, p(&lt), 1,
-                             p(&meta), hl as i32, kl as i32, ns as i32, t as i32, p(&pm), p(&pl), p(&pacc)));
+                             p(&meta), hl as i32, kl as i32, ns as i32, t as i32, p(&pm), p(&pl), p(&pacc), 0));
             ok(ink_attn_combine(st.raw(), p(&pm), p(&pl), p(&pacc), p(&proj), a.ldp as i64, soff as i32, goff as i32, hl as i32,
                                 kl as i32, ns as i32, t as i32, p(&o)));
         }
@@ -495,11 +551,26 @@ fn fused_prefill_attention_matches_the_reference() {
         let (proj, proj_t, qcd, rcd) = (dev(&a.proj), dev(&a.proj_t), dev(&qc), dev(&rc));
         let o = DeviceBuffer::<u16>::zeroed(t * hl * D).unwrap();
         unsafe {
-            ok(ink_pf_flash(st.raw(), p(&qcd), p(&rcd), p(&proj_t), 1024, p(&kv), rowk as i64, lo_key as i32, p(&proj), a.ldp as i64,
-                            soff as i32, goff as i32, hl as i32, kl as i32, t as i32, p0 as i32, window as i32, p(&o)));
+            ok(ink_pf_flash(st.raw(), p(&qcd), p(&rcd), p(&proj_t), 1024, p(&kv), (rowk * 2) as i64, lo_key as i32, p(&proj), a.ldp as i64,
+                            soff as i32, goff as i32, hl as i32, kl as i32, t as i32, p0 as i32, window as i32, p(&o), 0));
         }
         let allf = fl(&all);
         let want = a.reference(&fl(&qc), &fl(&rc), &|pos| allf[pos * rowk..(pos + 1) * rowk].to_vec(), window);
+        if window == 0 {
+            // the same rows in an FP8 cache: against the reference on what its reader sees, and how far
+            // that is from the bf16 cache's answer
+            let (c8, deq) = fp8_rows(&all, kl);
+            let o8 = DeviceBuffer::<u16>::zeroed(t * hl * D).unwrap();
+            unsafe {
+                ok(ink_pf_flash(st.raw(), p(&qcd), p(&rcd), p(&proj_t), 1024, p(&dev(&c8)), (kl * 2 * D + kl * 8) as i64, 0, p(&proj),
+                                a.ldp as i64, soff as i32, goff as i32, hl as i32, kl as i32, t as i32, p0 as i32, 0, p(&o8), 1));
+            }
+            let w8 = a.reference(&fl(&qc), &fl(&rc), &|pos| deq[pos * rowk..(pos + 1) * rowk].to_vec(), 0);
+            let g8 = fl(&o8.download().unwrap());
+            let (e8, cost) = (rel_err(&g8, &w8), rel_err(&g8, &want));
+            eprintln!("fused prefill attention fp8 cache p0 {p0} rows {t}: rel err {e8:.2e} (against the bf16 cache's answer {cost:.2e})");
+            assert!(e8 < 1e-2, "fused prefill attention fp8 p0 {p0}: {e8}");
+        }
         let got = fl(&o.download().unwrap());
         let e = rel_err(&got, &want);
         let worst = (0..t * hl).map(|i| rel_err(&got[i * D..][..D], &want[i * D..][..D])).fold(0f32, f32::max);
@@ -569,7 +640,7 @@ fn fused_decode_attention_matches_the_reference() {
             unsafe {
                 let f = if fused { ink_flash_part } else { ink_attn_part };
                 ok(f(st.raw(), p(&qcd), p(&rcd), p(&proj_t), 1024, p(&cache), ring as i32, ring as i64, window as i32, p(&ltd), nl,
-                     p(&metad), hl as i32, kl as i32, ns as i32, t as i32, p(&pm), p(&pl), p(&pacc)));
+                     p(&metad), hl as i32, kl as i32, ns as i32, t as i32, p(&pm), p(&pl), p(&pacc), 0));
                 ok(ink_attn_combine(st.raw(), p(&pm), p(&pl), p(&pacc), p(&proj), a.ldp as i64, soff as i32, goff as i32, hl as i32,
                                     kl as i32, ns as i32, t as i32, p(&o)));
             }
@@ -592,6 +663,40 @@ fn fused_decode_attention_matches_the_reference() {
         let worst = (0..t * hl).map(|i| rel_err(&new[i * D..][..D], &want[i * D..][..D])).fold(0f32, f32::max);
         eprintln!("fused decode attention window {window} groups {groups:?}: rel err {e_new:.2e} (worst {worst:.2e}; ink_attn_part {e_old:.2e})");
         assert!(e_new < 5e-3 && worst < 3e-2, "fused decode attention window {window} groups {groups:?}: {e_new}, worst {worst}");
+        if ring == 0 {
+            // an FP8 cache (a full layer's): both kernels against the reference on its dequantized rows
+            let (c8, deq) = fp8_rows(&cache_h, kl);
+            let c8d = dev(&c8);
+            let mut w8 = vec![];
+            let mut r0 = 0usize;
+            let mut koff = 32usize;
+            for &(n, p0) in &groups {
+                let az = Attn { hl, t: n, p0, ldp: a.ldp, proj: a.proj[r0 * a.ldp..(r0 + n) * a.ldp].to_vec(), proj_t: a.proj_t.clone(),
+                                extent: a.extent };
+                let k0 = koff;
+                w8.extend(az.reference(&qf[r0 * hl * D..(r0 + n) * hl * D], &rf[r0 * hl * REL..(r0 + n) * hl * REL],
+                                       &|pos| deq[(k0 + pos) * rowk..(k0 + pos + 1) * rowk].to_vec(), 0));
+                r0 += n;
+                koff += p0 + n;
+            }
+            for fused in [false, true] {
+                let pm = DeviceBuffer::<f32>::zeroed(t * kl * ns * G).unwrap();
+                let pl = DeviceBuffer::<f32>::zeroed(t * kl * ns * G).unwrap();
+                let pacc = DeviceBuffer::<f32>::zeroed(t * kl * ns * G * D).unwrap();
+                let o = DeviceBuffer::<u16>::zeroed(t * hl * D).unwrap();
+                unsafe {
+                    let f = if fused { ink_flash_part } else { ink_attn_part };
+                    ok(f(st.raw(), p(&qcd), p(&rcd), p(&proj_t), 1024, p(&c8d), 0, 0, 0, p(&ltd), nl, p(&metad), hl as i32, kl as i32,
+                         ns as i32, t as i32, p(&pm), p(&pl), p(&pacc), 1));
+                    ok(ink_attn_combine(st.raw(), p(&pm), p(&pl), p(&pacc), p(&proj), a.ldp as i64, soff as i32, goff as i32, hl as i32,
+                                        kl as i32, ns as i32, t as i32, p(&o)));
+                }
+                let g = fl(&o.download().unwrap());
+                let (e8, cost) = (rel_err(&g, &w8), rel_err(&g, &want));
+                eprintln!("decode attention fp8 cache fused {fused} groups {groups:?}: rel err {e8:.2e} (against the bf16 cache's {cost:.2e})");
+                assert!(e8 < 5e-3, "decode attention fp8 fused {fused} groups {groups:?}: {e8}");
+            }
+        }
     }
 }
 
@@ -620,7 +725,7 @@ fn fused_decode_attention_time() {
             let f = if fused { ink_flash_part } else { ink_attn_part };
             let go = || unsafe {
                 ok(f(st.raw(), p(&qcd), p(&rcd), p(&proj_t), 1024, p(&cache), 0, 0, 0, p(&ltd), 1, p(&metad), hl as i32, kl as i32,
-                     ns as i32, t as i32, p(&pm), p(&pl), p(&pacc)));
+                     ns as i32, t as i32, p(&pm), p(&pl), p(&pacc), 0));
             };
             go();
             let t0 = std::time::Instant::now();
@@ -704,8 +809,8 @@ fn fused_prefill_attention_time() {
         let (proj, proj_t) = (dev(&a.proj), dev(&a.proj_t));
         let o = DeviceBuffer::<u16>::zeroed(t * hl * D).unwrap();
         let run = || unsafe {
-            ok(ink_pf_flash(st.raw(), p(&qcd), p(&rcd), p(&proj_t), 1024, p(&kv), rowk as i64, 0, p(&proj), a.ldp as i64, soff as i32,
-                            goff as i32, hl as i32, kl as i32, t as i32, p0 as i32, 0, p(&o)));
+            ok(ink_pf_flash(st.raw(), p(&qcd), p(&rcd), p(&proj_t), 1024, p(&kv), (rowk * 2) as i64, 0, p(&proj), a.ldp as i64, soff as i32,
+                            goff as i32, hl as i32, kl as i32, t as i32, p0 as i32, 0, p(&o), 0));
         };
         run();
         let t0 = std::time::Instant::now();

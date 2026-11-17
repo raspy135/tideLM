@@ -20,6 +20,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <stdint.h>
 #include <utility>
 
@@ -308,6 +309,35 @@ __device__ __forceinline__ int64_t kv_row(const int* lanes, const int* meta, int
     return ring ? (int64_t)meta[4 * z] * lane_rows + (p & (ring - 1)) : (int64_t)lanes[4 * z + 3] + p;
 }
 
+// A full layer's cache row in FP8 (kvf, GLM_INK_KV=fp8): [kl][K 128 | V 128] e4m3 codes, then the
+// [kl][K, V] fp32 scales (a head's amax / 448 at its position) - 1,056 bytes at kl 4 against 2,048
+// as bf16. Its values are what the bf16 row held, divided by the scale and rounded to e4m3 (RNE,
+// saturating); a reader multiplies back and rounds to bf16, as the bf16 row's reader starts from.
+constexpr float kFp8Max = 448.f;
+__device__ __forceinline__ int64_t kv_row_bytes(int kl, int kvf) {
+    return kvf ? (int64_t)kl * 2 * kD + (int64_t)kl * 2 * 4 : (int64_t)kl * 2 * kD * 2;
+}
+__device__ __forceinline__ float fp8_dec(uint8_t c) {
+    const __half_raw h = __nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)c, __NV_E4M3);
+    return __half2float(__half(h));
+}
+__device__ __forceinline__ uint8_t fp8_enc(float v) { return (uint8_t)__nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3); }
+__device__ __forceinline__ float kv_scale(const uint8_t* rb, int kl, int g, int v) {
+    return reinterpret_cast<const float*>(rb + (int64_t)kl * 2 * kD)[g * 2 + v];
+}
+// dims c .. c + 7 of head g's keys (v 0) or values (v 1) in the row at rb, as 8 bf16
+__device__ __forceinline__ uint4 kv_load8(const uint8_t* rb, int kl, int kvf, int g, int v, int c) {
+    if (!kvf) return *reinterpret_cast<const uint4*>(rb + ((int64_t)g * 2 * kD + v * kD + c) * 2);
+    const uint2 u = *reinterpret_cast<const uint2*>(rb + (int64_t)g * 2 * kD + v * kD + c);
+    const float sc = kv_scale(rb, kl, g, v);
+    const uint8_t* b = reinterpret_cast<const uint8_t*>(&u);
+    uint4 out;
+    bf16* o = reinterpret_cast<bf16*>(&out);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) o[e] = to_bf(fp8_dec(b[e]) * sc);
+    return out;
+}
+
 // The projections' outputs into what the attention reads (Inkling2*Attention.forward, before the
 // attention interface). Grid (hl + 2 kl, t), 128 threads; block b:
 //   b < hl:        query head b of proj (q at qoff, 128 a head) times its learned scale, clipped to
@@ -321,9 +351,9 @@ __global__ void ink_heads_kernel(const bf16* __restrict__ proj, int64_t ldp, int
                                  const bf16* __restrict__ rscale, const bf16* __restrict__ kx, const bf16* __restrict__ vx,
                                  int hl, int kl, float qclip, float rclip, float eps, float alpha, float floor_n,
                                  const int* __restrict__ lanes, int nl, const int* __restrict__ meta, int ring, int64_t lane_rows,
-                                 bf16* __restrict__ qc, bf16* __restrict__ rc, bf16* __restrict__ cache) {
+                                 bf16* __restrict__ qc, bf16* __restrict__ rc, bf16* __restrict__ cache, int kvf) {
     pdl_enter();
-    __shared__ float part[4];
+    __shared__ float part[4], pmax[4];
     const int b = blockIdx.x, t = blockIdx.y, d = threadIdx.x, warp = d >> 5, lane = d & 31;
     const int z = lane_of(lanes, nl, t);
     if (z < 0) return;
@@ -353,9 +383,25 @@ __global__ void ink_heads_kernel(const bf16* __restrict__ proj, int64_t ldp, int
         }
         return;
     }
-    bf16* row = cache + kv_row(lanes, meta, z, p, ring, lane_rows) * (int64_t)(kl * 2 * kD);
-    if (b < hl + kl) row[(b - hl) * 2 * kD + d] = to_bf(x * fminf(qclip / (sqrtf(ss) + 1e-6f), 1.f));
-    else row[(b - hl - kl) * 2 * kD + kD + d] = to_bf(x * rsqrtf(ss / (float)kD + eps));
+    const bool isk = b < hl + kl;
+    const int hh = isk ? b - hl : b - hl - kl;
+    const float y = rbf(isk ? x * fminf(qclip / (sqrtf(ss) + 1e-6f), 1.f) : x * rsqrtf(ss / (float)kD + eps));
+    if (!kvf || ring) {
+        bf16* row = cache + kv_row(lanes, meta, z, p, ring, lane_rows) * (int64_t)(kl * 2 * kD);
+        row[hh * 2 * kD + (isk ? 0 : kD) + d] = to_bf(y);
+        return;
+    }
+    // FP8 (a full layer's paged row): the head's amax, its scale, the codes
+    float am = fabsf(y);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+    if (lane == 0) pmax[warp] = am;
+    __syncthreads();
+    const float amax = fmaxf(fmaxf(pmax[0], pmax[1]), fmaxf(pmax[2], pmax[3]));
+    const float sc = amax > 0.f ? amax / kFp8Max : 1.f;
+    uint8_t* rb = reinterpret_cast<uint8_t*>(cache) + kv_row(lanes, meta, z, p, ring, lane_rows) * kv_row_bytes(kl, 1);
+    rb[hh * 2 * kD + (isk ? 0 : kD) + d] = fp8_enc(y / sc);
+    if (d == 0) reinterpret_cast<float*>(rb + (int64_t)kl * 2 * kD)[hh * 2 + (isk ? 0 : 1)] = sc;
 }
 
 // ------------------------------------------------------------------ attention, decode rows
@@ -368,7 +414,7 @@ __global__ void ink_heads_kernel(const bf16* __restrict__ proj, int64_t ldp, int
 __global__ void ink_attn_part_kernel(const bf16* __restrict__ qc, const bf16* __restrict__ rc, const bf16* __restrict__ projT,
                                      int rel_extent, const bf16* __restrict__ cache, int ring, int64_t lane_rows, int window,
                                      const int* __restrict__ lanes, int nl, const int* __restrict__ meta, int hl, int kl, int ns,
-                                     float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ pacc) {
+                                     float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ pacc, int kvf) {
     pdl_enter();
     __shared__ float wm[8][kG], wl[8][kG];
     __shared__ float wacc[8][kG][kD];
@@ -394,10 +440,19 @@ __global__ void ink_attn_part_kernel(const bf16* __restrict__ qc, const bf16* __
     for (int i = 0; i < kG; ++i) { m[i] = -INFINITY; l[i] = 0.f; acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f; }
     const int64_t rowsz = (int64_t)kl * 2 * kD;
     for (int j = k0 + warp; j < k1; j += 8) {
-        const bf16* row = cache + kv_row(lanes, meta, z, j, ring, lane_rows) * rowsz + g * 2 * kD;
         float kk[4], vv[4];
+        if (kvf) {
+            const uint8_t* rb = reinterpret_cast<const uint8_t*>(cache) + kv_row(lanes, meta, z, j, ring, lane_rows) * kv_row_bytes(kl, 1);
+            const uint32_t ck = *reinterpret_cast<const uint32_t*>(rb + g * 2 * kD + lane * 4);
+            const uint32_t cv = *reinterpret_cast<const uint32_t*>(rb + g * 2 * kD + kD + lane * 4);
+            const float sk = kv_scale(rb, kl, g, 0), sv = kv_scale(rb, kl, g, 1);
 #pragma unroll
-        for (int e = 0; e < 4; ++e) { kk[e] = bf(row[lane * 4 + e]); vv[e] = bf(row[kD + lane * 4 + e]); }
+            for (int e = 0; e < 4; ++e) { kk[e] = rbf(fp8_dec((ck >> (8 * e)) & 0xff) * sk); vv[e] = rbf(fp8_dec((cv >> (8 * e)) & 0xff) * sv); }
+        } else {
+            const bf16* row = cache + kv_row(lanes, meta, z, j, ring, lane_rows) * rowsz + g * 2 * kD;
+#pragma unroll
+            for (int e = 0; e < 4; ++e) { kk[e] = bf(row[lane * 4 + e]); vv[e] = bf(row[kD + lane * 4 + e]); }
+        }
         const int d = p - j;
         const float pj = (lane < kRel && d < rel_extent) ? bf(projT[(int64_t)d * kRel + lane]) : 0.f;
 #pragma unroll
@@ -583,9 +638,9 @@ __device__ __forceinline__ void ink_mma_bf16(float* c, const uint32_t* a, uint32
 
 __global__ void __launch_bounds__(kFP * 2) ink_pf_flash_kernel(const bf16* __restrict__ qc, const bf16* __restrict__ rc,
                                                               const bf16* __restrict__ projT, int rel_extent,
-                                                              const bf16* __restrict__ kv, int64_t rowk, int lo_key,
+                                                              const bf16* __restrict__ kv, int64_t rowb, int lo_key,
                                                               const bf16* __restrict__ proj, int64_t ldp, int soff, int goff,
-                                                              int hl, int t, int p0, int window, bf16* __restrict__ o) {
+                                                              int hl, int t, int p0, int window, bf16* __restrict__ o, int kvf) {
     pdl_enter();
     __shared__ __align__(16) bf16 ks[kFK][kD + kFPad];
     __shared__ __align__(16) bf16 vt[kD][kFK + kFPad];
@@ -631,9 +686,9 @@ __global__ void __launch_bounds__(kFP * 2) ink_pf_flash_kernel(const bf16* __res
             const int row = i / (kD / 8), c = (i % (kD / 8)) * 8, key = k0 + row;
             uint4 kk = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
             if (key <= plast) {
-                const bf16* src = kv + (int64_t)(key - lo_key) * rowk + g * 2 * kD;
-                kk = *reinterpret_cast<const uint4*>(src + c);
-                vv = *reinterpret_cast<const uint4*>(src + kD + c);
+                const uint8_t* rb = reinterpret_cast<const uint8_t*>(kv) + (int64_t)(key - lo_key) * rowb;
+                kk = kv_load8(rb, gridDim.y, kvf, g, 0, c);
+                vv = kv_load8(rb, gridDim.y, kvf, g, 1, c);
             }
             *reinterpret_cast<uint4*>(&ks[row][c]) = kk;
             const bf16* ve = reinterpret_cast<const bf16*>(&vv);
@@ -766,7 +821,7 @@ __global__ void __launch_bounds__(kFP * 2) ink_flash_part_kernel(const bf16* __r
                                                                 int window, const int* __restrict__ lanes, int nl,
                                                                 const int* __restrict__ meta, int hl, int kl, int ns, int tiles,
                                                                 float* __restrict__ pm, float* __restrict__ pl,
-                                                                float* __restrict__ pacc) {
+                                                                float* __restrict__ pacc, int kvf) {
     pdl_enter();
     __shared__ __align__(16) bf16 ks[kFK][kD + kFPad];
     __shared__ __align__(16) bf16 vt[kD][kFK + kFPad];
@@ -811,16 +866,15 @@ __global__ void __launch_bounds__(kFP * 2) ink_flash_part_kernel(const bf16* __r
 #pragma unroll
     for (int i = 0; i < kD / 8; ++i) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f;
     float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
-    const int64_t rowsz = (int64_t)kl * 2 * kD;
     for (int k0 = k0s; k0 < k1s; k0 += kFK) {
         __syncthreads();
         for (int i = threadIdx.x; i < kFK * (kD / 8); i += blockDim.x) {
             const int row = i / (kD / 8), c = (i % (kD / 8)) * 8, key = k0 + row;
             uint4 kk = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
             if (key < k1s) {
-                const bf16* src = cache + kv_row(lanes, meta, z, key, ring, lane_rows) * rowsz + g * 2 * kD;
-                kk = *reinterpret_cast<const uint4*>(src + c);
-                vv = *reinterpret_cast<const uint4*>(src + kD + c);
+                const uint8_t* rb = reinterpret_cast<const uint8_t*>(cache) + kv_row(lanes, meta, z, key, ring, lane_rows) * kv_row_bytes(kl, kvf);
+                kk = kv_load8(rb, kl, kvf, g, 0, c);
+                vv = kv_load8(rb, kl, kvf, g, 1, c);
             }
             *reinterpret_cast<uint4*>(&ks[row][c]) = kk;
             const bf16* ve = reinterpret_cast<const bf16*>(&vv);
@@ -997,21 +1051,21 @@ int ink_mix(void* stream, const void* blocks, int64_t ldb, int nb, const void* c
 
 int ink_heads(void* stream, const void* proj, int64_t ldp, int qoff, int roff, const void* qscale, const void* rscale,
               const void* kx, const void* vx, int hl, int kl, float qclip, float rclip, float eps, float alpha, float floor_n,
-              const void* lanes, int nl, const void* meta, int ring, int64_t lane_rows, int t, void* qc, void* rc, void* cache) {
+              const void* lanes, int nl, const void* meta, int ring, int64_t lane_rows, int t, void* qc, void* rc, void* cache, int kvf) {
     if (hl != kl * kG) return 1;
     pdl_launch(ink_heads_kernel, dim3(hl + 2 * kl, t), dim3(kD), 0, GST, (const bf16*)proj, ldp, qoff, roff, (const bf16*)qscale,
                (const bf16*)rscale, (const bf16*)kx, (const bf16*)vx, hl, kl, qclip, rclip, eps, alpha, floor_n, (const int*)lanes,
-               nl, (const int*)meta, ring, lane_rows, (bf16*)qc, (bf16*)rc, (bf16*)cache);
+               nl, (const int*)meta, ring, lane_rows, (bf16*)qc, (bf16*)rc, (bf16*)cache, kvf);
     GRET;
 }
 
 int ink_attn_part(void* stream, const void* qc, const void* rc, const void* proj_t, int rel_extent, const void* cache, int ring,
                   int64_t lane_rows, int window, const void* lanes, int nl, const void* meta, int hl, int kl, int ns, int t,
-                  void* pm, void* pl, void* pacc) {
+                  void* pm, void* pl, void* pacc, int kvf) {
     if (hl != kl * kG || ns < 1) return 1;
     pdl_launch(ink_attn_part_kernel, dim3(ns, kl, t), dim3(256), 0, GST, (const bf16*)qc, (const bf16*)rc, (const bf16*)proj_t,
                rel_extent, (const bf16*)cache, ring, lane_rows, window, (const int*)lanes, nl, (const int*)meta, hl, kl, ns,
-               (float*)pm, (float*)pl, (float*)pacc);
+               (float*)pm, (float*)pl, (float*)pacc, kvf);
     GRET;
 }
 
@@ -1038,21 +1092,22 @@ int ink_pf_softmax(void* stream, const void* sc, const void* rc, const void* pro
 
 int ink_flash_part(void* stream, const void* qc, const void* rc, const void* proj_t, int rel_extent, const void* cache, int ring,
                    int64_t lane_rows, int window, const void* lanes, int nl, const void* meta, int hl, int kl, int ns, int t,
-                   void* pm, void* pl, void* pacc) {
+                   void* pm, void* pl, void* pacc, int kvf) {
     if (hl != kl * kG || ns < 1 || t <= 0 || nl <= 0) return t < 0 || nl < 0;
     const int tiles = (t + kFR - 1) / kFR;
     pdl_launch(ink_flash_part_kernel, dim3(ns, kl, nl * tiles), dim3(kFP * 2), 0, GST, (const bf16*)qc, (const bf16*)rc,
                (const bf16*)proj_t, rel_extent, (const bf16*)cache, ring, lane_rows, window, (const int*)lanes, nl, (const int*)meta,
-               hl, kl, ns, tiles, (float*)pm, (float*)pl, (float*)pacc);
+               hl, kl, ns, tiles, (float*)pm, (float*)pl, (float*)pacc, kvf);
     GRET;
 }
 
-int ink_pf_flash(void* stream, const void* qc, const void* rc, const void* proj_t, int rel_extent, const void* kv, int64_t rowk,
-                 int lo_key, const void* proj, int64_t ldp, int soff, int goff, int hl, int kl, int t, int p0, int window, void* o) {
+int ink_pf_flash(void* stream, const void* qc, const void* rc, const void* proj_t, int rel_extent, const void* kv, int64_t rowb,
+                 int lo_key, const void* proj, int64_t ldp, int soff, int goff, int hl, int kl, int t, int p0, int window, void* o,
+                 int kvf) {
     if (hl != kl * kG || t <= 0) return t < 0;
     pdl_launch(ink_pf_flash_kernel, dim3((t + kFR - 1) / kFR, kl), dim3(kFP * 2), 0, GST, (const bf16*)qc, (const bf16*)rc,
-               (const bf16*)proj_t, rel_extent, (const bf16*)kv, rowk, lo_key, (const bf16*)proj, ldp, soff, goff, hl, t, p0, window,
-               (bf16*)o);
+               (const bf16*)proj_t, rel_extent, (const bf16*)kv, rowb, lo_key, (const bf16*)proj, ldp, soff, goff, hl, t, p0, window,
+               (bf16*)o, kvf);
     GRET;
 }
 

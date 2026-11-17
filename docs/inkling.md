@@ -119,6 +119,10 @@ the MoE, residency, hot reads, lanes, graphs and serving code are the same code.
 
 - Routing: a history of 116K prefilled tokens of `corpus/sources` puts 94.6% of the routed weight in
   the top 65.2% of the experts (86.5% in 48.8%, 73.5% in 32.6%). GLM-5.3's top 59% hold 72%.
+  That was seed v0; the bundled seed is now v1 (profiles/inkling2-history-v1.json), the development
+  pair's state file after a day of serving on top of v0 (chat and agent traffic with screenshots,
+  generated answers in 16 languages, the benches): 19.2x v0's mass, about 2.2M tokens' worth, its top
+  64.9% holding 93.0% - flatter than a prefilled corpus, as decode traffic is.
 - Held-out NLL, `corpus/heldout_quick.jsonl` as raw text (12,617 tokens): 1.1567 with BF16 dense
   weights, 1.1587 with FP8 (+0.0020 +- 0.0014 paired); coding 0.95 / top-1 76.4%, general 1.64 / 59.7%;
   2.38% of the routed weight missed, 1.13 hot reads a pass.
@@ -156,6 +160,16 @@ the MoE, residency, hot reads, lanes, graphs and serving code are the same code.
   5 ABBA rounds at 2.5K: a pass of 1 / 2 / 4 / 8 rows -8.3 / -7.0 / -5.5 / -3.7% (38.05 -> 34.87 ms
   at one row). Left: the attention's part + combine (28 us a window layer), the k / v convolutions
   as one launch, the mix after a convolution as one kernel.
+- FP8 keys and values for the full layers (GLM_INK_KV=fp8, the default): a row is a rank's 4 heads'
+  e4m3 codes and a scale for each head's keys and values at its position (its amax / 448), 1,056
+  bytes against 2,048; written by ink_heads, read by ink_attn_part, ink_flash_part and ink_pf_flash
+  (each multiplies back and rounds to bf16; the window layers' rings stay bf16). The cache at 320K:
+  5.37 -> 2.77 GB a rank. Against the CPU reference on the dequantized rows the kernels agree to
+  1e-4-1.7e-3; on random rows the attention output moves 4-5% from the BF16 cache's (a sharply
+  attending head shows e4m3's rounding). On the model, held-out NLL (corpus/heldout_quick.jsonl, two
+  bench boots from one routing state): 1.1576 -> 1.1590 (+0.0014 +- 0.0011; code +0.0003, prose
+  +0.0039 +- 0.0022), top-1 71.3% both - the size of FP8 dense weights' cost. The disk store's key
+  names the format, so a BF16 segment is never read into an FP8 cache.
 
 ## Open
 
@@ -164,8 +178,7 @@ above), a history from chat traffic (tools/routing_session.py: decode routing, w
 never sees), sampled drafts (the
 reference draws its drafts at the request's temperature and verifies against that distribution: more
 accepted than a greedy draft's), the drafter's global window and a TP=2 split of it against one rank's,
-measured; FP8 key / value
-caches, prefill tuning (the fused expert epilogue, batched GEMMs, the window layers' attention, the
+measured; prefill tuning (the fused expert epilogue, batched GEMMs, the window layers' attention, the
 fused kernel's loads), the tower against transformers' own classes once a release has them (the reference
 here is a transcription, with RoPE theta 10000 and exact GELU taken from the config class's defaults),
 a third lane (two conversations beside an agent evict its lane; the store now restores it in seconds

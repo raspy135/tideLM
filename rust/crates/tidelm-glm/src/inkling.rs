@@ -37,6 +37,22 @@ pub fn dense_fp8() -> Result<bool> {
     }
 }
 
+/// GLM_INK_KV: the full-attention layers' key / value cache - fp8 (the default: e4m3 codes with a
+/// scale a head and position, 1,056 bytes a position a layer at 4 heads a rank against 2,048) or bf16.
+/// The 40 window layers' rings stay bf16 (their size does not grow with the context).
+pub fn kv_fp8() -> Result<bool> {
+    match std::env::var("GLM_INK_KV").as_deref() {
+        Err(_) | Ok("") | Ok("fp8") => Ok(true),
+        Ok("bf16") => Ok(false),
+        Ok(v) => Err(format!("GLM_INK_KV={v}: fp8 or bf16").into()),
+    }
+}
+
+/// A full-attention layer's cache row on a rank with `kl` key / value heads of `d` dims (bytes).
+pub fn kv_row_bytes(kl: usize, d: usize, fp8: bool) -> usize {
+    if fp8 { kl * 2 * d + kl * 2 * 4 } else { kl * 2 * d * 2 }
+}
+
 fn u16s(b: &[u8]) -> Vec<u16> {
     b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
 }

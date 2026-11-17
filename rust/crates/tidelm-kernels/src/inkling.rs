@@ -43,16 +43,19 @@ extern "C" {
     /// proj's query heads (at qoff) and relative states (at roff) scaled, clipped and (alpha > 0)
     /// log-scaled -> qc [t][hl][128], rc [t][hl][16]; the keys kx clipped and the values vx scaled
     /// to unit RMS -> the rows' cache rows.
+    /// kvf (ink_heads, ink_attn_part, ink_flash_part, ink_pf_flash): a full layer's cache rows in FP8 -
+    /// [kl][K 128 | V 128] e4m3 codes, then [kl][K, V] fp32 scales (a head's amax / 448), 1,056 bytes at kl
+    /// 4; 0: bf16 [kl][K | V]. ink_pf_flash's rowb is a row's bytes either way.
     pub fn ink_heads(stream: CudaStream, proj: *const c_void, ldp: i64, qoff: c_int, roff: c_int, qscale: *const c_void,
                      rscale: *const c_void, kx: *const c_void, vx: *const c_void, hl: c_int, kl: c_int, qclip: f32, rclip: f32,
                      eps: f32, alpha: f32, floor_n: f32, lanes: *const c_void, nl: c_int, meta: *const c_void, ring: c_int,
-                     lane_rows: i64, t: c_int, qc: *mut c_void, rc: *mut c_void, cache: *mut c_void) -> c_int;
+                     lane_rows: i64, t: c_int, qc: *mut c_void, rc: *mut c_void, cache: *mut c_void, kvf: c_int) -> c_int;
     /// Decode rows: each (row, key / value head)'s keys in `ns` splits -> softmax partials pm, pl
     /// fp32 [t][kl][ns][6] and pacc [t][kl][ns][6][128]. window > 0: the last `window` keys.
     pub fn ink_attn_part(stream: CudaStream, qc: *const c_void, rc: *const c_void, proj_t: *const c_void, rel_extent: c_int,
                          cache: *const c_void, ring: c_int, lane_rows: i64, window: c_int, lanes: *const c_void, nl: c_int,
                          meta: *const c_void, hl: c_int, kl: c_int, ns: c_int, t: c_int, pm: *mut c_void, pl: *mut c_void,
-                         pacc: *mut c_void) -> c_int;
+                         pacc: *mut c_void, kvf: c_int) -> c_int;
     /// The splits and the sink logit (proj at soff) into o [t][hl][128], gated (proj at goff).
     pub fn ink_attn_combine(stream: CudaStream, pm: *const c_void, pl: *const c_void, pacc: *const c_void, proj: *const c_void,
                             ldp: i64, soff: c_int, goff: c_int, hl: c_int, kl: c_int, ns: c_int, t: c_int,
@@ -74,14 +77,14 @@ extern "C" {
     pub fn ink_flash_part(stream: CudaStream, qc: *const c_void, rc: *const c_void, proj_t: *const c_void, rel_extent: c_int,
                           cache: *const c_void, ring: c_int, lane_rows: i64, window: c_int, lanes: *const c_void, nl: c_int,
                           meta: *const c_void, hl: c_int, kl: c_int, ns: c_int, t: c_int, pm: *mut c_void, pl: *mut c_void,
-                          pacc: *mut c_void) -> c_int;
+                          pacc: *mut c_void, kvf: c_int) -> c_int;
     /// The fused prefill attention (flash, tensor cores) of rows 0 .. t of one lane at positions p0 ..:
     /// keys lo_key .. each row's position (window > 0: its last `window`), kv the row of key lo_key
     /// in [keys][kl][K | V] rows rowk elements apart; bias, sink and gate as ink_attn_combine's, o
     /// [t][hl][128]. What ink_pf_softmax + the two GEMMs + ink_pf_gate compute, without the scores.
     pub fn ink_pf_flash(stream: CudaStream, qc: *const c_void, rc: *const c_void, proj_t: *const c_void, rel_extent: c_int,
-                        kv: *const c_void, rowk: i64, lo_key: c_int, proj: *const c_void, ldp: i64, soff: c_int, goff: c_int,
-                        hl: c_int, kl: c_int, t: c_int, p0: c_int, window: c_int, o: *mut c_void) -> c_int;
+                        kv: *const c_void, rowb: i64, lo_key: c_int, proj: *const c_void, ldp: i64, soff: c_int, goff: c_int,
+                        hl: c_int, kl: c_int, t: c_int, p0: c_int, window: c_int, o: *mut c_void, kvf: c_int) -> c_int;
     /// Positions p0 .. p0 + n of a lane's rings (`ring`: the lane's part of the first layer's ring
     /// [r][row] bf16, `ring_ls` elements a layer) into lin [layers][n][row] (`lin_ls` a layer), or
     /// back (to_ring): a snapshot and its restore.

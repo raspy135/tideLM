@@ -118,6 +118,8 @@ pub(crate) struct InkState {
     /// 41 and the final normed hidden), a round's result here and every rank's (the gather)
     pub(crate) draft_on: bool,
     draft: Option<crate::inkling_draft::InkDraft>,
+    /// GLM_INK_KV=fp8 (the default): the full layers' cache rows are FP8 codes and their scales
+    pub(crate) kvf: bool,
     /// TIDELM_INK_FUSE (default on; the bench knob ink_fuse): a decode pass's convolutions write their
     /// rings in the same launch, and ink_mix takes its vectorized kernel (2026-11-16 profile of plain
     /// decode, 39.5 ms a token: ink_mix 3.4 ms, the convolutions 1.9 + 0.9 ms of it; a mix 34.9 -> 8.2
@@ -209,6 +211,13 @@ impl InkState {
             snap_pend: vec![None; lanes],
             snap_want: vec![None; lanes],
             floor: vec![0; lanes],
+            kvf: {
+                let f = crate::inkling::kv_fp8()?;
+                if f && !pf_flash() {
+                    return Err("GLM_INK_KV=fp8 needs the fused prefill attention (TIDELM_INK_PF_FLASH=0 reads bf16 rows)".into());
+                }
+                f
+            },
             draft_on: false,
             draft: None,
             fuse: {
@@ -708,9 +717,11 @@ impl Engine {
             }
         };
         debug_assert_eq!(full, s.swa_of[l].is_none());
+        // a full layer's rows in FP8 (GLM_INK_KV); the window layers' rings are bf16
+        let kvf = (full && s.kvf) as i32;
         ck(unsafe { ink_heads(st, np(&ia.proj), ldp as i64, off.q as i32, off.r as i32, np(&w.q_scale), np(&w.r_scale), np(&ia.kc),
                               np(&ia.vc), hl as i32, kl as i32, ink.qk_clip, ink.rel_clip, cfg.rms_eps, alpha, ink.log_floor, lanes,
-                              nl, meta, ring as i32, lane_rows as i64, t as i32, np(&ia.qc), np(&ia.rc), cache) }, "heads")?;
+                              nl, meta, ring as i32, lane_rows as i64, t as i32, np(&ia.qc), np(&ia.rc), cache, kvf) }, "heads")?;
         if !prefill {
             let ns = if full { NS_FULL } else { NS_WINDOW };
             // a full layer with a lane of several rows (a verify pass): the split-key fused kernel,
@@ -722,7 +733,7 @@ impl Engine {
             unsafe {
                 ck(part(st, np(&ia.qc), np(&ia.rc), np(&w.proj_t), extent as i32, cache, ring as i32, lane_rows as i64,
                                  window as i32, lanes, nl, meta, hl as i32, kl as i32, ns as i32, t as i32, np(&ia.pm), np(&ia.pl),
-                                 np(&ia.pacc)), "attention")?;
+                                 np(&ia.pacc), kvf), "attention")?;
                 ck(ink_attn_combine(st, np(&ia.pm), np(&ia.pl), np(&ia.pacc), np(&ia.proj), ldp as i64, off.sink as i32,
                                     off.gate as i32, hl as i32, kl as i32, ns as i32, t as i32, np(&a.o)), "attention combine")?;
             }
@@ -752,10 +763,11 @@ impl Engine {
         // fused kernel 1.4-2.4 s for the 8 layers (fused_prefill_attention_time). TIDELM_INK_PF_FLASH=0
         // keeps the cuBLAS path (boot-guarded: the two round differently).
         if window == 0 && ring == 0 && pf_flash() {
-            let kv = unsafe { (cache as *mut u16).add(self.lane * self.dec_lane_rows * rowk) as *const c_void };
-            return ck(unsafe { ink_pf_flash(st, np(&ia.qc), np(&ia.rc), np(&w.proj_t), extent as i32, kv, rowk as i64, 0, np(&ia.proj),
+            let rowb = crate::inkling::kv_row_bytes(kl, d, s.kvf);
+            let kv = unsafe { (cache as *mut u8).add(self.lane * self.dec_lane_rows * rowb) as *const c_void };
+            return ck(unsafe { ink_pf_flash(st, np(&ia.qc), np(&ia.rc), np(&w.proj_t), extent as i32, kv, rowb as i64, 0, np(&ia.proj),
                                             ldp as i64, off.sink as i32, off.gate as i32, hl as i32, kl as i32, t as i32, p0 as i32, 0,
-                                            np(&a.o)) }, "prefill attention");
+                                            np(&a.o), s.kvf as i32) }, "prefill attention");
         }
         let budget = a.scores.len().min(ia.wp.len());
         // rows a block: its scores [hl][rb][keys] fit the buffers (keys: the block's rows and the

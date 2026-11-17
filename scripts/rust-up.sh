@@ -113,7 +113,7 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
         ro+=("$(dirname "$db")")
     elif [[ $ink == 1 ]]; then
         # Inkling 2's own seed (GLM-5.3's is another model's, and another shape)
-        db=/app/profiles/inkling2-history-v0.npz
+        db=/app/profiles/inkling2-history-v1.npz
     else
         db=/app/profiles/glm53-experts-v2.npz
     fi
@@ -186,6 +186,8 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
     # TIDELM_INK_FUSE=0: Inkling 2's small decode kernels unmerged (the mix's first kernel, convolutions
     # and ring writes apart)
     [[ -n "${TIDELM_INK_FUSE:-}" ]] && envs+=(TIDELM_INK_FUSE="$TIDELM_INK_FUSE")
+    # GLM_INK_KV=fp8|bf16: the full-attention layers' key / value cache (fp8 the default)
+    [[ -n "${GLM_INK_KV:-}" ]] && envs+=(GLM_INK_KV="$GLM_INK_KV")
     # Inkling 2's likewise (GLM_INK_DENSE=fp8|bf16)
     [[ -n "${GLM_INK_DENSE:-}" ]] && envs+=(GLM_INK_DENSE="$GLM_INK_DENSE")
     # GLM-5.3-Flash on one box: the MTP draft passes score a listed vocabulary (unset: the built-in

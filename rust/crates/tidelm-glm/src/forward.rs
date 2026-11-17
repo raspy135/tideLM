@@ -133,7 +133,7 @@ impl Options {
              lanes {}\nkv_tokens {}\npack_source {}\nablit {}\nenv {}\nflags {}\n",
             sha2::Sha256::digest(&cfg), sha2::Sha256::digest(&exe), self.max_seq, self.chunk, self.slots, self.kv_split,
             self.prefill_reduce_bf16, self.moe_rows, self.lanes, self.kv_tokens, pack.source_sha256, crate::ablit::digest()?,
-            ["TIDELM_GLM_HOT", "TIDELM_GLM_WIDE_DECODE_FROM", "NCCL_PROTO", "TIDELM_GLM_MLA_HALF", "TIDELM_GLM_FAT", "GLM_FLASH_DENSE", "TIDELM_FLASH_HC_FUSED", "GLM_INK_DENSE", "TIDELM_INK_PF_FLASH", "TIDELM_INK_FLASH_DECODE", "TIDELM_INK_FUSE"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
+            ["TIDELM_GLM_HOT", "TIDELM_GLM_WIDE_DECODE_FROM", "NCCL_PROTO", "TIDELM_GLM_MLA_HALF", "TIDELM_GLM_FAT", "GLM_FLASH_DENSE", "TIDELM_FLASH_HC_FUSED", "GLM_INK_DENSE", "TIDELM_INK_PF_FLASH", "TIDELM_INK_FLASH_DECODE", "TIDELM_INK_FUSE", "GLM_INK_KV"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
                 .collect::<Vec<_>>().join(" "), self.guard_extra);
         Ok(s.into_bytes())
     }
@@ -595,8 +595,12 @@ impl Engine {
         // memory the unpaged caches took, to within a chunk a cache): lanes share it.
         let lanes = opt.lanes.clamp(1, MAX_LANES);
         let gran = PagedKv::gran()?;
-        // Inkling 2: a full-attention layer's row is this rank's key / value heads' K | V (bf16)
-        let ink_row = cfg.ink.map_or(0, |k| k.kv_heads / world * 2 * k.head_dim * 2);
+        // Inkling 2: a full-attention layer's row is this rank's key / value heads' K | V (GLM_INK_KV:
+        // fp8 codes and their scales, or bf16)
+        let ink_row = match cfg.ink {
+            Some(k) => crate::inkling::kv_row_bytes(k.kv_heads / world, k.head_dim, crate::inkling::kv_fp8()?),
+            None => 0,
+        };
         let widths: Vec<usize> = if cfg.is_inkling() { vec![ink_row] } else { KV_ROW_BYTES.to_vec() };
         let dec_rows = PagedKv::padded_rows(gran, s_loc + 1, &widths);
         let mtp_rows = PagedKv::padded_rows(gran, opt.max_seq, &widths);

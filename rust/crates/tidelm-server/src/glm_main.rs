@@ -229,7 +229,8 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         };
         // Inkling 2's dense format changes every row
         let key = if eng.cfg.is_inkling() {
-            format!("{key} ink dense {}", if tidelm_glm::inkling::dense_fp8()? { "fp8" } else { "bf16" })
+            format!("{key} ink dense {} kv {}", if tidelm_glm::inkling::dense_fp8()? { "fp8" } else { "bf16" },
+                    if tidelm_glm::inkling::kv_fp8()? { "fp8" } else { "bf16" })
         } else {
             key
         };
