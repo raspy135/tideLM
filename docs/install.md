@@ -2,8 +2,8 @@
 
 The README's quick start in full: two DGX Sparks serving DeepSeek-V4.1-Flash-1017 or GLM-5.3
 with the Rust engine, in Docker. One profile serves at a time, using both boxes.
-GLM-5.3-Flash (one Spark or two) is set up in the README itself, its profiles' headers and
-[docs/glm-flash.md](glm-flash.md).
+GLM-5.3-Flash (one Spark or two) and Inkling-2-Small are set up in the README itself and their
+profiles' headers ([docs/glm-flash.md](glm-flash.md), [docs/inkling.md](inkling.md)).
 
 ## What you need
 
@@ -22,17 +22,15 @@ Disk, per node:
 | profile | both nodes | head only, while setting up |
 |---|---|---|
 | `ds41-mxfp4` | 510 GB checkpoint | |
-| `glm53-exlr8` | 22 GB of non-expert weights + a 120 GB expert pack | 246 GB of the exlr8 release (the `bit260` profile's part of 838 GB), read only to pack, then deletable; the worker's pack is streamed to it |
-| `glm53-exlr8-home` | the same 22 GB of non-expert weights + a 150 GB expert pack | 308 GB of the release (the `home` profile's part; 172 GB more where `bit260`'s is already there), read only to pack, then deletable |
+| `glm53-exlr8-home` | 22 GB of non-expert weights + a 150 GB expert pack | 308 GB of the exlr8 release (the `home` profile's part of 838 GB), read only to pack, then deletable; the worker's pack is streamed to it |
 | `glm53-exl3` | 15 GB of non-expert weights + a 128 GB expert pack | the 293 GB checkpoint, read only to pack, then deletable (+128 GB for the worker's pack if you pack both on the head) |
 
 ## 1. Profile
 
 ```bash
 cp configs/ds41-mxfp4.env.example  .env.ds41-mxfp4     # DeepSeek-V4.1-Flash-1017
-cp configs/glm53-exlr8.env.example .env.glm53-exlr8    # GLM-5.3 (exlr8 bit260: the default)
-cp configs/glm53-exlr8-home.env.example .env.glm53-exlr8-home    # GLM-5.3 (exlr8 home, 3.25 bpw: wider experts, fewer resident)
-cp configs/glm53-exl3.env.example  .env.glm53-exl3     # GLM-5.3 (EXL3 2.75 bpw: the profile before it)
+cp configs/glm53-exlr8-home.env.example .env.glm53-exlr8-home    # GLM-5.3 (exlr8 home, 3.25 bpw: the default)
+cp configs/glm53-exl3.env.example  .env.glm53-exl3     # GLM-5.3 (EXL3 2.75 bpw: the profile before exlr8)
 ```
 
 Set the paths (`/home/you/...`), `PEER` (the worker's `user@address`) and, in the DeepSeek
@@ -50,18 +48,18 @@ MODEL_REPO=deepseek-ai/DeepSeek-V4.1-Flash-1017 MODEL_DIR=<dir> bash scripts/dow
 on both nodes, or on the head and copy it across (below). Resumable; `HF_TOKEN` is optional. Set
 `MODEL_DIR=<dir>` in the profile.
 
-### GLM-5.3 (`glm53-exlr8`)
+### GLM-5.3 (`glm53-exlr8-home`)
 
 [`kindlingai/glm-5.3-exlr8-k2-k3-k4`](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4)
 stores every routed expert at 2, 3 and 4 bits, in units of 128 intermediate channels that decode
 on their own, and a profile (a manifest in the release) names one width a unit. The whole release
-is 838 GB; `bit260` reads 237 GB of it. `tools/exlr8_fetch.py` fetches a profile's units by HTTP
-range requests into a mirror in the release's own layout (sparse files: another profile's fetch
-adds to it). Stdlib Python, resumable, a few tens of MB of memory, every finished piece synced and
+is 838 GB; `home` (3.25 bpw: 192 of a layer's routed experts at 3 bits, 64 at 4) reads 300 GB of
+it. `tools/exlr8_fetch.py` fetches a profile's units by HTTP range requests into a mirror in the
+release's own layout (sparse files: another profile's fetch adds to it). Stdlib Python, resumable, a few tens of MB of memory, every finished piece synced and
 dropped from the page cache - it can run beside a serving engine. On the head:
 
 ```bash
-python3 tools/exlr8_fetch.py --manifest bit260 --out <exlr8 dir>     # 237 GB, 57 minutes at 70 MB/s
+python3 tools/exlr8_fetch.py --manifest home --out <exlr8 dir>       # 300 GB
 python3 tools/exlr8_fetch.py --dense --out <exlr8 dir>               # the dense layer files, 8.8 GB
 ```
 
@@ -115,23 +113,23 @@ cd <dir> && ls | split -n r/8 - /tmp/files. && \
 ## 3. Image, then the GLM packs
 
 ```bash
-scripts/tide.sh build .env.glm53-exl3    # either profile: builds the image here and ships it to PEER
+scripts/tide.sh build .env.glm53-exlr8-home    # any profile: builds the image here and ships it to PEER
 ```
 
 The Rust engine is compiled inside the build. After every `git pull` run it again: the launcher
 refuses an image built from other sources than the checkout.
 
-`glm53-exlr8`: pack each node's half of the routed experts and write the combined non-expert
+`glm53-exlr8-home`: pack each node's half of the routed experts and write the combined non-expert
 weights, once, on the head. Both tools need numpy and xxhash on the host (`pip install numpy
 xxhash`, or `uv run --with numpy --with xxhash python ...`): every unit and dense block read is
 checked against the release's xxhash64, so a unit the fetch has not brought stops the pack.
 
 ```bash
-python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest bit260 --rank 0 \
-    --out <packs dir>/glm-exlr8-bit260-r0of2.bin                      # 120.4 GB
-python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest bit260 --rank 1 --out - | \
-    ssh <worker> 'cat > <packs dir>/glm-exlr8-bit260-r1of2.bin'       # the worker's, streamed
-python3 tools/glm_exlr8_dense.py --base <base dense dir> --exlr8 <exlr8 dir> --manifest bit260 \
+python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest home --rank 0 \
+    --out <packs dir>/glm-exlr8-home-r0of2.bin                        # 149.8 GB
+python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest home --rank 1 --out - | \
+    ssh <worker> 'cat > <packs dir>/glm-exlr8-home-r1of2.bin'         # the worker's, streamed
+python3 tools/glm_exlr8_dense.py --base <base dense dir> --exlr8 <exlr8 dir> --manifest home \
     --out <dense dir>
 ```
 
@@ -150,23 +148,10 @@ both nodes. `tools/exlr8_check.py` and `tools/test_glm_pack_exlr8.py` hold the d
 against the release (docs/exlr8.md). To serve another profile of the release, repeat the fetch and
 the three commands with its `--manifest` and point the profile's keys at the new files; switching
 between profiles already packed is those keys and a restart. `GLM_SLOTS` is a memory budget, so it
-stays as it is: a profile of smaller records holds more experts in it.
-
-`glm53-exlr8-home` is that for the release's `home` profile (3.25 bpw: 192 of a layer's routed
-experts at 3 bits and 64 at 4), with its own example, `configs/glm53-exlr8-home.env.example`:
-
-```bash
-python3 tools/exlr8_fetch.py --manifest home --out <exlr8 dir>       # 300 GB of experts; 172 GB into bit260's mirror (54 minutes at 53 MB/s)
-python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest home --rank 0 \
-    --out <packs dir>/glm-exlr8-home-r0of2.bin                        # 149.8 GB
-python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest home --rank 1 --out - | \
-    ssh <worker> 'cat > <packs dir>/glm-exlr8-home-r1of2.bin'
-```
-
-Its shared experts have `bit260`'s widths, so `<dense dir>` is the same directory and the dense
-command is not run again (without `bit260`'s: run it with `--manifest home`). In the same
-`GLM_SLOTS` it holds fewer experts than `bit260` - 11,430 for 14,361 at 12,400 - because its
-records are larger.
+stays as it is: a profile of smaller records holds more experts in it. `bit260` (2.6 bpw), the
+profile served before `home`, is one: a 120.4 GB pack (`--manifest bit260`) that holds 14,361
+experts at `GLM_SLOTS=12400` where `home` holds 11,430, with the same `<dense dir>` (home's shared
+experts have its widths) - faster, and further from the unquantized model ([exlr8](exlr8.md)).
 
 `glm53-exl3`: pack each node's half of the routed experts once, as your own user (the packer reads
 the checkpoint and writes one file per rank; ~10 minutes each):
@@ -187,7 +172,7 @@ memory, against 13,300), its own directory as `GLM_MODEL_DIR`.
 ## 4. Start
 
 ```bash
-scripts/tide.sh start .env.glm53-exlr8   # stops whatever is serving, starts this profile
+scripts/tide.sh start .env.glm53-exlr8-home   # stops whatever is serving, starts this profile
 scripts/tide.sh logs -f                  # one line a request: prefill and decode speeds (--rank 1: the worker)
 scripts/tide.sh stop
 ```

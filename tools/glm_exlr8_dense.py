@@ -1,7 +1,7 @@
 """The dense checkpoint of an exlr8 profile: GLM_MODEL_DIR with exlr8's trellis matrices in EXL3's layout.
 
     uv run --with numpy --with xxhash python tools/glm_exlr8_dense.py --base ~/models/GLM-5.3-dense-from-3.0bpw \
-        --exlr8 ~/models/glm-5.3-exlr8 --manifest bit260 --out ~/models/GLM-5.3-dense-exlr8
+        --exlr8 ~/models/glm-5.3-exlr8 --manifest home --out ~/models/GLM-5.3-dense-exlr8
 
 The engine reads its non-expert weights from an EXL3 checkpoint (tools/glm_fetch_dense.py: bertholomus's
 3.0bpw, 5-6 bits a weight). exlr8 stores the large ones as 4-bit trellis - o_proj, q_b, the dense
@@ -118,7 +118,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--base", required=True)
     ap.add_argument("--exlr8", required=True)
-    ap.add_argument("--manifest", default="bit260")
+    ap.add_argument("--manifest", default="home", help="the release profile (the served one: home)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", default="0-78")
     ap.add_argument("--no-verify", action="store_true")

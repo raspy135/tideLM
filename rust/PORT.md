@@ -570,7 +570,8 @@ shared-memory work; Triton's 64-key tiles were ~1.8x faster per pick).
 
 ## GLM-5.3 on exlr8 (`bit260`, 2026-11-11)
 
-The default GLM profile (`configs/glm53-exlr8.env.example`; docs/exlr8.md has every number).
+The GLM profile served then (`configs/glm53-exlr8.env.example`, dropped 2026-11-17: `home` is served;
+docs/exlr8.md has every number).
 kindlingai/glm-5.3-exlr8-k2-k3-k4 stores each routed expert at 2, 3 and 4 bits in 128-channel
 units, a profile naming one width a unit; its trellis is EXL3's with the codebook rounded to FP8
 E4M3. The engine's structure did not change: `tools/glm_pack_exlr8.py` regroups a profile's units

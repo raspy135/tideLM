@@ -38,7 +38,8 @@ budget (3-bit records), so a profile of smaller records holds more experts in it
 
 ## Serving it
 
-`configs/glm53-exlr8.env.example` is the profile, and the README's quick start the setup: fetch
+`configs/glm53-exlr8.env.example` was the profile (dropped 2026-11-17: `home`, below, is served;
+`configs/glm53-exlr8-home.env.example`), and the README's quick start the setup: fetch
 (`tools/exlr8_fetch.py`), pack a rank (`tools/glm_pack_exlr8.py`), write the dense checkpoint
 (`tools/glm_exlr8_dense.py`). Against the EXL3 profile three keys differ - `GLM_EXL3_DIR`,
 `GLM_EXL3_PACK`, `GLM_MODEL_DIR` - and `GLM_EXLR8_ROUND=exact` asks for the format's own rounding

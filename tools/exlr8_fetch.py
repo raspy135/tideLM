@@ -1,9 +1,9 @@
 """Fetch what one exlr8 profile needs from kindlingai/glm-5.3-exlr8-k2-k3-k4, by HTTP Range.
 
-    python3 tools/exlr8_fetch.py --manifest bit260 --out ~/models/glm-5.3-exlr8 [--jobs 8] [--layers 3-78]
+    python3 tools/exlr8_fetch.py --manifest home --out ~/models/glm-5.3-exlr8 [--jobs 8] [--layers 3-78]
 
 The release is 838 GB because every routed expert is stored at K2, K3 and K4; a profile (manifest)
-names one width a unit, so it needs a third of it or less (bit260: 240 GB). This writes a local
+names one width a unit, so it needs a third of it or less (home: 300 GB, bit260: 240 GB). This writes a local
 mirror in the release's own layout - the small files whole (config, tokenizer, manifests, a layer's
 index file), each trellis file as a sparse file of the remote's size holding only the units the
 manifest names, at their own offsets - so tools/exlr8_ref.py's SafeFile, the packer and the
@@ -204,7 +204,7 @@ def plan_layer(out: str, layer: int, lay: dict, hidden: int = 6144):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--manifest", default="bit260")
+    ap.add_argument("--manifest", default="home", help="the release profile (the served one: home)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--layers", default="3-78")

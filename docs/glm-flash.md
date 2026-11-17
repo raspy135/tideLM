@@ -194,7 +194,8 @@ in cheaper rounds - the gate leaves out the rows that would be rejected.
 
 ## TP=2 (2026-11-12, first run)
 
-configs/glm53-flash-35-tp2.env.example: each rank's pack re-sliced from the one-box pack
+configs/glm53-flash-35-tp2.env.example (the 3.5bpw profiles were dropped 2026-11-17 for 4bpw's): each
+rank's pack re-sliced from the one-box pack
 (`glm_pack_exl3.py --from-pack ... --world 2 --rank R`, 68.6 GB a rank, ~1 min each at 2.2-2.7 GB/s;
 rank 1's copied to the peer at ~490 MB/s), the dense dir on both nodes. All 12,096 routed experts
 resident (66.8 GB a rank), dense 5.76 GB a rank, KV 2.24 GB (whole on each rank: GLM-5.3's position

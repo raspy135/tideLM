@@ -1,8 +1,8 @@
 """Offline packer: an exlr8 profile's routed experts -> one aligned file per rank, in the EXL3 pack's layout.
 
     uv run --with numpy --with xxhash python tools/glm_pack_exlr8.py --source ~/models/glm-5.3-exlr8 \
-        --manifest bit260 --rank 0 --out ~/models/glm-exlr8-packs/glm-exlr8-bit260-r0of2.bin
-    ... --rank 1 --out - | ssh PEER 'cat > models/glm-exlr8-packs/glm-exlr8-bit260-r1of2.bin'
+        --manifest home --rank 0 --out ~/models/glm-exlr8-packs/glm-exlr8-home-r0of2.bin
+    ... --rank 1 --out - | ssh PEER 'cat > models/glm-exlr8-packs/glm-exlr8-home-r1of2.bin'
 
 --source is tools/exlr8_fetch.py's mirror. An exlr8 unit is 128 intermediate channels of one expert
 and decodes on its own (tools/exlr8_ref.py), its tiles independent 16 x 16 blocks and both rotations
@@ -133,7 +133,7 @@ class Layer:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--source", required=True)
-    ap.add_argument("--manifest", default="bit260")
+    ap.add_argument("--manifest", default="home", help="the release profile (the served one: home)")
     ap.add_argument("--out", required=True, help="the pack, or - for stdout")
     ap.add_argument("--rank", type=int, default=0)
     ap.add_argument("--world", type=int, default=2)

@@ -106,7 +106,7 @@ quantized with ExLlamaV3 from `deepseek-ai/DeepSeek-V4.1-Flash`.
 
 ## exlr8 routed experts and dense matrices
 
-The default GLM-5.3 profile serves the `bit260` profile of **KindlingAI**'s
+The GLM-5.3 profile serves the `home` profile of **KindlingAI**'s
 [`kindlingai/glm-5.3-exlr8-k2-k3-k4`](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4), a
 quantization of Z.ai's GLM-5.3 in their exlr8 v2 format (the weights under the GLM-5.3 License, the
 packing and manifests also CC BY 4.0). The format is ExLlamaV3's trellis (MIT, Copyright (c) 2025
