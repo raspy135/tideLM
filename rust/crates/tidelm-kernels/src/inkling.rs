@@ -17,12 +17,19 @@ pub const MAX_BLOCKS: usize = 9;
 
 extern "C" {
     pub fn ink_set_pdl(on: c_int) -> c_int;
+    /// ink_mix through its vectorized kernel where the shape allows (on by default).
+    pub fn ink_set_mix_v(on: c_int) -> c_int;
     /// y = bf16((sum_lag w(lag) x(t - lag) + x(t)) / div) over `c` channels of x [t][ldx] bf16; rows
     /// before the pass from the lane's ring [lanes][CONV_RING][c]. wmode 0: w [c][4] (conv1d's
     /// order); 1: w [4][c] by lag plus dyn [t][c / 128 x 4] (`ldd` apart). omode 0: out bf16
     /// [t][ldo] = y; 1: res fp32 [t][c] = y; 2: res = h + y (h bf16 [t][c]); 3: h = bf16(res + y).
     pub fn ink_conv(stream: CudaStream, x: *const c_void, ldx: i64, c: c_int, w: *const c_void, wmode: c_int, dyn_w: *const c_void,
                     ldd: i64, ring: *const c_void, lane_stride: i64, lanes: *const c_void, nl: c_int, meta: *const c_void,
+                    t: c_int, div: f32, omode: c_int, out: *mut c_void, ldo: i64, res: *mut c_void, h: *mut c_void) -> c_int;
+    /// ink_conv with ink_conv_state's ring write in the same launch, for a pass of at most 60 rows
+    /// (returns 1 past that: the two launches it needs).
+    pub fn ink_conv_fused(stream: CudaStream, x: *const c_void, ldx: i64, c: c_int, w: *const c_void, wmode: c_int, dyn_w: *const c_void,
+                    ldd: i64, ring: *mut c_void, lane_stride: i64, lanes: *const c_void, nl: c_int, meta: *const c_void,
                     t: c_int, div: f32, omode: c_int, out: *mut c_void, ldo: i64, res: *mut c_void, h: *mut c_void) -> c_int;
     /// The ring after the pass: each lane's last rows of x at their positions.
     pub fn ink_conv_state(stream: CudaStream, x: *const c_void, ldx: i64, c: c_int, ring: *mut c_void, lane_stride: i64,
@@ -61,6 +68,13 @@ extern "C" {
     /// o [t][hl][128] rows r0 .. = bf16(ov [hl][rb][128] * sigmoid(gate)).
     pub fn ink_pf_gate(stream: CudaStream, ov: *const c_void, proj: *const c_void, ldp: i64, goff: c_int, hl: c_int, r0: c_int,
                        rb: c_int, o: *mut c_void) -> c_int;
+    /// ink_attn_part's partials (same arguments, same layout, for ink_attn_combine) from a fused
+    /// split-key kernel: a lane group's rows (16 a block) share each key tile instead of reading
+    /// every key once a row.
+    pub fn ink_flash_part(stream: CudaStream, qc: *const c_void, rc: *const c_void, proj_t: *const c_void, rel_extent: c_int,
+                          cache: *const c_void, ring: c_int, lane_rows: i64, window: c_int, lanes: *const c_void, nl: c_int,
+                          meta: *const c_void, hl: c_int, kl: c_int, ns: c_int, t: c_int, pm: *mut c_void, pl: *mut c_void,
+                          pacc: *mut c_void) -> c_int;
     /// The fused prefill attention (flash, tensor cores) of rows 0 .. t of one lane at positions p0 ..:
     /// keys lo_key .. each row's position (window > 0: its last `window`), kv the row of key lo_key
     /// in [keys][kl][K | V] rows rowk elements apart; bias, sink and gate as ink_attn_combine's, o

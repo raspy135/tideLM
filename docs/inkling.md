@@ -67,8 +67,11 @@ the MoE, residency, hot reads, lanes, graphs and serving code are the same code.
   rank 0 sends a request's patches (`OP_INK_IMAGES`), the last rank encodes, a gather gives every
   rank the same feature rows, which replace the placeholder's embedding in the prefill. An image is
   a token a 40 x 40 px cell at its own size (alpha over a checkerboard, padded with -1), scaled down
-  only past `GLM_VISION_MAX_TOKENS` (ours: the reference never resizes). A prompt with images is not
-  saved to the disk store, and restores only what lies before its first image.
+  only past `GLM_VISION_MAX_TOKENS` (ours: the reference never resizes). In the disk store an
+  image's placeholder rows are keyed by the image (serve.rs `store_tokens`: ids past the vocabulary
+  from its patches' hash), so prompts with images are saved and restored like text; until
+  2026-11-16 they were not, and an agent's lane evicted by two short chats re-prefilled its
+  110K-token, 20-image prompt (about 3 minutes, the other lane at 5-7 tok/s meanwhile).
 
 - The drafter (`inkling_draft.rs`, `cuda/inkling_draft.cu`; spec from SGLang's branch
   `inkling-2-small-support` @ `ea3742849fa4`): "DSpark", 5 dense layers over a block of 8 rows
@@ -129,6 +132,30 @@ the MoE, residency, hot reads, lanes, graphs and serving code are the same code.
   each re-reading every key for each head. `ink_pf_flash` (fused, tensor cores) instead: 2,427
   tokens at 110K in 4.45 s (546 tok/s), a fresh 60K prompt at 895 tok/s (292 before), and 1.4-2.4 s
   for the 8 layers of a 2,300-row turn at 150K in the kernel's own timing (11-24 TFLOP/s).
+- Decode deep in a context: `ink_attn_part` reads a full layer's keys once a verify row, 1.24 ms a
+  row a layer at 140K, so a pass's 8 layers took 40.5 / 77.4 / 152 ms at 4 / 8 / 16 rows.
+  `ink_flash_part` (split over the keys, the lane's rows sharing each tile, ink_attn_combine after):
+  10.9 / 10.8 / 11.2 ms, about 212 GB/s (fused_decode_attention_time). One row a lane keeps
+  `ink_attn_part` (1.24 against 1.35 ms). Live: a fresh 176K-token prompt, prefill 779 tok/s, decode
+  39.5-39.8 tok/s at 4.4 tokens a step; before, 140-163K turns decoded at 21 tok/s alone.
+- The drafter's listed vocabulary (inkling_draft.rs `open_with`, the ranking in
+  engine/inkling_draft_vocab_ranking_v1.txt: ultrachat, the model's own answers, this repository's
+  code, Wikipedia in 8 languages; tools/build_glm_draft_vocab.py --name "Inkling 2"). Its head is the
+  unembed's and the fold's rows of 65,536 ids (0.32 GB FP8); a lane drafts over it while at most 4% of
+  its recent tokens are outside (GLM-5.3-Flash's rule), every id otherwise. A round in isolation
+  (inkling_draft_check --listed --time 20, FP8): 16.55 -> 11.96 ms, the same 7 tokens. Served (two runs
+  each of three short chats, default sampling and greedy): within the +-5% two runs of one build
+  differ by; every round listed for code, prose and stories, 10-30% for an answer on TCP / QUIC
+  (acronyms and symbols past the 4%). Not resolved by these runs: the ~6% a listed round should give.
+- Where plain decode goes (nsys, graph nodes traced, rank 0, one-row passes, 2026-11-16): 39.5 ms a
+  token, 1,668 launches. The dense FP8 GEMVs 16.1 ms (~180 GB/s) and the EXL3 experts 14.8 (~210),
+  near the read roof; the rest Inkling's small kernels and the pair's gathers: ink_mix 3.4 ms (35.7
+  us a call for one row), the short convolutions 1.9 + 0.9 (their ring writes), gathers 2.1, down
+  combine 2.0, attention 1.4. Merged (TIDELM_INK_FUSE, the bench knob ink_fuse): a vectorized mix
+  (8.2 us) and a decode pass's convolutions with their ring writes (4.1 against 8.2 us). In-boot A/B,
+  5 ABBA rounds at 2.5K: a pass of 1 / 2 / 4 / 8 rows -8.3 / -7.0 / -5.5 / -3.7% (38.05 -> 34.87 ms
+  at one row). Left: the attention's part + combine (28 us a window layer), the k / v convolutions
+  as one launch, the mix after a convolution as one kernel.
 
 ## Open
 
@@ -137,9 +164,10 @@ above), a history from chat traffic (tools/routing_session.py: decode routing, w
 never sees), sampled drafts (the
 reference draws its drafts at the request's temperature and verifies against that distribution: more
 accepted than a greedy draft's), the drafter's global window and a TP=2 split of it against one rank's,
-measured; decode attention past ~100K (the verify rows each read every key: about +33 ms a step at 140K
-against 20K; a lane's rows could share one read, as the drafter's attention does), FP8 key / value
+measured; FP8 key / value
 caches, prefill tuning (the fused expert epilogue, batched GEMMs, the window layers' attention, the
 fused kernel's loads), the tower against transformers' own classes once a release has them (the reference
 here is a transcription, with RoPE theta 10000 and exact GELU taken from the config class's defaults),
-image prompts in the disk store (their key would need the images' hashes).
+a third lane (two conversations beside an agent evict its lane; the store now restores it in seconds
+instead of a re-prefill, but a third lane costs ~0.5 GB a rank), a smaller GLM_LANE_CHUNK (a long
+prefill gives the other lane one decode step per 1,024-row part, ~1.5 s at 120K).

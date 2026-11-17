@@ -2,7 +2,7 @@
 //! for tools/inkling_draft_ref.py to compare with a PyTorch transcription of the specification
 //! (docs/inkling-dspark.md, section 8).
 //!
-//!   inkling_draft_check --model-dir DIR --out OUTDIR [--fp8] [--ctx 40] [--first 33] [--start 0]
+//!   inkling_draft_check --model-dir DIR --out OUTDIR [--fp8] [--listed] [--ctx 40] [--first 33] [--start 0]
 //!                       [--anchor 1000] [--seed 1] [--local-ring 2048] [--global-ring 4096]
 //!                       [--max-rows 64] [--time N]
 //!
@@ -130,7 +130,11 @@ fn main() -> Result<()> {
     tidelm_cuda::set_device(0)?;
     let st = Stream::new()?;
     let t0 = Instant::now();
-    let d = InkDraft::open(&dir, &st, DraftOpts { fp8, lanes: 2, local_ring, global_ring, max_rows })?;
+    // --listed: the built-in listed vocabulary too; with --time, rounds alternate over every id and
+    // over the list (each timed), and the last round of each is compared
+    let listed = args.iter().any(|a| a == "--listed");
+    let ids = if listed { inkling_draft::listed_ids(200058)? } else { None };
+    let d = InkDraft::open_with(&dir, &st, DraftOpts { fp8, lanes: 2, local_ring, global_ring, max_rows }, ids.as_deref())?;
     let b = d.bytes();
     let mb = |n: usize| n as f64 / 1e6;
     eprintln!("drafter loaded in {:.1} s ({}): {:.1} MB on the device - layers {:.1}, unembed {:.1}, head {:.1}, rings of 2 lanes \
@@ -152,13 +156,27 @@ fn main() -> Result<()> {
     let embed = (erow.raw() as *const u8).wrapping_sub(anchor * D * 2) as *const c_void;
     let toks = DeviceBuffer::<i32>::zeroed(DRAFTS)?;
     let probs = DeviceBuffer::<f32>::zeroed(DRAFTS)?;
-    for rep in 0..time.max(1) {
+    let mut sums = [(0f64, 0usize); 2];
+    let mut last = [(vec![], vec![]), (vec![], vec![])];
+    for rep in 0..time.max(1) * if listed { 2 } else { 1 } {
+        let over_list = listed && rep % 2 == 1;
         let t1 = Instant::now();
-        d.draft(&st, LANE, anchor as u32, p, start, embed, toks.raw(), probs.raw())?;
+        d.draft(&st, LANE, anchor as u32, p, start, embed, toks.raw(), probs.raw(), over_list)?;
         st.synchronize()?;
+        let ms = 1e3 * t1.elapsed().as_secs_f64();
         if time > 0 {
-            eprintln!("round {rep}: {:.2} ms", 1e3 * t1.elapsed().as_secs_f64());
+            eprintln!("round {rep}{}: {ms:.2} ms", if over_list { " (listed)" } else { "" });
+            if rep >= 2 {
+                sums[over_list as usize].0 += ms;
+                sums[over_list as usize].1 += 1;
+            }
         }
+        last[over_list as usize] = (toks.download()?, probs.download()?);
+    }
+    if listed {
+        let avg = |i: usize| sums[i].0 / sums[i].1.max(1) as f64;
+        eprintln!("every id: {:.2} ms a round, tokens {:?} probabilities {:?}", avg(0), last[0].0, last[0].1);
+        eprintln!("listed:   {:.2} ms a round, tokens {:?} probabilities {:?}", avg(1), last[1].0, last[1].1);
     }
     let (tk, pr) = (toks.download()?, probs.download()?);
     eprintln!("anchor {anchor} at position {p} (context from {start}): tokens {tk:?}, probabilities {pr:?}");

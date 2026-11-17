@@ -84,8 +84,9 @@ const OP_SNAP_COMMIT: u32 = 14;
 
 /// Schedule knobs a benchmark can switch on both ranks inside one boot (Engine::bench_knob): each
 /// moves no value, only when and where kernels run.
-pub const BENCH_KNOBS: [&str; 19] = ["l2pf", "pdl", "evict_first", "evict_kvb", "evict_skinny", "mla_half", "index_side", "fat",
-                                      "split", "osplit", "qsplit", "rot1", "round", "hot_plan", "rescue", "hc_fused", "flash_pf", "flash_both", "draft_vocab"];
+pub const BENCH_KNOBS: [&str; 20] = ["l2pf", "pdl", "evict_first", "evict_kvb", "evict_skinny", "mla_half", "index_side", "fat",
+                                      "split", "osplit", "qsplit", "rot1", "round", "hot_plan", "rescue", "hc_fused", "flash_pf", "flash_both", "draft_vocab",
+                                      "ink_fuse"];
 
 /// Lanes a pass may carry (glm.cu kMaxLanes).
 pub const MAX_LANES: usize = 4;
@@ -132,7 +133,7 @@ impl Options {
              lanes {}\nkv_tokens {}\npack_source {}\nablit {}\nenv {}\nflags {}\n",
             sha2::Sha256::digest(&cfg), sha2::Sha256::digest(&exe), self.max_seq, self.chunk, self.slots, self.kv_split,
             self.prefill_reduce_bf16, self.moe_rows, self.lanes, self.kv_tokens, pack.source_sha256, crate::ablit::digest()?,
-            ["TIDELM_GLM_HOT", "TIDELM_GLM_WIDE_DECODE_FROM", "NCCL_PROTO", "TIDELM_GLM_MLA_HALF", "TIDELM_GLM_FAT", "GLM_FLASH_DENSE", "TIDELM_FLASH_HC_FUSED", "GLM_INK_DENSE", "TIDELM_INK_PF_FLASH"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
+            ["TIDELM_GLM_HOT", "TIDELM_GLM_WIDE_DECODE_FROM", "NCCL_PROTO", "TIDELM_GLM_MLA_HALF", "TIDELM_GLM_FAT", "GLM_FLASH_DENSE", "TIDELM_FLASH_HC_FUSED", "GLM_INK_DENSE", "TIDELM_INK_PF_FLASH", "TIDELM_INK_FLASH_DECODE", "TIDELM_INK_FUSE"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
                 .collect::<Vec<_>>().join(" "), self.guard_extra);
         Ok(s.into_bytes())
     }
@@ -1826,11 +1827,14 @@ impl Engine {
 
     /// Whether this engine drafts over a listed vocabulary at all.
     pub fn has_draft_list(&self) -> bool {
-        self.w.draft.is_some() && self.draft_on
+        (self.w.draft.is_some() && self.draft_on) || self.ink.as_ref().is_some_and(|s| s.draft_on && s.draft_listed.is_some())
     }
 
     /// Whether the draft head can propose `id` (true without one).
     pub fn draft_lists(&self, id: u32) -> bool {
+        if let Some(m) = self.ink.as_ref().and_then(|s| s.draft_listed.as_ref()) {
+            return m.get(id as usize).copied().unwrap_or(false);
+        }
         self.w.draft.as_ref().is_none_or(|d| d.listed.get(id as usize).copied().unwrap_or(false))
     }
 
@@ -2944,6 +2948,13 @@ impl Engine {
             17 => {
                 self.hc_fused = on;
                 self.flash_pf = on;
+            }
+            // Inkling 2's merged small kernels (TIDELM_INK_FUSE): the vectorized mix, a decode pass's
+            // convolutions with their ring writes
+            19 => {
+                let s = self.ink.as_mut().ok_or("bench knob ink_fuse: an Inkling 2 engine's")?;
+                s.fuse = on;
+                unsafe { tidelm_kernels::inkling::ink_set_mix_v(on as i32) };
             }
             _ => return Err(format!("bench knob {code}").into()),
         }

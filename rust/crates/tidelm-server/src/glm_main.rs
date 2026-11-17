@@ -199,6 +199,7 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         two_pass_miss: num("--two-pass-miss", 0.15)?,
         preload: num("--preload", 0.0)? as usize,
         lane_chunk: num("--lane-chunk", 1024.0)? as usize,
+        prefill_share: std::env::var("GLM_PREFILL_SHARE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5),
     };
     // the disk prefix store: its namespace is everything that changes what a cached row means
     let mut store = None;
@@ -489,7 +490,7 @@ fn bench_width(eng: &mut Engine, path: &str, ctxs: &[usize], widths: &[usize], t
             // the next knob is measured against the boot's own setting of this one
             eng.bench_knob_reset(knob)?;
             let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
-            for (i, name) in widths.iter().map(|w| format!("{w:2} rows")).chain(["MTP pass".to_string()]).enumerate() {
+            for (i, name) in widths.iter().map(|w| format!("{w:2} rows")).chain(eng.cfg.mtp.then(|| "MTP pass".to_string())).enumerate() {
                 let (a, b) = (mean(&by[0][i]), mean(&by[1][i]));
                 let f = |v: &[f64]| v.iter().map(|x| format!("{x:.2}")).collect::<Vec<_>>().join(" / ");
                 eprintln!("bench-ab: {knob} context {ctx}: {name}: off {a:.2} ms ({}), on {b:.2} ms ({}), {:+.1}%", f(&by[0][i]),
@@ -525,6 +526,10 @@ fn bench_widths(eng: &mut Engine, ids: &[u32], ctx: usize, widths: &[usize]) -> 
         let (m, lo, hi) = median(ts);
         eprintln!("bench-width: {w:2} rows: verify {m:.2} ms (min {lo:.2}, max {hi:.2})");
         out.push(m);
+    }
+    // an engine without the MTP layer (Inkling 2: its drafter is not this pass) times widths only
+    if !eng.cfg.mtp {
+        return Ok(out);
     }
     let mut ts = Vec::new();
     let mut draft = None;

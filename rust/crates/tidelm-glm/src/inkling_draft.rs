@@ -107,6 +107,18 @@ const M_DFLARE: usize = 2 * D;
 const MTP_FILE: &str = "mtp.safetensors";
 const UNEMBED: &str = "model.llm.unembed.weight";
 
+/// The built-in ranking of the listed vocabulary (engine/inkling_draft_vocab_ranking_v1.txt: how it
+/// was built, and each group's held-out tokens unlisted - at 65,536 ids chat 0.91%, code 0.26%,
+/// Japanese 0.29%, Chinese 0.90%, Korean 0.46%, European Wikipedia 1.5-2.6%).
+pub const RANKING_V1: &str = include_str!("../../../../engine/inkling_draft_vocab_ranking_v1.txt");
+pub const LISTED_ROWS: usize = 65536;
+
+/// The listed ids (ascending) for open_with: GLM_DRAFT_VOCAB / GLM_DRAFT_VOCAB_ROWS as
+/// GLM-5.3-Flash reads them (unset: RANKING_V1's first LISTED_ROWS; `all`: None, every id).
+pub fn listed_ids(real: usize) -> Result<Option<Vec<u32>>> {
+    crate::flash::draft_ids_from(RANKING_V1, LISTED_ROWS, real)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct DraftOpts {
     /// every matrix (the layers', the head's, the unembed copy) as FP8 with 32 x 32 block scales;
@@ -134,12 +146,25 @@ pub struct DraftBytes {
     pub rings: usize,
     /// a pass's and a block's activations
     pub scratch: usize,
+    /// the listed vocabulary's head (open_with): its unembed rows, fold, ids
+    pub listed: usize,
 }
 
 impl DraftBytes {
     pub fn total(&self) -> usize {
-        self.layers + self.unembed + self.markov + self.rings + self.scratch
+        self.layers + self.unembed + self.markov + self.rings + self.scratch + self.listed
     }
+}
+
+/// The listed vocabulary's own head (open_with): the unembed's and the fold's rows of its ids,
+/// ascending, so the lowest index on a tie is the lowest id as over every id.
+struct ListHead {
+    n: usize,
+    /// the ids, i32 [n]: a pick's index to its id
+    ids: DeviceBuffer<i32>,
+    unembed: Lin,
+    fold_w: Lin,
+    fold_b: DeviceBuffer<u16>,
 }
 
 fn lin_bytes(n: usize, k: usize, fp8: bool) -> usize {
@@ -158,6 +183,7 @@ pub fn bytes_for(o: &DraftOpts, vocab: usize) -> DraftBytes {
             + 2 * (LAYERS + 1) * TAPS + 2 * 3 * D + 4 * (HD / 2),
         rings: o.lanes * 2 * ((LAYERS - 1) * o.local_ring * ROW + o.global_ring * ROW + F_RING * D),
         scratch: Act::bytes(o.max_rows, vocab, false),
+        listed: 0,
     }
 }
 
@@ -616,6 +642,8 @@ pub struct InkDraft {
     /// split-K partials for store_context's GEMMs
     part: DeviceBuffer<f32>,
     bytes: DraftBytes,
+    /// the listed vocabulary's head, when opened with one (draft's `listed`)
+    list: Option<ListHead>,
     /// TIDELM_DRAFT_DUMP's prefix, and the passes store_context has dumped
     dump: Option<String>,
     passes: AtomicUsize,
@@ -631,6 +659,15 @@ impl InkDraft {
     /// model_dir holds config.json, the target's non-expert shards (for the unembed) and
     /// mtp.safetensors (read by path: it is not in the weight index).
     pub fn open(model_dir: &Path, st: &Stream, opts: DraftOpts) -> Result<Self> {
+        Self::open_with(model_dir, st, opts, None)
+    }
+
+    /// open, with a listed vocabulary (ascending ids below the real vocabulary, a multiple of 32):
+    /// a second head over only those ids, which draft's `listed` rounds read instead of every id's.
+    /// The head's step is its unembed (7 rows) and fold_w (7 times): 0.93 + 0.36 GB over all
+    /// 200,058 ids in FP8. A token outside the list cannot be drafted; the target verifies every
+    /// token either way.
+    pub fn open_with(model_dir: &Path, st: &Stream, opts: DraftOpts, listed: Option<&[u32]>) -> Result<Self> {
         let pow2 = |n: usize| n.is_power_of_two();
         if opts.lanes == 0 || opts.max_rows == 0 || !pow2(opts.local_ring) || !pow2(opts.global_ring)
             || opts.local_ring < WINDOW + opts.max_rows.max(BLOCK) || opts.global_ring < 2 * BLOCK
@@ -719,6 +756,36 @@ impl InkDraft {
             std::fs::write(format!("{prefix}.fold_b.bin"), le(&fold_b.download()?))?;
         }
         let fold_w = lin_from_device(st, fw, vocab, RANK, fp8)?;
+        let list = match listed {
+            None => None,
+            Some(ids) => {
+                let k = ids.len();
+                if k == 0 || k % 32 != 0 || ids.windows(2).any(|w| w[0] >= w[1]) || ids.last().is_some_and(|&i| i as usize >= real) {
+                    return Err(format!("the drafter's listed vocabulary: {k} ids, ascending, below {real}, a multiple of 32").into());
+                }
+                let mut host = vec![0u16; k * D];
+                let mut j = 0usize;
+                Tens::new(&ush, UNEMBED, &[vocab, D])?.pieces(|bytes, r0, m| {
+                    while j < k && (ids[j] as usize) < r0 + m {
+                        let r = ids[j] as usize - r0;
+                        for (c, b) in bytes[r * D * 2..(r + 1) * D * 2].chunks_exact(2).enumerate() {
+                            host[j * D + c] = u16::from_le_bytes([b[0], b[1]]);
+                        }
+                        j += 1;
+                    }
+                    Ok(())
+                })?;
+                let rows = DeviceBuffer::from_slice(&host)?;
+                drop(host);
+                let (fwl, fbl) = (DeviceBuffer::<u16>::new(k * RANK)?, DeviceBuffer::<u16>::new(k)?);
+                ck(unsafe { inkd_fold(st.raw(), rows.raw(), k as i32, D as i32, RANK as i32, how.raw(), hob.raw(), fwl.raw(), fbl.raw()) },
+                   "listed fold")?;
+                st.synchronize()?;
+                let ids_dev = DeviceBuffer::from_slice(&ids.iter().map(|&i| i as i32).collect::<Vec<i32>>())?;
+                Some(ListHead { n: k, ids: ids_dev, unembed: lin_from_device(st, rows, k, D, fp8)?, fold_w: lin_from_device(st, fwl, k, RANK, fp8)?,
+                                fold_b: fbl })
+            }
+        };
 
         let lring = DeviceBuffer::<u16>::zeroed((LAYERS - 1) * opts.lanes * opts.local_ring * ROW)?;
         let gring = DeviceBuffer::<u16>::zeroed(opts.lanes * opts.global_ring * ROW)?;
@@ -734,10 +801,11 @@ impl InkDraft {
                 + rnn_x.bytes() + 4 * inv.len(),
             rings: 2 * (lring.len() + gring.len() + frnn.len()),
             scratch: Act::bytes(opts.max_rows, vocab, dump.is_some()),
+            listed: list.as_ref().map_or(0, |l| l.unembed.bytes() + l.fold_w.bytes() + 2 * l.n + 4 * l.n),
         };
-        debug_assert_eq!(DraftBytes { scratch: Act::bytes(opts.max_rows, vocab, false), ..bytes }, bytes_for(&opts, vocab));
+        debug_assert_eq!(DraftBytes { scratch: Act::bytes(opts.max_rows, vocab, false), listed: 0, ..bytes }, bytes_for(&opts, vocab));
         Ok(InkDraft { opts, vocab, real, cap, layers, alpha, misc, inv, unembed, fold_w, fold_b, w1, rnn_s, rnn_x, rnn_b, lring, gring,
-                      frnn, act, part, bytes, dump, passes: AtomicUsize::new(0) })
+                      frnn, act, part, bytes, list, dump, passes: AtomicUsize::new(0) })
     }
 
     /// Device bytes the drafter holds: weights, every lane's rings, scratch.
@@ -847,9 +915,10 @@ impl InkDraft {
     /// probability under softmax of the corrected, softcapped, cropped logits at temperature 1
     /// (`probs`: device fp32 [7]). The 7 steps chain on the device (a step reads the token the one
     /// before wrote to `toks`); nothing is read back, and no grid depends on anchor, p or lo.
+    /// `listed`: the steps over the listed vocabulary's head (open_with; ignored without one).
     #[allow(clippy::too_many_arguments)]
     pub fn draft(&self, st: &Stream, lane: usize, anchor: u32, p: usize, lo: usize, embed: *const c_void, toks: *mut c_void,
-                 probs: *mut c_void) -> Result<()> {
+                 probs: *mut c_void, listed: bool) -> Result<()> {
         if lane >= self.opts.lanes || anchor as usize >= self.vocab || lo > p || p > (i32::MAX as usize) - BLOCK || embed.is_null()
             || toks.is_null() || probs.is_null() {
             return Err(format!("draft round: lane {lane} of {}, anchor {anchor} of {}, position {p}, context from {lo}",
@@ -894,9 +963,15 @@ impl InkDraft {
             self.dump::<u16>(st, &format!("res{l}"), a.res.raw(), BLOCK * D)?;
         }
         self.dump::<u16>(st, "hidden", a.xn.raw(), BLOCK * D)?;
+        // the head's vocabulary: every id, or the listed ones (their own unembed and fold rows)
+        let lh = self.list.as_ref().filter(|_| listed);
+        let (unembed, fold_w, fold_b, n, real, ids) = match lh {
+            Some(l) => (&l.unembed, &l.fold_w, &l.fold_b, l.n, l.n, l.ids.raw() as *const c_void),
+            None => (&self.unembed, &self.fold_w, &self.fold_b, self.vocab, self.real, null),
+        };
         // base logits of rows 1 .. 7 (the anchor's own row predicts nothing)
-        lin::gemm(st, &self.part, a.xn.ptr_at(D), D, &self.unembed, DRAFTS, a.base.raw(), false, self.vocab)?;
-        self.dump::<u16>(st, "base", a.base.raw(), DRAFTS * self.vocab)?;
+        lin::gemm(st, &self.part, a.xn.ptr_at(D), D, unembed, DRAFTS, a.base.raw(), false, n)?;
+        self.dump::<u16>(st, "base", a.base.raw(), DRAFTS * n)?;
         // the head: rnn_proj's block-constant columns for the 7 steps at once
         let f: *const c_void = if p > lo { self.frnn.ptr_at((lane * F_RING + ((p - 1) & (F_RING - 1))) * D) } else { null };
         ck(unsafe { inkd_rnn_x(s, a.xn.raw(), f, a.zx.raw(), di) }, "draft head input")?;
@@ -909,16 +984,16 @@ impl InkDraft {
             lin::gemm(st, &self.part, a.zs.raw(), 2 * RANK, &self.rnn_s, 1, a.rs.raw(), true, 3 * RANK)?;
             ck(unsafe { inkd_rnn_cell(s, a.pre.ptr_at(i * 3 * RANK), a.rs.raw(), self.rnn_b.raw(), a.state.raw(), a.latent.raw(),
                                       (i == 0) as i32) }, "draft cell")?;
-            lin::gemm(st, &self.part, a.latent.raw(), RANK, &self.fold_w, 1, a.lw.raw(), true, self.vocab)?;
+            lin::gemm(st, &self.part, a.latent.raw(), RANK, fold_w, 1, a.lw.raw(), true, n)?;
             unsafe {
-                ck(inkd_step_part(s, a.base.ptr_at(i * self.vocab), a.lw.raw(), self.fold_b.raw(), vi, self.real as i32, self.cap,
-                                  a.sp.raw(), ylog), "draft logits")?;
-                ck(inkd_step_pick(s, a.sp.raw(), vi, step, toks, probs), "draft pick")?;
+                ck(inkd_step_part(s, a.base.ptr_at(i * n), a.lw.raw(), fold_b.raw(), n as i32, real as i32, self.cap, a.sp.raw(), ylog),
+                   "draft logits")?;
+                ck(inkd_step_pick(s, a.sp.raw(), n as i32, step, toks, probs, ids), "draft pick")?;
             }
             if self.dump.is_some() {
                 self.dump::<u16>(st, &format!("state{i}"), a.state.raw(), RANK)?;
                 self.dump::<u16>(st, &format!("latent{i}"), a.latent.raw(), RANK)?;
-                self.dump::<f32>(st, &format!("y{i}"), ylog, self.vocab)?;
+                self.dump::<f32>(st, &format!("y{i}"), ylog, n)?;
             }
         }
         Ok(())

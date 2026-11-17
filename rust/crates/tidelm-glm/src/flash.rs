@@ -52,19 +52,24 @@ const DRAFT_RANKING_V1: &str = include_str!("../../../../engine/glm_draft_vocab_
 /// token (sampled: the draft's q is 0 there and the rejection sampling stays exact). The DS engine's
 /// tidelm_engine::draft_vocab, one box only here.
 pub fn draft_ids(vocab: usize) -> Result<Option<Vec<u32>>> {
+    draft_ids_from(DRAFT_RANKING_V1, DRAFT_ROWS, vocab)
+}
+
+/// draft_ids over another built-in ranking and default size (Inkling 2's: inkling_fwd.rs).
+pub fn draft_ids_from(builtin: &str, default_rows: usize, vocab: usize) -> Result<Option<Vec<u32>>> {
     let path = std::env::var("GLM_DRAFT_VOCAB").unwrap_or_default();
     if path.trim() == "all" {
         return Ok(None);
     }
     let rows = match std::env::var("GLM_DRAFT_VOCAB_ROWS") {
         Ok(v) if !v.trim().is_empty() => v.trim().parse::<usize>().map_err(|_| format!("GLM_DRAFT_VOCAB_ROWS={v}: not a number"))?,
-        _ => DRAFT_ROWS,
+        _ => default_rows,
     };
     if rows == 0 || rows % 32 != 0 || rows > vocab {
         return Err(format!("GLM_DRAFT_VOCAB_ROWS must be a multiple of 32 in 32..={vocab}, got {rows}").into());
     }
     let text = if path.trim().is_empty() {
-        DRAFT_RANKING_V1.to_string()
+        builtin.to_string()
     } else {
         std::fs::read_to_string(path.trim()).map_err(|e| format!("GLM_DRAFT_VOCAB {path}: {e}"))?
     };

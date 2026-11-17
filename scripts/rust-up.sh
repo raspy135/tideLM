@@ -179,6 +179,13 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
     [[ -n "${GLM_INK_DRAFT:-}" ]] && envs+=(GLM_INK_DRAFT="$GLM_INK_DRAFT")
     # TIDELM_INK_PF_FLASH=0: full layers' prefill attention through cuBLAS instead of the fused kernel
     [[ -n "${TIDELM_INK_PF_FLASH:-}" ]] && envs+=(TIDELM_INK_PF_FLASH="$TIDELM_INK_PF_FLASH")
+    # TIDELM_INK_FLASH_DECODE=0: full layers' verify rows through the per-row decode kernel
+    [[ -n "${TIDELM_INK_FLASH_DECODE:-}" ]] && envs+=(TIDELM_INK_FLASH_DECODE="$TIDELM_INK_FLASH_DECODE")
+    # GLM_PREFILL_SHARE (0.5): a prompt's share of the engine's time beside decoding lanes
+    [[ -n "${GLM_PREFILL_SHARE:-}" ]] && envs+=(GLM_PREFILL_SHARE="$GLM_PREFILL_SHARE")
+    # TIDELM_INK_FUSE=0: Inkling 2's small decode kernels unmerged (the mix's first kernel, convolutions
+    # and ring writes apart)
+    [[ -n "${TIDELM_INK_FUSE:-}" ]] && envs+=(TIDELM_INK_FUSE="$TIDELM_INK_FUSE")
     # Inkling 2's likewise (GLM_INK_DENSE=fp8|bf16)
     [[ -n "${GLM_INK_DENSE:-}" ]] && envs+=(GLM_INK_DENSE="$GLM_INK_DENSE")
     # GLM-5.3-Flash on one box: the MTP draft passes score a listed vocabulary (unset: the built-in

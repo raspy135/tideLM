@@ -37,6 +37,12 @@ const DRAFT_GLOBAL_RING: usize = 16384;
 pub(crate) const OP_INK_DRAFT: u32 = 41;
 /// A draft round's result: 7 tokens (i32) then their probabilities (fp32).
 const DRAFT_OUT: usize = 7 * 8;
+/// TIDELM_INK_FLASH_DECODE (default on): full layers' verify rows through ink_flash_part.
+fn dec_flash() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TIDELM_INK_FLASH_DECODE").as_deref() != Ok("0"))
+}
+
 /// TIDELM_INK_PF_FLASH (default on): full layers' prefill attention through ink_pf_flash.
 fn pf_flash() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -112,6 +118,16 @@ pub(crate) struct InkState {
     /// 41 and the final normed hidden), a round's result here and every rank's (the gather)
     pub(crate) draft_on: bool,
     draft: Option<crate::inkling_draft::InkDraft>,
+    /// TIDELM_INK_FUSE (default on; the bench knob ink_fuse): a decode pass's convolutions write their
+    /// rings in the same launch, and ink_mix takes its vectorized kernel (2026-11-16 profile of plain
+    /// decode, 39.5 ms a token: ink_mix 3.4 ms, the convolutions 1.9 + 0.9 ms of it; a mix 34.9 -> 8.2
+    /// us, a convolution with its ring write 8.2 -> 4.1). In-boot A/B, 5 ABBA rounds at 2.5K context:
+    /// a pass of 1 / 2 / 4 / 8 rows 38.05 -> 34.87 / 45.97 -> 42.78 / 55.64 -> 52.56 / 83.38 -> 80.29 ms
+    /// (-8.3 / -7.0 / -5.5 / -3.7%).
+    pub(crate) fuse: bool,
+    /// the drafter's listed vocabulary as a membership table [real vocabulary] (every rank: rank 0's
+    /// scheduler decides a lane's rounds by it), None: every id
+    pub(crate) draft_listed: Option<Vec<bool>>,
     taps: DeviceBuffer<u16>,
     tap_rows: usize,
     dout: DeviceBuffer<u8>,
@@ -195,6 +211,12 @@ impl InkState {
             floor: vec![0; lanes],
             draft_on: false,
             draft: None,
+            fuse: {
+                let on = std::env::var("TIDELM_INK_FUSE").as_deref() != Ok("0");
+                unsafe { ink_set_mix_v(on as i32) };
+                on
+            },
+            draft_listed: None,
             taps: DeviceBuffer::zeroed(1)?,
             tap_rows: 0,
             dout: DeviceBuffer::zeroed(DRAFT_OUT)?,
@@ -451,6 +473,10 @@ impl Engine {
             None => (0, std::ptr::null_mut(), (taps + 1.0).sqrt()),
         };
         unsafe {
+            if s.fuse && t + 4 <= CONV_RING {
+                return ck(ink_conv_fused(st, x, ldx as i64, c as i32, np(w), wmode, dw, ldx as i64, rg, ls, lanes, nl, meta, t as i32, div,
+                                         omode, out, c as i64, np(&s.act.res), np(&a.h)), "short conv");
+            }
             ck(ink_conv(st, x, ldx as i64, c as i32, np(w), wmode, dw, ldx as i64, rg, ls, lanes, nl, meta, t as i32, div, omode, out,
                         c as i64, np(&s.act.res), np(&a.h)), "short conv")?;
             ck(ink_conv_state(st, x, ldx as i64, c as i32, rg, ls, lanes, nl, meta), "short conv state")
@@ -544,13 +570,22 @@ impl Engine {
     /// Returns the drafter's device bytes on this rank (0 where it is not).
     pub fn enable_drafter(&mut self, model_dir: &Path, fp8: bool) -> Result<usize> {
         let (h, r, last) = (self.cfg.hidden, self.opt.chunk.max(HEAD_ROWS), self.rank + 1 == self.world);
+        let real = self.cfg.ink.ok_or("the DSpark drafter is Inkling 2's")?.real_vocab;
+        let ids = crate::inkling_draft::listed_ids(real)?;
         let s = self.ink.as_mut().ok_or("the DSpark drafter is Inkling 2's")?;
         s.draft_on = true;
+        s.draft_listed = ids.as_ref().map(|ids| {
+            let mut m = vec![false; real];
+            for &i in ids {
+                m[i as usize] = true;
+            }
+            m
+        });
         if !last {
             return Ok(0);
         }
-        let d = crate::inkling_draft::InkDraft::open(model_dir, &self.st, crate::inkling_draft::DraftOpts {
-            fp8, lanes: s.lanes, local_ring: s.ring, global_ring: DRAFT_GLOBAL_RING, max_rows: r })?;
+        let d = crate::inkling_draft::InkDraft::open_with(model_dir, &self.st, crate::inkling_draft::DraftOpts {
+            fp8, lanes: s.lanes, local_ring: s.ring, global_ring: DRAFT_GLOBAL_RING, max_rows: r }, ids.as_deref())?;
         let bytes = d.device_bytes() + 8 * r * h * 2;
         s.taps = DeviceBuffer::zeroed(8 * r * h)?;
         s.tap_rows = r;
@@ -559,12 +594,13 @@ impl Engine {
     }
 
     /// One draft round for `lane` (rank 0): its anchor at position `p` -> the drafter's 7 tokens and
-    /// each one's probability under the drafter (the gate's confidence).
-    pub fn ink_draft(&mut self, lane: usize, anchor: u32, p: usize) -> Result<(Vec<u32>, Vec<f32>)> {
+    /// each one's probability under the drafter (the gate's confidence). `listed`: over the listed
+    /// vocabulary's head (the scheduler's choice for the lane; ignored without a list).
+    pub fn ink_draft(&mut self, lane: usize, anchor: u32, p: usize, listed: bool) -> Result<(Vec<u32>, Vec<f32>)> {
         self.mirror_msg(|m| {
-            m.u32(OP_INK_DRAFT).u32(lane as u32).u32(anchor).u32(p as u32);
+            m.u32(OP_INK_DRAFT).u32(lane as u32).u32(anchor).u32(p as u32).u32(listed as u32);
         })?;
-        self.ink_draft_local(lane, anchor, p)?;
+        self.ink_draft_local(lane, anchor, p, listed)?;
         self.st.synchronize()?;
         let b = self.ink().dout.download()?;
         let w = |i: usize| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
@@ -573,14 +609,14 @@ impl Engine {
 
     /// A draft round on this rank: drafted here when this rank has the drafter, the drafting rank's
     /// result through a gather otherwise.
-    pub(crate) fn ink_draft_local(&mut self, lane: usize, anchor: u32, p: usize) -> Result<()> {
+    pub(crate) fn ink_draft_local(&mut self, lane: usize, anchor: u32, p: usize, listed: bool) -> Result<()> {
         let s = self.ink();
         let out = np(&s.dout);
         match s.draft.as_ref() {
             Some(d) => {
                 let crate::weights::Embed::Bf16(table) = &self.w.embed else { return Err("the drafter needs the BF16 embedding".into()) };
                 let probs = unsafe { (out as *mut u8).add(28) } as *mut c_void;
-                d.draft(&self.st, lane, anchor, p, s.ctx_lo[lane], np(table), out, probs)?;
+                d.draft(&self.st, lane, anchor, p, s.ctx_lo[lane], np(table), out, probs, listed)?;
             }
             None => ck(unsafe { tidelm_cuda::ffi::cudaMemsetAsync(out, 0, DRAFT_OUT, self.st.raw()) }, "draft out")?,
         }
@@ -596,8 +632,8 @@ impl Engine {
 
     /// Rank 1's side of OP_INK_DRAFT.
     pub(crate) fn follow_ink_draft(&mut self, r: &mut tidelm_comm::Reader) -> Result<()> {
-        let (lane, anchor, p) = (r.u32()? as usize, r.u32()?, r.u32()? as usize);
-        self.ink_draft_local(lane, anchor, p)
+        let (lane, anchor, p, listed) = (r.u32()? as usize, r.u32()?, r.u32()? as usize, r.u32()? != 0);
+        self.ink_draft_local(lane, anchor, p, listed)
     }
 
     /// The embedding rows of the staged ids (the table holds them normed) -> act.h.
@@ -677,8 +713,14 @@ impl Engine {
                               nl, meta, ring as i32, lane_rows as i64, t as i32, np(&ia.qc), np(&ia.rc), cache) }, "heads")?;
         if !prefill {
             let ns = if full { NS_FULL } else { NS_WINDOW };
+            // a full layer with a lane of several rows (a verify pass): the split-key fused kernel,
+            // which reads each key once for all of the lane's rows. ink_attn_part reads it once a row:
+            // at 140K keys 1.24 ms a row a layer, so 40.5 / 77.4 ms a pass's 8 layers at 4 / 8 rows,
+            // against the fused 10.9 / 10.8 (fused_decode_attention_time, 2026-11-16); one row a lane
+            // keeps ink_attn_part (1.24 against 1.35 ms). TIDELM_INK_FLASH_DECODE=0: ink_attn_part always.
+            let part = if full && t > nl as usize && dec_flash() { ink_flash_part } else { ink_attn_part };
             unsafe {
-                ck(ink_attn_part(st, np(&ia.qc), np(&ia.rc), np(&w.proj_t), extent as i32, cache, ring as i32, lane_rows as i64,
+                ck(part(st, np(&ia.qc), np(&ia.rc), np(&w.proj_t), extent as i32, cache, ring as i32, lane_rows as i64,
                                  window as i32, lanes, nl, meta, hl as i32, kl as i32, ns as i32, t as i32, np(&ia.pm), np(&ia.pl),
                                  np(&ia.pacc)), "attention")?;
                 ck(ink_attn_combine(st, np(&ia.pm), np(&ia.pl), np(&ia.pacc), np(&ia.proj), ldp as i64, off.sink as i32,

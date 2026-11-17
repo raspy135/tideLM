@@ -103,6 +103,7 @@ def main():
     ap.add_argument('--top', type=int, default=98304, help='ids written')
     ap.add_argument('--out', required=True)
     ap.add_argument('--dump', help="also write every group's counts (train, held-out) to this JSON, for studies")
+    ap.add_argument('--name', default='GLM', help="the tokenizer's name in the file's header")
     args = ap.parse_args()
     from tokenizers import Tokenizer
     tok = Tokenizer.from_file(args.tokenizer)
@@ -145,7 +146,7 @@ def main():
     order = (special + [i for i in sorted(score, key=lambda i: (-score[i], i)) if i not in first])[:args.top]
 
     totals = [int(t) for t in args.totals.split(',')]
-    lines = [f'# GLM tokenizer draft vocabulary ranking (tools/build_glm_draft_vocab.py): {len(order)} ids, the',
+    lines = [f'# {args.name} tokenizer draft vocabulary ranking (tools/build_glm_draft_vocab.py): {len(order)} ids, the',
              f"# tokenizer's {len(special)} added tokens, then most frequent first. Per-group frequencies, weighted:"]
     for g in train:
         lines.append(f'#   {g} x{weights[g]:g}: {sum(train[g].values())} tokens, {len(train[g])} distinct ids - ' + ', '.join(names[g]))

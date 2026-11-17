@@ -480,7 +480,7 @@ __global__ void inkd_step_part_kernel(const bf16* __restrict__ base, const float
 // The blocks' partials into the step's token (argmax, the lowest id on ties) and its probability
 // under softmax(y): 1 / sum exp(y - max). One thread.
 __global__ void inkd_step_pick_kernel(const float* __restrict__ part, int nb, int step, int* __restrict__ toks,
-                                      float* __restrict__ probs) {
+                                      float* __restrict__ probs, const int* __restrict__ ids) {
     pdl_enter();
     if (threadIdx.x != 0) return;
     float mx = -INFINITY;
@@ -493,7 +493,7 @@ __global__ void inkd_step_pick_kernel(const float* __restrict__ part, int nb, in
     float sum = 0.f;
     for (int b = 0; b < nb; ++b)
         if (part[b] > -INFINITY) sum = fmaf(part[2 * nb + b], expf(part[b] - mx), sum);
-    toks[step] = best;
+    toks[step] = ids ? ids[best] : best;     // a listed head's index -> its id
     probs[step] = 1.f / sum;
 }
 
@@ -615,10 +615,10 @@ int inkd_step_part(void* stream, const void* base, const void* lw, const void* f
     GRET;
 }
 
-int inkd_step_pick(void* stream, const void* part, int n, int step, void* toks, void* probs) {
+int inkd_step_pick(void* stream, const void* part, int n, int step, void* toks, void* probs, const void* ids) {
     if (step < 0 || step >= kRows - 1) return 1;
     pdl_launch(inkd_step_pick_kernel, dim3(1), dim3(32), 0, GST, (const float*)part, inkd_step_blocks(n), step, (int*)toks,
-               (float*)probs);
+               (float*)probs, (const int*)ids);
     GRET;
 }
 

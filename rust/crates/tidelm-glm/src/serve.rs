@@ -17,6 +17,26 @@ use crate::forward::{Engine, Hidden, MtpRows, RowCands, HEAD_ROWS};
 use crate::weights::MAX_ROWS;
 use crate::Result;
 
+/// The prompt as the disk store keys it: each image's placeholder rows carry the image's key
+/// (flash_image::image_key) instead, as ids no vocabulary reaches (2^31 | 31 bits of the key mixed
+/// with the row), so a segment's hash tells one image from another; text rows are the prompt's.
+/// Before this, every image shared the one placeholder id, so prompts with images were never saved
+/// and a restore stopped at the first image: an agent's lane evicted by two short chats re-prefilled
+/// its 110K-token, 20-image prompt (about 3 minutes, the other lane at 5-7 tok/s meanwhile;
+/// 2026-11-16).
+fn store_tokens(prompt: &[u32], images: &[tidelm_engine::vision::ImageIn], keys: &[u128]) -> Vec<u32> {
+    let mut out = prompt.to_vec();
+    for (im, &k) in images.iter().zip(keys) {
+        let n = crate::flash_image::image_rows(im).min(out.len().saturating_sub(im.start));
+        for j in 0..n {
+            let h = (k as u64 ^ (k >> 64) as u64).wrapping_add((j as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let h = (h ^ (h >> 31)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            out[im.start + j] = 0x8000_0000 | (h >> 33) as u32;
+        }
+    }
+    out
+}
+
 /// mtp_cal.py: the calibrated draft gate.
 pub struct CalGate {
     pub tau: f64,
@@ -267,6 +287,9 @@ pub struct ServeOptions {
     /// GLM_LANE_CHUNK: a prompt admitted while other lanes decode prefills in parts of this many
     /// rows, a round of theirs between parts (a part alone would hold them up seconds a chunk)
     pub lane_chunk: usize,
+    /// the share of the engine's time a prefill takes beside decoding lanes (GLM_PREFILL_SHARE,
+    /// 0.5: a part, then as long in decode rounds; 1: a round a part, the old turn)
+    pub prefill_share: f64,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -429,6 +452,8 @@ pub struct Server {
     queue: VecDeque<Job>,
     /// share_running's wait: the queued request's id and the running one's whose prefill it waits for
     held: Option<(u64, u64)>,
+    /// seconds of decode rounds the decoding lanes are owed before the next prefill part (step)
+    decode_owed: f64,
     /// share_running's early save, made: the queued request's id and the running one's
     saved_for: Option<(u64, u64)>,
     /// lanes by last use, oldest first: a prompt that matches none better takes the oldest
@@ -443,7 +468,7 @@ impl Server {
             .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
         let lanes = eng.lanes();
         Server { eng, opt, cal, stats: Stats::default(), store: None, ds_history: None, conv_votes: HashMap::new(), conv_seq: 0, sampling: vec![None; lanes], log, round_log,
-                 runs: (0..lanes).map(|_| None).collect(), queue: VecDeque::new(), held: None, saved_for: None, lru: (0..lanes).collect(), done: vec![] }
+                 runs: (0..lanes).map(|_| None).collect(), queue: VecDeque::new(), held: None, decode_owed: 0.0, saved_for: None, lru: (0..lanes).collect(), done: vec![] }
     }
 
     fn log_json(&mut self, v: serde_json::Value) {
@@ -538,10 +563,23 @@ impl Server {
         self.admit()?;
         let decoding: Vec<usize> = (0..self.runs.len()).filter(|&l| self.runs[l].as_ref().is_some_and(|r| r.part.is_none())).collect();
         if !decoding.is_empty() {
+            let t0 = Instant::now();
             self.round(&decoding)?;
+            self.decode_owed -= t0.elapsed().as_secs_f64();
+        } else {
+            self.decode_owed = 0.0;
         }
-        if let Some(l) = (0..self.runs.len()).find(|&l| self.runs[l].as_ref().is_some_and(|r| r.part.is_some())) {
-            self.prefill_part(l)?;
+        // decoding lanes and a prefill share the engine by time: after a part, the decoding lanes
+        // get as long as it took (GLM_PREFILL_SHARE: the part's share, 0.5 here) before the next.
+        // One round a part gave a chat beside an 86K-token prefill 2.4 tok/s (a 512-row part is
+        // ~0.85 s at 40-80K; 2026-11-16).
+        if decoding.is_empty() || self.decode_owed <= 0.0 {
+            if let Some(l) = (0..self.runs.len()).find(|&l| self.runs[l].as_ref().is_some_and(|r| r.part.is_some())) {
+                let t0 = Instant::now();
+                self.prefill_part(l)?;
+                let share = self.opt.prefill_share.clamp(0.05, 1.0);
+                self.decode_owed = t0.elapsed().as_secs_f64() * (1.0 - share) / share;
+            }
         }
         Ok(std::mem::take(&mut self.done))
     }
@@ -621,6 +659,8 @@ impl Server {
         let Some(store) = self.store.as_ref() else { return Ok(true) };
         let job = self.queue.front().unwrap();
         let (id, prompt) = (job.id, &job.prompt);
+        let keys: Vec<u128> = job.images.iter().map(crate::flash_image::image_key).collect();
+        let skey = store_tokens(prompt, &job.images, &keys);
         let limit = prompt.len().saturating_sub(1);
         let best = self.runs.iter().flatten()
             .map(|r| (r.lane, prompt.iter().zip(&r.job.prompt).take_while(|(a, b)| a == b).count().min(limit)))
@@ -636,7 +676,7 @@ impl Server {
         }
         // the store already holding the shared rows (the other restored them) leaves nothing to
         // wait for; a disk short of room leaves this one to prefill them, as without the store
-        let stored = store.plan_restore(prompt, here).map_or(here, |(_, end)| end);
+        let stored = store.plan_restore(&skey, here).map_or(here, |(_, end)| end);
         if n < stored + SHARE_MIN || crate::prefix::free_bytes(&store.dir) < 10_000_000_000 {
             return Ok(true);
         }
@@ -646,10 +686,12 @@ impl Server {
             return Ok(false);
         }
         let p = run.job.prompt.clone();
+        let rkeys: Vec<u128> = run.job.images.iter().map(crate::flash_image::image_key).collect();
+        let pk = store_tokens(&p, &run.job.images, &rkeys);
         self.saved_for = Some((id, other));
         (self.log)(&format!("[prefix] request {id} shares {n} tokens with request {other}'s prompt: saving that now, to restore it"));
         self.eng.select(lane)?;
-        self.disk_save(&p)?;
+        self.disk_save(&p, &pk)?;
         Ok(true)
     }
 
@@ -696,10 +738,11 @@ impl Server {
         // prefill goes on from exactly that position
         let mut restored = false;
         if let Some(store) = self.store.as_mut().filter(|_| !self.eng.cfg.is_flash()) {
-            // a prompt with images restores only what lies before its first one: a segment is its
-            // tokens' hash, which cannot tell one image from another (and none is saved with images)
-            let upto = job.images.iter().map(|im| im.start).min().unwrap_or(prompt.len()).min(prompt.len());
-            if let Some((chain, end)) = store.plan_restore(&prompt[..upto], common) {
+            // images count by their keys (store_tokens); a restore never ends inside one (a segment
+            // ends where a saved prompt's did, past its images, so this does not happen in practice)
+            let skey = store_tokens(&prompt, &job.images, &keys);
+            let inside = |end: usize| job.images.iter().any(|im| im.start < end && im.start + crate::flash_image::image_rows(im) > end);
+            if let Some((chain, end)) = store.plan_restore(&skey, common).filter(|&(_, end)| !inside(end)) {
                 let c: Vec<(u64, usize, usize, String)> = chain.iter().map(|s| (s.id, s.start, s.end, s.hash.clone())).collect();
                 let ids: Vec<u64> = chain.iter().map(|s| s.id).collect();
                 let bad = chain.last().unwrap().id;
@@ -714,6 +757,10 @@ impl Server {
                                         t0.elapsed().as_secs_f64()));
                     common = end;
                     restored = self.eng.cfg.is_inkling();
+                    // the lane's sequence is the restored one now, its images those wholly before end
+                    let seq = job.images.iter().zip(&keys).filter(|(im, _)| im.start + crate::flash_image::image_rows(im) <= end)
+                        .map(|(im, &k)| (im.start, crate::flash_image::image_rows(im), k)).collect();
+                    self.eng.set_image_seq(lane, seq);
                 } else {
                     // a segment some rank could not read: forget it (and what extends it)
                     let store = self.store.as_mut().unwrap();
@@ -785,8 +832,11 @@ impl Server {
         // GLM-5.3-Flash: the KDA state two rows before the prompt's end, for the next turn (its prompt
         // shares this one to its end; a regenerate's reprefills its last two rows)
         self.eng.want_snapshot(prompt.len().saturating_sub(2))?;
-        let beside = self.runs.iter().any(|r| r.is_some());
-        if beside && suffix.len() > self.opt.lane_chunk.max(self.opt.two_pass) {
+        // a long prompt prefills in parts even alone, so a request that comes meanwhile is admitted
+        // at the next part instead of after the whole prompt: a whole 86K-token prefill (96 s) kept a
+        // 28-token chat queued 93.5 s (2026-11-16). Alone, a part is the engine's chunk (one pass, as
+        // the whole prefill took it); beside other requests, lane_chunk (prefill_part).
+        if suffix.len() > self.opt.lane_chunk.max(self.opt.two_pass) {
             run.part = Some((suffix, 0));
             self.runs[lane] = Some(run);
             return Ok(());
@@ -826,7 +876,9 @@ impl Server {
         }
         let (suffix, c0) = self.runs[lane].as_ref().unwrap().part.clone().unwrap();
         let depth = self.runs[lane].as_ref().unwrap().depth;
-        let n = self.opt.lane_chunk.max(HEAD_ROWS + 1).min(suffix.len() - c0);
+        let others = !self.queue.is_empty() || self.runs.iter().enumerate().any(|(l, r)| l != lane && r.is_some());
+        let size = if others { self.opt.lane_chunk } else { self.eng.opt.chunk.max(self.opt.lane_chunk) };
+        let n = size.max(HEAD_ROWS + 1).min(suffix.len() - c0);
         let end = self.eng.lane_pos(lane) + n;
         if !self.make_room(lane, end, 0)? {
             return Ok(()); // waits for the decoding lanes to give chunks back
@@ -958,11 +1010,13 @@ impl Server {
                            r1.preload - r0.preload, (r1.preload_mb - r0.preload_mb) / 1_000_000, r1.preload_s - r0.preload_s,
                            s.fallbacks);
         let (id, lane, prompt) = (run.job.id, run.lane, run.job.prompt.clone());
+        let rkeys: Vec<u128> = run.job.images.iter().map(crate::flash_image::image_key).collect();
+        let pkey = store_tokens(&prompt, &run.job.images, &rkeys);
         let mut job = run.job;
         (job.sink)(Event::Done(finish, run.g));
         if ok {
             self.eng.select(lane)?;
-            self.disk_save(&prompt)?;
+            self.disk_save(&prompt, &pkey)?;
         }
         self.touch(lane);
         self.done.push(Finished { id, line });
@@ -970,24 +1024,22 @@ impl Server {
     }
 
     /// The prompt's rows past its deepest saved prefix to the disk store (both ranks, the
-    /// selected lane's), when they are new enough to keep and the disks have room.
-    fn disk_save(&mut self, prompt: &[u32]) -> Result<()> {
+    /// selected lane's), when they are new enough to keep and the disks have room. `key`: the
+    /// prompt as the store keys it (store_tokens: its images by their keys).
+    fn disk_save(&mut self, prompt: &[u32], key: &[u32]) -> Result<()> {
         let Some(store) = self.store.as_mut() else { return Ok(()) };
-        if self.eng.tokens.len() < prompt.len() || self.eng.tokens[..prompt.len()] != *prompt {
-            return Ok(());
-        }
-        if self.eng.lane_has_images(self.eng.lane) {
+        if self.eng.tokens.len() < prompt.len() || self.eng.tokens[..prompt.len()] != *prompt || key.len() != prompt.len() {
             return Ok(());
         }
         // Inkling 2: a segment ends where the lane's snapshot is (near the prompt's end: its tail is
         // that snapshot); no snapshot inside the prompt, nothing to save
         let prompt = if self.eng.cfg.is_inkling() {
             match self.eng.ink_snapshot_pos(self.eng.lane).filter(|&p| p <= prompt.len()) {
-                Some(p) => &prompt[..p],
+                Some(p) => &key[..p],
                 None => return Ok(()),
             }
         } else {
-            prompt
+            key
         };
         if crate::prefix::free_bytes(&store.dir) < 10_000_000_000 {
             return Ok(());
@@ -1159,7 +1211,20 @@ impl Server {
                     continue;
                 }
                 let (lane, anchor) = (runs[blocks[k].i].lane, runs[blocks[k].i].anchor);
-                let (toks, probs) = self.eng.ink_draft(lane, anchor, blocks[k].p)?;
+                // over the listed vocabulary while this lane's recent text is in it (a lane drafts alone
+                // here, so the choice is its own: GLM-5.3-Flash's rule, DRAFT_UNLISTED_MAX)
+                let listed = self.eng.has_draft_list() && {
+                    let r = &mut runs[blocks[k].i];
+                    for &t in &r.out[r.folded..] {
+                        let miss = if self.eng.draft_lists(t) { 0.0 } else { 1.0 };
+                        r.unlisted += (miss - r.unlisted) * DRAFT_UNLISTED_EMA;
+                    }
+                    r.folded = r.out.len();
+                    r.unlisted <= DRAFT_UNLISTED_MAX
+                };
+                runs[blocks[k].i].stats.mtp_rounds += 1;
+                runs[blocks[k].i].stats.listed_rounds += listed as usize;
+                let (toks, probs) = self.eng.ink_draft(lane, anchor, blocks[k].p, listed)?;
                 let b = &mut blocks[k];
                 for step in 0..toks.len().min(b.dmax) {
                     let pk = probs[step] as f64;
@@ -1510,6 +1575,24 @@ impl Server {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn store_tokens_tell_images_apart() {
+        use tidelm_engine::vision::ImageIn;
+        let im = |start: usize, v: u16| ImageIn { start, vit_h: 4, vit_w: 4, patches: vec![v; 64] };
+        let prompt: Vec<u32> = (0..20).collect();
+        let (a, b) = (vec![im(3, 1)], vec![im(3, 2)]);
+        let ka: Vec<u128> = a.iter().map(crate::flash_image::image_key).collect();
+        let kb: Vec<u128> = b.iter().map(crate::flash_image::image_key).collect();
+        let (ta, tb) = (super::store_tokens(&prompt, &a, &ka), super::store_tokens(&prompt, &b, &kb));
+        // text rows as they were, the image's 4 rows past any vocabulary, two images apart
+        assert_eq!((&ta[..3], &ta[7..]), (&prompt[..3], &prompt[7..]));
+        assert!(ta[3..7].iter().all(|&t| t >= 0x8000_0000));
+        assert_ne!(ta[3..7], tb[3..7]);
+        assert_eq!(ta, super::store_tokens(&prompt, &a, &ka), "deterministic: a restart finds what was saved");
+        // the rows of one image differ from each other (no run of one id)
+        assert!(ta[3..7].windows(2).all(|w| w[0] != w[1]));
+    }
     use super::*;
 
     #[test]

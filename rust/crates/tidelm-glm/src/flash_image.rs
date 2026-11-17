@@ -195,6 +195,15 @@ impl Engine {
 
     /// Whether the lane's sequence holds images. The disk prefix store names a segment by its
     /// tokens, and every image is the same placeholder id: such a sequence is not saved.
+    /// After a disk restore: the lane's sequence is the restored prompt's, its images `seq` (first
+    /// position, rows, key; those wholly before the restore's end). Rank 0's bookkeeping, as
+    /// encode_images keeps it: the restored rows' features are in the cache already.
+    pub fn set_image_seq(&mut self, lane: usize, seq: Vec<(usize, usize, u128)>) {
+        if let Some(v) = self.vis.as_mut() {
+            v.lanes[lane].seq = seq;
+        }
+    }
+
     pub fn lane_has_images(&self, lane: usize) -> bool {
         self.vis.as_ref().is_some_and(|v| !v.lanes[lane].seq.is_empty())
     }

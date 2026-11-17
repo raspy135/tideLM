@@ -126,8 +126,10 @@ fn convolutions_in_two_passes_are_the_sequence_in_one() {
     let want_s = conv_ref(&xf, t, c, &|_, ch, lag| wsf[ch * 4 + (3 - lag)], 5f32.sqrt());
     let want_d = conv_ref(&xf, t, c, &|i, ch, lag| wlf[lag * c + ch] + wdf[i * (c / D) * 4 + (ch / D) * 4 + lag], 3.0);
     for (dynamic, want) in [(false, &want_s), (true, &want_d)] {
-        for split in [t, 17, 1] {
-            // rows 0 .. split, then split .. t (a pass of everything when split == t)
+        let mut rings: Vec<Vec<u16>> = vec![];
+        for (split, fused) in [(t, false), (17, false), (1, false), (t, true), (17, true), (1, true)] {
+            // rows 0 .. split, then split .. t (a pass of everything when split == t); fused: the
+            // convolution and its ring write in one launch (ink_conv_fused), the ring bit for bit the same
             let ring = DeviceBuffer::<u16>::zeroed(lanes * CONV_RING * c).unwrap();
             let out = DeviceBuffer::<u16>::zeroed(t * c).unwrap();
             let mut r0 = 0;
@@ -143,18 +145,29 @@ fn convolutions_in_two_passes_are_the_sequence_in_one() {
                     (dev(&ws), 0, dev(&[0u16]), 0, 5f32.sqrt())
                 };
                 unsafe {
-                    ok(ink_conv(st.raw(), p(&xd), c as i64, c as i32, p(&w), wmode, p(&dw), ldd as i64, p(&ring), (CONV_RING * c) as i64,
-                                p(&lt), 1, p(&meta), n as i32, div, 0, out.ptr_at(r0 * c), c as i64, null(), null()));
-                    ok(ink_conv_state(st.raw(), p(&xd), c as i64, c as i32, p(&ring), (CONV_RING * c) as i64, p(&lt), 1, p(&meta)));
+                    if fused {
+                        ok(ink_conv_fused(st.raw(), p(&xd), c as i64, c as i32, p(&w), wmode, p(&dw), ldd as i64, p(&ring),
+                                          (CONV_RING * c) as i64, p(&lt), 1, p(&meta), n as i32, div, 0, out.ptr_at(r0 * c), c as i64, null(),
+                                          null()));
+                    } else {
+                        ok(ink_conv(st.raw(), p(&xd), c as i64, c as i32, p(&w), wmode, p(&dw), ldd as i64, p(&ring), (CONV_RING * c) as i64,
+                                    p(&lt), 1, p(&meta), n as i32, div, 0, out.ptr_at(r0 * c), c as i64, null(), null()));
+                        ok(ink_conv_state(st.raw(), p(&xd), c as i64, c as i32, p(&ring), (CONV_RING * c) as i64, p(&lt), 1, p(&meta)));
+                    }
                 }
                 r0 += n;
             }
             let got = fl(&out.download().unwrap());
             let e = rel_err(&got, want);
-            eprintln!("conv dynamic {dynamic} split {split}: rel err {e:.2e}");
-            assert!(e < 1e-6, "conv dynamic {dynamic} split {split}: rel err {e}");
+            eprintln!("conv dynamic {dynamic} split {split} fused {fused}: rel err {e:.2e}");
+            assert!(e < 1e-6, "conv dynamic {dynamic} split {split} fused {fused}: rel err {e}");
             // the other lane's ring is untouched
-            assert!(ring.download().unwrap()[..CONV_RING * c].iter().all(|&v| v == 0));
+            let rh = ring.download().unwrap();
+            assert!(rh[..CONV_RING * c].iter().all(|&v| v == 0));
+            if fused {
+                assert_eq!(rh, rings[rings.len() - 3], "the fused ring, split {split}");
+            }
+            rings.push(rh);
         }
     }
 }
@@ -193,7 +206,10 @@ fn mix_matches_the_reference() {
     let Some(st) = setup() else { return };
     let mut rng = Rng(0xb10c_5);
     let (t, h, nbmax) = (3usize, 4608usize, 8usize);
-    for (nb, nq, cur_f32) in [(0usize, 1usize, true), (3, 3, false), (8, 1, false), (2, 1, true)] {
+    for (nb, nq, cur_f32, vec) in [(0usize, 1usize, true, false), (3, 3, false, false), (8, 1, false, false), (2, 1, true, false),
+                                   (0, 1, true, true), (3, 3, false, true), (8, 1, false, true), (2, 1, true, true)] {
+        // vec: the vectorized kernel (ink_set_mix_v; this test runs alone: --test-threads 1 if others mix)
+        unsafe { ink_set_mix_v(vec as i32) };
         let blocks = rng.bf16_vec(t * nbmax * h, 2.0);
         let cur_b = rng.bf16_vec(t * h, 3.0);
         let cur_f = rng.f32_vec(t * h, 3.0);
@@ -232,9 +248,10 @@ fn mix_matches_the_reference() {
             }
         }
         let e = rel_err(&got, &want);
-        eprintln!("mix nb {nb} nq {nq} fp32 {cur_f32}: rel err {e:.2e}");
-        assert!(e < 2e-3, "mix nb {nb} nq {nq}: rel err {e}");
+        eprintln!("mix nb {nb} nq {nq} fp32 {cur_f32} vectorized {vec}: rel err {e:.2e}");
+        assert!(e < 2e-3, "mix nb {nb} nq {nq} vectorized {vec}: rel err {e}");
     }
+    unsafe { ink_set_mix_v(1) };
 }
 
 // ------------------------------------------------------------------ attention
@@ -489,6 +506,182 @@ fn fused_prefill_attention_matches_the_reference() {
         eprintln!("fused prefill attention window {window} p0 {p0} rows {t}: rel err {e:.2e}, worst (row, head) {worst:.2e}");
         assert!(e < 1e-2 && worst < 3e-2, "fused prefill attention window {window} p0 {p0}: rel err {e}, worst {worst}");
     }
+}
+
+#[test]
+fn fused_decode_attention_matches_the_reference() {
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(0xdec0_de);
+    let kl = 2usize;
+    let rowk = kl * 2 * D;
+    // (window, ring, splits, groups of (rows, first position)): verify rows of one lane on a full
+    // layer in and past the bias's band, two lanes in one pass, 20 rows (two tiles), a window
+    // layer's wrapped ring
+    let cases: Vec<(usize, usize, usize, Vec<(usize, usize)>)> = vec![
+        (0, 0, 64, vec![(4, 2500)]),
+        (0, 0, 64, vec![(1, 300)]),
+        (0, 0, 16, vec![(3, 900), (5, 4000)]),
+        (0, 0, 64, vec![(20, 3000)]),
+        (1024, 2048, 4, vec![(4, 5000), (2, 700)]),
+    ];
+    for (window, ring, ns, groups) in cases {
+        let t: usize = groups.iter().map(|g| g.0).sum();
+        let a = Attn::new(&mut rng, kl, t, 0, 1024);
+        let hl = a.hl;
+        let (_, _, goff, soff) = a.offs();
+        // every group's positions' rows; its cache: lane z's ring, or flat rows from an offset
+        let alls: Vec<Vec<u16>> = groups.iter().map(|&(n, p0)| rng.bf16_vec((p0 + n) * rowk, 1.0)).collect();
+        let mut lt = vec![];
+        let mut meta = vec![];
+        let mut cache_h: Vec<u16> = vec![];
+        let (mut row0, mut koff) = (0usize, 32usize);
+        if ring > 0 {
+            cache_h = vec![0u16; groups.len() * ring * rowk];
+        } else {
+            cache_h.resize(koff * rowk, 0);
+        }
+        for (z, &(n, p0)) in groups.iter().enumerate() {
+            let np_ = p0 + n;
+            if ring > 0 {
+                for pos in np_.saturating_sub(ring)..np_ {
+                    let row = z * ring + (pos & (ring - 1));
+                    cache_h[row * rowk..(row + 1) * rowk].copy_from_slice(&alls[z][pos * rowk..(pos + 1) * rowk]);
+                }
+                lt.extend([row0 as i32, n as i32, p0 as i32, 0]);
+            } else {
+                cache_h.extend_from_slice(&alls[z]);
+                lt.extend([row0 as i32, n as i32, p0 as i32, koff as i32]);
+                koff += np_;
+            }
+            meta.extend([z as i32, 0, 0, 0]);
+            row0 += n;
+        }
+        let (cache, ltd, metad) = (dev(&cache_h), dev(&lt), dev(&meta));
+        let qc = rng.bf16_vec(t * hl * D, 2.0);
+        let rc = rng.bf16_vec(t * hl * REL, 1.0);
+        let (proj, proj_t, qcd, rcd) = (dev(&a.proj), dev(&a.proj_t), dev(&qc), dev(&rc));
+        let nl = groups.len() as i32;
+        let run = |fused: bool| -> Vec<f32> {
+            let pm = DeviceBuffer::<f32>::zeroed(t * kl * ns * G).unwrap();
+            let pl = DeviceBuffer::<f32>::zeroed(t * kl * ns * G).unwrap();
+            let pacc = DeviceBuffer::<f32>::zeroed(t * kl * ns * G * D).unwrap();
+            let o = DeviceBuffer::<u16>::zeroed(t * hl * D).unwrap();
+            unsafe {
+                let f = if fused { ink_flash_part } else { ink_attn_part };
+                ok(f(st.raw(), p(&qcd), p(&rcd), p(&proj_t), 1024, p(&cache), ring as i32, ring as i64, window as i32, p(&ltd), nl,
+                     p(&metad), hl as i32, kl as i32, ns as i32, t as i32, p(&pm), p(&pl), p(&pacc)));
+                ok(ink_attn_combine(st.raw(), p(&pm), p(&pl), p(&pacc), p(&proj), a.ldp as i64, soff as i32, goff as i32, hl as i32,
+                                    kl as i32, ns as i32, t as i32, p(&o)));
+            }
+            fl(&o.download().unwrap())
+        };
+        let (old, new) = (run(false), run(true));
+        // the reference, a group at a time (its rows' slice of q, r, proj)
+        let (qf, rf) = (fl(&qc), fl(&rc));
+        let mut want = vec![];
+        let mut r0 = 0usize;
+        for (z, &(n, p0)) in groups.iter().enumerate() {
+            let az = Attn { hl, t: n, p0, ldp: a.ldp, proj: a.proj[r0 * a.ldp..(r0 + n) * a.ldp].to_vec(), proj_t: a.proj_t.clone(),
+                            extent: a.extent };
+            let allf = fl(&alls[z]);
+            want.extend(az.reference(&qf[r0 * hl * D..(r0 + n) * hl * D], &rf[r0 * hl * REL..(r0 + n) * hl * REL],
+                                     &|pos| allf[pos * rowk..(pos + 1) * rowk].to_vec(), window));
+            r0 += n;
+        }
+        let (e_old, e_new) = (rel_err(&old, &want), rel_err(&new, &want));
+        let worst = (0..t * hl).map(|i| rel_err(&new[i * D..][..D], &want[i * D..][..D])).fold(0f32, f32::max);
+        eprintln!("fused decode attention window {window} groups {groups:?}: rel err {e_new:.2e} (worst {worst:.2e}; ink_attn_part {e_old:.2e})");
+        assert!(e_new < 5e-3 && worst < 3e-2, "fused decode attention window {window} groups {groups:?}: {e_new}, worst {worst}");
+    }
+}
+
+/// TIDELM_INK_FLASH_BENCH=1: one verify pass's attention, a full layer, R rows at 140K keys: the
+/// per-row kernel against the fused one.
+#[test]
+fn fused_decode_attention_time() {
+    if std::env::var("TIDELM_INK_FLASH_BENCH").as_deref() != Ok("1") {
+        return;
+    }
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(0x71e5);
+    let (kl, ns) = (4usize, 64usize);
+    let rowk = kl * 2 * D;
+    let p0 = 140_000usize;
+    let cache = dev(&rng.bf16_vec((p0 + 32) * rowk, 1.0));
+    for t in [1usize, 4, 8, 16] {
+        let a = Attn::new(&mut rng, kl, t, p0, 1024);
+        let hl = a.hl;
+        let (qcd, rcd, proj_t) = (dev(&rng.bf16_vec(t * hl * D, 2.0)), dev(&rng.bf16_vec(t * hl * REL, 1.0)), dev(&a.proj_t));
+        let (ltd, metad) = (dev(&[0i32, t as i32, p0 as i32, 0]), dev(&[0i32, 0, 0, 0]));
+        let pm = DeviceBuffer::<f32>::zeroed(t * kl * ns * G).unwrap();
+        let pl = DeviceBuffer::<f32>::zeroed(t * kl * ns * G).unwrap();
+        let pacc = DeviceBuffer::<f32>::zeroed(t * kl * ns * G * D).unwrap();
+        let time = |fused: bool| {
+            let f = if fused { ink_flash_part } else { ink_attn_part };
+            let go = || unsafe {
+                ok(f(st.raw(), p(&qcd), p(&rcd), p(&proj_t), 1024, p(&cache), 0, 0, 0, p(&ltd), 1, p(&metad), hl as i32, kl as i32,
+                     ns as i32, t as i32, p(&pm), p(&pl), p(&pacc)));
+            };
+            go();
+            let t0 = std::time::Instant::now();
+            for _ in 0..10 {
+                go();
+            }
+            t0.elapsed().as_secs_f64() * 1e3 / 10.0
+        };
+        let (old, new) = (time(false), time(true));
+        eprintln!("decode attention, {t} rows at {p0}: ink_attn_part {old:.2} ms, fused {new:.2} ms a layer (8 layers: {:.1} -> {:.1} ms)",
+                  8.0 * old, 8.0 * new);
+    }
+}
+
+/// TIDELM_INK_FLASH_BENCH=1: a decode row's mix (8 saved states, 4,608 channels) by the old kernel and
+/// the vectorized one, and a 4,608-channel convolution with its ring write apart and merged.
+#[test]
+fn small_kernels_time() {
+    if std::env::var("TIDELM_INK_FLASH_BENCH").as_deref() != Ok("1") {
+        return;
+    }
+    let Some(st) = setup() else { return };
+    let mut rng = Rng(0x5a11);
+    let h = 4608usize;
+    let blocks = dev(&rng.bf16_vec(9 * h, 2.0));
+    let cur = dev(&rng.f32_vec(h, 3.0));
+    let (q, nw) = (dev(&rng.f32_vec(h, 0.5)), dev(&rng.bf16_vec(h, 1.0)));
+    let out = DeviceBuffer::<u16>::zeroed(h).unwrap();
+    let time = |f: &dyn Fn()| {
+        f();
+        unsafe { tidelm_cuda::ffi::cudaDeviceSynchronize() };
+        let t0 = std::time::Instant::now();
+        for _ in 0..200 {
+            f();
+        }
+        unsafe { tidelm_cuda::ffi::cudaDeviceSynchronize() };
+        t0.elapsed().as_secs_f64() * 1e6 / 200.0
+    };
+    for vec in [false, true] {
+        unsafe { ink_set_mix_v(vec as i32) };
+        let us = time(&|| unsafe {
+            ink_mix(st.raw(), p(&blocks), (9 * h) as i64, 8, p(&cur), 1, p(&q), 1, p(&nw), 1e-6, p(&out), h as i64, 1, h as i32);
+        });
+        eprintln!("mix, one row, 8 states: vectorized {vec}: {us:.1} us a call");
+    }
+    unsafe { ink_set_mix_v(1) };
+    let x = dev(&rng.bf16_vec(h, 1.0));
+    let w = dev(&rng.bf16_vec(h * 4, 0.5));
+    let ring = DeviceBuffer::<u16>::zeroed(CONV_RING * h).unwrap();
+    let (lt, meta) = tables(0, 1, 100, 0);
+    let o = DeviceBuffer::<u16>::zeroed(h).unwrap();
+    let apart = time(&|| unsafe {
+        ink_conv(st.raw(), p(&x), h as i64, h as i32, p(&w), 0, null(), 0, p(&ring), (CONV_RING * h) as i64, p(&lt), 1, p(&meta), 1, 2.236,
+                 0, p(&o), h as i64, null(), null());
+        ink_conv_state(st.raw(), p(&x), h as i64, h as i32, p(&ring), (CONV_RING * h) as i64, p(&lt), 1, p(&meta));
+    });
+    let merged = time(&|| unsafe {
+        ink_conv_fused(st.raw(), p(&x), h as i64, h as i32, p(&w), 0, null(), 0, p(&ring), (CONV_RING * h) as i64, p(&lt), 1, p(&meta), 1,
+                       2.236, 0, p(&o), h as i64, null(), null());
+    });
+    eprintln!("conv, one row, 4608 channels: with its state apart {apart:.1} us, merged {merged:.1} us");
 }
 
 /// TIDELM_INK_FLASH_BENCH=1: the fused prefill attention's time for a 2048-row chunk of one rank's

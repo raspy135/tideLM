@@ -63,8 +63,9 @@ extern "C" {
                           cap: f32, part: *mut c_void, ylog: *mut c_void) -> c_int;
     /// part -> toks[step] (i32: the argmax, the lowest id on ties) and probs[step] (fp32: its
     /// softmax probability).
+    /// `ids` (or null): a listed head's index -> its token id, i32 [n].
     pub fn inkd_step_pick(stream: CudaStream, part: *const c_void, n: c_int, step: c_int, toks: *mut c_void,
-                          probs: *mut c_void) -> c_int;
+                          probs: *mut c_void, ids: *const c_void) -> c_int;
     /// fw bf16 [n][r] = bf16(u w), fb bf16 [n] = bf16(u b) in fp64: u bf16 [n][h] (rows of the
     /// unembed), w bf16 [h][r], b bf16 [h]; h 4608, r 256.
     pub fn inkd_fold(stream: CudaStream, u: *const c_void, n: c_int, h: c_int, r: c_int, w: *const c_void, b: *const c_void,
