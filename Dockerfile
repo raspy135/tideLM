@@ -119,7 +119,8 @@ WORKDIR /src
 COPY rust rust
 COPY tools/roce/roce.cu tools/roce/roce_common.h tools/roce/
 COPY tools/fp4_moe_cuda.cu tools/exl3_moe_cuda.cu tools/
-COPY engine/engram_gather.cpp engine/draft_vocab_ranking_v1.txt engine/glm_draft_vocab_ranking_v1.txt engine/
+COPY engine/engram_gather.cpp engine/draft_vocab_ranking_v1.txt engine/glm_draft_vocab_ranking_v1.txt \
+     engine/inkling_draft_vocab_ranking_v1.txt engine/
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/src/rust/target \
     cd rust && cargo build --release --locked --bin tidelm-server \
