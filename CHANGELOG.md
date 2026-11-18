@@ -13,7 +13,7 @@ belong to it.
 tagged with it: `ghcr.io/<owner>/tidelm:<version>`. A `-wip` version means
 exactly what it says: the defaults are not settled and the measurements are incomplete.
 
-## 0.6.0 — unreleased: the first release
+## 0.6.0 — 2026-11-17: the first release
 
 The first tagged version of TideLM, and the first whose numbers are a release's rather than work in
 progress. (The `-wip` versions below were never tagged; 0.6.0 follows on from them.) What it is: adaptive
