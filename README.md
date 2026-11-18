@@ -332,6 +332,12 @@ view can order a layer's cells by use. The page reads `GET /v1/expert-map` (JSON
 when one is set) once a second while it is open; the engine answers from host data between its steps
 and does nothing for it when no page is asking.
 
+![The expert map: 48 rows of 384 cells, each layer's experts ordered most used first, resident ones blue and the others orange](assets/expert-map.png)
+
+*Inkling-2-Small on the pair (2026-11-17), how much each expert is used, most used first: in every
+layer the experts in demand are resident (blue) and most of those not loaded (orange) are the rarely
+used tail. The first six layers keep 309-366 of their 384 experts, the last twelve 139-229.*
+
 ### Updating
 
 ```bash
