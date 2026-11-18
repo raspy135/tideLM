@@ -19,7 +19,7 @@
 #   MODELS_DIR     host directory bind-mounted at /models         (dirname of MODEL_DIR)
 #   MODEL_NAME     checkpoint directory name under it             (basename of MODEL_DIR)
 #   RECIPE_VERSION image tag                                      (VERSION)
-#   GHCR_OWNER     registry namespace                             (0xbakeer)
+#   GHCR_OWNER     registry namespace                             (raspy135)
 #   BUILD=1        build the image locally instead of pulling it
 #   MIN_FREE_GIB   memory the server demands before it will load  (90)
 # ---------------------------------------------------------------------------
@@ -49,7 +49,7 @@ MODEL_DIR="${MODEL_DIR:-./models/DeepSeek-V4.1-Flash}"
 MODELS_DIR="${MODELS_DIR:-$(dirname "$MODEL_DIR")}"
 MODEL_NAME="${MODEL_NAME:-$(basename "$MODEL_DIR")}"
 export PORT RECIPE_VERSION MODELS_DIR MODEL_NAME
-export GHCR_OWNER="${GHCR_OWNER:-0xbakeer}"
+export GHCR_OWNER="${GHCR_OWNER:-raspy135}"
 unset MODEL_DIR   # compose composes its own; a host path inside the container is a bug
 
 DC=(docker compose)
@@ -72,7 +72,7 @@ case "${1:-}" in
         log "building the image here (no engine compile in this recipe; it is a pip install)"
         "${DC[@]}" build
     else
-        log "pulling ghcr.io/$GHCR_OWNER/deepseek-v41-flash-spark:$RECIPE_VERSION"
+        log "pulling ghcr.io/$GHCR_OWNER/tidelm:$RECIPE_VERSION"
         "${DC[@]}" pull "$SERVICE"
     fi
     log "fetching the checkpoint into $MODELS_DIR/$MODEL_NAME (510 GB, resumable -- re-run if it stops)"

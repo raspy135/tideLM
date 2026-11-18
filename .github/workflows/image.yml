@@ -44,7 +44,7 @@ jobs:
             echo "release=false" >> "$GITHUB_OUTPUT"
           fi
           # GHCR namespaces are lowercase; the GitHub owner may not be.
-          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/deepseek-v41-flash-spark" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/tidelm" >> "$GITHUB_OUTPUT"
 
       - uses: docker/login-action@v3
         with:

@@ -14,7 +14,7 @@
 # with 510 GB of weights answering to anyone who finds it.
 services:
   v41:
-    image: ghcr.io/${GHCR_OWNER:-0xbakeer}/deepseek-v41-flash-spark:${RECIPE_VERSION:-0.1.0-wip}
+    image: ghcr.io/${GHCR_OWNER:-raspy135}/tidelm:${RECIPE_VERSION:-0.6.0}
     build: .
     container_name: deepseek-v41-flash
     ports:

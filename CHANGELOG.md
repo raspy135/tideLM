@@ -10,8 +10,39 @@ belong to it.
 - **PATCH** — documentation, corrections, tooling. Your numbers do not move.
 
 `./run.sh` and the container print the version they were launched from, and the image is
-tagged with it: `ghcr.io/<owner>/deepseek-v41-flash-spark:<version>`. A `-wip` version means
+tagged with it: `ghcr.io/<owner>/tidelm:<version>`. A `-wip` version means
 exactly what it says: the defaults are not settled and the measurements are incomplete.
+
+## 0.6.0 — unreleased: the first release
+
+The first tagged version of TideLM, and the first whose numbers are a release's rather than work in
+progress. (The `-wip` versions below were never tagged; 0.6.0 follows on from them.) What it is: adaptive
+expert residency on one or two DGX Sparks - the experts your traffic uses kept in memory, learned from the
+router's own demand while it serves, the misses that matter read from NVMe as decoding goes on - in a Rust
+engine (`rust/`, the default; the Python engine stays behind `TIDE_ENGINE=python`), for four models and
+five profiles (`configs/`, `scripts/tide.sh start <profile>`). Measured with `bench/bench.py` as the
+README states it (medians of three runs after a warmup, 1,024 tokens at temperature 0.6), each on the
+build of its day:
+
+| profile | Sparks | resident | context | prose | code | 8K prompt, first token |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ds41-mxfp4` (DeepSeek-V4.1-Flash-1017, MXFP4) | 2 | 10,000 / 15,360 | 1M (2 lanes) | 33.5 tok/s | 51.8 tok/s | 4.3 s |
+| `glm53-exlr8-home` (GLM-5.3, exlr8 `home` 3.25 bpw) | 2 | 11,430 / 19,200 | 320K (2 lanes) | 20.4 tok/s | 23.9 tok/s | 17.2 s |
+| `glm53-flash-40-tp1` (GLM-5.3-Flash, EXL3 4 bpw) | 1 | 7,282 / 12,096 | 320K (2 lanes) | 22.1 tok/s | 26.4 tok/s | 12.1 s |
+| `glm53-flash-40-tp2` (GLM-5.3-Flash, EXL3 4 bpw) | 2 | 12,096 / 12,096 | 1M (2 lanes) | 36.8 tok/s | 46.6 tok/s | 7.6 s |
+| `inkling2-small-40-tp2` (Inkling-2-Small, EXL3 4 bpw) | 2 | 11,865 / 18,432 | 768K (3 lanes) | 29.4 tok/s | 42.3 tok/s | 7.6 s |
+
+Inkling-2-Small's row was measured at a 512K context with 11,967 experts resident (2026-11-16); the
+profile has served 768K with 102 fewer since 2026-11-17.
+
+Around the residency: each model's own drafter for speculative decoding (DeepSeek's DSpark heads,
+GLM's MTP layer, Inkling's DSpark drafter); prompt caching in RAM and on disk; FP8 KV caches; paged
+context caches the lanes share; image input (DeepSeek, GLM-5.3-Flash on one Spark, Inkling-2-Small);
+tool calls, thinking and reasoning effort through an OpenAI-compatible API and an Anthropic route for
+Claude Code; a live expert map (`/expert-map`). Setup: `tools/exlr8_fetch.py`, `tools/hf_mirror.py` and
+`scripts/inkling2-setup.sh` fetch and lay out each model's weights; the routing seeds in `profiles/` give
+a fresh install a starting history. The per-profile measurements, and every one that said no, are in
+`results/`, `docs/` and the commit history.
 
 ## 0.2.0-wip — 2026-10-18: TideLM
 

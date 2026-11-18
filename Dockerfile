@@ -11,7 +11,7 @@
 # Build it on an arm64 machine -- normally GitHub's ubuntu-24.04-arm runner via
 # .github/workflows/image.yml, or the Spark itself:
 #
-#   docker build -t deepseek-v41-flash-spark .
+#   docker build -t tidelm .
 #
 # ---------------------------------------------------------------------------------------
 # Why the *devel* base and not -runtime
@@ -127,7 +127,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     && cp target/release/tidelm-server /usr/local/bin/tidelm-server
 
 FROM base
-ARG RECIPE_VERSION=0.1.0-wip
+ARG RECIPE_VERSION=0.6.0
 
 WORKDIR /app
 COPY . /app
