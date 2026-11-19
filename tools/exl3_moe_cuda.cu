@@ -119,17 +119,21 @@ __device__ __forceinline__ uint32_t e4m3_round2(uint32_t v) {
     return *reinterpret_cast<const uint32_t*>(&r);
 }
 
-// Two codebook values (0 3inst, 1 mcg, 2 mul1, 3 mcg rounded to E4M3: exlr8) as half2, bit-identical
-// to ExLlamaV3's decode (3: to kindlingai/exlr8's, tools/exlr8_ref.py).
+// Two codebook values (0 3inst, 1 mcg, 2 mul1, 3 mcg rounded to E4M3: exlr8 0.5, 5 mul1 rounded to E4M3:
+// exlr8 0.6 on) as half2, bit-identical to ExLlamaV3's decode (3 and 5: to kindlingai/exlr8's,
+// tools/exlr8_ref.py). 4 and 6: 3 and 5 with the two-instruction rounding below.
+// mul1's values are (byte sum - 510) x fp16 0x1EEE, |v| < 3.46: under 4, as e4m3_round2 needs.
 template <int CB>
 __device__ __forceinline__ uint32_t cb_pair(uint32_t s0, uint32_t s1) {
-    if constexpr (CB == 2) {
+    if constexpr (CB == 2 || CB == 5 || CB == 6) {
         const uint32_t x0 = s0 * 0x83DCD12Du, x1 = s1 * 0x83DCD12Du;
         const uint32_t sum0 = __dp4a(x0, 0x01010101u, 0x6400u);
         const uint32_t sum1 = __dp4a(x1, 0x01010101u, 0x6400u);
         const uint32_t hv = __byte_perm(sum0, sum1, 0x5410);
         half2 h = *reinterpret_cast<const half2*>(&hv);
         half2 r = __hfma2(h, __half2half2(__ushort_as_half(0x1eee)), __half2half2(__ushort_as_half(0xc931)));
+        if constexpr (CB == 5) return e4m3_round2(*reinterpret_cast<uint32_t*>(&r));
+        if constexpr (CB == 6) return (*reinterpret_cast<uint32_t*>(&r) + 0x00400040u) & 0xFF80FF80u;
         return *reinterpret_cast<uint32_t*>(&r);
     } else {
         uint32_t x0, x1;
@@ -1829,7 +1833,11 @@ void exl3m_grouped(const void* X0, const void* X1, const int64_t* tp0, const int
                    const int* k2_1, const int* uids, const int* ucount, const int* members, float* Z, int K, int N,
                    int P, int SK, int maxm, int slots, int nexp_max, int mats, int nt, int warps, int pf, int lo,
                    int hi, int cb, cudaStream_t s) {
-    if (cb == 4) exl3::grouped_launch<4>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, SK,
+    if (cb == 6) exl3::grouped_launch<6>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, SK,
+                                         maxm, slots, nexp_max, mats, nt, warps, pf, lo, hi, s);
+    else if (cb == 5) exl3::grouped_launch<5>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, SK,
+                                         maxm, slots, nexp_max, mats, nt, warps, pf, lo, hi, s);
+    else if (cb == 4) exl3::grouped_launch<4>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, SK,
                                          maxm, slots, nexp_max, mats, nt, warps, pf, lo, hi, s);
     else if (cb == 3) exl3::grouped_launch<3>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, SK,
                                          maxm, slots, nexp_max, mats, nt, warps, pf, lo, hi, s);
@@ -1868,8 +1876,8 @@ void exl3m_prefill_smem_mode(const void* X0, const void* X1, const int64_t* tp0,
                                       nblocks, mats, warps, mtw, ntb, mode, s);
 }
 
-// exl3m_prefill_smem_mode's 4x1x8 tile at cp.async depth 4 for a mixed-width arena: codebook cb (2 mul1,
-// 1 mcg), widths up to hi (K2 = 2 x bits: 6 or 8).
+// exl3m_prefill_smem_mode's 4x1x8 tile at cp.async depth 4 for a mixed-width arena: codebook cb (cb_pair's
+// numbering), widths up to hi (K2 = 2 x bits: 6 or 8).
 void exl3m_prefill_smem_cb(const void* X0, const void* X1, const int64_t* tp0, const int64_t* tp1, const int* k2_0,
                            const int* k2_1, const int* uids, const int* ucount, const int* members, float* Z, int K,
                            int N, int P, int slots, int nblocks, int mats, int cb, int hi, cudaStream_t s) {
@@ -1884,6 +1892,12 @@ void exl3m_prefill_smem_cb(const void* X0, const void* X1, const int64_t* tp0, c
                                            nblocks, mats, s);
     else if (cb == 4 && hi <= 8)
         exl3::prefill_smem_cb_launch<4, 8>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots,
+                                           nblocks, mats, s);
+    else if (cb == 5 && hi <= 8)
+        exl3::prefill_smem_cb_launch<5, 8>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots,
+                                           nblocks, mats, s);
+    else if (cb == 6 && hi <= 8)
+        exl3::prefill_smem_cb_launch<6, 8>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots,
                                            nblocks, mats, s);
     else EXL3_CHECK(false, "smem prefill (mixed widths): codebook mul1, mcg or exlr8's, widths up to 4 bits");
 }
@@ -1910,6 +1924,14 @@ void exl3m_prefill_fat(const void* X0, const void* X1, const int64_t* tp0, const
         exl3::prefill_fat_launch<4, 6>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots, nblocks, mats, s);
     else if (cb == 4 && hi <= 8)
         exl3::prefill_fat_launch<4, 8>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots, nblocks, mats, s);
+    else if (cb == 5 && hi <= 6)
+        exl3::prefill_fat_launch<5, 6>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots, nblocks, mats, s);
+    else if (cb == 5 && hi <= 8)
+        exl3::prefill_fat_launch<5, 8>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots, nblocks, mats, s);
+    else if (cb == 6 && hi <= 6)
+        exl3::prefill_fat_launch<6, 6>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots, nblocks, mats, s);
+    else if (cb == 6 && hi <= 8)
+        exl3::prefill_fat_launch<6, 8>(X0, X1, tp0, tp1, k2_0, k2_1, uids, ucount, members, Z, K, N, P, slots, nblocks, mats, s);
     else EXL3_CHECK(false, "fat prefill: codebook mul1, mcg or exlr8's, widths up to 4 bits");
 }
 
@@ -1929,6 +1951,10 @@ void exl3m_prefill_fat_gateup(const void* X0, const void* X1, const int64_t* tp0
     else if (cb == 3 && hi <= 8) EXL3_FG(3, 8);
     else if (cb == 4 && hi <= 6) EXL3_FG(4, 6);
     else if (cb == 4 && hi <= 8) EXL3_FG(4, 8);
+    else if (cb == 5 && hi <= 6) EXL3_FG(5, 6);
+    else if (cb == 5 && hi <= 8) EXL3_FG(5, 8);
+    else if (cb == 6 && hi <= 6) EXL3_FG(6, 6);
+    else if (cb == 6 && hi <= 8) EXL3_FG(6, 8);
     else EXL3_CHECK(false, "fat prefill: codebook mul1, mcg or exlr8's, widths up to 4 bits");
 #undef EXL3_FG
 }

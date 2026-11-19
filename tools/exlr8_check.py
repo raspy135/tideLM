@@ -59,11 +59,14 @@ def main():
         spec = importlib.util.spec_from_file_location("exlr8_oracle", a.oracle)
         oracle = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(oracle)
+    # the layer's codebook (its trellis files' tensor names: FORMAT.md), checked for every width below
+    lcb = X.SafeFile(X.REPO + f"{base}.k{a.widths.split(',')[0]}.safetensors").trellis("trellis.gate")[1]
+    print(f"codebook of the trellis files: {lcb}")
     if a.torch:
         import torch
         import exl3_ref as R
-        cb = X.codebook()
-        raw16 = R.codebook("mcg").numpy()
+        cb = X.codebook(lcb)
+        raw16 = R.codebook(lcb).numpy()
         cast = torch.from_numpy(raw16.astype(np.float32)).clamp(-448, 448).to(torch.float8_e4m3fn)
         same = np.array_equal(cast.float().numpy(), cb) and np.array_equal(cast.view(torch.uint8).numpy(), X.e4m3_bits(cb))
         print(f"codebook: 65,536 states, {len(np.unique(cb))} distinct E4M3 values in [{cb.min()}, {cb.max()}]; "
@@ -88,24 +91,25 @@ def main():
                 raws, ws = {}, {}
                 for pi, p in enumerate(X.PROJS):
                     off, n = (int(v) for v in index[e, pi, u])
-                    rule = tf.offset(f"trellis.{p}") + (16 * e + u) * B
+                    tname, fcb = tf.trellis(f"trellis.{p}")
+                    rule = tf.offset(tname) + (16 * e + u) * B
                     flat = X.DATA0 + ((pi * 256 + e) * 16 + u) * B
                     raw = tf.read_at(off, n)
                     chan, block = (dsu[e, c], dsv[e]) if p == "down" else (side[p][1][e, c], side[p][0][e])
                     got = xxhash.xxh64(raw + chan.tobytes() + block.tobytes(), seed=0).intdigest()
                     ok = n == B and off == rule and got == int(check[e, pi, u])
-                    w = X.down_unit(raw, k, chan, sout, block) if p == "down" else X.gate_up_unit(raw, k, sin, block, chan)
+                    w = X.down_unit(raw, k, chan, sout, block, fcb) if p == "down" else X.gate_up_unit(raw, k, sin, block, chan, fcb)
                     note = ""
                     if oracle is not None:
                         import torch
                         r = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
                         if p == "down":
-                            t = oracle.tiles_in_major(r, k, hidden)
+                            t = oracle.tiles_in_major(r, k, hidden, fcb)
                             ow = oracle.reconstruct(t, torch.from_numpy(chan.copy()), torch.from_numpy(sout.astype(np.float32) * np.repeat(block.astype(np.float32), 128)))
                         else:
-                            t = oracle.tiles_out_major(r, k, hidden, 128)
+                            t = oracle.tiles_out_major(r, k, hidden, 128, fcb)
                             ow = oracle.reconstruct(t, torch.from_numpy(sin.astype(np.float32) * np.repeat(block.astype(np.float32), 128)), torch.from_numpy(chan.copy()))
-                        mine = X.unit_tiles(raw, k, hidden, p == "down")
+                        mine = X.unit_tiles(raw, k, hidden, p == "down", fcb)
                         t_same = np.array_equal(mine, t.numpy())
                         rel = float(np.abs(w - ow.numpy()).max() / np.abs(ow.numpy()).max())
                         fp8 = np.array_equal(X.e4m3_round(mine), mine)
@@ -118,8 +122,8 @@ def main():
                             tr = t16.view(hidden // 128, 8, 8, 16 * k).permute(1, 0, 2, 3).reshape(8, hidden // 16, 16 * k)
                         else:
                             tr = t16.view(hidden // 16, 8, 16 * k)
-                        mine = X.unit_tiles(raw, k, hidden, p == "down")
-                        t_same = np.array_equal(X.e4m3_round(R.unpack(tr.contiguous(), k, "mcg").numpy()), mine)
+                        mine = X.unit_tiles(raw, k, hidden, p == "down", fcb)
+                        t_same = np.array_equal(X.e4m3_round(R.unpack(tr.contiguous(), k, fcb).numpy()), mine)
                         ok = ok and t_same
                         note += f"  tiles against exl3_ref + rounding: {'identical' if t_same else 'DIFFER'}"
                     decoded[(e, u, p, k)] = w
@@ -133,7 +137,7 @@ def main():
                               side["gate"][1][e, c], side["up"][1][e, c], dsu[e, c]))
                 g, up = x.astype(np.float64) @ ws["gate"], x.astype(np.float64) @ ws["up"]
                 want += wt * ((g / (1 + np.exp(-g)) * up) @ ws["down"])
-        got = X.forward_units(x, sin, sout, units)
+        got = X.forward_units(x, sin, sout, units, lcb)
         rel = float(np.abs(got - want).max() / np.abs(want).max())
         bad += rel > 1e-4
         print(f"K{k}: the engine's order over {len(units)} units against x W: max rel {rel:.1e}")
@@ -146,7 +150,9 @@ def main():
             ref = decoded[(e, u, p, top)]
             rel = float(np.linalg.norm(w - ref) / np.linalg.norm(ref))
             corr = float(np.corrcoef(w.ravel(), ref.ravel())[0, 1])
-            err = float(idx.tensor(f"k{k}.err_down")[e]) if p == "down" else float(idx.tensor(f"k{k}.err_{p}")[e, u])
+            # (the release's index files carry no error tables since 0.6)
+            en = f"k{k}.err_down" if p == "down" else f"k{k}.err_{p}"
+            err = (float(idx.tensor(en)[e]) if p == "down" else float(idx.tensor(en)[e, u])) if en in idx.header else float("nan")
             ok = corr > 0.8
             bad += not ok
             print(f"expert {e:3d} unit {u:2d} {p:4s}: K{k} against K{top}: |dW| / |W| {rel:.3f}, correlation {corr:.4f}"

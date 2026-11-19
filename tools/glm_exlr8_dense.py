@@ -1,7 +1,7 @@
 """The dense checkpoint of an exlr8 profile: GLM_MODEL_DIR with exlr8's trellis matrices in EXL3's layout.
 
     uv run --with numpy --with xxhash python tools/glm_exlr8_dense.py --base ~/models/GLM-5.3-dense-from-3.0bpw \
-        --exlr8 ~/models/glm-5.3-exlr8 --manifest home --out ~/models/GLM-5.3-dense-exlr8
+        --exlr8 ~/models/glm-5.3-exlr8 --manifest bit322 --out ~/models/GLM-5.3-dense-exlr8
 
 The engine reads its non-expert weights from an EXL3 checkpoint (tools/glm_fetch_dense.py: bertholomus's
 3.0bpw, 5-6 bits a weight). exlr8 stores the large ones as 4-bit trellis - o_proj, q_b, the dense
@@ -9,8 +9,10 @@ MLPs of layers 0-2 - and the shared expert as units like a routed expert's (K4; 
 Those decode with the routed kernels' arithmetic (tools/exlr8_ref.py) and regroup, tile for tile, into
 the full EXL3 matrix `<name>.trellis` int16 [in/16][out/16][16 K] with `<name>.suh` / `<name>.svh`,
 which the engine cuts per rank as it cuts the EXL3 ones (weights.rs). So --out is the base
-checkpoint (its shards hard-linked) with those matrices replaced, each marked `<name>.mcg_e4m3`
-instead of `<name>.mul1`: the engine takes the codebook from the marker.
+checkpoint (its shards hard-linked) with those matrices replaced, each marked with its codebook instead
+of `<name>.mul1`: `<name>.mcg_e4m3` or `<name>.mul1_e4m3` (the release's dense matrices are mcg; its
+shared experts are mul1 since 0.6, 2026-11-18, read from the trellis files' tensor names). The engine
+takes the codebook from the marker.
 
 A decode pass then reads 4 bits where it read 5 (6 in the MTP layer): a rank's o_proj 31.5 -> 25.2 MB a
 layer, q_b 10.5 -> 8.4, the shared expert 11.8 -> 9.4.
@@ -34,7 +36,9 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import exlr8_ref as X  # noqa: E402
 
-MARKER = np.array(0xCBAC1FED, np.uint32).view(np.int32)
+# a matrix's codebook marker tensor (weights.rs): its name and the hash's multiplier as its value
+MARKER = {"mcg": ("mcg_e4m3", np.array(0xCBAC1FED, np.uint32).view(np.int32)),
+          "mul1": ("mul1_e4m3", np.array(0x83DCD12D, np.uint32).view(np.int32))}
 DENSE = ("self_attn.o_proj", "self_attn.q_b_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
 SHARED = (("gate", "mlp.shared_experts.gate_proj"), ("up", "mlp.shared_experts.up_proj"), ("down", "mlp.shared_experts.down_proj"))
 DT = {np.dtype(np.int16): "I16", np.dtype(np.float16): "F16", np.dtype(np.int32): "I32"}
@@ -57,12 +61,14 @@ def write_safetensors(path: str, tensors: dict[str, np.ndarray], meta: dict[str,
 
 
 def dense_matrix(f: X.SafeFile, name: str, verify: bool):
-    """(trellis int16 [in/16][out/16][16 K], suh [in], svh [out], K) of a format-1 matrix; None for another format."""
+    """(trellis int16 [in/16][out/16][16 K], suh [in], svh [out], K, codebook) of a format-1 matrix; None for another
+    format."""
     rec = [int(v) for v in f.tensor(name + ".record")]
     fmt, out, inn, k, side = rec[0], rec[1], rec[2], rec[3], rec[4]
     if fmt != 1:
         return None
-    tr, suh, svh = f.tensor(name + ".trellis"), f.tensor(name + ".suh"), f.tensor(name + ".svh")
+    tname, cb = f.trellis(name + ".trellis")
+    tr, suh, svh = f.tensor(tname), f.tensor(name + ".suh"), f.tensor(name + ".svh")
     if verify:
         import xxhash
         want = f.tensor(name + ".checksum")
@@ -76,7 +82,7 @@ def dense_matrix(f: X.SafeFile, name: str, verify: bool):
         full = tr.reshape(inn // 128, out // 128, 8, 8, t).transpose(0, 2, 1, 3, 4).reshape(inn // 16, out // 16, t)
     else:               # entry g = output columns 128g.., tiles [k16][c] -> [k16][n16 = 8g + c]
         full = tr.reshape(out // 128, inn // 16, 8, t).transpose(1, 0, 2, 3).reshape(inn // 16, out // 16, t)
-    return np.ascontiguousarray(full).view(np.int16), suh, svh, k
+    return np.ascontiguousarray(full).view(np.int16), suh, svh, k, cb
 
 
 def shared_matrix(root: str, layer: int, p: str, widths, verify: bool):
@@ -93,6 +99,7 @@ def shared_matrix(root: str, layer: int, p: str, widths, verify: bool):
     index, check = idx.tensor(f"shared.k{k}.index"), idx.tensor(f"shared.k{k}.checksum")
     block = idx.tensor(f"shared.k{k}.{p}.sv_block" if p == "down" else f"shared.k{k}.{p}.su_block")[0]
     chan = idx.tensor(f"shared.k{k}.down.suh" if p == "down" else f"shared.k{k}.{p}.svh")[0]
+    cb = X.SafeFile(f"{base}.k{k}.safetensors").trellis(f"shared.trellis.{p}")[1]
     with open(f"{base}.k{k}.safetensors", "rb") as f:
         f.seek(int(index[0, pi, 0, 0]))
         raw = f.read(16 * B)
@@ -111,14 +118,14 @@ def shared_matrix(root: str, layer: int, p: str, widths, verify: bool):
     else:
         full = units.reshape(16, H // 16, 8, t).transpose(1, 0, 2, 3).reshape(H // 16, 128, t)
         suh, svh = idx.tensor("signs.in").astype(np.float16) * rep, chan
-    return np.ascontiguousarray(full).view(np.int16), suh, svh, k
+    return np.ascontiguousarray(full).view(np.int16), suh, svh, k, cb
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--base", required=True)
     ap.add_argument("--exlr8", required=True)
-    ap.add_argument("--manifest", default="home", help="the release profile (the served one: home)")
+    ap.add_argument("--manifest", default="bit322", help="the release profile (the served one: bit322)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", default="0-78")
     ap.add_argument("--no-verify", action="store_true")
@@ -154,21 +161,24 @@ def main(argv=None) -> int:
             if m is None:
                 notes.append(f"{name.split('.')[-1]} kept")
                 continue
-            tr, suh, svh, k = m
+            tr, suh, svh, k, cb = m
             old = json.loads(open(os.path.join(base, wm[pre + ".trellis"]), "rb").read(8 + struct.unpack("<Q", open(os.path.join(base, wm[pre + ".trellis"]), "rb").read(8))[0])[8:])[pre + ".trellis"]["shape"]
             if old[:2] != list(tr.shape[:2]) or len(suh) != 16 * old[0] or len(svh) != 16 * old[1]:
                 raise SystemExit(f"{pre}: exlr8 {tr.shape} against the base's {old}")
             new[pre + ".trellis"], new[pre + ".suh"], new[pre + ".svh"] = tr, np.ascontiguousarray(suh, np.float16), np.ascontiguousarray(svh, np.float16)
-            new[pre + ".mcg_e4m3"] = MARKER
+            marker, value = MARKER[cb]
+            new[f"{pre}.{marker}"] = value
             saved[0] += old[0] * old[1] * old[2] * 2
             saved[1] += tr.nbytes
-            notes.append(f"{name.split('.')[-1]} {old[2] // 16}->{k} bit")
+            notes.append(f"{name.split('.')[-1]} {old[2] // 16}->{k} bit {cb}")
         if new:
             shard = f"exlr8-overlay-{L:03d}.safetensors"
             write_safetensors(os.path.join(out, shard), new, {"source": f"exlr8 {man['set_id']} {a.manifest}", "layer": str(L)})
             for name in new:
                 wm[name] = shard
-                wm.pop(name[:-len(".mcg_e4m3")] + ".mul1", None) if name.endswith(".mcg_e4m3") else None
+                for marker, _ in MARKER.values():
+                    if name.endswith("." + marker):
+                        wm.pop(name[:-len(marker)] + "mul1", None)      # the base's EXL3 marker of the same matrix
         print(f"layer {L}: {', '.join(notes)}", flush=True)
     index["weight_map"] = wm
     index.setdefault("metadata", {})["exlr8"] = f"{man['set_id']} {a.manifest}: trellis matrices and shared experts of layers {lo}-{hi}"

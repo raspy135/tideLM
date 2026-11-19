@@ -1,8 +1,8 @@
 """Offline packer: an exlr8 profile's routed experts -> one aligned file per rank, in the EXL3 pack's layout.
 
     uv run --with numpy --with xxhash python tools/glm_pack_exlr8.py --source ~/models/glm-5.3-exlr8 \
-        --manifest home --rank 0 --out ~/models/glm-exlr8-packs/glm-exlr8-home-r0of2.bin
-    ... --rank 1 --out - | ssh PEER 'cat > models/glm-exlr8-packs/glm-exlr8-home-r1of2.bin'
+        --manifest bit322 --rank 0 --out ~/models/glm-exlr8-packs/glm-exlr8-bit322-r0of2.bin
+    ... --rank 1 --out - | ssh PEER 'cat > models/glm-exlr8-packs/glm-exlr8-bit322-r1of2.bin'
 
 --source is tools/exlr8_fetch.py's mirror. An exlr8 unit is 128 intermediate channels of one expert
 and decodes on its own (tools/exlr8_ref.py), its tiles independent 16 x 16 blocks and both rotations
@@ -18,7 +18,10 @@ EXL3 kernels and the engine's TP split already read (tools/exl3_ref.py's record,
   svh2       signs.out x the expert's down block scales, the rank's columns
 
 and the engine serves them unchanged, with codebook "mcg-e4m3" (mcg, every value rounded to FP8 E4M3:
-kernel CB 3). This is the first exlr8 layout - the engine's own split, not the format's sharding rule
+kernel CB 3) or, for the release's weights since 0.6 (2026-11-18: every expert re-encoded in mul1),
+"mul1-e4m3" (kernel CB 5). The codebook is read from the trellis files' tensor names (FORMAT.md: a
+codebook other than mcg suffixes them, `trellis.gate.mul1`); a pack takes one, and refuses layers or
+widths that differ in it. This is the first exlr8 layout - the engine's own split, not the format's sharding rule
 (16 e + u + L) mod N; the one-rotation, one-exchange layout that rule allows comes after it.
 
 A profile must give an expert one width a projection (every shipped manifest does). Every unit read is
@@ -71,6 +74,14 @@ class Layer:
         self.sin, self.sout = self.idx.tensor("signs.in").astype(np.float16), self.idx.tensor("signs.out").astype(np.float16)
         self.hidden = self.sin.shape[0]
         self.side, self.fds = {}, {}
+
+    def codebook(self, k: int) -> str:
+        """The width-k trellis file's codebook (mcg, mul1), the same for its three projections."""
+        f = X.SafeFile(f"{self.base}.k{k}.safetensors")
+        cbs = {f.trellis(f"trellis.{p}")[1] for p in X.PROJS}
+        if len(cbs) != 1:
+            raise SystemExit(f"layer {self.L} K{k}: projections in different codebooks {cbs}")
+        return cbs.pop()
 
     def k(self, k: int):
         if k not in self.side:
@@ -133,7 +144,7 @@ class Layer:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--source", required=True)
-    ap.add_argument("--manifest", default="home", help="the release profile (the served one: home)")
+    ap.add_argument("--manifest", default="bit322", help="the release profile (the served one: bit322)")
     ap.add_argument("--out", required=True, help="the pack, or - for stdout")
     ap.add_argument("--rank", type=int, default=0)
     ap.add_argument("--world", type=int, default=2)
@@ -174,15 +185,25 @@ def main(argv=None) -> int:
             off += align_up(nb)
             tot += sum(b)
         bits_l[str(L)] = tot / (3 * n)
+    # the codebook: every width a layer reads, in every layer, one
+    cbs = {}
+    for L in layers:
+        lay = Layer(src, L, man["layers"][str(L)], False)
+        for k in sorted({b for e in range(n) for b in records[f"{L},{e}"]["bits"]}):
+            cbs.setdefault(lay.codebook(k), []).append(f"{L}:K{k}")
+        lay.close()
+    if len(cbs) != 1:
+        raise SystemExit(f"the layers' trellis files differ in codebook: { {c: v[:4] for c, v in cbs.items()} }; a pack takes one")
+    codebook = f"{next(iter(cbs))}-e4m3"
     source = hashlib.sha256(f"exlr8 {man['set_id']} {a.manifest} {hashlib.sha256(open(mpath, 'rb').read()).hexdigest()} tp-output".encode()).hexdigest()
-    header = {"format": "exl3-experts", "version": 2, "rank": a.rank, "world": a.world, "codebook": "mcg-e4m3", "bits": bits_l,
+    header = {"format": "exl3-experts", "version": 2, "rank": a.rank, "world": a.world, "codebook": codebook, "bits": bits_l,
               "record_align": ALIGN, "tensors": list(RECORD_TENSORS), "source_sha256": source, "data_nbytes": off,
               "dims": [hidden, inter], "records": records,
               "exlr8": {"manifest": a.manifest, "manifest_version": man.get("version"), "set_id": man["set_id"], "layout": "tp-output"}}
     blob = json.dumps(header, separators=(",", ":"), sort_keys=True).encode()
     data0 = align_up(8 + len(blob))
     widths = sorted({tuple(r["bits"]) for r in records.values()})
-    log(f"[pack] exlr8 {a.manifest}: {len(layers)} layers x {n} experts, widths {widths}, rank {a.rank}/{a.world}, "
+    log(f"[pack] exlr8 {a.manifest}: {len(layers)} layers x {n} experts, widths {widths}, codebook {codebook}, rank {a.rank}/{a.world}, "
         f"{(data0 + off) / 1e9:.1f} GB, source {source[:16]}")
     out = sys.stdout.buffer if a.out == "-" else open(os.path.expanduser(a.out), "wb")
     out.write((struct.pack("<Q", len(blob)) + blob).ljust(data0, b"\0"))

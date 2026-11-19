@@ -1409,10 +1409,18 @@ __global__ void exl3_unpack_kernel(const uint32_t* __restrict__ tr, int NT, int 
         const uint32_t hi = off >= 16 ? w0 << (off - 16) : w0 >> (16 - off);
         const uint32_t lo = off > 16 ? w1 >> (48 - off) : 0u;
         const uint32_t state = (hi | lo) & 0xffffu;
-        if (cb == 3 || cb == 4) {
-            const uint32_t x = ((state * 0xCBAC1FEDu) & 0x8FFF8FFFu) ^ 0x3B603B60u;
-            const __half v = __hadd(__ushort_as_half((unsigned short)(x & 0xffffu)), __ushort_as_half((unsigned short)(x >> 16)));
-            if (cb == 4) {      // the two-instruction rounding (exl3_moe_cuda.cu cb_pair<4>)
+        if (cb >= 3) {
+            // 3 / 4: mcg; 5 / 6: mul1 (exl3_moe_cuda.cu cb_pair<5>: its fp16 fma, then the same rounding)
+            __half v;
+            if (cb <= 4) {
+                const uint32_t x = ((state * 0xCBAC1FEDu) & 0x8FFF8FFFu) ^ 0x3B603B60u;
+                v = __hadd(__ushort_as_half((unsigned short)(x & 0xffffu)), __ushort_as_half((unsigned short)(x >> 16)));
+            } else {
+                const uint32_t x = state * 0x83DCD12Du;
+                const uint32_t h = 1024u + (x & 255u) + ((x >> 8) & 255u) + ((x >> 16) & 255u) + (x >> 24);
+                v = __float2half_rn((float)h * 0.00676727294921875f + -10.3828125f);
+            }
+            if (cb == 4 || cb == 6) {      // the two-instruction rounding (exl3_moe_cuda.cu cb_pair<4>)
                 W[((int64_t)kt * 16 + r) * N + c] = __ushort_as_half((unsigned short)((__half_as_ushort(v) + 0x40u) & 0xFF80u));
                 continue;
             }
@@ -1919,9 +1927,9 @@ int glm_argmax_combine(void* stream, const void* pairs, int world, int M, void* 
     GRET;
 }
 
-// cb: 2 mul1, 3 exlr8's mcg rounded to E4M3 (tidelm_kernels::exl3::CB_*)
+// cb: 2 mul1, 3 / 4 exlr8's mcg rounded to E4M3, 5 / 6 exlr8's mul1 rounded to E4M3 (tidelm_kernels::exl3::CB_*)
 int glm_exl3_unpack_cb(void* stream, const void* trellis, int K, int N, int bits, int cb, void* w) {
-    if (K % 16 || N % 128 || cb < 2 || cb > 4) return (int)cudaErrorInvalidValue;
+    if (K % 16 || N % 128 || cb < 2 || cb > 6) return (int)cudaErrorInvalidValue;
     pdl_launch(exl3_unpack_kernel, dim3(K / 16, N / 128), 256, 0, GST, static_cast<const uint32_t*>(trellis), N / 16, N, bits,
                                                                cb, static_cast<__half*>(w));
     GRET;

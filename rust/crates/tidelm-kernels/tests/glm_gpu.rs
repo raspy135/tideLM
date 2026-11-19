@@ -961,6 +961,12 @@ fn exlr8_codebook_matches_the_reference() {
         return;
     };
     let Some(st) = setup() else { return };
+    // the pack's codebook (tools/exlr8_fixture.py prints it): mcg (the release to 0.5) or mul1 (0.6 on);
+    // each against its own plain hash, which must miss the reference, and with the two-instruction rounding
+    let (exact, fast, plain, name) = match std::env::var("EXLR8_FIXTURE_CB").as_deref() {
+        Ok("mul1") => (CB_MUL1_E4M3, CB_MUL1_E4M3_FAST, CB_MUL1, "mul1"),
+        _ => (CB_MCG_E4M3, CB_MCG_E4M3_FAST, CB_MCG, "mcg"),
+    };
     let f = std::fs::read(&path).unwrap();
     let u16s = |b: &[u8]| -> Vec<u16> { b.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect() };
     let mut at = 0usize;
@@ -991,7 +997,7 @@ fn exlr8_codebook_matches_the_reference() {
         let d_mem = dev(&members);
         let d_y = DeviceBuffer::<f32>::new(t * n).unwrap();
         let mut errs = vec![];
-        for cb in [CB_MCG_E4M3, CB_MCG] {
+        for cb in [exact, plain, fast] {
             unsafe {
                 exl3m_grouped(p(&d_xh), p(&d_xh), p(&d_ptr), p(&d_ptr), p(&d_k2), p(&d_k2), p(&d_uids), p(&d_cnt), p(&d_mem),
                               p(&d_z), k as i32, n as i32, t as i32, sk as i32, 16, 1, 1, 1, 8, 4, 1, 2, 10, cb, st.raw());
@@ -1000,9 +1006,10 @@ fn exlr8_codebook_matches_the_reference() {
             last_ok();
             errs.push(rel_err(&d_y.download().unwrap(), &want));
         }
-        eprintln!("exlr8 {k} x {n}, {bits}-bit: decode rel {:.2e} against the reference; read as plain mcg {:.2e}", errs[0], errs[1]);
+        eprintln!("exlr8 {k} x {n}, {bits}-bit, {name}: decode rel {:.2e} against the reference; read as plain {name} {:.2e}; \
+                   the two-instruction rounding {:.2e}", errs[0], errs[1], errs[2]);
         assert!(errs[0] < 2e-3, "exlr8 decode {}", errs[0]);
-        assert!(errs[1] > 5.0 * errs[0], "plain mcg {} should miss the reference (exlr8 {})", errs[1], errs[0]);
+        assert!(errs[1] > 5.0 * errs[0], "plain {name} {} should miss the reference (exlr8 {})", errs[1], errs[0]);
         seen += 1;
     }
     assert_eq!(seen, 2);

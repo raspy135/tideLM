@@ -276,10 +276,13 @@ impl<'a> Loader<'a> {
         let (mut k, mut n, mut tr_bytes) = (0, 0, 0);
         let mut cb = 0;
         for (gi, pre) in prefixes.iter().enumerate() {
-            // the codebook's marker tensor: `.mul1` (EXL3), or `.mcg_e4m3` (an exlr8 matrix in EXL3's
-            // layout: mcg, every value rounded to FP8 E4M3)
+            // the codebook's marker tensor: `.mul1` (EXL3), or `.mcg_e4m3` / `.mul1_e4m3` (an exlr8 matrix in
+            // EXL3's layout: mcg or mul1, every value rounded to FP8 E4M3; tools/glm_exlr8_dense.py - the
+            // release's dense matrices are mcg, its shared experts mul1 since 0.6)
             let (marker, want, c) = if self.ck.meta(&format!("{pre}.mcg_e4m3")).is_ok() {
                 ("mcg_e4m3", 0xCBAC_1FEDu32, CB_MCG_E4M3)
+            } else if self.ck.meta(&format!("{pre}.mul1_e4m3")).is_ok() {
+                ("mul1_e4m3", 0x83DC_D12D, tidelm_kernels::exl3::CB_MUL1_E4M3)
             } else {
                 ("mul1", 0x83DC_D12D, CB_MUL1)
             };

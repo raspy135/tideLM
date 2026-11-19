@@ -2834,16 +2834,12 @@ impl Engine {
     /// format's rounding (`exact`) or the two-instruction one. A boot's choice (GLM_EXLR8_ROUND, in the
     /// guard) or the bench knob `round`; an EXL3 pack or matrix is not touched.
     pub fn set_exlr8_round(&mut self, exact: bool) {
-        let cb = if exact { CB_MCG_E4M3 } else { CB_MCG_E4M3_FAST };
+        // each matrix keeps its hash (the release's experts are mul1 since 0.6, its dense matrices mcg)
         for a in std::iter::once(&mut self.arena).chain(self.mtp_arena.iter_mut()) {
-            if is_exlr8(a.cb) {
-                a.cb = cb;
-            }
+            a.cb = tidelm_kernels::exl3::exlr8_round(a.cb, exact);
         }
         self.w.for_each_mat(&mut |m| {
-            if is_exlr8(m.cb) {
-                m.cb = cb;
-            }
+            m.cb = tidelm_kernels::exl3::exlr8_round(m.cb, exact);
         });
         self.exlr8_exact = exact;
     }

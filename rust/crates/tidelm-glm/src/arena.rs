@@ -88,7 +88,8 @@ impl Pack {
             // an exlr8 profile's units regrouped into EXL3 records (tools/glm_pack_exlr8.py): mcg, every
             // value rounded to FP8 E4M3
             (Some("exl3-experts"), Some("mcg-e4m3")) => tidelm_kernels::exl3::CB_MCG_E4M3,
-            _ => return Err(format!("{}: not a mul1 / mcg / mcg-e4m3 EXL3 expert pack", path.display()).into()),
+            (Some("exl3-experts"), Some("mul1-e4m3")) => tidelm_kernels::exl3::CB_MUL1_E4M3,
+            _ => return Err(format!("{}: not a mul1 / mcg / mcg-e4m3 / mul1-e4m3 EXL3 expert pack", path.display()).into()),
         };
         let dims: Vec<u64> = field("dims")?.as_array().map(|a| a.iter().filter_map(|v| v.as_u64()).collect()).unwrap_or_default();
         if dims != [hidden as u64, inter as u64] {

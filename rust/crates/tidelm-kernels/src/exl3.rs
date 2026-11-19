@@ -22,9 +22,24 @@ pub const CB_MCG_E4M3: c_int = 3;
 /// 1,078 of the 65,536 states decode to a neighbouring E4M3 value. Not the format's; the engine takes
 /// it only when asked (GLM_EXLR8_ROUND=fast).
 pub const CB_MCG_E4M3_FAST: c_int = 4;
-/// An exlr8 codebook (either rounding): the pack's sides and the engine's exlr8 settings go with it.
+/// exlr8's codebook since the release's 0.6 (2026-11-18, every routed and shared expert re-encoded): mul1
+/// with every value rounded to FP8 E4M3. The release's dense trellis matrices stay mcg (CB_MCG_E4M3).
+pub const CB_MUL1_E4M3: c_int = 5;
+/// CB_MUL1_E4M3 with CB_MCG_E4M3_FAST's two-instruction rounding.
+pub const CB_MUL1_E4M3_FAST: c_int = 6;
+/// An exlr8 codebook (either hash, either rounding): the pack's sides and the engine's exlr8 settings go with it.
 pub fn is_exlr8(cb: c_int) -> bool {
-    cb == CB_MCG_E4M3 || cb == CB_MCG_E4M3_FAST
+    matches!(cb, CB_MCG_E4M3 | CB_MCG_E4M3_FAST | CB_MUL1_E4M3 | CB_MUL1_E4M3_FAST)
+}
+/// An exlr8 codebook `cb` at the format's rounding (`exact`) or the two-instruction one, its hash kept.
+pub fn exlr8_round(cb: c_int, exact: bool) -> c_int {
+    match (cb, exact) {
+        (CB_MCG_E4M3 | CB_MCG_E4M3_FAST, true) => CB_MCG_E4M3,
+        (CB_MCG_E4M3 | CB_MCG_E4M3_FAST, false) => CB_MCG_E4M3_FAST,
+        (CB_MUL1_E4M3 | CB_MUL1_E4M3_FAST, true) => CB_MUL1_E4M3,
+        (CB_MUL1_E4M3 | CB_MUL1_E4M3_FAST, false) => CB_MUL1_E4M3_FAST,
+        _ => cb,
+    }
 }
 /// Decode grouping: at most this many members a slot (`exl3m_group`'s maxm).
 pub const MAX_MEMBERS: c_int = 16;

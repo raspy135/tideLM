@@ -48,13 +48,18 @@ def main():
     sin, sout = idx.tensor("signs.in"), idx.tensor("signs.out")
     base = os.path.join(src, "experts", f"exlr8-layer-{L:03d}")
     tf = X.SafeFile(f"{base}.k{kg}.safetensors")
+    gcb = tf.trellis("trellis.gate")[1]
     index, blk, chan = idx.tensor(f"k{kg}.index"), idx.tensor(f"k{kg}.gate.su_block"), idx.tensor(f"k{kg}.gate.svh")
-    wg = np.concatenate([X.gate_up_unit(tf.read_at(int(index[e, 0, u, 0]), int(index[e, 0, u, 1])), kg, sin, blk[e], chan[e, 128 * u:128 * u + 128])
+    wg = np.concatenate([X.gate_up_unit(tf.read_at(int(index[e, 0, u, 0]), int(index[e, 0, u, 1])), kg, sin, blk[e], chan[e, 128 * u:128 * u + 128], gcb)
                          for u in range(rank * 8, rank * 8 + 8)], axis=1)
     tf = X.SafeFile(f"{base}.k{kd}.safetensors")
+    dcb = tf.trellis("trellis.down")[1]
     index, blk, chan = idx.tensor(f"k{kd}.index"), idx.tensor(f"k{kd}.down.sv_block"), idx.tensor(f"k{kd}.down.suh")
-    wd = np.concatenate([X.down_unit(tf.read_at(int(index[e, 2, u, 0]), int(index[e, 2, u, 1])), kd, chan[e, 128 * u:128 * u + 128], sout, blk[e])
+    wd = np.concatenate([X.down_unit(tf.read_at(int(index[e, 2, u, 0]), int(index[e, 2, u, 1])), kd, chan[e, 128 * u:128 * u + 128], sout, blk[e], dcb)
                          for u in range(16)], axis=0)[:, rank * hl:(rank + 1) * hl]
+    if gcb != dcb:
+        raise SystemExit(f"record {key}: gate {gcb}, down {dcb}: one codebook a fixture")
+    print(f"codebook {gcb}: run the test with EXLR8_FIXTURE_CB={gcb}")
     rng = np.random.default_rng(7)
     with open(a.out, "wb") as o:
         for w, bits, tiles, suh, svh in ((wg, kg, part(0), part(3), part(6)), (wd, kd, part(2), part(5), part(8))):
