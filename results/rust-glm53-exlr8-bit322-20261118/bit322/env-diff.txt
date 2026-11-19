@@ -1,0 +1,10 @@
+155,156c155,156
+< RUST_GLM_STATE_DB=/home/ryan/tidelm-rust-state/glm-stats-rust-exlr8-bit322.npz
+< RUST_GLM_PREFIX_DIR=/home/ryan/tidelm-rust-state/glm-prefix
+---
+> RUST_GLM_STATE_DB=/home/ryan/tidelm-rust-state/exlr8-bit322/bench/20261118-1750/state.npz
+> RUST_GLM_PREFIX_DIR=/home/ryan/tidelm-rust-state/exlr8-bit322/bench/20261118-1750/prefix
+184c184
+< DSV41_DREAM=1
+---
+> DSV41_DREAM=0

@@ -13,6 +13,29 @@ belong to it.
 tagged with it: `ghcr.io/<owner>/tidelm:<version>`. A `-wip` version means
 exactly what it says: the defaults are not settled and the measurements are incomplete.
 
+## Unreleased
+
+- **GLM-5.3 serves exlr8 `bit322`** (`configs/glm53-exlr8-bit322.env.example`, replacing
+  `glm53-exlr8-home`): release 0.6 of `kindlingai/glm-5.3-exlr8-k2-k3-k4` re-encoded every expert in the
+  mul1 codebook and removed `home`; 0.7's `bit322` (3.22 bpw) holds 11,543 experts at `GLM_SLOTS=12400`
+  and decodes prose 20.35 / code 25.36 tok/s, 8K first token 17.09 s (`home`: 20.38 / 23.91, 17.18 s;
+  `results/rust-glm53-exlr8-bit322-20261118`). Held-out NLL at fixed residents 1.907, against 1.855 for
+  the old `bit260` with 2,800 more residents (docs/exlr8.md).
+- **`GLM_HOT_RESCUE` 0.4 -> 0.3 in the GLM-5.3 examples** (exlr8 `bit322` and EXL3): on `bit322` it
+  rescues 0.6-1.0 picks a pass for ~0.15 and `bench/bench.py` stays within noise. Its NLL A/B is still
+  owed. Inkling-2-Small's example too, from serving with it (not measured there), and GLM-5.3-Flash's on
+  one Spark: a same-build A/B gave 0.4 / 0.3 prose 21.86 / 22.01, code 26.64 / 26.62 tok/s, 8K first token
+  12.11 / 12.00 s, with 4-5x the rescues.
+- **exlr8's mul1 codebook**: kernel codebooks 5 and 6 (mul1 rounded to E4M3, exactly or in two
+  instructions), the pack's `mul1-e4m3`, the dense directory's `.mul1_e4m3` marker; the tools read a
+  trellis tensor's codebook from its name. Checked against the publisher's loader, and the kernels
+  against the reference on a pack record (2.1e-4).
+- **The expert map shows why experts move**: the engine keeps its recent residency events (a read
+  after a miss with the miss's share of the token's routing, an inline rescue, a load by the routing
+  history, a preload, and whose slot each took) and `/v1/expert-map` sends them; the page replays them,
+  lights the cells behind a number when it is hovered or clicked, and tells a cell's last event in its
+  tooltip. `/v1/expert-map` is open without the API key, like the page.
+
 ## 0.6.0 — 2026-11-17: the first release
 
 The first tagged version of TideLM, and the first whose numbers are a release's rather than work in

@@ -17,29 +17,31 @@ their 384 experts, the last twelve 139-229.*
 | Profile | Model | Sparks | Routed experts | Resident | Context | Prose | Code | 8K-token prompt, first token |
 | --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
 | `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | 2 | native MXFP4 | 10,000 / 15,360 (65.1%) | 1M (2 lanes, 1.5M shared) | **33.5 tok/s** | **51.8 tok/s** | 4.3 s |
-| `glm53-exlr8-home` | GLM-5.3 | 2 | exlr8 `home` (3.25 bpw: 3 or 4 bits an expert) | 11,430 / 19,200 (59.5%) | 320K (2 lanes) | **20.4 tok/s** | **23.9 tok/s** | 17.2 s |
+| `glm53-exlr8-bit322` | GLM-5.3 | 2 | exlr8 `bit322` (3.22 bpw: 2, 3 or 4 bits by layer) | 11,543 / 19,200 (60.1%) | 320K (2 lanes) | **20.4 tok/s** | **25.4 tok/s** | 17.1 s |
 | `glm53-flash-40-tp1` | GLM-5.3-Flash | **1** | EXL3 4 bpw (4 bits a projection) | 7,282 / 12,096 (60.2%) | 320K (2 lanes) | **22.1 tok/s** | **26.4 tok/s** | 12.1 s |
 | `glm53-flash-40-tp2` | GLM-5.3-Flash | 2 | EXL3 4 bpw (4 bits a projection) | 12,096 / 12,096 (100%) | 1M (2 lanes, 2M shared) | **36.8 tok/s** | **46.6 tok/s** | 7.6 s |
 | `inkling2-small-40-tp2` | Inkling-2-Small | 2 | EXL3 4 bpw (4 bits a projection) | 11,865 / 18,432 (64.4%) | 768K (3 lanes) | **29.4 tok/s** | **42.3 tok/s** | 7.6 s |
 
 *Medians of three `bench/bench.py` runs after a warmup, 1,024 tokens at temperature 0.6, each on
 the build of its day (raw runs: [DeepSeek](results/rust-ds41-20261028-pdl/README.md), 2026-10-28;
-[GLM-5.3 `home`](results/rust-glm53-exlr8-home-20261112/README.md), 2026-11-12; GLM-5.3-Flash
+[GLM-5.3 `bit322`](results/rust-glm53-exlr8-bit322-20261118/README.md), 2026-11-18; GLM-5.3-Flash
 [on one Spark](results/rust-glm53-flash-40-tp1-20261114/README.md) and
 [on two](results/rust-glm53-flash-40-tp2-20261114/README.md), 2026-11-14;
 [Inkling-2-Small](results/rust-inkling2-40-tp2-20261116-512k/README.md), 2026-11-16, at a 512K context
 with 11,967 experts resident: the profile has served 768K with 102 fewer since 2026-11-17, not
 measured again).*
 
-GLM-5.3 is served from the `home` profile (3.25 bpw: 3 or 4 bits an expert) of
-[kindlingai/glm-5.3-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4). The
-release measures it closer to the unquantized model than its 2.6 bpw `bit260`, the profile served
-here before it (KL 0.149 against 0.192 on its held-out set, with every expert loaded); on this pair
-its larger records leave 2,900 fewer experts resident in the same memory (11,430 against 14,361)
-and it decodes about 9% (prose) to 15% (code) slower. What it gives in answers with 59.5% of the
-experts resident is not measured here ([`home` on the pair](docs/exlr8.md#home-325-bpw-2026-11-12)).
-The EXL3 2.75 bpw profile before exlr8 is still served: its setup is in the
-[install guide](docs/install.md).
+GLM-5.3 is served from the `bit322` profile (3.22 bpw: by layer block, 2, 3 or 4 bits a projection) of
+[kindlingai/glm-5.3-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4), release
+0.7, which re-encoded every expert in the mul1 codebook and replaced the `home` profile served here
+before (3.25 bpw, its manifest removed from the release). On this pair `bit322` holds slightly more
+experts than `home` did in the same memory (11,543 against 11,430) and decodes as fast on prose and the
+8K prompt and 4-6% faster on code. The release measures it close to the unquantized model with every
+expert loaded; here 40% of them are not resident, and that is what decides its quality: at fixed
+residents its held-out NLL is 1.907 against 1.855 for the older 2.6 bpw `bit260`, which held 2,800 more
+experts, in step with the residents each held ([`bit322` on the pair](docs/exlr8.md#bit322-322-bpw-2026-11-18)).
+`bit340`, tried first, held 10,946 and was dropped for its answers. The EXL3 2.75 bpw profile before
+exlr8 is still served: its setup is in the [install guide](docs/install.md).
 
 GLM-5.3-Flash is served from Mia's AI Lab's
 [EXL3 4 bpw](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold) (every routed
@@ -98,8 +100,8 @@ experts. TideLM decides which share, keeps deciding, and cheaply covers the rest
    - GLM-5.3 (`GLM_HOT`): a layer's heaviest miss (≥ 0.2 of the routing weight, at most 16 a
      step, paced over the layers) is read into the slot of the coldest expert while the next
      round drafts, and serves from the round after (`GLM_HOT_ASYNC=1`, the example profiles'). A
-     miss carrying ≥ 0.4 is not left to the next round: it is read before its layer's MoE runs
-     and computed exactly (`GLM_HOT_RESCUE`). `GLM_HOT_ASYNC=0` reads every one that way, for
+     miss carrying ≥ 0.3 is not left to the next round: it is read before its layer's MoE runs
+     and computed exactly (`GLM_HOT_RESCUE`; 0.3 since 2026-11-18, at the bench's speed of 0.4). `GLM_HOT_ASYNC=0` reads every one that way, for
      about 5% of the decode speed.
 4. **Two Sparks as one.** Both boxes hold half of every resident expert and run tensor-parallel
    over RoCE; a boot-time guard refuses to start if the two ranks disagree on any setting that
@@ -128,7 +130,7 @@ are set up is one `scripts/tide.sh start`.
 | Profile | Model | Disk, each node | Head only, while setting up |
 | --- | --- | ---: | ---: |
 | [`ds41-mxfp4`](#deepseek-v41-flash-ds41-mxfp4) | DeepSeek-V4.1-Flash-1017 | 510 GB | |
-| [`glm53-exlr8-home`](#glm-53-exlr8-home-glm53-exlr8-home) | GLM-5.3, exlr8 `home` | 172 GB | 308 GB |
+| [`glm53-exlr8-bit322`](#glm-53-exlr8-bit322-glm53-exlr8-bit322) | GLM-5.3, exlr8 `bit322` | 170 GB | 305 GB |
 | [`glm53-flash-40-tp1`](#glm-53-flash-4-bpw-glm53-flash-40-tp1-glm53-flash-40-tp2) | GLM-5.3-Flash, EXL3 4 bpw, one Spark | 176 GB (one node) | |
 | [`glm53-flash-40-tp2`](#glm-53-flash-4-bpw-glm53-flash-40-tp1-glm53-flash-40-tp2) | GLM-5.3-Flash, EXL3 4 bpw | 98 GB | 156 GB |
 | [`inkling2-small-40-tp2`](#inkling-2-small-inkling2-small-40-tp2) | Inkling-2-Small, EXL3 4 bpw | 165 GB | 294 GB |
@@ -168,26 +170,28 @@ pack ([details](docs/lossless-scales.md)) is the Python engine's.
 scripts/tide.sh start .env.ds41-mxfp4
 ```
 
-### GLM-5.3, exlr8 `home` (`glm53-exlr8-home`)
+### GLM-5.3, exlr8 `bit322` (`glm53-exlr8-bit322`)
 
-The `home` profile (3.25 bpw: 192 of a layer's routed experts at 3 bits, 64 at 4) of
-[`kindlingai/glm-5.3-exlr8-k2-k3-k4`](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4).
-The release stores every routed expert at 2, 3 and 4 bits and a profile names one width a unit,
-so only the profile's part is fetched (308 GB of 838 GB, on the head, needed only to pack). What
-serves is a 150 GB pack of routed experts and 22 GB of other weights on each node.
+The `bit322` profile (3.22 bpw: gate and up at 2 bits in layers 3-17 and 4 in 48-72, down at 4 in
+38-67, 3 bits elsewhere) of
+[`kindlingai/glm-5.3-exlr8-k2-k3-k4`](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4), release
+0.7 (every expert in the mul1 codebook). The release stores every routed expert at 2, 3 and 4 bits and
+a profile names one width a unit, so only the profile's part is fetched (305 GB of 838 GB, on the
+head, needed only to pack). What serves is a 149 GB pack of routed experts and 21 GB of other
+weights on each node.
 
 **1. Profile.** Copy the example and fill in your paths and the worker's address:
 
 ```bash
-cp configs/glm53-exlr8-home.env.example .env.glm53-exlr8-home
+cp configs/glm53-exlr8-bit322.env.example .env.glm53-exlr8-bit322
 ```
 
 **2. Fetch**, by HTTP range requests (stdlib Python; resumable; it holds tens of MB and is safe
 beside a serving engine):
 
 ```bash
-python3 tools/exlr8_fetch.py --manifest home --out <exlr8 dir>       # head: 300 GB of experts
-python3 tools/exlr8_fetch.py --dense --out <exlr8 dir>               # head: 8.8 GB of dense layers
+python3 tools/exlr8_fetch.py --manifest bit322 --out <exlr8 dir>     # head: 297 GB of experts
+python3 tools/exlr8_fetch.py --dense --out <exlr8 dir>               # head: 8.2 GB of dense layers
 python3 tools/glm_fetch_dense.py --out <base dense dir>              # each node: 15 GB
 ```
 
@@ -201,36 +205,40 @@ is what `glm_fetch_dense.py` fetches.
 profile, and run it again after every `git pull`:
 
 ```bash
-scripts/tide.sh build .env.glm53-exlr8-home
+scripts/tide.sh build .env.glm53-exlr8-bit322
 ```
 
 **4. Packs and weights**, once, on the head: each node's half of the routed experts, and the
 combined non-expert weights. The tools need numpy and xxhash (`pip install numpy xxhash`, or
 `uv run --with numpy --with xxhash python ...`); every unit read is checked against the release's
-checksums. With `--follow 3600` a pack runs behind the fetch and both are done when it is.
+checksums, and the codebook is read from the release's tensor names. With `--follow 3600` a pack
+runs behind the fetch and both are done when it is.
 
 ```bash
-python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest home --rank 0 \
-    --out <packs dir>/glm-exlr8-home-r0of2.bin
-python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest home --rank 1 --out - | \
-    ssh <worker> 'cat > <packs dir>/glm-exlr8-home-r1of2.bin'
-python3 tools/glm_exlr8_dense.py --base <base dense dir> --exlr8 <exlr8 dir> --manifest home \
+python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest bit322 --rank 0 \
+    --out <packs dir>/glm-exlr8-bit322-r0of2.bin
+python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest bit322 --rank 1 --out - | \
+    ssh <worker> 'cat > <packs dir>/glm-exlr8-bit322-r1of2.bin'
+python3 tools/glm_exlr8_dense.py --base <base dense dir> --exlr8 <exlr8 dir> --manifest bit322 \
     --out <dense dir>             # the base's shards hard-linked, 6.9 GB of exlr8 matrices beside them
 # the worker's <dense dir>: its own copy of the base by hard links, then the new shards and the index
 ssh <worker> 'cp -al <base dense dir> <dense dir>'
 rsync -a <dense dir>/exlr8-overlay-*.safetensors <dense dir>/model.safetensors.index.json <worker>:<dense dir>/
 ```
 
-Set `GLM_EXL3_DIR=<packs dir>` and `GLM_MODEL_DIR=<dense dir>` in the profile, at the same paths
-on both nodes. Once the packs and weights are in place `<exlr8 dir>` is no longer read.
+Stream the worker's pack while nothing serves there: written at 150 GB, its page cache can push a
+serving worker under the memory guard. Set `GLM_EXL3_DIR=<packs dir>` and `GLM_MODEL_DIR=<dense dir>`
+in the profile, at the same paths on both nodes. Once the packs and weights are in place
+`<exlr8 dir>` is no longer read. The dense directory must come from the same release as the pack:
+the shared experts in it changed codebook with 0.6.
 
 **5. Start:**
 
 ```bash
-scripts/tide.sh start .env.glm53-exlr8-home
+scripts/tide.sh start .env.glm53-exlr8-bit322
 ```
 
-Another profile of the release (`bit260`, `bit243`, ...) is the same steps with its `--manifest`
+Another profile of the release (`bit300`, `bit340`, ...) is the same steps with its `--manifest`
 and its pack in `GLM_EXL3_PACK`: the fetch adds only the bytes the mirror lacks.
 
 ### GLM-5.3-Flash 4 bpw (`glm53-flash-40-tp1`, `glm53-flash-40-tp2`)
@@ -316,8 +324,8 @@ from then on the engine's own history (`RUST_GLM_STATE_DB`) takes over.
 ### Running it
 
 ```bash
-scripts/tide.sh start .env.glm53-exlr8-home   # stops whatever is serving, starts this profile
-scripts/tide.sh logs -f                       # its log (--rank 1: the worker's)
+scripts/tide.sh start .env.glm53-exlr8-bit322   # stops whatever is serving, starts this profile
+scripts/tide.sh logs -f                         # its log (--rank 1: the worker's)
 scripts/tide.sh stop
 ```
 
@@ -350,9 +358,9 @@ answers from host data between its steps and does nothing for it when no page is
 
 ```bash
 git pull                                   # on both nodes for a two-Spark profile
-scripts/tide.sh build .env.glm53-exlr8-home     # the image again (--local-only on one Spark)
-diff .env.glm53-exlr8-home configs/glm53-exlr8-home.env.example
-scripts/tide.sh start .env.glm53-exlr8-home
+scripts/tide.sh build .env.glm53-exlr8-bit322     # the image again (--local-only on one Spark)
+diff .env.glm53-exlr8-bit322 configs/glm53-exlr8-bit322.env.example
+scripts/tide.sh start .env.glm53-exlr8-bit322
 ```
 
 The engine refuses an image built from other sources than the checkout, so every `git pull` needs
@@ -437,7 +445,7 @@ python3 tools/glm_ablit_fit.py --alpha 3 --out ~/models/glm53-ablit/glm53-derisk
 ```
 
 Copy the file to **both nodes** at the same path and set it in the GLM profile, then start it
-(`scripts/tide.sh start .env.glm53-exlr8-home`); the log shows
+(`scripts/tide.sh start .env.glm53-exlr8-bit322`); the log shows
 `[glm] ablit: 48 layers (2-49), alpha 3.000-3.000, from ... (sha256 ...)`:
 
 ```bash
@@ -448,7 +456,7 @@ As with the DeepSeek overlay, both ranks refuse to pair over different files (th
 boot guard), and the disk prefix store keeps the abliterated model's prompts apart from the stock
 model's: the first request of a conversation after switching prefills its whole prompt again. On
 held-out text (`corpus/heldout_quick.jsonl`, 10,151 tokens) it costs NLL +0.018 +- 0.005 (+1.0%)
-and top-1 60.22 -> 59.95% (measured on the EXL3 profile; not yet on `glm53-exlr8-home`).
+and top-1 60.22 -> 59.95% (measured on the EXL3 profile; not yet on `glm53-exlr8-bit322`).
 
 ## Use
 
@@ -473,7 +481,7 @@ with what each setting measured.
 
 | DeepSeek | GLM-5.3 | What it controls |
 | --- | --- | --- |
-| `RUST_BUDGET=10000` | `GLM_SLOTS=12400` | How many experts stay resident (GLM: expert memory a rank, in 3-bit experts' worth, 7.1 MB each - a budget, not a count: 11,430 of `home`'s, whose 4-bit records are larger). Fewer, more memory for context. |
+| `RUST_BUDGET=10000` | `GLM_SLOTS=12400` | How many experts stay resident (GLM: expert memory a rank, in 3-bit experts' worth, 7.1 MB each - a budget, not a count: 11,543 of `bit322`'s, whose 4-bit records are larger). Fewer, more memory for context. |
 | `MAX_SEQ=1048576`, `RUST_KV_TOKENS=1572864` | `GLM_MAX_SEQ=327680` | Context, generated tokens included (DeepSeek: the most one lane reaches, out of a pool of `RUST_KV_TOKENS` the lanes share). Less context, more experts. |
 | `DSV41_ADAPT_SENSITIVITY=high` | `GLM_ADAPT=1`, `GLM_ADAPT_EVERY=200` | How fast the resident set follows new traffic. |
 | `RUST_ADAPT_DB` | `RUST_GLM_STATE_DB` | The learned history, under `~/tidelm-rust-state`. With none yet, the first boot starts from the bundled one in `profiles/`. |

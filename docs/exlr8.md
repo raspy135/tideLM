@@ -38,8 +38,9 @@ budget (3-bit records), so a profile of smaller records holds more experts in it
 
 ## Serving it
 
-`configs/glm53-exlr8.env.example` was the profile (dropped 2026-11-17: `home`, below, is served;
-`configs/glm53-exlr8-home.env.example`), and the README's quick start the setup: fetch
+`configs/glm53-exlr8.env.example` was the profile (dropped 2026-11-17 for `home`, below, which was
+dropped 2026-11-18 for `bit322`, further below: `configs/glm53-exlr8-bit322.env.example`), and the
+README's quick start the setup: fetch
 (`tools/exlr8_fetch.py`), pack a rank (`tools/glm_pack_exlr8.py`), write the dense checkpoint
 (`tools/glm_exlr8_dense.py`). Against the EXL3 profile three keys differ - `GLM_EXL3_DIR`,
 `GLM_EXL3_PACK`, `GLM_MODEL_DIR` - and `GLM_EXLR8_ROUND=exact` asks for the format's own rounding
@@ -150,7 +151,7 @@ exist), a rank's pack 120.4 GB (each node), the dense checkpoint 6.9 GB beside t
 The release's `home` manifest: each routed expert whole at one width - in every decoder layer 192
 at K3 and 64 at K4 (the widths of GLM-5.3-EXL3-TR3-3.25bpw's tier bitmap), the MTP layer's 256 at
 K3 - and the shared experts as `bit260` has them (K4; K3 in the MTP layer). Profile:
-`configs/glm53-exlr8-home.env.example`, which differs from `bit260`'s in `GLM_EXL3_PACK`.
+`configs/glm53-exlr8-home.env.example` (since 2026-11-18 `configs/glm53-exlr8-bit322.env.example`), which differs from `bit260`'s in `GLM_EXL3_PACK`.
 
 Nothing in the engine changed for it. A pack's records carry their widths and the arena makes a
 pool of slots a width triple (`class_arena`), so 4/4/4 records are a class beside 3/3/3 as 2/2/3
@@ -203,3 +204,59 @@ not move between the widths until a restart re-plans them.
 
 Disk for `home`: 299.5 GB of the release's experts (172.1 GB more in a mirror that holds
 `bit260`), a rank's pack 149.8 GB (each node).
+
+## `bit322` (3.22 bpw, 2026-11-18)
+
+**The release changed under the profile.** 0.6 (2026-11-18) re-encoded every routed and shared expert
+of layers 3-78 in the **mul1** codebook (from the same Hessians), stored the embedding and head in BF16,
+gave the weights a new set ID and removed the `home` manifest (`bit325` had lower KL at its size); 0.7
+the same day replaced the width profiles with a block sweep's (`bit200` ... `bit400`, `bit325` gone for
+`bit322`). Nothing of the 0.5 mirror is reusable: the profile is a new fetch, pack and dense directory.
+
+**The port.** A trellis tensor now carries its codebook in its name (`trellis.gate.mul1`; bare is mcg),
+and the dense trellis matrices stay mcg while the experts are mul1. mul1 rounded to E4M3 is kernel
+codebook 5 (6 with the two-instruction rounding): `cb_pair` computes mul1's fp16 fma as for EXL3 and
+then the same `e4m3_round2` (mul1's values are under 3.46, inside its range), `exl3_unpack_kernel`
+likewise, and `exl3::exlr8_round` switches a matrix between its exact and fast rounding keeping its
+hash, since one boot now holds both. The pack's header says `mul1-e4m3`; the dense directory marks a
+mul1 shared expert `<name>.mul1_e4m3`. `tools/exlr8_ref.py`, the fetch, the packer, the dense writer
+and the checks read the codebook from the tensor names and refuse a file in none they know.
+
+Checks: `tools/exlr8_check.py` on layer 40 (units at K2/K3/K4) against the publisher's loader
+(`kindlingai/exlr8` `loader/exlr8.py`): tiles identical, the codebook identical in values and bytes
+to torch's E4M3 cast of `exl3_ref`'s mul1 table, offsets and checksums as the index says, the engine's
+operation order against x W within 1e-4. Both ranks' packs against the reference: 12 records each,
+spread over the layers, within 9e-8. The decode kernels over a pack record
+(`exlr8_codebook_matches_the_reference`, `EXLR8_FIXTURE_CB=mul1`): 2.1e-4 from the reference; the
+same tiles read as plain mul1 2.7e-2, with the two-instruction rounding 2.6e-3. That rounding moves 845
+of mul1's 65,536 values to a neighbouring E4M3 value (rms 0.24% of the codebook; mcg: 1,078, 0.79%,
+measured NLL-neutral), so it stays the default.
+
+**`bit340` first.** At `GLM_SLOTS=12400` it held 10,946 experts (estimated 10,964 beforehand from the
+routing history - the same estimate gave `home` 11,417 against its measured 11,406-11,430) and missed
+25-30% of its picks in serving. Its user found it hallucinating within the hour, and it was deleted
+without a measurement.
+
+**`bit322`.** 11,544 experts resident at the same slots (2/2/3 2,402, 3/3/3 3,676, 3/3/4 1,539, 4/4/3
+773, 4/4/4 3,154). Held-out NLL, `--bench-nll` on heldout_quick (10,151 tokens) with fixed residents,
+no adaptation and no hot reads, `bit260`'s arm settings (`GLM_SLOTS=12200`):
+
+| arm | residents | NLL | miss (scored passes) |
+| --- | ---: | ---: | ---: |
+| `bit260` (0.5 weights) | 14,133 | **1.8549** | - |
+| EXL3 2.75 bpw | 12,980 | 1.8793 | - |
+| `bit322` (0.7) | 11,359 | 1.9073 | 29.05% |
+
+In step with the residents, against the release's KL (which loads every expert: `bit322` 0.149 mean on
+its held-out text at every position, the old `bit260` 0.192): here a missed pick is covered by a
+substitute, and the experts a width costs are the larger effect. Estimated from the routing history at
+12,400 slots, the lower profiles of 0.7 would hold `bit262` ~14,107 (82.4% of the routed mass),
+`bit271` ~13,689, `bit280` ~13,252, `bit300` ~12,421 - not measured; its user keeps `bit322`.
+
+Speed (`bench/bench.py`, `results/rust-glm53-exlr8-bit322-20261118`, inline rescue at 0.3): prose
+20.35, code 25.36 tok/s, 8K first token 17.09 s, its decode 19.78 - `home`'s rows the same within
+noise but code, 4-6% faster. Inline rescue at 0.3 instead of 0.4 read 0.6-1.0 picks a pass inline for
+~0.15, at that speed; its NLL A/B is still not run.
+
+Disk for `bit322`: 297 GB of the release's experts and 8.2 GB of dense files (the head; 44 GB more
+than `bit340`'s mirror), a rank's pack 148.6 GB, the dense directory 21 GB (each node).
