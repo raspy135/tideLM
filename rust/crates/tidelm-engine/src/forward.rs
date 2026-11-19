@@ -2947,7 +2947,7 @@ impl Engine {
             counters.push(("hot reads", hot.stats.reads as f64));
         }
         Some(ExpertMap { layers: (0..nl).collect(), experts: e, state, demand: mass.filter(|m| m.len() == nl * e).map(|m| m.to_vec()),
-                         slots: set.owner.len(), spare, world: if self.is_paired() { 2 } else { 1 }, busy: false, counters })
+                         slots: set.owner.len(), spare, world: if self.is_paired() { 2 } else { 1 }, busy: false, counters, events: vec![] })
     }
 
     /// Residency moves between steps: each `[from_layer, from_expert, to_layer, to_expert]`

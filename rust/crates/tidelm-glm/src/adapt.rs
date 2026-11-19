@@ -89,6 +89,9 @@ pub struct Res {
     pub db_path: Option<std::path::PathBuf>,
     pub demand_tokens: u64,
     pub stats: ResStats,
+    /// the recent residency events and their causes, for the expert map (host bookkeeping: read by
+    /// nothing that decides anything)
+    pub events: tidelm_engine::expert_map::EventLog,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -168,8 +171,10 @@ pub struct Hot {
     pub host: PinnedBuffer<f32>,
     pub buf: PinnedBuffer<u8>,
     reads: usize,
-    /// the read installed for the layer being computed: (layer, expert)
+    /// the read installed for the layer being computed: (layer, expert), the missed pick's share,
+    /// and whether it was a rescue (for the expert map's events)
     live: Option<(usize, usize)>,
+    live_cause: (f32, bool),
     /// GLM_HOT_ASYNC's state (None: the synchronous reads above)
     pub asynch: Option<HotAsync>,
 }
@@ -177,7 +182,7 @@ pub struct Hot {
 impl Hot {
     pub fn new(slot: usize, max_record: usize, rows: usize, topk: usize) -> Result<Self> {
         Ok(Hot { min_share: 0.2, per_step: 16, rescue: None, rescue_boot: None, slot, host: PinnedBuffer::zeroed(rows * topk * 2)?,
-                 buf: PinnedBuffer::uninit(align_up(max_record))?, reads: 0, live: None, asynch: None })
+                 buf: PinnedBuffer::uninit(align_up(max_record))?, reads: 0, live: None, live_cause: (0.0, false), asynch: None })
     }
 }
 
@@ -451,7 +456,7 @@ impl Res {
         Res { owner, swap_layers, score: vec![0.0; nl * e], bg_score: vec![0.0; nl * e], bg_slow: vec![0.0; nl * e],
               victim_slow: false, bg_last: vec![0.0; nl * e],
               bg_until: vec![0; nl * e], bg_period: 0, hot_q: vec![], db_mass: None, db_tokens: 0, db_path: None,
-              demand_tokens: 0, stats: ResStats::default() }
+              demand_tokens: 0, stats: ResStats::default(), events: Default::default() }
     }
 }
 
@@ -527,8 +532,10 @@ impl Engine {
         if s.preload > 0 {
             counters.push(("preloaded", s.preload as f64));
         }
+        // the last six seconds' events (the page polls each second and replays them at their own spacing)
+        let events = self.res.events.recent(6.0, 4000);
         ExpertMap { layers, experts: e, state, demand, slots: self.res.owner.len(), spare: self.hot.is_some() as usize, world: self.world, busy,
-                    counters }
+                    counters, events }
     }
 
     pub(crate) fn push_lut(&mut self) -> Result<()> {
@@ -550,9 +557,16 @@ impl Engine {
             m.u32(OP_ADAPT).u32s(&flat);
         })?;
         self.adapt_apply(&plan)?;
+        self.log_plan(&plan, tidelm_engine::expert_map::EV_ADAPT);
         self.save_db()?;
         self.res.stats.adapt_s += t0.elapsed().as_secs_f64();
         Ok(plan.len())
+    }
+
+    fn log_plan(&mut self, plan: &[(usize, usize, usize, usize)], kind: u8) {
+        for &(l, c, vl, v) in plan {
+            self.res.events.push(l, c, kind, 0.0, Some((vl, v)));
+        }
     }
 
     /// adapt() with the newcomers loaded in the background (rank 0, mirrored): the victims stop
@@ -567,6 +581,7 @@ impl Engine {
             m.u32(OP_ADAPT_BG).u32s(&flat);
         })?;
         self.adapt_begin(&plan)?;
+        self.log_plan(&plan, tidelm_engine::expert_map::EV_ADAPT);
         self.save_db()?;
         self.res.stats.adapt_s += t0.elapsed().as_secs_f64();
         Ok(plan.len())
@@ -597,6 +612,7 @@ impl Engine {
             m.u32(OP_ADAPT).u32s(&flat);
         })?;
         self.adapt_apply(&plan)?;
+        self.log_plan(&plan, tidelm_engine::expert_map::EV_PRELOAD);
         self.res.stats.preload += plan.len();
         self.res.stats.preload_mb += mb;
         self.res.stats.preload_s += t0.elapsed().as_secs_f64();
@@ -968,7 +984,7 @@ impl Engine {
                 best = Some((v, x));
             }
         }
-        let Some((_, x)) = best else { return Ok(()) };
+        let Some((share, x)) = best else { return Ok(()) };
         if self.lut_h[l * e + x] >= 0 || self.adapt_pending(l * e + x) {
             return Ok(());
         }
@@ -990,6 +1006,7 @@ impl Engine {
             }
             h.reads += 1;
             h.live = Some((l, x));
+            h.live_cause = (share, rescue);
         }
         self.lut_h[l * e + x] = slot as i32;
         self.allowed_h[l * e + x] = 1;
@@ -1007,6 +1024,8 @@ impl Engine {
         let e = self.cfg.experts;
         let Some(h) = self.hot.as_mut() else { return Ok(()) };
         let Some((l, x)) = h.live.take() else { return Ok(()) };
+        let (share, rescue) = h.live_cause;
+        let kind = if rescue { tidelm_engine::expert_map::EV_RESCUE } else { tidelm_engine::expert_map::EV_HOT };
         let src = h.slot;
         let i = l * e + x;
         let bits = self.pack.record(l, x)?.bits;
@@ -1021,12 +1040,14 @@ impl Engine {
             self.lut_entry(vl * e + ve)?;
             self.lut_entry(i)?;
             self.res.stats.hot_kept += 1;
+            self.res.events.push(l, x, kind, share, Some((vl, ve)));
             return Ok(());
         }
         self.lut_h[i] = -1;
         self.allowed_h[i] = 0;
         self.lut_entry(i)?;
         self.res.stats.hot_unkept += 1;
+        self.res.events.push(l, x, tidelm_engine::expert_map::EV_DROPPED, share, None);
         Ok(())
     }
 
@@ -1100,7 +1121,7 @@ impl Engine {
         cands.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.partial_cmp(&a.1).unwrap()));
         cands.truncate(per_step);
         let mut traced: Vec<u16> = Vec::new();
-        for (_, _, l, x) in cands {
+        for (tier, share, l, x) in cands {
             let r = self.pack.record(l, x)?;
             let Some((vl, ve, vs)) = self.take_victim(r.bits) else {
                 self.res.stats.hot_unkept += 1;
@@ -1120,6 +1141,8 @@ impl Engine {
             a.jobs.send(job).map_err(|_| "hot read: the reader threads are gone")?;
             a.pending.push((vs, l, x, rx));
             self.res.stats.hot_reads += 1;
+            let kind = if tier == 1 { tidelm_engine::expert_map::EV_PREDICT } else { tidelm_engine::expert_map::EV_HOT };
+            self.res.events.push(l, x, kind, if tier == 1 { 0.0 } else { share.min(1.0) }, Some((vl, ve)));
         }
         let a = self.hot.as_mut().unwrap().asynch.as_mut().unwrap();
         a.predict = predict;

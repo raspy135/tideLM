@@ -85,6 +85,8 @@ fn serve_with(text: Text, family: Family, eos: u32, max_seq: usize, api_keys: Ve
                     let _ = to.send(Some(tidelm_engine::expert_map::ExpertMap {
                         layers: vec![1, 2], experts: 3, state: vec![1, 0, 3, 2, 1, 1], demand: Some(vec![4.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
                         slots: 5, spare: 1, world: 2, busy: true, counters: vec![("hot reads", 7.0)],
+                        events: vec![tidelm_engine::expert_map::MapEvent { seq: 9, at: 0.0, layer: 2, expert: 0, kind: tidelm_engine::expert_map::EV_HOT,
+                                                                           share: 0.4219, victim: Some((1, 1)) }],
                     }));
                     continue;
                 }
@@ -716,14 +718,14 @@ fn ds_conversation_log() {
 
 #[test]
 fn expert_map_route() {
-    // the page is a static file, open; its data wants the key and is the engine's snapshot
+    // the page and its data (the engine's snapshot) are open under a key; the API beside them is not
     let Some((addr, _engine, _ctx)) = glm_keyed(vec!["k1".into()]) else { return };
     let (status, ctype, body) = request(&addr, "GET", "/expert-map", "", "");
     assert_eq!(status, 200);
     assert!(ctype.starts_with("text/html"), "{ctype}");
     assert!(body.contains("/v1/expert-map"));
-    assert_eq!(request(&addr, "GET", "/v1/expert-map", "", "").0, 401);
-    let (status, _, body) = request(&addr, "GET", "/v1/expert-map", "Authorization: Bearer k1\r\n", "");
+    assert_eq!(request(&addr, "GET", "/v1/models", "", "").0, 401);
+    let (status, _, body) = request(&addr, "GET", "/v1/expert-map", "", "");
     assert_eq!(status, 200, "{body}");
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["states"], json!(["103", "211"]));
@@ -733,5 +735,9 @@ fn expert_map_route() {
     assert_eq!(v["resident_per_layer"], json!([1, 2]));
     assert_eq!((v["sparks"].as_u64(), v["arena_slots"].as_u64(), v["busy"].as_bool(), v["stale"].as_bool()), (Some(2), Some(5), Some(true), Some(false)));
     assert_eq!(v["counters"]["hot reads"], json!(7.0));
+    // an event: its layer as the map's row, its victim's too, the share in thousandths
+    let ev = &v["events"][0];
+    assert_eq!((ev[0].as_u64(), &ev[2], &ev[3], &ev[4], &ev[5], &ev[6], &ev[7]), (Some(9), &json!(1), &json!(0), &json!(1), &json!(422), &json!(0), &json!(1)));
+    assert_eq!(v["event_kinds"][1], "hot read");
     assert_eq!(v["engine"], json!("glm"));
 }

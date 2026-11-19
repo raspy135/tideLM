@@ -335,9 +335,16 @@ their settings (the examples as of `a6ec917`), and a profile the Rust engine doe
 and a cell an expert - resident, being read from disk, in DeepSeek's hot-read ring, or not loaded -
 with the cells that changed in the last few seconds outlined. Its second view colours each expert by
 how much the routing history uses it, so the ones in demand and not in memory stand out, and either
-view can order a layer's cells by use. The page reads `GET /v1/expert-map` (JSON, behind the API key
-when one is set) once a second while it is open; the engine answers from host data between its steps
-and does nothing for it when no page is asking.
+view can order a layer's cells by use. On GLM-5.3, GLM-5.3-Flash and Inkling-2-Small it also shows why each
+expert came in, replayed a second late at its own pace: an async read after a token picked an expert
+that was not loaded (a green comet along the layer's row), an inline rescue of a heavy miss (an orange
+streak), a normal load by the routing history (a blue dotted trail), each with a thin arc from the
+expert whose slot it took; the numbers above the map light their experts on it when hovered or
+clicked, and a cell's tooltip tells its last event (the miss's share of the token's routing, the
+expert it replaced). The motion is off when the system asks for reduced motion. The page reads
+`GET /v1/expert-map` (JSON; open, like the page, when an API key is set: residency, counters and the
+last seconds' residency events, nothing of any request) once a second while it is open; the engine
+answers from host data between its steps and does nothing for it when no page is asking.
 
 ### Updating
 

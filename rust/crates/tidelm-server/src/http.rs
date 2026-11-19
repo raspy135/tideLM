@@ -30,10 +30,11 @@ impl ApiError {
     }
 }
 
-/// The routes answered without a key: the health check, and the expert map's page (a static file;
-/// its data, /v1/expert-map, wants the key, which the page asks for).
+/// The routes answered without a key: the health check, and the expert map - its page (a static file) and its
+/// data, /v1/expert-map: which experts are resident and how much each is used, counters, nothing of any
+/// request (open since 2026-11-18, the user's call: a keyed map only showed a key form).
 fn open_route(method: &str, path: &str) -> bool {
-    matches!((method, path), ("GET", "/health" | "" | "/expert-map"))
+    matches!((method, path), ("GET", "/health" | "" | "/expert-map" | "/v1/expert-map"))
 }
 
 /// One request; with `api_keys`, one that carries none of them is refused before its body is read.

@@ -36,7 +36,12 @@ h2 { font-size: 14px; font-weight: 600; margin: 28px 0 8px; }
 p { margin: 4px 0; color: var(--ink-2); max-width: 80ch; }
 header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; }
 #what { color: var(--ink-2); }
-#status { margin-left: auto; color: var(--ink-2); }
+#live { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }
+#status { color: var(--ink-2); }
+#pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); position: relative; flex: none; }
+#pulse.live { background: var(--loading); }
+#pulse.bad { background: var(--hot); }
+
 #status.bad { color: var(--ink); font-weight: 600; }
 
 #stats { display: flex; flex-wrap: wrap; gap: 6px 36px; margin: 18px 0 4px; padding: 0; }
@@ -45,6 +50,14 @@ header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; }
 #stats dd { margin: 0; font-size: 20px; }
 #stats dd small { font-size: 13px; color: var(--ink-2); }
 #note { min-height: 1.45em; }
+#stats div.link { cursor: pointer; border-radius: 6px; padding: 3px 8px 4px; margin: -3px -8px -4px; transition: background .15s; }
+#stats div.link:hover, #stats div.link:focus-visible { background: var(--hair); outline: none; }
+#stats div.link[aria-pressed="true"] { background: var(--hair); box-shadow: inset 0 0 0 1.5px var(--ink); }
+#stats div.link dt::after { content: " ›"; color: var(--muted); }
+#stats div.tick { animation: tick 1.1s ease-out; }
+@keyframes tick { from { box-shadow: inset 0 -3px 0 var(--tick); } to { box-shadow: inset 0 -3px 0 transparent; } }
+#spot { min-height: 1.45em; color: var(--ink); margin-top: 6px; }
+#spot b { font-weight: 600; }
 
 #controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 22px; margin: 18px 0 10px; }
 fieldset { border: 0; margin: 0; padding: 0; display: flex; align-items: center; gap: 6px; }
@@ -69,10 +82,15 @@ button:focus-visible, canvas:focus-visible, input:focus-visible, summary:focus-v
 #legend i { width: 11px; height: 11px; display: inline-block; }
 #legend .ramp { width: 72px; }
 #legend .ring { background: none; outline: 1.5px solid var(--ink); outline-offset: -1.5px; }
+#legend .comet { width: 28px; height: 4px; background: linear-gradient(to right, var(--loading), transparent) !important; }
+#legend .streak { width: 28px; height: 5px; }
+#legend .dots { width: 28px; height: 4px; background: repeating-linear-gradient(to right, var(--resident) 0 4px, transparent 4px 7px) !important; }
+@media (prefers-reduced-motion: reduce) { #stats div.tick { animation: none; } #cursor { transition: none; } }
 
 #plot { position: relative; display: inline-block; max-width: 100%; vertical-align: top; background: var(--surface); border: 1px solid var(--hair); padding: 10px 12px 12px; overflow-x: auto; }
 canvas { display: block; }
-#cursor { position: absolute; pointer-events: none; outline: 1.5px solid var(--ink); display: none; }
+#cursor { position: absolute; pointer-events: none; outline: 1.5px solid var(--ink); display: none;
+          transition: left .1s ease-out, top .1s ease-out; }
 #tip { position: absolute; pointer-events: none; display: none; z-index: 2; background: var(--surface); color: var(--ink);
        border: 1px solid var(--axis); padding: 6px 9px; font-size: 13px; white-space: nowrap; box-shadow: 0 1px 4px rgba(0,0,0,.18); }
 #tip b { font-weight: 600; }
@@ -94,7 +112,7 @@ th:first-child, td:first-child { text-align: left; }
 <header>
   <h1>Expert map</h1>
   <span id="what"></span>
-  <span id="status" role="status">Connecting…</span>
+  <span id="live"><span id="pulse" aria-hidden="true"></span><span id="status" role="status">Connecting…</span></span>
 </header>
 <p>Which routed experts are in memory right now. Each row is a layer and each cell an expert; the engine moves experts in and out as your traffic changes.</p>
 
@@ -105,6 +123,7 @@ th:first-child, td:first-child { text-align: left; }
 </form>
 
 <dl id="stats"></dl>
+<p id="spot" aria-live="polite"></p>
 <p id="note"></p>
 
 <div id="controls">
@@ -158,6 +177,46 @@ let order = [];           // per row: column -> expert
 let geom = null;
 let paused = false, timer = null, key = "";
 let hover = null;         // {row, col}
+// Motion (client side; prefers-reduced-motion turns all of it off): each cell eases to the snapshot's colour
+// and column, a read flies in along its layer's row and lights the cell as it lands, an eviction fades out, a
+// cell being read has its outline breathe, and the numbers count. What
+// is drawn once it settles is the snapshot, exactly; the tooltip and the table read the snapshot itself.
+const reduce = window.matchMedia("(prefers-reduced-motion: reduce)");
+let motion = !reduce.matches;
+const TAU_COLOR = 110, TAU_SLIDE = 150, POP_MS = 950, DROP_MS = 650, MAX_FLIGHTS = 420, STAT_MS = 700;
+let A = null;             // per cell (index r * E + e, as the snapshot's states): colour, column, start; flights, flashes
+let events = [];          // the last poll's changes: [cell, from, to]
+let raf = 0, lastFrame = 0, statTw = [];
+// The engine's residency events (what brought each expert in, and whose slot it took), replayed at their
+// own spacing a little over a second late; and since this page opened, for the numbers' spotlight and the
+// tooltip. Kinds as the engine numbers them (event_kinds).
+const EV = { HOT: 1, RESCUE: 2, ADAPT: 3, PRELOAD: 4, PREDICT: 5, DROPPED: 6 }, REPLAY_MS = 1150;
+let lastSeq = 0, replayed = false, seen = null, cellEv = new Map(), evicted = new Map(), sessN = [0, 0, 0, 0, 0, 0, 0], sessShare = [];
+let spot = null, spotHover = null;
+// a number above the map -> the cells it counts (`bits`: the kinds seen since this page opened; `state`: now)
+const CATS = {
+  resident: { state: 1, what: "Experts in memory now", how: "The engine keeps the experts the routing history wants most." },
+  reading:  { state: 3, what: "Experts being read from disk now", how: "Each arrives a pass or two after a token missed it." },
+  hot:      { bits: 1 << EV.HOT | 1 << EV.RESCUE | 1 << EV.PREDICT | 1 << EV.DROPPED,
+              what: "Read from disk because a token picked them while they were not in memory",
+              how: "A green comet is an async read (ready the next pass), an orange streak an inline rescue. Hover a cell for the miss's weight and whose slot it took." },
+  kept:     { bits: 1 << EV.HOT | 1 << EV.RESCUE | 1 << EV.PREDICT,
+              what: "Read after a miss and kept, each in the slot of the least-wanted resident", how: "Hover a cell for the expert it replaced." },
+  rescue:   { bits: 1 << EV.RESCUE | 1 << EV.DROPPED,
+              what: "Rescued inline: read in the very pass that missed them, because the miss carried a large share of the token's routing",
+              how: "Below the gate, a miss is covered by a substitute in its pass and read in the background for the next." },
+  moved:    { bits: 1 << EV.ADAPT | 1 << EV.PRELOAD,
+              what: "Moved in by the routing history (adaptation) or for a continuing conversation (preload)",
+              how: "Each took the slot of an expert the history wanted less." },
+  preload:  { bits: 1 << EV.PRELOAD, what: "Preloaded for a continuing conversation, before its prompt ran", how: "" },
+};
+const CAT_OF = { "Resident": "resident", "Memory slots": "resident", "Being read now": "reading", "Hot reads since start": "hot",
+                 "Hot reads kept since start": "kept", "Inline rescues since start": "rescue", "Experts moved since start": "moved",
+                 "Preloaded since start": "preload" };
+const TICK_OF = { [EV.HOT]: ["Hot reads since start", "Hot reads kept since start"], [EV.PREDICT]: ["Hot reads since start", "Hot reads kept since start"],
+                  [EV.RESCUE]: ["Hot reads since start", "Inline rescues since start", "Hot reads kept since start"],
+                  [EV.DROPPED]: ["Hot reads since start", "Inline rescues since start"],
+                  [EV.ADAPT]: ["Experts moved since start"], [EV.PRELOAD]: ["Experts moved since start", "Preloaded since start"] };
 try { key = sessionStorage.getItem("tidelm-key") || ""; } catch (e) {}
 
 const view = () => document.querySelector("input[name=view]:checked").value;
@@ -180,6 +239,10 @@ function readColors() {
     abs: ramp([css("--seq-abs-0"), css("--seq-abs-1"), css("--seq-abs-2")]),
     ink: css("--ink"), ink2: css("--ink-2"), muted: css("--muted"), axis: css("--axis"), hair: css("--hair"), absent: css("--absent"),
   };
+  const rgb = s => s.startsWith("#") ? hex(s) : s.match(/[\d.]+/g).slice(0, 3).map(Number);
+  colors.rgb = { state: colors.state.map(rgb), res: colors.res.map(rgb), abs: colors.abs.map(rgb), absent: rgb(colors.absent),
+                 surface: rgb(css("--surface")), ink: rgb(colors.ink) };
+  colors.dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
 }
 
 function legend() {
@@ -204,6 +267,11 @@ function legend() {
     item(colors.absent, "Never used");
   }
   item("", "Changed in the last few seconds", "ring");
+  if (Array.isArray(d.events)) {
+    item("", "Async read: a token missed it, ready the next pass", "comet");
+    item(colors.state[2], "Inline rescue: a heavy miss, read in the same pass", "streak");
+    item("", "Normal load: moved in by the routing history", "dots");
+  }
 }
 
 function layout() {
@@ -231,12 +299,165 @@ function reorder() {
 }
 const level = (r, e) => data.demand ? parseInt(data.demand[r][e], 36) : 0;
 
-function draw() {
-  if (!data) return;
-  const d = data, g = geom, c = $("map"), x = c.getContext("2d"), dpr = window.devicePixelRatio || 1, now = Date.now();
+function ensureAnim() {
+  const E = data.experts_per_layer, R = data.layers.length, N = E * R;
+  if (A && A.N === N && A.E === E) return false;
+  A = { N, E, R, cur: new Float32Array(3 * N), tgt: new Float32Array(3 * N), start: new Float64Array(N),
+        x: new Float32Array(N), tx: new Float32Array(N), res: new Float32Array(R), resT: new Float32Array(R),
+        flights: [], pops: [], drops: [], reading: [], links: [], ticks: [] };
+  seen = new Uint8Array(N); cellEv = new Map(); evicted = new Map();
+  const s = colors.rgb.surface;
+  for (let i = 0; i < N; i++) A.cur.set(s, 3 * i);
+  return true;
+}
+
+// The snapshot's colours and columns as the cells' targets; `how`: "poll" (its changes spread over the next
+// second, each read as a flight), "view" (a cascade down the layers), anything else (no stagger).
+function retarget(how) {
+  if (!data || !geom) return;
+  const fresh = ensureAnim(), d = data, E = A.E, R = A.R, now = performance.now(), c = colors.rgb;
+  const demandView = view() === "demand" && d.demand;
+  A.reading = [];
+  for (let r = 0; r < R; r++) {
+    const st = d.states[r], ord = order[r];
+    for (let col = 0; col < E; col++) A.tx[r * E + ord[col]] = col;
+    for (let e = 0; e < E; e++) {
+      const i = r * E + e, s = st.charCodeAt(e) - 48;
+      let f;
+      if (demandView) { const v = level(r, e); f = v === 0 && s === 0 ? c.absent : (s === 0 ? c.abs : c.res)[v]; }
+      else f = c.state[s];
+      A.tgt.set(f, 3 * i);
+      if (s === 3) A.reading.push(i);
+    }
+    A.resT[r] = d.resident_per_layer[r];
+  }
+  if (!motion) {
+    A.cur.set(A.tgt); A.x.set(A.tx); A.res.set(A.resT); A.flights = []; A.pops = []; A.drops = [];
+  } else if (fresh) {
+    // the entrance: the map washes in from the top left, a layer at a time
+    A.x.set(A.tx);
+    for (let i = 0; i < A.N; i++) A.start[i] = now + 120 + 16 * Math.floor(i / E) + 1.3 * A.tx[i];
+  } else if (how === "view") {
+    for (let i = 0; i < A.N; i++) A.start[i] = now + 6 * Math.floor(i / E);
+  } else if (how === "poll") {
+    const covered = Array.isArray(d.events) ? replay(d, now) : null;
+    for (const [i, a, b] of events) {
+      if (covered) {      // the engine's events carry the story; a change without one just eases in
+        if (!covered.has(i)) A.start[i] = now + Math.random() * POLL_MS * 0.85;
+        continue;
+      }
+      const t0 = now + Math.random() * POLL_MS * 0.85;
+      if ((b === 3 || (b === 1 && a === 0)) && A.flights.length < MAX_FLIGHTS) {
+        const dur = 280 + 560 * (E - A.tx[i]) / E;      // from the disk side, the far cells a little longer
+        A.flights.push({ i, t0, dur, land: b });
+        A.start[i] = t0 + dur;                          // the cell turns as its expert lands
+      } else {
+        A.start[i] = t0;
+        if (b === 1 && a !== 1) A.pops.push({ i, t0 });
+        else if (b === 0 && a !== 0) A.drops.push({ i, t0, rgb: c.state[a] });
+      }
+    }
+  }
+  if (fresh && Array.isArray(d.events)) replay(d, now);     // the history before this page opened: told, not shown
+  events = [];
+  kick();
+}
+
+// The poll's new events: kept for the tooltip and the spotlight, and (after the first poll) scheduled at their
+// own spacing, REPLAY_MS late. Returns the cells they cover.
+function replay(d, now) {
+  const E = A.E, covered = new Set(), first = !replayed, wall = d.sampled_at * 1000;
+  replayed = true;
+  let n = 0;
+  for (const [seq, age, row, ex, kind, share, vrow, vex] of d.events) {
+    if (seq <= lastSeq || row < 0) continue;
+    const i = row * E + ex, vi = vrow >= 0 ? vrow * E + vex : -1, t = wall - age, sh = share / 1000;
+    cellEv.set(i, { kind, t, share: sh, victim: vi });       // the tooltip tells the history before this page too
+    if (vi >= 0) evicted.set(vi, { by: i, kind, t });
+    covered.add(i); if (vi >= 0) covered.add(vi);
+    if (first) continue;
+    seen[i] |= 1 << kind; sessN[kind]++;                       // the spotlight counts since this page opened
+    if (kind === EV.HOT || kind === EV.RESCUE || kind === EV.DROPPED) sessShare.push(sh);
+    if (!motion) continue;
+    // an adaptation's whole plan lands in one pass: spread it over the replay so it reads as a wave
+    const batch = kind === EV.ADAPT || kind === EV.PRELOAD;
+    const t0 = now + Math.max(0, REPLAY_MS - age) + (batch ? (n++ % 96) * 9 : Math.random() * 30);
+    for (const label of TICK_OF[kind] || []) A.ticks.push({ t0, label, kind });
+    const rescue = kind === EV.RESCUE || kind === EV.DROPPED, far = (E - A.tx[i]) / E;
+    // an inline rescue is quick, an async read medium, a normal load unhurried
+    const dur = rescue ? 150 + 120 * far : batch ? 650 + 650 * far : 300 + 520 * far;
+    if (A.flights.length < MAX_FLIGHTS) A.flights.push({ i, t0: t0 + 200, dur, kind, land: kind === EV.DROPPED ? 0 : 1 });
+    else A.pops.push({ i, t0: t0 + 200 + dur, kind });
+    if (kind !== EV.DROPPED) A.start[i] = t0 + 200 + dur;
+    if (vi >= 0) {
+      A.start[vi] = t0 + 200;
+      A.drops.push({ i: vi, t0: t0 + 200, rgb: colors.rgb.state[1] });
+      if (A.links.length < 160) A.links.push({ a: vi, b: i, t0: t0 + 200, dur: dur + 500, kind });
+    }
+  }
+  for (const [seq] of d.events) lastSeq = Math.max(lastSeq, seq);
+  return covered;
+}
+
+function kick() { if (!raf && data && A) raf = requestAnimationFrame(frame); }
+
+function frame(t) {
+  raf = 0;
+  if (!data || !A || !geom) return;
+  const dt = lastFrame ? Math.min(80, t - lastFrame) : 16, now = performance.now();
+  lastFrame = t;
+  let more = false;
+  if (motion) {
+    const kc = 1 - Math.exp(-dt / TAU_COLOR), kx = 1 - Math.exp(-dt / TAU_SLIDE);
+    const cur = A.cur, tgt = A.tgt, x = A.x, tx = A.tx, st = A.start;
+    for (let i = 0, j = 0; i < A.N; i++, j += 3) {
+      if (st[i] > now) { more = true; continue; }
+      for (let k = j; k < j + 3; k++) {
+        const dl = tgt[k] - cur[k];
+        if (dl > 0.5 || dl < -0.5) { cur[k] += dl * kc; more = true; } else cur[k] = tgt[k];
+      }
+      const dx = tx[i] - x[i];
+      if (dx > 0.003 || dx < -0.003) { x[i] += dx * kx; more = true; } else x[i] = tx[i];
+    }
+    for (let r = 0; r < A.R; r++) {
+      const dr = A.resT[r] - A.res[r];
+      if (dr > 0.05 || dr < -0.05) { A.res[r] += dr * kx; more = true; } else A.res[r] = A.resT[r];
+    }
+    A.flights = A.flights.filter(f => {
+      if (now < f.t0 + f.dur) return true;
+      A.pops.push({ i: f.i, t0: now, soft: f.land === 3, kind: f.kind });
+      return false;
+    });
+    A.links = A.links.filter(p => now < p.t0 + p.dur);
+    A.ticks = A.ticks.filter(k => {
+      if (now < k.t0) return true;
+      const el = statEls.find(s => s.label === k.label);
+      if (el) { el.div.style.setProperty("--tick", "var(" + (k.kind === EV.RESCUE || k.kind === EV.DROPPED ? "--hot" : k.kind === EV.ADAPT || k.kind === EV.PRELOAD ? "--resident" : "--loading") + ")");
+                el.div.classList.remove("tick"); void el.div.offsetWidth; el.div.classList.add("tick"); }
+      return false;
+    });
+    A.pops = A.pops.filter(p => now < p.t0 + POP_MS);
+    A.drops = A.drops.filter(p => now < p.t0 + DROP_MS);
+    statTw = statTw.filter(s => {
+      const p = Math.min(1, (now - s.t0) / STAT_MS), e = 1 - (1 - p) ** 3;
+      s.shown = s.from + (s.target - s.from) * e;
+      s.num.textContent = fmt(Math.round(s.shown));
+      return p < 1;
+    });
+    more = more || A.flights.length || A.pops.length || A.drops.length || A.links.length || A.ticks.length
+                || statTw.length || A.reading.length;
+  }
+  render(now);
+  const ring = [...changed.values()].some(v => Date.now() - v < RECENT_MS);
+  if ((more || (motion && ring)) && !document.hidden) raf = requestAnimationFrame(frame); else lastFrame = 0;
+}
+
+function render(now) {
+  const d = data, g = geom, c = $("map"), x = c.getContext("2d"), dpr = window.devicePixelRatio || 1, wall = Date.now();
+  const E = A.E, w = g.cw - g.gap, h = g.rh - g.rgap, gridW = E * g.cw, col = colors.rgb;
   x.setTransform(dpr, 0, 0, dpr, 0, 0);
   x.clearRect(0, 0, g.w, g.h);
-  const demandView = view() === "demand" && d.demand;
+  x.globalCompositeOperation = "source-over"; x.globalAlpha = 1;
   x.font = "11px system-ui, sans-serif"; x.textBaseline = "middle";
   // column ticks: only meaningful in expert order
   x.fillStyle = colors.muted; x.textAlign = "center";
@@ -244,55 +465,181 @@ function draw() {
     for (let e = 0; e < g.E; e += 64) x.fillText(String(e), g.left + e * g.cw + g.cw / 2, 8);
   } else {
     x.textAlign = "left"; x.fillText("most used", g.left, 8);
-    x.textAlign = "right"; x.fillText("least used", g.left + g.E * g.cw, 8);
+    x.textAlign = "right"; x.fillText("least used", g.left + gridW, 8);
   }
-  const maxRes = Math.max(1, ...d.resident_per_layer);
-  const recent = [];
-  for (let r = 0; r < g.R; r++) {
-    const y = g.top + r * g.rh, h = g.rh - g.rgap, st = d.states[r], ord = order[r];
-    for (let col = 0; col < g.E; col++) {
-      const e = ord[col], s = st.charCodeAt(e) - 48;
-      let fill;
-      if (demandView) {
-        const v = level(r, e);
-        fill = v === 0 && s === 0 ? colors.absent : (s === 0 ? colors.abs : colors.res)[v];
-      } else {
-        fill = colors.state[s];
-      }
-      x.fillStyle = fill;
-      x.fillRect(g.left + col * g.cw, y, g.cw - g.gap, h);
-      const t = changed.get(r * g.E + e);
-      if (t && now - t < RECENT_MS) recent.push([col, y, h]);
+  // the cells, batched by colour: a Path2D a colour, so a settled frame is a few dozen fills, not 19,000
+  const buckets = new Map();
+  for (let r = 0, i = 0; r < g.R; r++) {
+    const y = g.top + r * g.rh;
+    for (let e = 0; e < E; e++, i++) {
+      const j = 3 * i, key = ((A.cur[j] + 0.5) & 255) << 16 | ((A.cur[j + 1] + 0.5) & 255) << 8 | ((A.cur[j + 2] + 0.5) & 255);
+      let p = buckets.get(key);
+      if (!p) { p = new Path2D(); buckets.set(key, p); }
+      p.rect(g.left + A.x[i] * g.cw, y, w, h);
     }
+  }
+  for (const [key, p] of buckets) { x.fillStyle = "rgb(" + (key >> 16) + "," + (key >> 8 & 255) + "," + (key & 255) + ")"; x.fill(p); }
+  const cellX = i => g.left + A.x[i] * g.cw, cellY = i => g.top + Math.floor(i / E) * g.rh;
+  if (motion) {
+    x.save();
+    x.beginPath(); x.rect(g.left - 2 * g.cw, 0, gridW + 4 * g.cw + 12, g.h); x.clip();
+    const kindRgb = k => k === EV.RESCUE || k === EV.DROPPED ? col.state[2] : k === EV.ADAPT || k === EV.PRELOAD ? col.state[1] : col.state[3];
+    // being read: the cell's outline breathes
+    for (const i of A.reading) {
+      const ph = 0.5 + 0.5 * Math.sin(now / 170 + i * 0.37);
+      x.strokeStyle = "rgba(" + col.state[3].join(",") + "," + (0.35 + 0.6 * ph) + ")"; x.lineWidth = 1.5;
+      x.strokeRect(cellX(i) - 1.5, cellY(i) - 1.5, w + 3, h + 3);
+    }
+    // whose slot it took: a thin arc from the evicted expert to its replacement
+    for (const l of A.links) {
+      const u = (now - l.t0) / l.dur;
+      if (u < 0) continue;
+      const ax = cellX(l.a) + w / 2, ay = cellY(l.a) + h / 2, bx = cellX(l.b) + w / 2, by = cellY(l.b) + h / 2;
+      const mx = (ax + bx) / 2 + (by - ay) * 0.18, my = (ay + by) / 2 - (bx - ax) * 0.18;
+      x.strokeStyle = "rgba(" + kindRgb(l.kind).join(",") + "," + (0.5 * (1 - u) ** 1.5) + ")";
+      x.lineWidth = 1; x.beginPath(); x.moveTo(ax, ay); x.quadraticCurveTo(mx, my, bx, by); x.stroke();
+    }
+    // flights along the layer's row from the disk side: an async read a comet that slows as it lands, an inline
+    // rescue a fast solid streak, a normal load a dotted trail at an even pace
+    x.lineCap = "butt";
+    for (const f of A.flights) {
+      const u = (now - f.t0) / f.dur;
+      if (u < 0) continue;
+      const k = f.kind || EV.HOT, rgb = kindRgb(k), rc = rgb.join(","), v = Math.min(1, u);
+      const rescue = k === EV.RESCUE || k === EV.DROPPED, normal = k === EV.ADAPT || k === EV.PRELOAD;
+      const e = rescue ? v : normal ? v * v * (3 - 2 * v) : 1 - (1 - v) ** 3;
+      const sx = g.left + gridW + 8, ex = cellX(f.i) + w / 2, y = cellY(f.i) + h / 2, hx = sx + (ex - sx) * e;
+      if (rescue) {
+        const tail = Math.min(150, sx - hx + 4), th = Math.max(2.5, h * 0.42);
+        x.fillStyle = "rgba(" + rc + ",0.95)"; x.fillRect(hx, y - th / 2, tail, th);
+        x.fillStyle = "rgba(255,255,255,0.9)"; x.fillRect(hx, y - th / 2, Math.min(4, tail), th);
+      } else if (normal) {
+        const tail = Math.min(70, sx - hx + 4), th = Math.max(1.5, h * 0.24);
+        for (let dx = 0; dx < tail; dx += 6) {
+          x.fillStyle = "rgba(" + rc + "," + (0.9 * (1 - dx / tail)) + ")"; x.fillRect(hx + dx, y - th / 2, 3.5, th);
+        }
+      } else {
+        const tail = Math.min(90, (sx - hx) * 0.9 + 6), th = Math.max(1.5, h * 0.3);
+        const gr = x.createLinearGradient(hx, 0, hx + tail, 0);
+        gr.addColorStop(0, "rgba(" + rc + ",0.95)"); gr.addColorStop(1, "rgba(" + rc + ",0)");
+        x.fillStyle = gr; x.fillRect(hx, y - th / 2, tail, th);
+      }
+    }
+    // landings: the cell flashes as its expert arrives
+    x.globalCompositeOperation = "source-over";
+    for (const p of A.pops) {
+      const u = (now - p.t0) / POP_MS;
+      if (u < 0) continue;
+      x.fillStyle = "rgba(255,255,255," + (0.85 * (1 - u) ** 4) + ")";
+      x.fillRect(cellX(p.i), cellY(p.i), w, h);
+    }
+    // evictions: the old colour shrinks into the cell
+    x.globalCompositeOperation = "source-over";
+    for (const p of A.drops) {
+      const u = (now - p.t0) / DROP_MS;
+      if (u < 0) continue;
+      const k = (1 - u) ** 2, cx = cellX(p.i) + w / 2, cy = cellY(p.i) + h / 2;
+      x.fillStyle = "rgba(" + p.rgb.join(",") + "," + (0.9 * (1 - u)) + ")";
+      x.fillRect(cx - w * k / 2, cy - h * k / 2, w * k, h * k);
+    }
+    x.restore();
+  }
+  // the spotlight: the cells a number counts, the rest veiled
+  const cat = CATS[spotHover || spot];
+  if (cat && seen) {
+    const sr = col.surface.join(",");
+    x.fillStyle = "rgba(" + sr + ",0.82)"; x.fillRect(g.left - 1, g.top - 1, gridW + 2, g.R * g.rh + 2);
+    const tw = wall, buckets2 = new Map();
+    for (let i = 0; i < A.N; i++) {
+      const r = Math.floor(i / E), on = cat.bits ? (seen[i] & cat.bits) : (d.states[r].charCodeAt(i - r * E) - 48 === cat.state);
+      if (!on) continue;
+      const j = 3 * i, key = ((A.cur[j] + 0.5) & 255) << 16 | ((A.cur[j + 1] + 0.5) & 255) << 8 | ((A.cur[j + 2] + 0.5) & 255);
+      let p = buckets2.get(key); if (!p) { p = new Path2D(); buckets2.set(key, p); } p.rect(cellX(i), cellY(i), w, h);
+      const ev = cat.bits && cellEv.get(i);
+      if (ev && tw - ev.t < 20000) {     // the recent ones ringed, fading over 20 s
+        x.strokeStyle = "rgba(" + col.ink.join(",") + "," + (0.9 * (1 - (tw - ev.t) / 20000)) + ")"; x.lineWidth = 1;
+        x.strokeRect(cellX(i) - 1.5, cellY(i) - 1.5, w + 3, h + 3);
+      }
+    }
+    for (const [key, p] of buckets2) { x.fillStyle = "rgb(" + (key >> 16) + "," + (key >> 8 & 255) + "," + (key & 255) + ")"; x.fill(p); }
+  }
+  // the layers' labels, residents (the bar and the number count to the snapshot's)
+  const maxRes = Math.max(1, ...d.resident_per_layer);
+  for (let r = 0; r < g.R; r++) {
+    const y = g.top + r * g.rh, n = A.res[r], bx = g.left + gridW + 10;
     x.fillStyle = colors.ink2; x.textAlign = "right";
     x.fillText(String(d.layers[r]), g.left - 7, y + h / 2);
-    // the layer's residents: a number and a thin bar
-    const n = d.resident_per_layer[r], bx = g.left + g.E * g.cw + 10;
     x.fillStyle = colors.hair; x.fillRect(bx, y + h / 2 - 1.5, 52, 3);
     x.fillStyle = colors.state[1]; x.fillRect(bx, y + h / 2 - 1.5, 52 * n / maxRes, 3);
     x.fillStyle = colors.ink2; x.textAlign = "left";
-    x.fillText(String(n), bx + 58, y + h / 2);
+    x.fillText(String(Math.round(n)), bx + 58, y + h / 2);
   }
-  x.strokeStyle = colors.ink; x.lineWidth = 1.5;
-  for (const [col, y, h] of recent) x.strokeRect(g.left + col * g.cw - 0.75, y - 0.75, g.cw - g.gap + 1.5, h + 1.5);
+  // the cells that changed in the last few seconds: a ring that fades
+  x.lineWidth = 1.5;
+  for (const [i, t] of changed) {
+    const age = wall - t;
+    if (age >= RECENT_MS) continue;
+    x.strokeStyle = "rgba(" + col.ink.join(",") + "," + (motion ? 1 - age / RECENT_MS : 1) + ")";
+    x.strokeRect(cellX(i) - 0.75, cellY(i) - 0.75, w + 1.5, h + 1.5);
+  }
   x.fillStyle = colors.muted; x.textAlign = "left";
-  x.fillText("resident", g.left + g.E * g.cw + 10, 8);
+  x.fillText("resident", g.left + gridW + 10, 8);
 }
 
+let statEls = [], statKeys = "";
+// the spotlight's caption: what the cells are, how many since this page opened
+function spotText() {
+  const key = spotHover || spot, c = CATS[key], el = $("spot");
+  if (!c || !data) { el.textContent = spot ? "" : "Click or hover a number to see its experts on the map."; return; }
+  let n = 0;
+  if (c.bits && seen) for (let i = 0; i < seen.length; i++) n += (seen[i] & c.bits) !== 0;
+  else for (const row of data.states) for (let k = 0; k < row.length; k++) n += row.charCodeAt(k) - 48 === c.state;
+  el.textContent = "";
+  const b = document.createElement("b"); b.textContent = c.what;
+  let tail = c.bits ? ": " + fmt(n) + " expert" + (n === 1 ? "" : "s") + " since this page opened" : ": " + fmt(n);
+  if (key === "hot" && sessShare.length) {
+    const s = [...sessShare].sort((a, b) => a - b), med = s[Math.floor(s.length / 2)];
+    tail += ", the median miss " + Math.round(100 * med) + "% of its token's routing";
+  }
+  el.append(b, document.createTextNode(tail + ". " + c.how + (spot ? " (Click it again, or press Escape, to clear.)" : "")));
+}
+function tweenTo(s, v) {
+  if (s.shown === null || !motion) { s.shown = s.target = v; s.num.textContent = fmt(v); return; }
+  if (v === s.target) return;
+  s.from = s.shown; s.target = v; s.t0 = performance.now();
+  if (!statTw.includes(s)) statTw.push(s);
+  kick();
+}
 function stats() {
-  const d = data, c = d.counts, dl = $("stats");
-  dl.textContent = "";
-  const add = (label, value, small) => {
-    const div = document.createElement("div"), dt = document.createElement("dt"), dd = document.createElement("dd");
-    dt.textContent = label; dd.textContent = value;
-    if (small) { const s = document.createElement("small"); s.textContent = " " + small; dd.append(s); }
-    div.append(dt, dd); dl.append(div);
-  };
-  add("Resident", fmt(c.resident), "of " + fmt(d.total_experts) + " (" + (100 * c.resident / d.total_experts).toFixed(1) + "%)");
-  if (c.hot || d.engine === "deepseek") add("In the hot-read ring", fmt(c.hot), d.spare_slots ? "of " + fmt(d.spare_slots) : "");
-  add("Being read now", fmt(c.loading));
-  add("Memory slots", fmt(d.arena_slots));
-  for (const [k, v] of Object.entries(d.counters || {})) add(k[0].toUpperCase() + k.slice(1) + " since start", fmt(v));
+  const d = data, c = d.counts, dl = $("stats"), rows = [];
+  const add = (label, value, small) => rows.push([label, value, small]);
+  add("Resident", c.resident, "of " + fmt(d.total_experts) + " (" + (100 * c.resident / d.total_experts).toFixed(1) + "%)");
+  if (c.hot || d.engine === "deepseek") add("In the hot-read ring", c.hot, d.spare_slots ? "of " + fmt(d.spare_slots) : "");
+  add("Being read now", c.loading);
+  add("Memory slots", d.arena_slots);
+  for (const [k, v] of Object.entries(d.counters || {})) add(k[0].toUpperCase() + k.slice(1) + " since start", v);
+  const keys = rows.map(r => r[0]).join("|");
+  if (keys !== statKeys) {
+    dl.textContent = "";
+    statEls = rows.map(([label]) => {
+      const div = document.createElement("div"), dt = document.createElement("dt"), dd = document.createElement("dd");
+      const num = document.createElement("span"), small = document.createElement("small");
+      dt.textContent = label; dd.append(num, small); div.append(dt, dd); dl.append(div);
+      const cat = CAT_OF[label];
+      if (cat && (CATS[cat].state || Array.isArray(d.events))) {
+        div.className = "link"; div.tabIndex = 0; div.setAttribute("role", "button"); div.setAttribute("aria-pressed", "false");
+        div.title = "Show these on the map";
+        div.addEventListener("mouseenter", () => { spotHover = cat; spotText(); kick(); });
+        div.addEventListener("mouseleave", () => { spotHover = null; spotText(); kick(); });
+        const toggle = () => { spot = spot === cat ? null : cat; for (const s of statEls) s.div.setAttribute?.("aria-pressed", String(spot && CAT_OF[s.label] === spot)); spotText(); kick(); };
+        div.addEventListener("click", toggle);
+        div.addEventListener("keydown", ev => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggle(); } });
+      }
+      return { num, small, shown: null, target: null, label, div };
+    });
+    statTw = []; statKeys = keys;
+  }
+  rows.forEach(([, v, small], k) => { const s = statEls[k]; s.small.textContent = small ? " " + small : ""; tweenTo(s, Number(v)); });
   $("what").textContent = d.model + " · " + (d.sparks > 1 ? d.sparks + " Sparks" : "one Spark");
   const notes = [];
   if (c.not_loaded === 0 && c.loading === 0) notes.push("Every expert is in memory, so nothing is read from disk while serving.");
@@ -318,6 +665,38 @@ function table() {
   });
 }
 
+// the poll's events, summed up for the log
+function logEvents(d) {
+  if (!Array.isArray(d.events)) return;
+  const top = d.events.reduce((m, ev) => Math.max(m, ev[0]), 0);
+  if (logEvents.seq === undefined) { logEvents.seq = top; return; }      // the history before this page: not news
+  const by = {}, layers = new Set(), shares = [];
+  for (const [seq, , row, , kind, share] of d.events) {
+    if (seq <= logEvents.seq) continue;
+    by[kind] = (by[kind] || 0) + 1; layers.add(d.layers[row]);
+    if (kind === EV.HOT || kind === EV.RESCUE) shares.push(share / 10);
+  }
+  logEvents.seq = Math.max(logEvents.seq, top);
+  const parts = [], n = k => by[k] || 0;
+  if (n(EV.HOT) + n(EV.PREDICT)) parts.push(fmt(n(EV.HOT) + n(EV.PREDICT)) + " read after misses");
+  if (n(EV.RESCUE) + n(EV.DROPPED)) parts.push(fmt(n(EV.RESCUE) + n(EV.DROPPED)) + " rescued inline");
+  if (n(EV.ADAPT)) parts.push(fmt(n(EV.ADAPT)) + " moved by the routing history");
+  if (n(EV.PRELOAD)) parts.push(fmt(n(EV.PRELOAD)) + " preloaded");
+  if (!parts.length) return;
+  if (shares.length) {
+    shares.sort((a, b) => a - b);
+    const lo = Math.round(shares[0]), hi = Math.round(shares[shares.length - 1]);
+    parts[0] += lo === hi ? " (" + (shares.length > 1 ? "misses of " : "a miss of ") + lo + "% of a token's routing)"
+                          : " (misses " + lo + "–" + hi + "% of a token's routing)";
+  }
+  const ls = [...layers].sort((a, b) => a - b), where = ls.length > 8 ? ls.length + " layers" : "layer" + (ls.length > 1 ? "s " : " ") + ls.join(", ");
+  const li = document.createElement("li"), t = document.createElement("time");
+  t.textContent = new Date().toLocaleTimeString("en-GB");
+  li.append(t, document.createTextNode(parts.join(", ") + " in " + where));
+  $("nolog")?.remove(); $("log").prepend(li);
+  while ($("log").children.length > LOG_MAX) $("log").lastChild.remove();
+}
+
 function diff() {
   const d = data, E = d.experts_per_layer, flat = d.states.join(""), now = Date.now();
   if (prev && prev.length === flat.length) {
@@ -327,10 +706,11 @@ function diff() {
       const a = prev.charCodeAt(i) - 48, b = flat.charCodeAt(i) - 48;
       if (a === b) continue;
       changed.set(i, now);
+      events.push([i, a, b]);
       layers.add(d.layers[Math.floor(i / E)]);
       if (b === 0) dropped++; else if (b === 3) reading++; else if (a === 0 || a === 3) loaded++;
     }
-    if (loaded || dropped || reading) {
+    if ((loaded || dropped || reading) && !Array.isArray(d.events)) {
       const parts = [];
       if (loaded) parts.push(fmt(loaded) + " loaded");
       if (reading) parts.push(fmt(reading) + " started reading");
@@ -350,17 +730,22 @@ function diff() {
 }
 
 function status(text, bad) { const s = $("status"); s.textContent = text; s.className = bad ? "bad" : ""; }
+function beat(ok) {
+  const p = $("pulse");
+  p.className = ok ? "live" : "bad";
+}
 
 async function poll() {
   if (paused || document.hidden) return;
   try {
     const r = await fetch("/v1/expert-map", { headers: key ? { Authorization: "Bearer " + key } : {}, cache: "no-store" });
-    if (r.status === 401) { $("key").hidden = false; status("Waiting for an API key", true); return; }
+    if (r.status === 401) { $("key").hidden = false; status("Waiting for an API key", true); beat(false); return; }
     $("key").hidden = true;
     if (!r.ok) {
       let msg = "The engine answered " + r.status;
       try { msg = (await r.json()).error.message; } catch (e) {}
       status(msg[0].toUpperCase() + msg.slice(1), true);
+      beat(false);
       return;
     }
     const first = !data, d = await r.json(), shape = data && (data.experts_per_layer !== d.experts_per_layer || data.layers.length !== d.layers.length);
@@ -368,11 +753,14 @@ async function poll() {
     if (shape) { prev = null; changed.clear(); }
     diff();
     if (first || shape) { layout(); }
-    reorder(); legend(); stats(); table(); draw();
+    logEvents(d);
+    reorder(); legend(); stats(); table(); retarget(first || shape ? "first" : "poll"); spotText();
+    beat(true);
     const at = new Date(d.sampled_at * 1000).toLocaleTimeString("en-GB");
     status(d.stale ? "Engine is mid-step; map from " + at : (d.busy ? "Serving a request" : "Idle") + " · updated " + at, false);
   } catch (e) {
     status("No answer from the server; retrying", true);
+    beat(false);
   }
 }
 
@@ -394,6 +782,23 @@ function showTip() {
   const b = document.createElement("b"); b.textContent = STATE_TEXT[s][0].toUpperCase() + STATE_TEXT[s].slice(1);
   const where = document.createElement("span"); where.textContent = "Layer " + d.layers[hover.row] + ", expert " + e;
   tip.append(b, document.createElement("br"), where);
+  const ago = t => { const s = Math.max(0, Math.round((Date.now() - t) / 1000)); return s < 90 ? s + " s ago" : Math.round(s / 60) + " min ago"; };
+  const whereOf = i => i >= 0 ? "layer " + d.layers[Math.floor(i / d.experts_per_layer)] + ", expert " + (i % d.experts_per_layer) : "";
+  const i0 = hover.row * d.experts_per_layer + e, ev = cellEv.get(i0), gone = evicted.get(i0);
+  const line = text => { const sp = document.createElement("span"); sp.textContent = text; tip.append(document.createElement("br"), sp); };
+  if (ev && (!gone || gone.t < ev.t)) {
+    const pct = Math.round(100 * ev.share) + "%";
+    const over = ev.victim >= 0 ? " It took the slot of " + whereOf(ev.victim) + "." : "";
+    if (ev.kind === EV.HOT) line("Read " + ago(ev.t) + ": a token picked it while it was not in memory (" + pct + " of that token's routing)." + over);
+    else if (ev.kind === EV.PREDICT) line("Read " + ago(ev.t) + " on the predictor's call." + over);
+    else if (ev.kind === EV.RESCUE) line("Rescued inline " + ago(ev.t) + ": its miss carried " + pct + " of a token's routing, so it was read before the layer ran." + over);
+    else if (ev.kind === EV.DROPPED) line("Rescued inline " + ago(ev.t) + " (" + pct + " of a token's routing) and let go: no slot of its width was free.");
+    else if (ev.kind === EV.ADAPT) line("Moved in " + ago(ev.t) + " by the routing history." + over);
+    else if (ev.kind === EV.PRELOAD) line("Preloaded " + ago(ev.t) + " for a continuing conversation." + over);
+  } else if (gone) {
+    const why = { [EV.HOT]: "a read after a miss", [EV.PREDICT]: "a predicted read", [EV.RESCUE]: "an inline rescue", [EV.ADAPT]: "the routing history", [EV.PRELOAD]: "a preload" }[gone.kind] || "a read";
+    line("Evicted " + ago(gone.t) + " for " + whereOf(gone.by) + " (" + why + ").");
+  }
   if (d.demand) {
     const v = level(hover.row, e), use = document.createElement("span");
     use.textContent = v === 0 ? "Never used so far" : "Used " + Math.max(1, Math.round(100 * (v / 35) ** 2)) + "% as much as the layer's most used";
@@ -422,7 +827,7 @@ for (const i of document.querySelectorAll("input[name=view], input[name=order]")
   i.addEventListener("change", () => {
     // the choice lives in the address, so a reload or a bookmark keeps it
     history.replaceState(null, "", "#view=" + view() + "&order=" + ordering());
-    if (data) { reorder(); legend(); draw(); showTip(); }
+    if (data) { reorder(); legend(); retarget("view"); showTip(); }
   });
 }
 for (const [k, v] of new URLSearchParams(location.hash.slice(1))) {
@@ -441,9 +846,13 @@ $("key").addEventListener("submit", ev => {
   try { sessionStorage.setItem("tidelm-key", key); } catch (e) {}
   poll();
 });
-window.addEventListener("resize", () => { if (data) { layout(); draw(); showTip(); } });
-window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { readColors(); if (data) { legend(); draw(); } });
+window.addEventListener("resize", () => { if (data) { layout(); retarget(); showTip(); } });
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { readColors(); if (data) { legend(); retarget("view"); } });
+reduce.addEventListener("change", () => { motion = !reduce.matches; if (data) { legend(); stats(); retarget(); } });
 document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(); });
+document.addEventListener("keydown", ev => {
+  if (ev.key === "Escape" && spot) { spot = null; for (const s of statEls) s.div.setAttribute("aria-pressed", "false"); spotText(); kick(); }
+});
 
 readColors();
 poll();

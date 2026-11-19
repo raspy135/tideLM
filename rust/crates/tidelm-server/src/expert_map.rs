@@ -22,9 +22,20 @@ pub const PAGE: &str = include_str!("expert_map.html");
 
 /// The snapshot as the page reads it. `states`: a string a layer, a digit an expert (0 not loaded,
 /// 1 resident, 2 in the hot-read ring, 3 being read); `demand`: the same shape in base 36, an
-/// expert's share of its layer's routing history (0 none, z the layer's most used).
+/// expert's share of its layer's routing history (0 none, z the layer's most used). `events`: the
+/// engine's recent residency events, oldest first, each [seq, age ms, row, expert, kind, share in
+/// thousandths, victim row, victim expert] (-1, -1 without a victim; `event_kinds` names the kinds) -
+/// what brought each expert in: a missed pick (its share of the token's routing weight), an inline
+/// rescue, an adaptation, a preload.
 pub fn json(m: &ExpertMap, model: &str, engine: &str) -> serde_json::Value {
     let c = m.counts();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    let row = |l: u16| m.layers.binary_search(&(l as usize)).map(|r| r as i64).unwrap_or(-1);
+    let events: Vec<serde_json::Value> = m.events.iter().filter(|e| row(e.layer) >= 0).map(|e| {
+        let (vr, vx) = e.victim.map(|(l, x)| (row(l), x as i64)).unwrap_or((-1, -1));
+        serde_json::json!([e.seq, ((now - e.at) * 1000.0).max(0.0).round() as i64, row(e.layer), e.expert, e.kind,
+                           (e.share * 1000.0).round() as i64, vr, vx])
+    }).collect();
     let resident_per_layer: Vec<usize> =
         m.state.chunks(m.experts.max(1)).map(|r| r.iter().filter(|&&s| s == tidelm_engine::expert_map::RESIDENT).count()).collect();
     let counters: serde_json::Map<String, serde_json::Value> = m.counters.iter().map(|&(k, v)| (k.to_string(), v.into())).collect();
@@ -35,7 +46,7 @@ pub fn json(m: &ExpertMap, model: &str, engine: &str) -> serde_json::Value {
         "sparks": m.world,
         "busy": m.busy,
         "stale": false,
-        "sampled_at": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0),
+        "sampled_at": now,
         "layers": m.layers,
         "experts_per_layer": m.experts,
         "total_experts": m.state.len(),
@@ -47,6 +58,8 @@ pub fn json(m: &ExpertMap, model: &str, engine: &str) -> serde_json::Value {
         "counters": counters,
         "states": m.state_rows(),
         "demand": m.demand_rows(),
+        "events": events,
+        "event_kinds": tidelm_engine::expert_map::EV_NAMES,
     })
 }
 
