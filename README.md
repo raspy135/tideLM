@@ -21,13 +21,15 @@ tokens share.*
 | --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
 | `ds41-mxfp4` | DeepSeek-V4.1-Flash-1017 | 2 | native MXFP4 | 10,000 / 15,360 (65.1%) | 1M (2 lanes, 1.5M shared) | **33.5 tok/s** | **51.8 tok/s** | 4.3 s |
 | `glm53-exlr8-bit322` | GLM-5.3 | 2 | exlr8 `bit322` (3.22 bpw: 2, 3 or 4 bits by layer) | 11,543 / 19,200 (60.1%) | 320K (2 lanes) | **20.4 tok/s** | **25.4 tok/s** | 17.1 s |
+| `glm53-exlr8-bit280` | GLM-5.3 | 2 | exlr8 `bit280` (2.80 bpw: 2, 3 or 4 bits by layer) | 13,265 / 19,200 (69.1%) | 320K (2 lanes) | **22.1 tok/s** | **27.6 tok/s** | 17.1 s |
 | `glm53-flash-40-tp1` | GLM-5.3-Flash | **1** | EXL3 4 bpw (4 bits a projection) | 7,282 / 12,096 (60.2%) | 320K (2 lanes) | **22.1 tok/s** | **26.4 tok/s** | 12.1 s |
 | `glm53-flash-40-tp2` | GLM-5.3-Flash | 2 | EXL3 4 bpw (4 bits a projection) | 12,096 / 12,096 (100%) | 1M (2 lanes, 2M shared) | **36.8 tok/s** | **46.6 tok/s** | 7.6 s |
 | `inkling2-small-40-tp2` | Inkling-2-Small | 2 | EXL3 4 bpw (4 bits a projection) | 11,865 / 18,432 (64.4%) | 768K (3 lanes) | **29.4 tok/s** | **42.3 tok/s** | 7.6 s |
 
 *Medians of three `bench/bench.py` runs after a warmup, 1,024 tokens at temperature 0.6, each on
 the build of its day (raw runs: [DeepSeek](results/rust-ds41-20261028-pdl/README.md), 2026-10-28;
-[GLM-5.3 `bit322`](results/rust-glm53-exlr8-bit322-20261118/README.md), 2026-11-18; GLM-5.3-Flash
+[GLM-5.3 `bit322`](results/rust-glm53-exlr8-bit322-20261118/README.md), 2026-11-18, and
+[`bit280`](results/rust-glm53-exlr8-bit280-20261121/README.md), 2026-11-21; GLM-5.3-Flash
 [on one Spark](results/rust-glm53-flash-40-tp1-20261114/README.md) and
 [on two](results/rust-glm53-flash-40-tp2-20261114/README.md), 2026-11-14;
 [Inkling-2-Small](results/rust-inkling2-40-tp2-20261116-512k/README.md), 2026-11-16, at a 512K context
@@ -48,10 +50,11 @@ exlr8 is still served: its setup is in the [install guide](docs/install.md).
 
 `bit280` (2.80 bpw) is the alternative, from the same release and dense weights, and beside `bit322`
 it is one more fetch and pack ([`bit280`](#glm-53-exlr8-bit280-glm53-exlr8-bit280)). It holds 13,264
-experts in the same memory, its held-out NLL at fixed residents is lower (1.890 against 1.907), the
-release measures it further from the unquantized model with every expert loaded, and its decode steps
-time within a few percent of `bit322`'s. In use the two were hard to tell apart; `bit322` stays the
-default ([`bit280` on the pair](docs/exlr8.md#bit280-280-bpw-2026-11-21)).
+experts in the same memory and decodes 8-9% faster on prose and code (a decode step 3-5% shorter, the
+rest the text's tokens a step; the 8K prompt's first token the same). Its held-out NLL at fixed
+residents is lower (1.890 against 1.907), while the release measures it further from the unquantized
+model with every expert loaded. In use the two were hard to tell apart; `bit322` stays the default
+([`bit280` on the pair](docs/exlr8.md#bit280-280-bpw-2026-11-21)).
 
 GLM-5.3-Flash is served from Mia's AI Lab's
 [EXL3 4 bpw](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold) (every routed

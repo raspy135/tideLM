@@ -25,8 +25,9 @@ exactly what it says: the defaults are not settled and the measurements are inco
   from the same 0.7 release and dense directory as `bit322`, one more fetch and pack beside it. It holds
   13,264 experts at `GLM_SLOTS=12400` (`bit322` 11,543), held-out NLL at fixed residents 1.890 against
   1.907 (paired 95% [-0.029, -0.006]; that test favours residency), the release's KL with every expert
-  loaded higher (0.086 against 0.058), decode steps within a few percent, hard to tell apart in use.
-  `bit322` stays the default (docs/exlr8.md, `bit280`).
+  loaded higher (0.086 against 0.058), prose 22.06 / code 27.65 tok/s against 20.35 / 25.36 on
+  `bench/bench.py` (8K first token 17.09 s for both; `results/rust-glm53-exlr8-bit280-20261121`), hard
+  to tell apart in use. `bit322` stays the default (docs/exlr8.md, `bit280`).
 - **`GLM_HOT_RESCUE` 0.4 -> 0.3 in the GLM-5.3 examples** (exlr8 `bit322` and EXL3): on `bit322` it
   rescues 0.6-1.0 picks a pass for ~0.15 and `bench/bench.py` stays within noise. Its NLL A/B is still
   owed. Inkling-2-Small's example too, from serving with it (not measured there), and GLM-5.3-Flash's on

@@ -1,0 +1,6 @@
+156,157c156,157
+< RUST_GLM_STATE_DB=/home/ryan/tidelm-rust-state/glm-stats-rust-exlr8-bit280.npz
+< RUST_GLM_PREFIX_DIR=/home/ryan/tidelm-rust-state/glm-prefix
+---
+> RUST_GLM_STATE_DB=/home/ryan/tidelm-rust-state/exlr8-bit280/bench/20261121-1534/state.npz
+> RUST_GLM_PREFIX_DIR=/home/ryan/tidelm-rust-state/exlr8-bit280/bench/20261121-1534/prefix

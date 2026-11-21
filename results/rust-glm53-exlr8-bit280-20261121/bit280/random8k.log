@@ -1,0 +1,12 @@
+== p2-random: workload=random isl=8192 osl=256 runs=3 warmup=1 thinking=False engine=tidelm-rust
+  warmup  isl=8219 ttft=  17174.6 ms  tpot=  42.79 ms  decode= 23.37 tok/s  out=256 (length)
+          accept_len=2.451923076923077  expert_hit=None  nvme=None GB  engram_rows=None
+  run1    isl=8211 ttft=  17087.7 ms  tpot=  49.65 ms  decode= 20.14 tok/s  out=256 (length)
+          accept_len=1.795774647887324  expert_hit=None  nvme=None GB  engram_rows=None
+  run2    isl=8225 ttft=  17265.7 ms  tpot=  45.35 ms  decode= 22.05 tok/s  out=256 (length)
+          accept_len=2.056451612903226  expert_hit=None  nvme=None GB  engram_rows=None
+  run3    isl=8205 ttft=  16995.0 ms  tpot=  48.45 ms  decode= 20.64 tok/s  out=256 (length)
+          accept_len=1.9029850746268657  expert_hit=None  nvme=None GB  engram_rows=None
+  -> MEDIAN  ttft=17087.7336 ms  tpot=48.4524 ms  decode=20.6388 tok/s
+  -> ENGINE  accept_len=1.903  expert_hit=None  nvme=None GB  engram_rows=None
+  wrote /home/ryan/tidelm-rust-state/exlr8-bit280/bench/20261121-1534/random8k.json

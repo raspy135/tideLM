@@ -1,0 +1,57 @@
+boot: routing history /home/ryan/tidelm-rust-state/exlr8-bit280/bench/20261121-1534/state.npz 
+[glm] dense weights: layer 12 (1.9 GB, 4 s)
+[glm] dense weights: layer 25 (2.7 GB, 6 s)
+[glm] dense weights: layer 38 (3.6 GB, 8 s)
+[glm] dense weights: layer 51 (4.5 GB, 11 s)
+[glm] dense weights: layer 64 (5.3 GB, 13 s)
+[glm] dense weights: layer 77 (6.2 GB, 15 s)
+[glm] dense weights 6.26 GB a rank in 16 s
+[glm] 13265 routed experts resident (88.3 GB; 2/2/2 x1833, 2/2/3 x1628, 3/3/3 x8878, 3/3/4 x926) in 9 s
+[glm] KV cache 9.25 GB a rank (327680 positions a lane, split, 327680 over 2 lanes)
+boot: prefix store /home/ryan/tidelm-rust-state/exlr8-bit280/bench/20261121-1534/prefix/439ee4d129d3eefb/rank-0 (0 segments, 60 GB)
+boot: DS-rule routing history /home/ryan/tidelm-rust-state/exlr8-bit280/bench/20261121-1534/glm-ds-history.npz (0 folds)
+boot: warm-up 11.6 s
+engine up in 42.1s; serving glm-5.3 on 0.0.0.0:8000 (GLM-5.3, depth 7, calibrated gate 0.36)
+api keys: 1 (Authorization: Bearer or x-api-key; /health open)
+memory at boot: device 101.33 GiB (+0.00 since up), pinned 0.07 GiB (+0.00), graphs 1233 (0 made since up; 1.70 GiB, heap 0.61), host anon 1.70 GiB (heap in use 1.59, held free 0.13), file-backed 0.23 GiB
+request 1: prompt 53, prefill 53 in 1.31 s (41 tok/s), decode 1024 in 47.68 s (21.46 tok/s, 2.14 a step), length
+memory: device 101.33 GiB (+0.00 since up), pinned 0.13 GiB (+0.06), graphs 1234 (1 made since up; 1.71 GiB, heap 0.61), host anon 1.70 GiB (heap in use 1.59, held free 0.13), file-backed 0.23 GiB
+request 1, GLM-5.3: 2.09 drafted / 1.15 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 12.8% (prompt 21.2%, decode 12.2%; by score 9.9%), hot reads 1605 (kept 1603, 186 inline, 0.31 s waited), swaps 1792 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0
+request 2: prompt 53, prefill 53 in 0.86 s (62 tok/s), decode 1024 in 46.04 s (22.22 tok/s, 2.15 a step), length
+memory: device 101.33 GiB (+0.00 since up), pinned 0.13 GiB (+0.06), graphs 1234 (1 made since up; 1.71 GiB, heap 0.61), host anon 1.70 GiB (heap in use 1.59, held free 0.13), file-backed 0.23 GiB
+request 2, GLM-5.3: 1.92 drafted / 1.15 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 4.9% (prompt 10.1%, decode 4.7%; by score 3.6%), hot reads 288 (kept 288, 37 inline, 0.21 s waited), swaps 1304 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0
+request 3: prompt 53 (13 cached), prefill 40 in 0.44 s (91 tok/s), decode 1024 in 46.37 s (22.06 tok/s, 2.14 a step), length
+memory: device 101.33 GiB (+0.00 since up), pinned 0.13 GiB (+0.06), graphs 1234 (1 made since up; 1.71 GiB, heap 0.61), host anon 1.70 GiB (heap in use 1.59, held free 0.13), file-backed 0.23 GiB
+request 3, GLM-5.3: 1.92 drafted / 1.14 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 4.4% (prompt 9.3%, decode 4.3%; by score 3.3%), hot reads 298 (kept 298, 36 inline, 0.17 s waited), swaps 317 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0
+request 4: prompt 53 (13 cached), prefill 40 in 0.44 s (92 tok/s), decode 1024 in 47.93 s (21.34 tok/s, 1.97 a step), length
+memory: device 101.33 GiB (+0.00 since up), pinned 0.13 GiB (+0.06), graphs 1234 (1 made since up; 1.71 GiB, heap 0.61), host anon 1.70 GiB (heap in use 1.59, held free 0.13), file-backed 0.23 GiB
+request 4, GLM-5.3: 1.67 drafted / 0.97 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 4.2% (prompt 10.2%, decode 4.0%; by score 3.2%), hot reads 280 (kept 280, 27 inline, 0.27 s waited), swaps 244 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0
+request 5: prompt 68 (12 cached), prefill 56 in 1.08 s (52 tok/s), decode 1024 in 36.89 s (27.73 tok/s, 3.25 a step), length
+memory: device 101.33 GiB (+0.00 since up), pinned 0.13 GiB (+0.06), graphs 1234 (1 made since up; 1.71 GiB, heap 0.61), host anon 1.70 GiB (heap in use 1.59, held free 0.13), file-backed 0.23 GiB
+request 5, GLM-5.3: 2.77 drafted / 2.25 accepted a round, copy rounds 2 (0 long, 3 accepted), miss rate 15.9% (prompt 19.8%, decode 15.5%; by score 13.3%), hot reads 2247 (kept 2244, 233 inline, 0.16 s waited), swaps 877 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0
+request 6: prompt 68 (12 cached), prefill 56 in 0.50 s (112 tok/s), decode 1024 in 37.00 s (27.65 tok/s, 3.18 a step), length
+memory: device 101.33 GiB (+0.00 since up), pinned 0.13 GiB (+0.06), graphs 1234 (1 made since up; 1.71 GiB, heap 0.61), host anon 1.70 GiB (heap in use 1.59, held free 0.13), file-backed 0.23 GiB
+request 6, GLM-5.3: 2.74 drafted / 2.18 accepted a round, copy rounds 2 (0 long, 2 accepted), miss rate 10.8% (prompt 12.4%, decode 10.8%; by score 8.5%), hot reads 837 (kept 840, 79 inline, 0.18 s waited), swaps 392 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0
+request 7: prompt 68 (14 cached), prefill 54 in 0.50 s (108 tok/s), decode 1024 in 35.38 s (28.92 tok/s, 3.41 a step), length
+memory: device 101.33 GiB (+0.00 since up), pinned 0.13 GiB (+0.06), graphs 1234 (1 made since up; 1.71 GiB, heap 0.61), host anon 1.70 GiB (heap in use 1.59, held free 0.13), file-backed 0.23 GiB
+request 7, GLM-5.3: 2.88 drafted / 2.41 accepted a round, copy rounds 3 (0 long, 12 accepted), miss rate 9.6% (prompt 11.8%, decode 9.5%; by score 7.5%), hot reads 589 (kept 589, 70 inline, 0.14 s waited), swaps 328 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0
+request 8: prompt 68 (14 cached), prefill 54 in 0.49 s (109 tok/s), decode 1024 in 37.91 s (26.98 tok/s, 3.10 a step), length
+memory: device 101.33 GiB (+0.00 since up), pinned 0.13 GiB (+0.06), graphs 1234 (1 made since up; 1.71 GiB, heap 0.61), host anon 1.70 GiB (heap in use 1.59, held free 0.12), file-backed 0.23 GiB
+request 8, GLM-5.3: 2.78 drafted / 2.10 accepted a round, copy rounds 4 (0 long, 5 accepted), miss rate 8.4% (prompt 11.6%, decode 8.3%; by score 6.6%), hot reads 514 (kept 514, 59 inline, 0.19 s waited), swaps 244 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0
+request 9: prompt 8219 (9 cached), prefill 8210 in 17.17 s (478 tok/s), decode 256 in 10.91 s (23.37 tok/s, 2.45 a step), length
+memory: device 101.33 GiB (+0.00 since up), pinned 0.13 GiB (+0.06), graphs 1234 (1 made since up; 1.71 GiB, heap 0.61), host anon 1.71 GiB (heap in use 1.66, held free 0.13), file-backed 0.23 GiB
+memory: 67.1 MB of pinned host memory allocated after launch, at crates/tidelm-glm/src/prefix.rs:413
+[prefix] saved [0, 8219) in 0.06 s
+request 9, GLM-5.3: 2.00 drafted / 1.45 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 35.2% (prompt 35.8%, decode 19.4%; by score 35.4%), hot reads 600 (kept 599, 43 inline, 0.10 s waited), swaps 768 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0
+request 10: prompt 8211 (9 cached), prefill 8202 in 17.08 s (480 tok/s), decode 256 in 12.66 s (20.15 tok/s, 1.80 a step), length
+memory: device 101.33 GiB (+0.00 since up), pinned 0.19 GiB (+0.12), graphs 1311 (78 made since up; 1.73 GiB, heap 0.64), host anon 1.72 GiB (heap in use 1.70, held free 0.10), file-backed 0.23 GiB
+[prefix] saved [0, 8211) in 0.04 s
+request 10, GLM-5.3: 1.26 drafted / 0.80 accepted a round, copy rounds 0 (0 long, 0 accepted), miss rate 16.2% (prompt 16.1%, decode 18.7%; by score 14.3%), hot reads 776 (kept 776, 65 inline, 0.06 s waited), swaps 768 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0
+request 11: prompt 8225 (11 cached), prefill 8214 in 17.26 s (476 tok/s), decode 256 in 11.56 s (22.06 tok/s, 2.06 a step), length
+memory: device 101.33 GiB (+0.00 since up), pinned 0.19 GiB (+0.12), graphs 1311 (78 made since up; 1.73 GiB, heap 0.64), host anon 1.72 GiB (heap in use 1.70, held free 0.10), file-backed 0.23 GiB
+[prefix] saved [0, 8225) in 0.04 s
+request 11, GLM-5.3: 1.49 drafted / 1.06 accepted a round, copy rounds 1 (1 long, 0 accepted), miss rate 8.3% (prompt 8.0%, decode 16.1%; by score 7.2%), hot reads 624 (kept 617, 56 inline, 0.07 s waited), swaps 768 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0
+request 12: prompt 8205 (10 cached), prefill 8195 in 16.99 s (482 tok/s), decode 256 in 12.35 s (20.64 tok/s, 1.90 a step), length
+memory: device 101.33 GiB (+0.00 since up), pinned 0.19 GiB (+0.12), graphs 1311 (78 made since up; 1.73 GiB, heap 0.64), host anon 1.72 GiB (heap in use 1.70, held free 0.10), file-backed 0.23 GiB
+[prefix] saved [0, 8205) in 0.03 s
+request 12, GLM-5.3: 1.45 drafted / 0.91 accepted a round, copy rounds 3 (3 long, 4 accepted), miss rate 5.1% (prompt 4.6%, decode 15.8%; by score 4.4%), hot reads 801 (kept 804, 68 inline, 0.07 s waited), swaps 768 (0.00 s waited), preload 0 (0 MB, 0.00 s), fallbacks 0

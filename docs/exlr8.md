@@ -296,14 +296,19 @@ inline rescue, so it weighs residency above precision. It also ranks the old `bi
 user found less capable than `bit322`: it says what the extra residents do, not which profile answers
 better.
 
-**Speed**, not `bench/bench.py`: live requests on one boot against `bit322`'s bench rows. A decode step
-took ~97 ms at ~2 tokens a step (`bit322` 102) and 114-119 ms at ~3 (`bit322` 118): a few percent for
-0.42 fewer bits a weight. Tokens a second follow the tokens a step, which the text sets. Generation
-gate 5 of 6: the HTML prompt ended on its own at 762 tokens with a complete page (another seed: 1,200
-tokens, pass), as `bit340`'s first run did.
+**Speed** (`bench/bench.py`, `results/rust-glm53-exlr8-bit280-20261121`, `bit322`'s protocol, 13,265
+residents): prose 22.06, code 27.65 tok/s (`bit322` 20.35 / 25.36: +8.4 / +9.0%), the 8K prompt's
+decode 20.64 (19.78), its first token 17.09 s (17.09). A decode step is 3-7% shorter (prose 96.8
+against 101.5 ms, code 114.9 against 118.3, 8K 92.2 against 99.2) for 0.42 fewer bits a weight, and
+decode misses fell to 4-5% on prose (7-8%) and 8-11% on code (14-17%); the rest of the gain is tokens a
+step (2.14 / 3.18 against 2.07 / 3.00), which the sampled text sets. Three days and two builds apart,
+so not an A/B. Live requests before it agreed on the step (~97 against 102 ms at ~2 tokens a step).
+Generation gate 5 of 6: the HTML prompt ended on its own at 762 tokens with a complete page (another
+seed: 1,200 tokens, pass), as `bit340`'s first run did.
 
 **In use**, about 40 minutes of its user's requests: "Hard to tell the difference." `bit322` stays
-the default and `bit280` is the alternative (`configs/glm53-exlr8-bit280.env.example`).
+the default and `bit280` is the alternative (`configs/glm53-exlr8-bit280.env.example`), 8-9% faster
+on the benchmark.
 
 Disk for `bit280`: 258.7 GB of the release's experts (106.7 GB more than `bit322`'s mirror held,
 fetched in 83 min beside a serving engine), a rank's pack 129.4 GB, and `bit322`'s dense directory.
