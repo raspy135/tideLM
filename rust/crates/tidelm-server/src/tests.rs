@@ -87,6 +87,8 @@ fn serve_with(text: Text, family: Family, eos: u32, max_seq: usize, api_keys: Ve
                         slots: 5, spare: 1, world: 2, busy: true, counters: vec![("hot reads", 7.0)],
                         events: vec![tidelm_engine::expert_map::MapEvent { seq: 9, at: 0.0, layer: 2, expert: 0, kind: tidelm_engine::expert_map::EV_HOT,
                                                                            share: 0.4219, victim: Some((1, 1)) }],
+                        routes: vec![tidelm_engine::expert_map::MapRoute { seq: 4, at: 0.0, lane: 1, pos: 12, token: 1000, topk: 2,
+                                                                           picks: vec![(0, 0.75, false), (2, 0.25, true), (1, 0.5, false), (2, 0.5, true)] }],
                     }));
                     continue;
                 }
@@ -740,4 +742,19 @@ fn expert_map_route() {
     assert_eq!((ev[0].as_u64(), &ev[2], &ev[3], &ev[4], &ev[5], &ev[6], &ev[7]), (Some(9), &json!(1), &json!(0), &json!(1), &json!(422), &json!(0), &json!(1)));
     assert_eq!(v["event_kinds"][1], "hot read");
     assert_eq!(v["engine"], json!("glm"));
+    // a token's route: its picks row by row; its text is the conversation's, so only a keyed request reads it
+    let r = &v["routes"][0];
+    assert_eq!((&r["seq"], &r["lane"], &r["pos"], &r["k"]), (&json!(4), &json!(1), &json!(12), &json!(2)));
+    assert_eq!((&r["experts"], &r["share"], &r["missed"]), (&json!([0, 2, 1, 2]), &json!([750, 250, 500, 500]), &json!("0101")));
+    assert!(r["token"].is_null() && v["tokens_shown"] == json!(false), "{r}");
+    assert_eq!((&v["route_seq"], &v["event_seq"], v["demand"].is_array()), (&json!(4), &json!(9), true));
+    let (status, _, body) = request(&addr, "GET", "/v1/expert-map", "Authorization: Bearer k1\r\n", "");
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(v["routes"][0]["token"].is_string() && v["tokens_shown"] == json!(true), "{}", v["routes"]);
+    // a page's fast poll: nothing it has seen, no usage rows
+    let (_, _, body) = request(&addr, "GET", "/v1/expert-map?since=4&events_since=9&demand=0", "", "");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!((v["routes"].as_array().map(Vec::len), v["events"].as_array().map(Vec::len)), (Some(0), Some(0)));
+    assert_eq!((&v["route_seq"], v["demand"].is_null(), &v["has_demand"]), (&json!(4), true, &json!(true)));
 }

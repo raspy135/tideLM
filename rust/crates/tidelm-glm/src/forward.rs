@@ -2590,6 +2590,7 @@ impl Engine {
         self.flash_commit(groups);
         let out = self.read_tokens(t)?;
         if t <= MAX_ROWS {
+            self.route_record(ids, groups); // the expert map's routes, from the table hot_plan reads
             self.hot_plan(ids, groups[0].2)?; // wider passes leave no candidates (moe_exact)
         }
         Ok(out)

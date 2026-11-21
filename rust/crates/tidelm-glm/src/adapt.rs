@@ -92,6 +92,10 @@ pub struct Res {
     /// the recent residency events and their causes, for the expert map (host bookkeeping: read by
     /// nothing that decides anything)
     pub events: tidelm_engine::expert_map::EventLog,
+    /// the decoded tokens' routing, for the expert map (the same: bookkeeping only), and each lane's last pass's
+    /// drafted rows (lane, first position, [(token, picks)]) until the lane's next pass shows which were accepted
+    pub routes: tidelm_engine::expert_map::RouteLog,
+    pub route_pending: Vec<(usize, usize, Vec<(u32, Vec<(u16, f32, bool)>)>)>,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -456,7 +460,8 @@ impl Res {
         Res { owner, swap_layers, score: vec![0.0; nl * e], bg_score: vec![0.0; nl * e], bg_slow: vec![0.0; nl * e],
               victim_slow: false, bg_last: vec![0.0; nl * e],
               bg_until: vec![0; nl * e], bg_period: 0, hot_q: vec![], db_mass: None, db_tokens: 0, db_path: None,
-              demand_tokens: 0, stats: ResStats::default(), events: Default::default() }
+              demand_tokens: 0, stats: ResStats::default(), events: Default::default(),
+              routes: Default::default(), route_pending: Vec::new() }
     }
 }
 
@@ -532,10 +537,12 @@ impl Engine {
         if s.preload > 0 {
             counters.push(("preloaded", s.preload as f64));
         }
-        // the last six seconds' events (the page polls each second and replays them at their own spacing)
+        // the last six seconds' events (the page replays them at their own spacing) and routes (the server sends a
+        // page only those it has not seen)
         let events = self.res.events.recent(6.0, 4000);
+        let routes = self.res.routes.recent(6.0, 400);
         ExpertMap { layers, experts: e, state, demand, slots: self.res.owner.len(), spare: self.hot.is_some() as usize, world: self.world, busy,
-                    counters, events }
+                    counters, events, routes }
     }
 
     pub(crate) fn push_lut(&mut self) -> Result<()> {
@@ -1049,6 +1056,44 @@ impl Engine {
         self.res.stats.hot_unkept += 1;
         self.res.events.push(l, x, tidelm_engine::expert_map::EV_DROPPED, share, None);
         Ok(())
+    }
+
+    /// The expert map's routes (host bookkeeping, decides nothing), after a decode pass of `ids` over `groups` (each
+    /// (lane, rows, first position)): every row's picks are in the async hot reads' table, already on the host. A
+    /// lane's first row is a token fed, kept now; its drafted rows wait for the lane's next pass, whose first position
+    /// says how many were accepted (a draft never accepted is not a token, and the lane's last drafts go unseen).
+    pub(crate) fn route_record(&mut self, ids: &[u32], groups: &[(usize, usize, usize)]) {
+        let n = self.moe_layers().len();
+        let Some(a) = self.hot.as_ref().and_then(|h| h.asynch.as_ref()) else { return };
+        let k = self.cfg.topk;
+        let w = crate::weights::MAX_ROWS * k * 2;
+        let picks = |r: usize| -> Vec<(u16, f32, bool)> {
+            (0..n).flat_map(|i| (0..k).map(move |j| {
+                let o = i * w + (r * k + j) * 2;
+                let v = a.table[o];
+                (a.table[o + 1] as u16, v.abs(), v > 0.0)
+            })).collect()
+        };
+        let mut row = 0;
+        for &(lane, rows, pos0) in groups {
+            if rows == 0 || row + rows > ids.len() {
+                break;
+            }
+            if let Some(i) = self.res.route_pending.iter().position(|p| p.0 == lane) {
+                let (_, p0, drafts) = self.res.route_pending.swap_remove(i);
+                for (d, (tok, p)) in drafts.into_iter().enumerate() {
+                    if p0 + 1 + d < pos0 {
+                        self.res.routes.push(lane, p0 + 1 + d, tok, k, p);
+                    }
+                }
+            }
+            self.res.routes.push(lane, pos0, ids[row], k, picks(row));
+            let drafts: Vec<(u32, Vec<(u16, f32, bool)>)> = (1..rows).map(|r| (ids[row + r], picks(row + r))).collect();
+            if !drafts.is_empty() {
+                self.res.route_pending.push((lane, pos0, drafts));
+            }
+            row += rows;
+        }
     }
 
     /// A new pass: no reads yet.

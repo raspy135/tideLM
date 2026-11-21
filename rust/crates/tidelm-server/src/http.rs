@@ -15,6 +15,11 @@ pub struct Request {
     pub sent_key: bool,
     /// the server wants a key and none sent matched: the body was not read
     pub refused: bool,
+    /// the server wants no key, or one sent matched (an open route answers either way; the expert map sends the
+    /// routed tokens' text only to a keyed request)
+    pub keyed: bool,
+    /// the target's query, after "?" ("" without one)
+    pub query: String,
 }
 
 /// A client-visible error in OpenAI's shape.
@@ -47,7 +52,8 @@ fn read_request(stream: &TcpStream, api_keys: &[String]) -> std::io::Result<Opti
     let mut parts = line.split_whitespace();
     let (method, target) = (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("").to_string());
     // the query goes; a trailing "/" goes too (Claude Code posts /v1/messages?beta=true)
-    let path = target.split('?').next().unwrap_or("").trim_end_matches('/').to_string();
+    let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
+    let (path, query) = (path.trim_end_matches('/').to_string(), query.to_string());
     let (mut len, mut keys) = (0usize, vec![]);
     loop {
         let mut h = String::new();
@@ -69,10 +75,11 @@ fn read_request(stream: &TcpStream, api_keys: &[String]) -> std::io::Result<Opti
             }
         }
     }
-    let refused = !api_keys.is_empty() && !open_route(&method, &path) && !key_ok(api_keys, &keys);
+    let keyed = api_keys.is_empty() || key_ok(api_keys, &keys);
+    let refused = !keyed && !open_route(&method, &path);
     let mut body = vec![0u8; if refused { 0 } else { len }];
     r.read_exact(&mut body)?;
-    Ok(Some(Request { method, path, body, sent_key: !keys.is_empty(), refused }))
+    Ok(Some(Request { method, path, body, sent_key: !keys.is_empty(), refused, keyed, query }))
 }
 
 fn reason(status: u16) -> &'static str {
@@ -151,7 +158,7 @@ pub fn serve(mut stream: TcpStream, ctx: &Ctx) {
     }
     let res = match (req.method.as_str(), path) {
         ("GET", "/expert-map") => send_html(&mut stream, crate::expert_map::PAGE).map_err(Into::into),
-        ("GET", "/v1/expert-map") => crate::expert_map::serve(&mut stream, ctx),
+        ("GET", "/v1/expert-map") => crate::expert_map::serve(&mut stream, ctx, &req.query, req.keyed),
         (m, p) if open_route(m, p) => send_json(&mut stream, 200, &serde_json::json!({"status": "ok", "engine": "tidelm-rust"})).map_err(Into::into),
         ("GET", "/v1/models") => send_json(&mut stream, 200, &serde_json::json!({
             "object": "list",
