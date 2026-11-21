@@ -364,7 +364,7 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
     let addr = format!("{}:{}", arg(args, "--host").unwrap_or_else(|| "0.0.0.0".into()),
                        arg(args, "--port").unwrap_or_else(|| "8000".into()));
     let listener = TcpListener::bind(&addr)?;
-    eprintln!("engine up in {:.1}s; serving {} on {addr} (GLM, depth {}, {})", t0.elapsed().as_secs_f64(), ctx.model,
+    eprintln!("engine up in {:.1}s; serving {} on {addr} ({}, depth {}, {})", t0.elapsed().as_secs_f64(), ctx.model, srv.eng.cfg.arch.name(),
               srv.opt.depth, match srv.opt.cal { Some(t) => format!("calibrated gate {t}"), None => format!("flat gate {}", srv.opt.dyn_gate) });
     eprintln!("api keys: {}", match ctx.api_keys.len() {
         0 => "none (TIDELM_API_KEY unset: every client is answered)".to_string(),

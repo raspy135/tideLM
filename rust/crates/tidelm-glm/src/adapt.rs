@@ -1204,7 +1204,7 @@ impl Engine {
         let mut f = std::fs::File::create(path)?;
         f.write_all(&b)?;
         self.hot.as_mut().unwrap().asynch.as_mut().unwrap().trace = Some(f);
-        eprintln!("[glm] hot trace: {path}");
+        eprintln!("{} hot trace: {path}", self.cfg.arch.tag());
         Ok(())
     }
 
@@ -1375,7 +1375,7 @@ impl Engine {
             let (path, min) = HotOracle::spec(&v, self.rank)?;
             let o = HotOracle::load(&path, min, &self.moe_layers().to_vec(), self.cfg.experts, self.cfg.topk)?;
             let (np, nm) = o.summary();
-            eprintln!("[glm] hot oracle: {path}, misses >= {min}: {nm} in {np} passes");
+            eprintln!("{} hot oracle: {path}, misses >= {min}: {nm} in {np} passes", self.cfg.arch.tag());
             self.hot.as_mut().unwrap().asynch.as_mut().unwrap().oracle = Some(o);
         }
         ck(0, "")

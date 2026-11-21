@@ -824,8 +824,8 @@ impl Server {
                     let (mb, s) = (self.eng.res.stats.preload_mb, self.eng.res.stats.preload_s);
                     let n = self.eng.preload(m, self.opt.preload)?;
                     let (mbytes, secs) = (self.eng.res.stats.preload_mb, self.eng.res.stats.preload_s);
-                    (self.log)(&format!("[glm] preload request {}: {} experts of its conversation's demand, \
-                                         {} MB read, {:.2} s", run.job.id, n, (mbytes - mb) / 1_000_000, secs - s));
+                    (self.log)(&format!("{} preload request {}: {} experts of its conversation's demand, \
+                                         {} MB read, {:.2} s", self.eng.cfg.arch.tag(), run.job.id, n, (mbytes - mb) / 1_000_000, secs - s));
                 }
             }
         }
@@ -999,10 +999,10 @@ impl Server {
         } else {
             String::new()
         };
-        let line = format!("request {}, GLM: {:.2} drafted / {:.2} accepted a round, copy rounds {} ({} long, {} accepted), \
+        let line = format!("request {}, {}: {:.2} drafted / {:.2} accepted a round, copy rounds {} ({} long, {} accepted), \
                             miss rate {:.1}% (prompt {:.1}%, decode {:.1}%; by score {:.1}%), hot reads {} (kept {}, {} inline, {:.2} s waited), \
                             swaps {} ({:.2} s waited), preload {} ({} MB, {:.2} s), fallbacks {}{nan}{beside}{listed}",
-                           run.job.id, s.drafted as f64 / rounds, s.accepted as f64 / rounds, s.copy_rounds, s.long_copies,
+                           run.job.id, self.eng.cfg.arch.name(), s.drafted as f64 / rounds, s.accepted as f64 / rounds, s.copy_rounds, s.long_copies,
                            s.copy_accepted, pct(p[0] + d[0], p[1] + d[1]), pct(p[0], p[1]), pct(d[0], d[1]),
                            pct(p[2] + d[2], p[3] + d[3]), r1.hot_reads - r0.hot_reads, r1.hot_kept - r0.hot_kept,
                            r1.hot_rescue - r0.hot_rescue, r1.hot_wait_s - r0.hot_wait_s, r1.swaps - r0.swaps,

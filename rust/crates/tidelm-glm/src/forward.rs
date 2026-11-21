@@ -505,6 +505,8 @@ impl Engine {
     pub fn load(model_dir: &Path, opt: Options, rank: usize, world: usize, pair: Option<Pair>,
                 residents: &[(usize, usize)], log: &dyn Fn(&str)) -> Result<Self> {
         let cfg = GlmConfig::load(model_dir)?;
+        // the boot lines name the family ("[inkling] KV cache ..."), as flash.rs and inkling.rs do their weight loads
+        let tag = cfg.arch.tag();
         if cfg.is_flash() && opt.kv_split && world > 1 {
             // the split cache is GLM-5.3's MLA path (its decode gathers merge the ranks' positions);
             // GLM-5.3-Flash's sparse attention reads a whole cache on each rank
@@ -549,7 +551,7 @@ impl Engine {
         }
         let t0 = std::time::Instant::now();
         let w = Weights::load(model_dir, &cfg, rank, world, opt.max_seq, &st, log)?;
-        log(&format!("[glm] dense weights {:.2} GB a rank in {:.0} s", w.bytes as f64 / 1e9, t0.elapsed().as_secs_f64()));
+        log(&format!("{tag} dense weights {:.2} GB a rank in {:.0} s", w.bytes as f64 / 1e9, t0.elapsed().as_secs_f64()));
         let nl = cfg.n_layers();
         let e = cfg.experts;
         // the decoder arena: a class of slots for each width triple among the residents and a
@@ -566,7 +568,7 @@ impl Engine {
         load_slots(&pack, &arena, &placed)?;
         let widths: Vec<String> = arena.classes.iter().filter(|c| c.n > 1 || arena.classes.len() == 1)
             .map(|c| format!("{}/{}/{} x{}", c.bits[0], c.bits[1], c.bits[2], c.n)).collect();
-        log(&format!("[glm] {} routed experts resident ({:.1} GB; {}) in {:.0} s", residents.len(), arena.bytes() as f64 / 1e9,
+        log(&format!("{tag} {} routed experts resident ({:.1} GB; {}) in {:.0} s", residents.len(), arena.bytes() as f64 / 1e9,
                      widths.join(", "), t1.elapsed().as_secs_f64()));
         let mtp_arena = if cfg.mtp {
             let l = cfg.mtp_layer();
@@ -634,7 +636,7 @@ impl Engine {
         let ablit = crate::ablit::load(cfg.layers, cfg.hidden)?;
         if let (Some(ab), Some(p)) = (ablit.as_ref(), crate::ablit::path()) {
             let (lo, hi) = (ab.layers.iter().min().unwrap(), ab.layers.iter().max().unwrap());
-            log(&format!("[glm] ablit: {} layers ({lo}-{hi}), alpha {:.3}-{:.3}, from {} (sha256 {})", ab.layers.len(),
+            log(&format!("{tag} ablit: {} layers ({lo}-{hi}), alpha {:.3}-{:.3}, from {} (sha256 {})", ab.layers.len(),
                          ab.alpha.iter().cloned().fold(f32::INFINITY, f32::min), ab.alpha.iter().cloned().fold(0.0, f32::max),
                          p.display(), crate::ablit::digest()?));
         }
@@ -660,7 +662,7 @@ impl Engine {
             i += rows.len();
             kv.push(lk);
         }
-        log(&format!("[glm] KV cache {:.2} GB a rank ({} positions a lane{}, {} over {lanes} lane{})",
+        log(&format!("{tag} KV cache {:.2} GB a rank ({} positions a lane{}, {} over {lanes} lane{})",
                      (pool * gran) as f64 / 1e9, opt.max_seq, if opt.kv_split { ", split" } else { "" },
                      opt.kv_tokens.max(opt.max_seq), if lanes > 1 { "s" } else { "" }));
         let act = Act::new(&cfg, &opt, hl, vl, s_loc, n_slots, lanes)?;

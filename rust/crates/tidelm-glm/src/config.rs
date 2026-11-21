@@ -19,6 +19,28 @@ pub enum Arch {
     Inkling2,
 }
 
+impl Arch {
+    /// The family's name in the server log: "request 3, Inkling 2: ...", "(Inkling 2, depth 7, ...)". The crate
+    /// is tidelm-glm because GLM-5.3 came first; it serves all three, and a log that says GLM while Inkling
+    /// answers misleads.
+    pub fn name(self) -> &'static str {
+        match self {
+            Arch::Glm53 => "GLM-5.3",
+            Arch::Flash => "GLM-5.3-Flash",
+            Arch::Inkling2 => "Inkling 2",
+        }
+    }
+
+    /// The boot log's tag, the one flash.rs and inkling.rs already print their weight loads under
+    pub fn tag(self) -> &'static str {
+        match self {
+            Arch::Glm53 => "[glm]",
+            Arch::Flash => "[flash]",
+            Arch::Inkling2 => "[inkling]",
+        }
+    }
+}
+
 /// A layer's attention.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttnKind {
