@@ -46,6 +46,13 @@ experts, in step with the residents each held ([`bit322` on the pair](docs/exlr8
 `bit340`, tried first, held 10,946 and was dropped for its answers. The EXL3 2.75 bpw profile before
 exlr8 is still served: its setup is in the [install guide](docs/install.md).
 
+`bit280` (2.80 bpw) is the alternative, from the same release and dense weights, and beside `bit322`
+it is one more fetch and pack ([`bit280`](#glm-53-exlr8-bit280-glm53-exlr8-bit280)). It holds 13,264
+experts in the same memory, its held-out NLL at fixed residents is lower (1.890 against 1.907), the
+release measures it further from the unquantized model with every expert loaded, and its decode steps
+time within a few percent of `bit322`'s. In use the two were hard to tell apart; `bit322` stays the
+default ([`bit280` on the pair](docs/exlr8.md#bit280-280-bpw-2026-11-21)).
+
 GLM-5.3-Flash is served from Mia's AI Lab's
 [EXL3 4 bpw](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold) (every routed
 expert at 4 bits) on **one Spark**: its non-expert weights in FP8, 60.2% of its routed experts
@@ -134,6 +141,7 @@ are set up is one `scripts/tide.sh start`.
 | --- | --- | ---: | ---: |
 | [`ds41-mxfp4`](#deepseek-v41-flash-ds41-mxfp4) | DeepSeek-V4.1-Flash-1017 | 510 GB | |
 | [`glm53-exlr8-bit322`](#glm-53-exlr8-bit322-glm53-exlr8-bit322) | GLM-5.3, exlr8 `bit322` | 170 GB | 305 GB |
+| [`glm53-exlr8-bit280`](#glm-53-exlr8-bit280-glm53-exlr8-bit280) | GLM-5.3, exlr8 `bit280` (the alternative) | 150 GB (129 GB beside `bit322`) | 267 GB (107 GB beside `bit322`) |
 | [`glm53-flash-40-tp1`](#glm-53-flash-4-bpw-glm53-flash-40-tp1-glm53-flash-40-tp2) | GLM-5.3-Flash, EXL3 4 bpw, one Spark | 176 GB (one node) | |
 | [`glm53-flash-40-tp2`](#glm-53-flash-4-bpw-glm53-flash-40-tp1-glm53-flash-40-tp2) | GLM-5.3-Flash, EXL3 4 bpw | 98 GB | 156 GB |
 | [`inkling2-small-40-tp2`](#inkling-2-small-inkling2-small-40-tp2) | Inkling-2-Small, EXL3 4 bpw | 165 GB | 294 GB |
@@ -241,8 +249,28 @@ the shared experts in it changed codebook with 0.6.
 scripts/tide.sh start .env.glm53-exlr8-bit322
 ```
 
-Another profile of the release (`bit300`, `bit340`, ...) is the same steps with its `--manifest`
-and its pack in `GLM_EXL3_PACK`: the fetch adds only the bytes the mirror lacks.
+### GLM-5.3, exlr8 `bit280` (`glm53-exlr8-bit280`)
+
+The release's `bit280` profile (2.80 bpw: gate and up at 2 bits in layers 3-22, down at 2 in 3-12 and
+4 in 48-52, 3 bits elsewhere), from the same 0.7 weights as `bit322` and served with the same dense
+directory: the two name the same shared-expert widths. On a pair set up for `bit322` it is one more
+fetch (the 107 GB the mirror lacks) and a 129 GB pack on each node, with the tools and cautions of
+`bit322`'s step 4:
+
+```bash
+cp configs/glm53-exlr8-bit280.env.example .env.glm53-exlr8-bit280    # bit322's paths
+python3 tools/exlr8_fetch.py --manifest bit280 --out <exlr8 dir>
+python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest bit280 --rank 0 \
+    --out <packs dir>/glm-exlr8-bit280-r0of2.bin
+python3 tools/glm_pack_exlr8.py --source <exlr8 dir> --manifest bit280 --rank 1 --out - | \
+    ssh <worker> 'cat > <packs dir>/glm-exlr8-bit280-r1of2.bin'
+scripts/tide.sh start .env.glm53-exlr8-bit280
+```
+
+On its own it is `bit322`'s five steps with `--manifest bit280` (259 GB of experts to fetch), and
+either profile's dense directory serves both. Other profiles of the release (`bit300`, `bit340`, ...)
+are the same steps with their `--manifest` and their pack in `GLM_EXL3_PACK`: the fetch adds only
+the bytes the mirror lacks.
 
 ### GLM-5.3-Flash 4 bpw (`glm53-flash-40-tp1`, `glm53-flash-40-tp2`)
 
