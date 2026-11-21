@@ -5,159 +5,180 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Expert map</title>
 <style>
+/* A specimen plate: serif type, a gray stage lit from the middle, experts as cells and routes as stained fibres.
+   Marks only carry colour (text stays in the ink tones). Stains, checked on the gray field (dataviz
+   validate_palette.js, contrast vs surface >= 3:1, normal-vision separation >= 15): eosin for a missed pick, a
+   violet for a read after a miss, a fluorescent green for an adaptive load - each also named in the key and the
+   observations, and drawn with its own mark. */
 :root {
-  color-scheme: light;
-  --page: #f9f9f7; --surface: #fcfcfb;
-  --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
-  --hair: #e1e0d9; --axis: #c3c2b7;
-  --absent: #e6e5df;
-  --resident: #2a78d6; --hot: #eb6834; --loading: #1baf7a;
-  --seq-res-0: #cde2fb; --seq-res-1: #2a78d6; --seq-res-2: #0d366b;
-  --seq-abs-0: #fbe3d6; --seq-abs-1: #eb6834; --seq-abs-2: #7a2c0d;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    color-scheme: dark;
-    --page: #0d0d0d; --surface: #1a1a19;
-    --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
-    --hair: #2c2c2a; --axis: #383835;
-    --absent: #2a2a28;
-    --resident: #3987e5; --hot: #d95926; --loading: #199e70;
-    --seq-res-0: #0d366b; --seq-res-1: #3987e5; --seq-res-2: #cde2fb;
-    --seq-abs-0: #5a200a; --seq-abs-1: #d95926; --seq-abs-2: #fbd9c7;
-  }
+  color-scheme: dark;
+  --page: #34373a; --panel: #3a3d41; --field-hi: #4a4e53; --field-lo: #2f3134; --fog: #3d4044;
+  --rule: #4f5459; --rule-2: #5e6369;
+  --ink: #f1ebdd; --ink-2: #d2cbbc; --muted: #a59f92; --faint: #7f7b72;
+  --cell: #b3ab9b; --cell-off: #27292c; --fibre: #f6eedb;
+  --miss: #e8749f; --read: #a493f5; --load: #5fd08f;
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", "URW Palladio L", P052, Georgia, "DejaVu Serif", serif;
 }
 * { box-sizing: border-box; }
-html { background: var(--page); }
-body { margin: 0 auto; max-width: 1500px; padding: 20px 24px 40px; color: var(--ink); background: var(--page);
-       font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
-h1 { font-size: 20px; font-weight: 600; margin: 0; }
-h2 { font-size: 14px; font-weight: 600; margin: 28px 0 8px; }
-p { margin: 4px 0; color: var(--ink-2); max-width: 80ch; }
-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; }
-#what { color: var(--ink-2); }
-#live { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }
-#status { color: var(--ink-2); }
-#pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); position: relative; flex: none; }
-#pulse.live { background: var(--loading); }
-#pulse.bad { background: var(--hot); }
-
-#status.bad { color: var(--ink); font-weight: 600; }
-
-#stats { display: flex; flex-wrap: wrap; gap: 6px 36px; margin: 18px 0 4px; padding: 0; }
-#stats div { min-width: 0; }
-#stats dt { color: var(--ink-2); font-size: 12px; }
-#stats dd { margin: 0; font-size: 20px; }
-#stats dd small { font-size: 13px; color: var(--ink-2); }
-#note { min-height: 1.45em; }
-#stats div.link { cursor: pointer; border-radius: 6px; padding: 3px 8px 4px; margin: -3px -8px -4px; transition: background .15s; }
-#stats div.link:hover, #stats div.link:focus-visible { background: var(--hair); outline: none; }
-#stats div.link[aria-pressed="true"] { background: var(--hair); box-shadow: inset 0 0 0 1.5px var(--ink); }
-#stats div.link dt::after { content: " ›"; color: var(--muted); }
-#stats div.tick { animation: tick 1.1s ease-out; }
-@keyframes tick { from { box-shadow: inset 0 -3px 0 var(--tick); } to { box-shadow: inset 0 -3px 0 transparent; } }
-#spot { min-height: 1.45em; color: var(--ink); margin-top: 6px; }
-#spot b { font-weight: 600; }
-
-#controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 22px; margin: 18px 0 10px; }
-fieldset { border: 0; margin: 0; padding: 0; display: flex; align-items: center; gap: 6px; }
-legend { float: left; padding: 0; margin-right: 8px; color: var(--ink-2); }
-.seg { display: inline-flex; }
-.seg label { position: relative; }
-.seg input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
-.seg span { display: block; padding: 4px 11px; border: 1px solid var(--axis); margin-left: -1px; background: var(--surface); }
-.seg label:first-child span { border-radius: 4px 0 0 4px; margin-left: 0; }
-.seg label:last-child span { border-radius: 0 4px 4px 0; }
-.seg input:checked + span { background: var(--ink); color: var(--page); border-color: var(--ink); }
-.seg input:focus-visible + span { outline: 2px solid var(--resident); outline-offset: 2px; }
-.seg input:disabled + span { color: var(--muted); }
-button { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--axis); border-radius: 4px; padding: 4px 11px; cursor: pointer; }
-button:focus-visible, canvas:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--resident); outline-offset: 2px; }
-
-#key { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 14px 0; }
-#key input { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--axis); border-radius: 4px; padding: 4px 8px; width: 28ch; }
-
-#legend { display: flex; flex-wrap: wrap; gap: 4px 18px; color: var(--ink-2); font-size: 13px; margin: 0 0 8px; padding: 0; list-style: none; }
-#legend li { display: flex; align-items: center; gap: 6px; }
-#legend i { width: 11px; height: 11px; display: inline-block; }
-#legend .ramp { width: 72px; }
-#legend .ring { background: none; outline: 1.5px solid var(--ink); outline-offset: -1.5px; }
-#legend .comet { width: 28px; height: 4px; background: linear-gradient(to right, var(--loading), transparent) !important; }
-#legend .streak { width: 28px; height: 5px; }
-#legend .dots { width: 28px; height: 4px; background: repeating-linear-gradient(to right, var(--resident) 0 4px, transparent 4px 7px) !important; }
-@media (prefers-reduced-motion: reduce) { #stats div.tick { animation: none; } #cursor { transition: none; } }
-
-#plot { position: relative; display: inline-block; max-width: 100%; vertical-align: top; background: var(--surface); border: 1px solid var(--hair); padding: 10px 12px 12px; overflow-x: auto; }
-canvas { display: block; }
-#cursor { position: absolute; pointer-events: none; outline: 1.5px solid var(--ink); display: none;
-          transition: left .1s ease-out, top .1s ease-out; }
-#tip { position: absolute; pointer-events: none; display: none; z-index: 2; background: var(--surface); color: var(--ink);
-       border: 1px solid var(--axis); padding: 6px 9px; font-size: 13px; white-space: nowrap; box-shadow: 0 1px 4px rgba(0,0,0,.18); }
-#tip b { font-weight: 600; }
-#tip span { color: var(--ink-2); }
-
-#log { margin: 0; padding: 0; list-style: none; font-variant-numeric: tabular-nums; color: var(--ink-2); }
-#log li { padding: 2px 0; }
-#log time { color: var(--ink); margin-right: 10px; }
-details { margin-top: 28px; }
-summary { cursor: pointer; font-weight: 600; }
-table { border-collapse: collapse; margin-top: 8px; font-variant-numeric: tabular-nums; }
-th, td { text-align: right; padding: 3px 18px 3px 0; border-bottom: 1px solid var(--hair); font-weight: 400; }
-th { color: var(--ink-2); font-size: 12px; }
-th:first-child, td:first-child { text-align: left; }
+html, body { margin: 0; background: var(--page); color: var(--ink); }
+body { font: 15px/1.45 var(--serif); font-variant-numeric: lining-nums tabular-nums; }
+button, input { font: inherit; color: inherit; }
+:focus-visible { outline: 1.5px solid var(--ink); outline-offset: 2px; }
 [hidden] { display: none !important; }
+
+.page { max-width: 1680px; margin: 0 auto; padding: 18px 24px 12px; display: grid; grid-template-columns: minmax(0, 1fr) 330px;
+        grid-template-rows: auto auto minmax(0, 1fr) auto; grid-template-areas: "head head" "notes notes" "field margin" "foot foot";
+        gap: 0 28px; height: 100vh; min-height: 660px; }
+
+header { grid-area: head; display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px 28px; padding-bottom: 10px; border-bottom: 1px solid var(--rule); }
+h1 { margin: 0; font-weight: 400; font-size: 30px; letter-spacing: .01em; line-height: 1.1; }
+.sub { margin: 3px 0 0; color: var(--ink-2); font-size: 14.5px; }
+.sub i { color: var(--muted); }
+.ctl { margin-left: auto; display: flex; flex-wrap: wrap; gap: 4px 18px; align-items: baseline; font-size: 13.5px; color: var(--muted); }
+.opt { display: inline-flex; gap: 2px; align-items: baseline; }
+.opt > span { margin-right: 4px; font-variant: small-caps; letter-spacing: .06em; text-transform: lowercase; }
+.opt button { background: none; border: 0; padding: 0 3px; cursor: pointer; color: var(--muted); font-style: italic; }
+.opt button + button::before { content: "·"; color: var(--faint); margin-right: 5px; font-style: normal; display: inline-block; text-decoration: none; }
+.opt button[aria-pressed="true"] { color: var(--ink); font-style: normal; text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.opt button:disabled { opacity: .4; cursor: default; }
+#pause { background: none; border: 1px solid var(--rule-2); border-radius: 12px; padding: 0 10px; cursor: pointer; color: var(--ink-2); font-style: italic; }
+
+#notes { grid-area: notes; display: flex; flex-wrap: wrap; gap: 2px 26px; margin: 10px 0 12px; }
+#notes div { display: flex; align-items: baseline; gap: 7px; }
+#notes dt { font-variant: small-caps; letter-spacing: .06em; text-transform: lowercase; color: var(--muted); font-size: 14px; }
+#notes dd { margin: 0; font-size: 21px; }
+#notes dd small { font-size: 13px; color: var(--muted); font-style: italic; margin-left: 4px; }
+
+figure.field { grid-area: field; margin: 0; display: grid; grid-template-columns: 38px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; min-height: 0; }
+#focal { grid-row: 1; display: flex; flex-direction: column-reverse; justify-content: center; gap: 1px; padding: 8px 6px 8px 0; min-height: 0; }
+#focal.down { flex-direction: column; }
+#focal button { flex: 1 1 0; min-height: 3px; max-height: 14px; padding: 0; border: 0; background: none; cursor: pointer; display: flex; align-items: center; gap: 3px; }
+#focal button i { display: block; height: 2px; background: var(--ink-2); opacity: .55; border-radius: 1px; transition: width .3s, opacity .3s; }
+#focal button b { width: 4px; height: 4px; border-radius: 50%; background: var(--miss); opacity: 0; flex: none; transition: opacity .3s; }
+#focal button.on i { opacity: 1; background: var(--ink); }
+#focal button:hover i { opacity: 1; }
+#plot { grid-row: 1; grid-column: 2; position: relative; min-height: 0; overflow: auto; border-radius: 6px; background: var(--field-lo); }
+#plot.brain { overflow: hidden; } #plot.brain #map { cursor: grab; touch-action: none; } #plot.brain #map.drag { cursor: grabbing; }
+#gl { position: absolute; left: 0; top: 0; } #map { position: relative; } #plot:not(.brain) #gl { display: none; }
+canvas { display: block; }
+figcaption { grid-column: 2; font-size: 13.5px; color: var(--ink-2); padding: 7px 2px 0; }
+figcaption b { font-weight: 600; font-variant: small-caps; letter-spacing: .05em; text-transform: lowercase; }
+#tip { position: absolute; pointer-events: none; display: none; z-index: 3; background: rgba(58,61,65,.97); color: var(--ink);
+       border: 1px solid var(--rule-2); border-radius: 4px; padding: 7px 10px; font-size: 13.5px; line-height: 1.4; max-width: 340px;
+       box-shadow: 0 6px 20px rgba(0,0,0,.35); }
+#tip .k { font-variant: small-caps; letter-spacing: .05em; color: var(--muted); }
+#tip span { color: var(--ink-2); }
+#keyform { grid-column: 2; margin: 8px 0; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; color: var(--ink-2); }
+#keyform input, #tokkey input { background: var(--page); border: 1px solid var(--rule-2); border-radius: 4px; padding: 2px 7px; width: 22ch; font-size: 13px; }
+#keyform button, #tokkey button { background: none; border: 1px solid var(--rule-2); border-radius: 12px; padding: 1px 10px; cursor: pointer; font-style: italic; font-size: 13px; }
+
+aside { grid-area: margin; display: flex; flex-direction: column; min-height: 0; border-left: 1px solid var(--rule); padding-left: 22px; }
+aside h2 { font-weight: 400; font-size: 14px; font-variant: small-caps; letter-spacing: .08em; text-transform: lowercase; color: var(--muted);
+           margin: 2px 0 6px; display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+#signals { list-style: none; margin: 0 0 10px; padding: 0; overflow-y: auto; flex: 0 1 auto; min-height: 120px; }
+.grp { font-style: italic; color: var(--muted); font-size: 13.5px; margin: 8px 0 2px; }
+.sig { display: grid; grid-template-columns: 16px 1fr auto; gap: 0 9px; padding: 4px 6px 5px 4px; margin: 0 0 1px -6px; border-left: 2px solid transparent;
+       cursor: pointer; color: var(--ink-2); border-radius: 0 4px 4px 0; }
+.sig:hover { background: rgba(255,255,255,.035); }
+.sig .sw { width: 9px; height: 9px; border-radius: 50%; margin-top: 6px; box-shadow: 0 0 0 2px rgba(255,255,255,.06); }
+.sig b { color: var(--ink); font-weight: 400; font-size: 15.5px; }
+.sig .n { color: var(--muted); font-size: 13px; text-align: right; white-space: nowrap; }
+.sig .desc { grid-column: 2 / 4; font-size: 13px; font-style: italic; color: var(--muted); line-height: 1.3; }
+.sig[aria-pressed="true"] { border-left-color: var(--ink); background: rgba(255,255,255,.06); }
+.sig[aria-pressed="true"] b { text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+
+.obs { display: flex; flex-direction: column; flex: 1 1 0; min-height: 160px; border-top: 1px solid var(--rule); padding-top: 10px; }
+#lock { font-size: 12.5px; font-variant: normal; letter-spacing: 0; text-transform: none; font-style: italic; color: var(--faint); display: flex; gap: 6px; align-items: baseline; }
+#tokkey { display: inline-flex; gap: 4px; }
+#tokkey input { width: 11ch; }
+#log { flex: 1; overflow-y: auto; margin: 0; padding: 0 4px 0 0; list-style: none; font-size: 13.5px; line-height: 1.5; color: var(--ink-2); scrollbar-width: thin; }
+#log li { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#log time { color: var(--faint); font-size: 12px; margin-right: 8px; }
+#log q { color: var(--ink); quotes: "‘" "’"; font-style: italic; }
+#log .sw { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin: 0 6px 1px 0; vertical-align: middle; }
+#log .d { color: var(--muted); }
+#log .first { color: var(--muted); font-style: italic; }
+
+footer { grid-area: foot; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 20px; padding: 8px 0 0; margin-top: 8px;
+         border-top: 1px solid var(--rule); font-size: 13px; color: var(--muted); font-style: italic; }
+#sel b { font-style: normal; color: var(--ink); font-weight: 400; }
+#status.bad { color: var(--ink); font-style: normal; }
+
+details.data { max-width: 1680px; margin: 0 auto; padding: 4px 24px 30px; color: var(--ink-2); }
+details.data summary { cursor: pointer; font-variant: small-caps; letter-spacing: .06em; text-transform: lowercase; color: var(--muted); padding: 8px 0; }
+table { border-collapse: collapse; font-size: 13.5px; }
+th, td { text-align: right; padding: 3px 18px 3px 0; border-bottom: 1px solid var(--rule); font-weight: 400; }
+th { color: var(--muted); font-variant: small-caps; letter-spacing: .04em; } th:first-child, td:first-child { text-align: left; }
+
+@media (max-width: 980px) {
+  .page { grid-template-columns: minmax(0, 1fr); grid-template-rows: none; grid-template-areas: "head" "notes" "field" "margin" "foot"; height: auto; padding: 14px 16px; }
+  aside { border-left: 0; padding-left: 0; border-top: 1px solid var(--rule); padding-top: 10px; margin-top: 10px; }
+  #plot { height: 70vh; }
+  #focal { height: 70vh; }
+  .obs { height: 320px; flex: none; }
+  .ctl { margin-left: 0; }
+  h1 { font-size: 26px; }
+}
 </style>
 </head>
 <body>
+<div class="page">
 <header>
-  <h1>Expert map</h1>
-  <span id="what"></span>
-  <span id="live"><span id="pulse" aria-hidden="true"></span><span id="status" role="status">Connecting…</span></span>
+  <div>
+    <h1>Expert map</h1>
+    <p class="sub"><i>a living section of</i> <span id="what">the served model</span></p>
+  </div>
+  <nav class="ctl" aria-label="What the field shows">
+    <span class="opt" role="group" aria-label="View"><span>view</span>
+      <button type="button" data-mode="brain" aria-pressed="true">section</button><button type="button" data-mode="grid" aria-pressed="false">grid</button></span>
+    <span class="opt" role="group" aria-label="Colour cells by"><span>cells</span>
+      <button type="button" data-view="state" aria-pressed="true">state</button><button type="button" data-view="demand" aria-pressed="false">usage</button></span>
+    <span class="opt" role="group" aria-label="Place cells by"><span>placed by</span>
+      <button type="button" data-order="demand" aria-pressed="true">usage</button><button type="button" data-order="index" aria-pressed="false">number</button></span>
+    <span class="opt" role="group" aria-label="How long fibres stay"><span>fibres stay</span>
+      <button type="button" data-trail="5" aria-pressed="false">5 s</button><button type="button" data-trail="15" aria-pressed="true">15 s</button><button type="button" data-trail="60" aria-pressed="false">60 s</button></span>
+    <span class="opt" role="group" aria-label="What is drawn"><span>show</span>
+      <button type="button" data-k="routes" aria-pressed="true">routes</button><button type="button" data-k="reads" aria-pressed="true">reads</button><button type="button" data-k="loads" aria-pressed="true">loads</button></span>
+    <button id="pause" type="button" aria-pressed="false">pause</button>
+  </nav>
 </header>
-<p>Which routed experts are in memory right now. Each row is a layer and each cell an expert; the engine moves experts in and out as your traffic changes.</p>
 
-<form id="key" hidden>
-  <label for="keyin">This server wants an API key to show its data:</label>
-  <input id="keyin" type="password" autocomplete="off">
-  <button>Use key</button>
-</form>
+<dl id="notes" aria-label="Counts"></dl>
 
-<dl id="stats"></dl>
-<p id="spot" aria-live="polite"></p>
-<p id="note"></p>
+<figure class="field">
+  <div id="focal" role="group" aria-label="Focal plane: pick a layer to bring it and its neighbours into focus"></div>
+  <div id="plot">
+    <canvas id="gl" aria-hidden="true"></canvas>
+    <canvas id="map" tabindex="0" aria-label="Expert map: each layer's experts as one section of a brain-like volume (or, in the grid view, one row a layer), every decoded token's routing drawn through the layers. In the section view, drag or the arrow keys turn it and the wheel zooms; in the grid, arrow keys move between cells. The table below has the same counts."></canvas>
+    <div id="tip"></div>
+  </div>
+  <form id="keyform" hidden>
+    <label for="keyin">This server wants an API key to show its data:</label>
+    <input id="keyin" type="password" autocomplete="off"><button>use key</button>
+  </form>
+  <figcaption id="caption"></figcaption>
+</figure>
 
-<div id="controls">
-  <fieldset>
-    <legend>Show</legend>
-    <div class="seg">
-      <label><input type="radio" name="view" value="state" checked><span>What is loaded</span></label>
-      <label><input type="radio" name="view" value="demand"><span>How much each is used</span></label>
-    </div>
-  </fieldset>
-  <fieldset>
-    <legend>Order cells by</legend>
-    <div class="seg">
-      <label><input type="radio" name="order" value="index" checked><span>Expert number</span></label>
-      <label><input type="radio" name="order" value="demand"><span>Most used first</span></label>
-    </div>
-  </fieldset>
-  <button id="pause" type="button" aria-pressed="false">Pause</button>
+<aside>
+  <h2><span>Key</span><span>select to trace</span></h2>
+  <ul id="signals"></ul>
+  <section class="obs" aria-label="Observations: tokens and residency events as they happen">
+    <h2><span>Observations</span><span id="lock"><span id="locktext"></span>
+      <form id="tokkey" hidden><input type="password" id="tokkeyin" autocomplete="off" placeholder="API key" aria-label="API key to show token text"><button>use</button></form></span></h2>
+    <ol id="log"><li class="first">Watching. Tokens appear here as they are decoded.</li></ol>
+  </section>
+</aside>
+
+<footer>
+  <span>Read from /v1/expert-map <span id="rate">five times a second</span> · <span id="status" role="status">connecting</span> · <span id="fps"></span></span>
+  <span id="sel" aria-live="polite"></span>
+</footer>
 </div>
 
-<ul id="legend"></ul>
-<div id="plot">
-  <canvas id="map" tabindex="0" aria-label="Expert map: one row a layer, one cell an expert. Arrow keys move between cells; the table below has the same counts."></canvas>
-  <div id="cursor"></div>
-  <div id="tip"></div>
-</div>
-
-<h2>Recent changes</h2>
-<ul id="log"><li id="nolog">Nothing has moved since this page opened.</li></ul>
-
-<details>
+<details class="data">
   <summary>Layers as a table</summary>
   <table>
-    <thead><tr><th>Layer</th><th>Resident</th><th>Of the layer</th><th>In hot ring</th><th>Being read</th></tr></thead>
+    <thead><tr><th>Layer</th><th>Resident</th><th>Of the layer</th><th>In hot ring</th><th>Being read</th><th>Picked lately</th><th>Missed lately</th></tr></thead>
     <tbody id="rows"></tbody>
   </table>
 </details>
@@ -168,155 +189,199 @@ const $ = id => document.getElementById(id);
 const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 const fmt = n => Number(n).toLocaleString("en-US");
 const STATE_TEXT = ["not loaded", "resident", "in the hot-read ring", "being read from disk"];
-const POLL_MS = 1000, RECENT_MS = 4000, LOG_MAX = 40;
-
-let data = null;          // the last snapshot
-let prev = null;          // its states, flat, for the diff
-let changed = new Map();  // cell index -> time it last changed
-let order = [];           // per row: column -> expert
-let geom = null;
-let paused = false, timer = null, key = "";
-let hover = null;         // {row, col}
-// Motion (client side; prefers-reduced-motion turns all of it off): each cell eases to the snapshot's colour
-// and column, a read flies in along its layer's row and lights the cell as it lands, an eviction fades out, a
-// cell being read has its outline breathe, and the numbers count. What
-// is drawn once it settles is the snapshot, exactly; the tooltip and the table read the snapshot itself.
+// Polls: five a second, each asking only for the routes and events it has not seen; the usage rows every 2 s.
+const POLL_MS = 200, DEMAND_EVERY = 10, LOG_MAX = 400;
+// Engine event kinds (event_kinds)
+const EV = { HOT: 1, RESCUE: 2, ADAPT: 3, PRELOAD: 4, PREDICT: 5, DROPPED: 6 };
+// Motion: a token's route grows through the layers over GROW_MS, a little behind real time (its own spacing
+// kept), is held whole for HOLD_MS, and its strongest links stay on as fibres that fade over the chosen time.
+// Events replay at their own spacing REPLAY_MS late. Reduced motion: no growth, no turning.
 const reduce = window.matchMedia("(prefers-reduced-motion: reduce)");
 let motion = !reduce.matches;
-const TAU_COLOR = 110, TAU_SLIDE = 150, POP_MS = 950, DROP_MS = 650, MAX_FLIGHTS = 420, STAT_MS = 700;
-let A = null;             // per cell (index r * E + e, as the snapshot's states): colour, column, start; flights, flashes
-let events = [];          // the last poll's changes: [cell, from, to]
-let raf = 0, lastFrame = 0, statTw = [];
-// The engine's residency events (what brought each expert in, and whose slot it took), replayed at their
-// own spacing a little over a second late; and since this page opened, for the numbers' spotlight and the
-// tooltip. Kinds as the engine numbers them (event_kinds).
-const EV = { HOT: 1, RESCUE: 2, ADAPT: 3, PRELOAD: 4, PREDICT: 5, DROPPED: 6 }, REPLAY_MS = 1150;
-let lastSeq = 0, replayed = false, seen = null, cellEv = new Map(), evicted = new Map(), sessN = [0, 0, 0, 0, 0, 0, 0], sessShare = [];
-let spot = null, spotHover = null;
-// a number above the map -> the cells it counts (`bits`: the kinds seen since this page opened; `state`: now)
-const CATS = {
-  resident: { state: 1, what: "Experts in memory now", how: "The engine keeps the experts the routing history wants most." },
-  reading:  { state: 3, what: "Experts being read from disk now", how: "Each arrives a pass or two after a token missed it." },
-  hot:      { bits: 1 << EV.HOT | 1 << EV.RESCUE | 1 << EV.PREDICT | 1 << EV.DROPPED,
-              what: "Read from disk because a token picked them while they were not in memory",
-              how: "A green comet is an async read (ready the next pass), an orange streak an inline rescue. Hover a cell for the miss's weight and whose slot it took." },
-  kept:     { bits: 1 << EV.HOT | 1 << EV.RESCUE | 1 << EV.PREDICT,
-              what: "Read after a miss and kept, each in the slot of the least-wanted resident", how: "Hover a cell for the expert it replaced." },
-  rescue:   { bits: 1 << EV.RESCUE | 1 << EV.DROPPED,
-              what: "Rescued inline: read in the very pass that missed them, because the miss carried a large share of the token's routing",
-              how: "Below the gate, a miss is covered by a substitute in its pass and read in the background for the next." },
-  moved:    { bits: 1 << EV.ADAPT | 1 << EV.PRELOAD,
-              what: "Moved in by the routing history (adaptation) or for a continuing conversation (preload)",
-              how: "Each took the slot of an expert the history wanted less." },
-  preload:  { bits: 1 << EV.PRELOAD, what: "Preloaded for a continuing conversation, before its prompt ran", how: "" },
-};
-const CAT_OF = { "Resident": "resident", "Memory slots": "resident", "Being read now": "reading", "Hot reads since start": "hot",
-                 "Hot reads kept since start": "kept", "Inline rescues since start": "rescue", "Experts moved since start": "moved",
-                 "Preloaded since start": "preload" };
-const TICK_OF = { [EV.HOT]: ["Hot reads since start", "Hot reads kept since start"], [EV.PREDICT]: ["Hot reads since start", "Hot reads kept since start"],
-                  [EV.RESCUE]: ["Hot reads since start", "Inline rescues since start", "Hot reads kept since start"],
-                  [EV.DROPPED]: ["Hot reads since start", "Inline rescues since start"],
-                  [EV.ADAPT]: ["Experts moved since start"], [EV.PRELOAD]: ["Experts moved since start", "Preloaded since start"] };
+const GROW_MS = 700, HOLD_MS = 1800, ROUTE_DELAY = 260, REPLAY_MS = 320, MAX_ROUTES = 320, TAU_COLOR = 110, TAU_SLIDE = 150, TAU_PLACE = 420;
+// fast decoding (70 tokens a second with copy rounds) leaves a route a token: the fibres are capped at SYN_MAX (the
+// weakest pruned) and the log is appended once a poll
+const SYN_MAX = 30000, MAX_DROPS = 600, MAX_GLOWS = 400;
+const STAT_MS = 500, LIT_MS = 9000, READ_LIT_MS = 3500, DROP_MS = 650, NOTE_MS = 7000, MAX_NOTES = 5, PING_MS = 900;
+
+let data = null, demandRows = null, key = "", paused = false, timer = 0, polls = 0;
+let lastRouteSeq = 0, lastEventSeq = 0, firstPoll = true, bytes = 0;
+let geom = null, order = [], A = null, B = null, raf = 0, lastFrame = 0, lastDraw = 0;
+let hover = -1, hoverRC = null;
+let routes = [];          // {seq, t (wall ms), start (perf ms), lane, pos, token, k, ex, sh, miss, nMiss, top, fed}
+let heat = null, missHeat = null;   // per expert: recent picks (share-weighted), recent missed picks
+let syn = new Map();      // fibres: (lower row * E + a) * E + b -> [weight, missed weight], the routes' top picks linked
+let trailSecs = 15, synAt = 0, fpsCount = 0, fpsAt = 0;
+let lit = new Map();      // expert -> {t0, kind}: one that just came in glows
+let pings = [], notes = [], noteNo = 0, tokenNote = null;
+let cellEv = new Map(), evicted = new Map(), seen = null;
+let sess = { tokens: 0, picks: 0, missed: 0, hot: 0, rescue: 0, moved: 0, preload: 0 };
+let layersOn = { routes: true, reads: true, loads: true };
+let mode = "brain", view = "state", ordering = "demand", spot = null, spotHover = null, band = null;  // band: [r0, r1) in focus
+const cam = { yaw: 1.15, pitch: 0.3, zoom: 1, drag: null, idleAt: 0 };
 try { key = sessionStorage.getItem("tidelm-key") || ""; } catch (e) {}
 
-const view = () => document.querySelector("input[name=view]:checked").value;
-const ordering = () => document.querySelector("input[name=order]:checked").value;
-
+// ---------------------------------------------------------------- colours
 function hex(c) { return [1, 3, 5].map(i => parseInt(c.slice(i, i + 2), 16)); }
-function ramp(stops) {  // 36 steps through three stops
-  const s = stops.map(hex), out = [];
-  for (let i = 0; i < 36; i++) {
-    const t = i / 35 * 2, seg = t < 1 ? 0 : 1, f = t - seg, a = s[seg], b = s[seg + 1];
-    out.push("rgb(" + a.map((v, k) => Math.round(v + (b[k] - v) * f)).join(",") + ")");
-  }
-  return out;
-}
-let colors = null;
+function ramp(a, b, n) { const x = hex(a), y = hex(b); return Array.from({ length: n }, (_, i) => x.map((v, k) => Math.round(v + (y[k] - v) * i / (n - 1)))); }
+let C = null;
 function readColors() {
-  colors = {
-    state: [css("--absent"), css("--resident"), css("--hot"), css("--loading")],
-    res: ramp([css("--seq-res-0"), css("--seq-res-1"), css("--seq-res-2")]),
-    abs: ramp([css("--seq-abs-0"), css("--seq-abs-1"), css("--seq-abs-2")]),
-    ink: css("--ink"), ink2: css("--ink-2"), muted: css("--muted"), axis: css("--axis"), hair: css("--hair"), absent: css("--absent"),
-  };
-  const rgb = s => s.startsWith("#") ? hex(s) : s.match(/[\d.]+/g).slice(0, 3).map(Number);
-  colors.rgb = { state: colors.state.map(rgb), res: colors.res.map(rgb), abs: colors.abs.map(rgb), absent: rgb(colors.absent),
-                 surface: rgb(css("--surface")), ink: rgb(colors.ink) };
-  colors.dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+  C = { hi: css("--field-hi"), lo: css("--field-lo"), fogc: hex(css("--fog")), loc: hex(css("--field-lo")), cell: hex(css("--cell")), off: hex(css("--cell-off")),
+        fibre: hex(css("--fibre")), miss: hex(css("--miss")), read: hex(css("--read")), load: hex(css("--load")),
+        ink: hex(css("--ink")), ink2: hex(css("--ink-2")), muted: css("--muted"), faint: css("--faint"), rule: css("--rule"), serif: css("--serif") };
+  // usage: residents from slate to ivory by their layer's routing history; the unloaded from dark to a dim eosin
+  C.useRes = ramp("#55595e", "#e6dece", 36);
+  C.useAbs = ramp("#2a2c2f", "#a35a7a", 36);
+  C.state = [C.off, C.cell, C.read, C.read];
 }
+const rgba = (c, a) => "rgba(" + c[0] + "," + c[1] + "," + c[2] + "," + a + ")";
+const WHITE = [255, 255, 255];
+const font = (px, italic) => (italic ? "italic " : "") + px + "px " + C.serif;
 
-function legend() {
-  const ul = $("legend"), d = data;
-  ul.textContent = "";
-  const item = (style, text, cls) => {
-    const li = document.createElement("li"), i = document.createElement("i");
-    if (cls) i.className = cls;
-    if (style) i.style.background = style;
-    li.append(i, document.createTextNode(text));
-    ul.append(li);
-  };
-  if (view() === "state" || !d.demand) {
-    item(colors.state[1], "Resident");
-    if (d.counts.hot || d.engine === "deepseek") item(colors.state[2], "In the hot-read ring");
-    item(colors.state[3], "Being read from disk");
-    item(colors.state[0], "Not loaded");
-  } else {
-    const g = r => "linear-gradient(to right," + [0, 8, 17, 26, 35].map(i => r[i]).join(",") + ")";
-    item(g(colors.res), "Resident: rarely used → the layer's most used", "ramp");
-    item(g(colors.abs), "Not loaded: rarely used → most used", "ramp");
-    item(colors.absent, "Never used");
+// ---------------------------------------------------------------- the section: a slice a layer
+// Layer 0 is the brainstem at the base and the last layer the crown: a token's route climbs. Each slice has a
+// folded rim and, above the stem, two hemispheres either side of a fissure; its experts sit on a sunflower
+// spiral inside it, the most used at the core when placed by usage (the rarely used, the likely misses, at the rim).
+const GOLD = Math.PI * (3 - Math.sqrt(5)), BH = 1.7;
+const smooth = (a, b, t) => { const u = Math.max(0, Math.min(1, (t - a) / (b - a))); return u * u * (3 - 2 * u); };
+function sliceOf(r, R) {
+  const t = R > 1 ? r / (R - 1) : 0.5, u = Math.max(0, (t - 0.16) / 0.84);
+  // the cerebrum: wide low down (the temporal lobes), a dome above; the stem below it, narrow and set back
+  const cer = u < 0.36 ? 0.8 + 0.2 * Math.sin(Math.PI / 2 * u / 0.36) : Math.sqrt(Math.max(0.03, 1 - ((u - 0.36) / 0.66) ** 2));
+  const stem = 1 - smooth(0.1, 0.2, t);
+  const cb = smooth(0.12, 0.2, t) * (1 - smooth(0.24, 0.36, t)), temp = smooth(0.15, 0.24, t) * (1 - smooth(0.36, 0.48, t));
+  const back = (1.32 + 0.16 * cb - 0.14 * smooth(0.72, 1, t)) * (1 - 0.25 * stem);
+  const front = (1.32 * (0.74 + 0.26 * smooth(0.22, 0.5, t)) - 0.16 * smooth(0.78, 1, t)) * (1 - 0.25 * stem);
+  return { r, y: -BH / 2 + t * BH, s: 0.2 + (cer - 0.2) * (1 - stem), fis: 0.11 * smooth(0.15, 0.24, t) * (1 - cb), stem, cb, temp, back, front,
+           zoff: 0.32 * stem - 0.06 * smooth(0.3, 0.9, t) };
+}
+// +z is the back of the head. A slice's rim: an egg (narrow at the front, wide at the back), folded; low slices
+// carry the cerebellum, a lobe at the back below the cerebrum
+function warp(rad, th, sl, out) {
+  const l = sl.r, c = Math.cos(th), sn = Math.sin(th);
+  const m = 1 + 0.055 * Math.sin(7 * th + l * 1.7) + 0.03 * Math.sin(13 * th - l * 0.8) + 0.018 * Math.sin(23 * th + l * 2.3);
+  const lobe = sl.cb * 0.42 * Math.exp(-(((th - Math.PI / 2) / 0.62) ** 2));
+  const rr = rad * (1 + (m - 1) * rad * rad * rad) * (1 + lobe * rad);
+  let x = rr * c, z = rr * sn;
+  z *= z > 0 ? sl.back : sl.front;
+  x *= (1 + 0.16 * (z / 1.32)) * (1 + 0.13 * sl.temp * Math.max(0, 1 - Math.abs(z + 0.15) / 0.9));
+  if (sl.fis > 0) {      // two hemispheres: the fissure between them, notched front and back
+    const ax = Math.abs(x);
+    x = (x < 0 ? -1 : 1) * (sl.fis + ax * (1 - sl.fis));
+    z *= 1 - 0.22 * Math.exp(-((ax / 0.1) ** 2)) * (sl.fis / 0.11);
   }
-  item("", "Changed in the last few seconds", "ring");
-  if (Array.isArray(d.events)) {
-    item("", "Async read: a token missed it, ready the next pass", "comet");
-    item(colors.state[2], "Inline rescue: a heavy miss, read in the same pass", "streak");
-    item("", "Normal load: moved in by the routing history", "dots");
+  out[0] = x * sl.s; out[1] = z * sl.s + sl.zoff;
+}
+function hash(a, b) { let h = (a * 374761393 + b * 668265263) | 0; h = Math.imul(h ^ (h >>> 13), 1274126177); return (h ^ (h >>> 16)) >>> 0; }
+function ensureBrain() {
+  const E = A.E, R = A.R, N = A.N;
+  if (B && B.N === N) return;
+  B = { N, P: new Float32Array(3 * N), T: new Float32Array(3 * N), SX: new Float32Array(N), SY: new Float32Array(N), SF: new Float32Array(N),
+        SZ: new Float32Array(N), slices: [], rim: [], perm: [], placed: "" };
+  const w = [0, 0], RIM = 72;
+  glDirty("pos col rim");
+  for (let r = 0; r < R; r++) {
+    const sl = sliceOf(r, R); B.slices.push(sl);
+    const rim = new Float32Array(2 * RIM);
+    for (let q = 0; q < RIM; q++) { warp(1.02, q / RIM * 2 * Math.PI, sl, w); rim[2 * q] = w[0]; rim[2 * q + 1] = w[1]; }
+    B.rim.push(rim);
+    // placed by number: a scatter that keeps no order (an expert's number says nothing about its neighbours)
+    B.perm.push(Array.from({ length: E }, (_, e) => e).sort((a, b) => hash(r, a) - hash(r, b)));
   }
 }
+function brainTargets() {
+  ensureBrain();
+  const E = A.E, R = A.R, w = [0, 0], byUse = ordering === "demand" && demandRows;
+  for (let r = 0; r < R; r++) {
+    const sl = B.slices[r], ranked = byUse ? order[r] : B.perm[r];
+    for (let k = 0; k < E; k++) {
+      const e = ranked[k], i = r * E + e, rad = Math.sqrt((k + 0.5) / E) * 0.97;
+      warp(rad, k * GOLD + r * 0.61, sl, w);
+      const j = 3 * i, jit = ((hash(e, r + 7) & 1023) / 1023 - 0.5) * 0.018;
+      B.T[j] = w[0]; B.T[j + 1] = sl.y + jit; B.T[j + 2] = w[1];
+    }
+  }
+  if (!B.placed || !motion) B.P.set(B.T);
+  B.placed = (byUse ? "use" : "index");
+}
+// the eye: a turn about the vertical axis (yaw), a tilt toward the viewer (pitch), perspective
+function project(w, h) {
+  const N = A.N, P = B.P, cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw), cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+  const S = Math.min(w / 2.7, h / (BH + 0.95)) * cam.zoom, D = 4.4, ox = w / 2, oy = h / 2 + 10;
+  B.view = { cy, sy, cp, sp, S, D, ox, oy };
+  for (let i = 0, j = 0; i < N; i++, j += 3) {
+    const x = P[j], y = P[j + 1], z = P[j + 2];
+    const x1 = x * cy + z * sy, z1 = -x * sy + z * cy;
+    const y2 = y * cp + z1 * sp, z2 = -y * sp + z1 * cp;
+    const f = D / (D + z2);
+    B.SX[i] = ox + x1 * S * f; B.SY[i] = oy - y2 * S * f; B.SF[i] = f; B.SZ[i] = z2;
+  }
+}
+function proj(x, y, z, out) {
+  const v = B.view, x1 = x * v.cy + z * v.sy, z1 = -x * v.sy + z * v.cy, y2 = y * v.cp + z1 * v.sp, z2 = -y * v.sp + z1 * v.cp, f = v.D / (v.D + z2);
+  out[0] = v.ox + x1 * v.S * f; out[1] = v.oy - y2 * v.S * f; out[2] = z2;
+}
+// depth: far cells sink into the stage's gray
+const fog = z => 0.3 + 0.7 * Math.max(0, Math.min(1, (1.7 - z) / 3.4));
 
+// ---------------------------------------------------------------- layout
 function layout() {
-  const d = data, E = d.experts_per_layer, R = d.layers.length;
-  const left = 34, right = 118, avail = Math.max(320, document.body.clientWidth - 48 - 26 - left - right);
-  const cw = Math.max(2, Math.min(9, Math.floor(avail / E)));
-  const rh = Math.max(12, Math.min(18, Math.floor(760 / R)));
-  const top = 18;
-  geom = { left, right, top, cw, rh, gap: cw >= 4 ? 1 : 0, rgap: 2, w: left + cw * E + right, h: top + rh * R, E, R };
-  const c = $("map"), dpr = window.devicePixelRatio || 1;
-  c.style.width = geom.w + "px"; c.style.height = geom.h + "px";
-  c.width = Math.round(geom.w * dpr); c.height = Math.round(geom.h * dpr);
+  const d = data, E = d.experts_per_layer, R = d.layers.length, plot = $("plot"), c = $("map"), dpr = window.devicePixelRatio || 1;
+  plot.className = mode === "brain" ? "brain" : "";
+  $("focal").className = mode === "brain" ? "" : "down";
+  const availW = Math.max(240, plot.clientWidth), availH = Math.max(320, plot.clientHeight);
+  let w, h;
+  geom = { E, R };
+  if (mode === "brain") { w = availW; h = availH; }
+  else {
+    const left = 34, right = 92, top = 26, bottom = 14, cw = Math.max(1.6, (availW - left - right) / E), rh = Math.max(9, Math.min(24, (availH - top - bottom) / R));
+    Object.assign(geom, { left, right, top, bottom, cw, rh, nodeH: Math.max(2, Math.min(5, rh * 0.32)), nodeW: Math.max(1, cw - (cw > 3 ? 1 : 0.25)) });
+    w = Math.ceil(left + cw * E + right); h = Math.ceil(top + rh * R + bottom);
+  }
+  Object.assign(geom, { w, h });
+  c.style.width = w + "px"; c.style.height = h + "px"; c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+  if (mode === "brain") { const glc = $("gl"), gd = glDpr(); glc.style.width = w + "px"; glc.style.height = h + "px"; glc.width = Math.round(w * gd); glc.height = Math.round(h * gd); }
+  geom.base = document.createElement("canvas"); geom.base.width = c.width; geom.base.height = c.height; geom.baseDirty = true;
+  // the stage's light: brightest in the middle, as under a condenser
+  const x = c.getContext("2d"), gr = x.createRadialGradient(w / 2, h * 0.52, 0, w / 2, h * 0.52, Math.hypot(w, h) * 0.58);
+  gr.addColorStop(0, C.hi); gr.addColorStop(1, C.lo);
+  geom.stage = gr;
 }
+const rowY = r => geom.top + r * geom.rh + geom.rh / 2;
+const colX = i => geom.left + A.x[i] * geom.cw + geom.cw / 2;
+// a cell's place on the canvas in the current view
+const _pp = [0, 0, 0];
+const PX = i => mode === "brain" ? (proj(B.P[3 * i], B.P[3 * i + 1], B.P[3 * i + 2], _pp), _pp[0]) : colX(i);
+const PY = i => mode === "brain" ? (proj(B.P[3 * i], B.P[3 * i + 1], B.P[3 * i + 2], _pp), _pp[1]) : rowY(Math.floor(i / A.E));
+// the GPU's copies of what changed: places, colours, the rims (a focal plane), the fibres
+function glDirty(what) { if (!GL) return; if (what.includes("pos")) GL.posDirty = true; if (what.includes("col")) GL.colDirty = true; if (what.includes("rim")) GL.rimDirty = true; GL.fibreAt = -1e9; }
 
 function reorder() {
-  const d = data, E = d.experts_per_layer, byDemand = ordering() === "demand" && d.demand;
+  const d = data, E = d.experts_per_layer, byDemand = ordering === "demand" && demandRows;
   order = d.layers.map((_, r) => {
     const idx = Array.from({ length: E }, (_, i) => i);
-    if (byDemand) {
-      const row = d.demand[r];
-      idx.sort((a, b) => row.charCodeAt(b) - row.charCodeAt(a) || a - b);  // digits sort before letters: base 36 in order
-    }
+    if (byDemand) { const row = demandRows[r]; idx.sort((a, b) => row.charCodeAt(b) - row.charCodeAt(a) || a - b); }
     return idx;
   });
+  if (A && B) brainTargets();
 }
-const level = (r, e) => data.demand ? parseInt(data.demand[r][e], 36) : 0;
+const level = (r, e) => demandRows ? parseInt(demandRows[r][e], 36) : 0;
 
 function ensureAnim() {
   const E = data.experts_per_layer, R = data.layers.length, N = E * R;
   if (A && A.N === N && A.E === E) return false;
-  A = { N, E, R, cur: new Float32Array(3 * N), tgt: new Float32Array(3 * N), start: new Float64Array(N),
-        x: new Float32Array(N), tx: new Float32Array(N), res: new Float32Array(R), resT: new Float32Array(R),
-        flights: [], pops: [], drops: [], reading: [], links: [], ticks: [] };
-  seen = new Uint8Array(N); cellEv = new Map(); evicted = new Map();
-  const s = colors.rgb.surface;
-  for (let i = 0; i < N; i++) A.cur.set(s, 3 * i);
+  A = { N, E, R, cur: new Float32Array(3 * N), tgt: new Float32Array(3 * N), start: new Float64Array(N), x: new Float32Array(N),
+        tx: new Float32Array(N), res: new Float32Array(R), resT: new Float32Array(R), reading: [], drops: [], links: [] };
+  heat = new Float32Array(N); missHeat = new Float32Array(N); seen = new Uint8Array(N);
+  cellEv = new Map(); evicted = new Map(); lit = new Map(); routes = []; notes = []; pings = []; syn = new Map(); B = null;
+  for (let i = 0; i < N; i++) A.cur.set(C.loc, 3 * i);
   return true;
 }
 
-// The snapshot's colours and columns as the cells' targets; `how`: "poll" (its changes spread over the next
-// second, each read as a flight), "view" (a cascade down the layers), anything else (no stagger).
+// the snapshot's colours and places as the cells' targets
 function retarget(how) {
   if (!data || !geom) return;
-  const fresh = ensureAnim(), d = data, E = A.E, R = A.R, now = performance.now(), c = colors.rgb;
-  const demandView = view() === "demand" && d.demand;
+  const fresh = ensureAnim(), d = data, E = A.E, R = A.R, now = performance.now(), usage = view === "demand" && demandRows;
   A.reading = [];
   for (let r = 0; r < R; r++) {
     const st = d.states[r], ord = order[r];
@@ -324,539 +389,1144 @@ function retarget(how) {
     for (let e = 0; e < E; e++) {
       const i = r * E + e, s = st.charCodeAt(e) - 48;
       let f;
-      if (demandView) { const v = level(r, e); f = v === 0 && s === 0 ? c.absent : (s === 0 ? c.abs : c.res)[v]; }
-      else f = c.state[s];
+      if (usage) { const v = level(r, e); f = v === 0 && s === 0 ? C.off : (s === 0 ? C.useAbs : C.useRes)[Math.max(0, v)]; }
+      else f = C.state[s];
       A.tgt.set(f, 3 * i);
       if (s === 3) A.reading.push(i);
     }
     A.resT[r] = d.resident_per_layer[r];
   }
-  if (!motion) {
-    A.cur.set(A.tgt); A.x.set(A.tx); A.res.set(A.resT); A.flights = []; A.pops = []; A.drops = [];
-  } else if (fresh) {
-    // the entrance: the map washes in from the top left, a layer at a time
-    A.x.set(A.tx);
-    for (let i = 0; i < A.N; i++) A.start[i] = now + 120 + 16 * Math.floor(i / E) + 1.3 * A.tx[i];
-  } else if (how === "view") {
-    for (let i = 0; i < A.N; i++) A.start[i] = now + 6 * Math.floor(i / E);
-  } else if (how === "poll") {
-    const covered = Array.isArray(d.events) ? replay(d, now) : null;
-    for (const [i, a, b] of events) {
-      if (covered) {      // the engine's events carry the story; a change without one just eases in
-        if (!covered.has(i)) A.start[i] = now + Math.random() * POLL_MS * 0.85;
-        continue;
-      }
-      const t0 = now + Math.random() * POLL_MS * 0.85;
-      if ((b === 3 || (b === 1 && a === 0)) && A.flights.length < MAX_FLIGHTS) {
-        const dur = 280 + 560 * (E - A.tx[i]) / E;      // from the disk side, the far cells a little longer
-        A.flights.push({ i, t0, dur, land: b });
-        A.start[i] = t0 + dur;                          // the cell turns as its expert lands
-      } else {
-        A.start[i] = t0;
-        if (b === 1 && a !== 1) A.pops.push({ i, t0 });
-        else if (b === 0 && a !== 0) A.drops.push({ i, t0, rgb: c.state[a] });
-      }
-    }
-  }
-  if (fresh && Array.isArray(d.events)) replay(d, now);     // the history before this page opened: told, not shown
-  events = [];
+  if (fresh || !B) brainTargets();
+  if (!motion) { A.cur.set(A.tgt); A.x.set(A.tx); A.res.set(A.resT); }
+  else if (fresh) { A.x.set(A.tx); for (let i = 0; i < A.N; i++) A.start[i] = now + 80 + 14 * Math.floor(i / E) + (mode === "grid" ? 0.8 * A.tx[i] : 0); }
+  else if (how === "view") { for (let i = 0; i < A.N; i++) A.start[i] = now + 5 * Math.floor(i / E); }
+  geom.baseDirty = true;
   kick();
 }
 
-// The poll's new events: kept for the tooltip and the spotlight, and (after the first poll) scheduled at their
-// own spacing, REPLAY_MS late. Returns the cells they cover.
-function replay(d, now) {
-  const E = A.E, covered = new Set(), first = !replayed, wall = d.sampled_at * 1000;
-  replayed = true;
-  let n = 0;
-  for (const [seq, age, row, ex, kind, share, vrow, vex] of d.events) {
-    if (seq <= lastSeq || row < 0) continue;
-    const i = row * E + ex, vi = vrow >= 0 ? vrow * E + vex : -1, t = wall - age, sh = share / 1000;
-    cellEv.set(i, { kind, t, share: sh, victim: vi });       // the tooltip tells the history before this page too
-    if (vi >= 0) evicted.set(vi, { by: i, kind, t });
-    covered.add(i); if (vi >= 0) covered.add(vi);
-    if (first) continue;
-    seen[i] |= 1 << kind; sessN[kind]++;                       // the spotlight counts since this page opened
-    if (kind === EV.HOT || kind === EV.RESCUE || kind === EV.DROPPED) sessShare.push(sh);
-    if (!motion) continue;
-    // an adaptation's whole plan lands in one pass: spread it over the replay so it reads as a wave
-    const batch = kind === EV.ADAPT || kind === EV.PRELOAD;
-    const t0 = now + Math.max(0, REPLAY_MS - age) + (batch ? (n++ % 96) * 9 : Math.random() * 30);
-    for (const label of TICK_OF[kind] || []) A.ticks.push({ t0, label, kind });
-    const rescue = kind === EV.RESCUE || kind === EV.DROPPED, far = (E - A.tx[i]) / E;
-    // an inline rescue is quick, an async read medium, a normal load unhurried
-    const dur = rescue ? 150 + 120 * far : batch ? 650 + 650 * far : 300 + 520 * far;
-    if (A.flights.length < MAX_FLIGHTS) A.flights.push({ i, t0: t0 + 200, dur, kind, land: kind === EV.DROPPED ? 0 : 1 });
-    else A.pops.push({ i, t0: t0 + 200 + dur, kind });
-    if (kind !== EV.DROPPED) A.start[i] = t0 + 200 + dur;
-    if (vi >= 0) {
-      A.start[vi] = t0 + 200;
-      A.drops.push({ i: vi, t0: t0 + 200, rgb: colors.rgb.state[1] });
-      if (A.links.length < 160) A.links.push({ a: vi, b: i, t0: t0 + 200, dur: dur + 500, kind });
+// ---------------------------------------------------------------- routes
+// ages, not the server's clock: a page on another machine may disagree with it
+function addRoutes(d, now) {
+  const R = A.R, wall = Date.now();
+  for (const r of d.routes || []) {
+    if (r.seq <= lastRouteSeq) continue;
+    lastRouteSeq = r.seq;
+    const k = r.k, n = R * k;
+    if (!r.experts || r.experts.length !== n) continue;
+    const ex = Int32Array.from(r.experts), sh = Float32Array.from(r.share, v => v / 1000), miss = new Uint8Array(n);
+    let nMiss = 0;
+    for (let j = 0; j < n; j++) { miss[j] = r.missed.charCodeAt(j) === 49; nMiss += miss[j]; }
+    // each row's two heaviest picks: the fibres it leaves
+    const top = new Int32Array(2 * R);
+    for (let row = 0; row < R; row++) {
+      let a = -1, b = -1;
+      for (let j = 0; j < k; j++) { const p = row * k + j; if (a < 0 || sh[p] > sh[a]) { b = a; a = p; } else if (b < 0 || sh[p] > sh[b]) b = p; }
+      top[2 * row] = a; top[2 * row + 1] = b;
+    }
+    const t = wall - r.age_ms;
+    // the first poll's routes are history: already grown
+    const start = firstPoll || !motion ? now - GROW_MS - r.age_ms : now + Math.max(0, ROUTE_DELAY - r.age_ms);
+    const rt = { seq: r.seq, t, start, lane: r.lane, pos: r.pos, token: r.token, k, ex, sh, miss, nMiss, top, fed: 0 };
+    routes.push(rt);
+    if (!firstPoll) { sess.tokens++; sess.picks += n; sess.missed += nMiss; logRoute(rt); }
+  }
+  if (routes.length > MAX_ROUTES) routes.splice(0, routes.length - MAX_ROUTES);
+}
+const grownRows = (rt, now) => motion ? Math.max(0, Math.min(A.R, Math.floor((now - rt.start) / GROW_MS * A.R) + 1)) : A.R;
+// a route's picks warm their cells as it reaches each row (the hubs light as the token passes), and its two
+// heaviest picks in a row are linked to the two in the row before: the fibres that stay
+function feed(rt, upto) {
+  const E = A.E, k = rt.k;
+  for (let r = rt.fed; r < upto; r++) {
+    for (let j = 0; j < k; j++) {
+      const p = r * k + j, i = r * E + rt.ex[p], s = rt.sh[p];
+      heat[i] = Math.min(4, heat[i] + 0.35 + s * 2.2);
+      if (rt.miss[p]) missHeat[i] = Math.min(4, missHeat[i] + 0.6 + s * 2.5);
+    }
+    if (r > 0) {
+      for (let u = 0; u < 2; u++) for (let v = 0; v < 2; v++) {
+        const pa = rt.top[2 * (r - 1) + u], pb = rt.top[2 * r + v];
+        if (pa < 0 || pb < 0) continue;
+        const key = ((r - 1) * E + rt.ex[pa]) * E + rt.ex[pb], w = rt.sh[pa] * rt.sh[pb] * 3, m = rt.miss[pa] || rt.miss[pb] ? w : 0;
+        const s = syn.get(key);
+        if (s) { s[0] = Math.min(6, s[0] + w); s[1] = Math.min(6, s[1] + m); } else syn.set(key, [w, m]);
+      }
     }
   }
-  for (const [seq] of d.events) lastSeq = Math.max(lastSeq, seq);
-  return covered;
+  rt.fed = Math.max(rt.fed, upto);
+}
+// the grid's strands for rows [r0, r1): each row's picks joined to the token's junction above and below it (the
+// residual stream: every pick of a layer feeds every pick of the next); alpha by the pick's share
+function strands(rt, r0, r1, alphaK, X, buckets) {
+  const k = rt.k, E = A.E, rh = geom.rh;
+  const jx = r => {
+    const rr = Math.min(r, A.R - 1); let sx = 0, ss = 0;
+    for (let j = 0; j < k; j++) { const p = rr * k + j; sx += X(rr * E + rt.ex[p]) * rt.sh[p]; ss += rt.sh[p]; }
+    return ss > 0 ? sx / ss : X(rr * E + rt.ex[rr * k]);
+  };
+  let ax = jx(r0);
+  for (let r = r0; r < r1; r++) {
+    const ay = rowY(r) - rh / 2, by = rowY(r) + rh / 2, bx = jx(r + 1), y = rowY(r);
+    for (let j = 0; j < k; j++) {
+      const p = r * k + j, px = X(r * E + rt.ex[p]);
+      const a = alphaK * (0.12 + 0.88 * Math.min(1, rt.sh[p] * k / 2.2));
+      const key = (rt.miss[p] ? 8 : 0) + Math.min(7, Math.floor(a * 8));
+      const path = buckets[key] || (buckets[key] = new Path2D());
+      path.moveTo(ax, ay); path.lineTo(px, y); path.lineTo(bx, by);
+    }
+    ax = bx;
+  }
+}
+function strokeBuckets(x, buckets, scale, width) {
+  x.lineWidth = width || 1;
+  buckets.forEach((p, key) => {
+    if (!p) return;
+    const m = key >= 8, a = ((key & 7) + 0.5) / 8 * scale;
+    x.strokeStyle = rgba(m ? C.miss : C.fibre, m ? Math.min(1, a * 1.4) : a);
+    x.stroke(p);
+  });
+}
+// fibres: the links the routes keep using, stronger the more; eosin where one end was missed
+function drawFibres(x, X, Y, keep) {
+  const sb = [], E = A.E, E2 = E * E;
+  for (const [key, s] of syn) {
+    if (s[0] < 0.05) continue;
+    const r = Math.floor(key / E2), rem = key - r * E2, a = r * E + Math.floor(rem / E), b = (r + 1) * E + rem % E;
+    const k = keep(r, a, b); if (!k) continue;
+    const al = Math.min(1, s[0] * 0.25) * k, bk = (s[1] > s[0] * 0.5 ? 8 : 0) + Math.min(7, Math.floor(al * 8));
+    const p = sb[bk] || (sb[bk] = new Path2D());
+    p.moveTo(X(a), Y(a)); p.lineTo(X(b), Y(b));
+  }
+  strokeBuckets(x, sb, 0.34);
 }
 
-function kick() { if (!raf && data && A) raf = requestAnimationFrame(frame); }
+// ---------------------------------------------------------------- events
+function addEvents(d, now) {
+  const E = A.E, wall = Date.now(), first = firstPoll, batch = {};
+  let n = 0;
+  for (const [seq, age, row, ex, kind, share, vrow, vex] of d.events || []) {
+    if (seq <= lastEventSeq || row < 0) continue;
+    lastEventSeq = Math.max(lastEventSeq, seq);
+    const i = row * E + ex, vi = vrow >= 0 ? vrow * E + vex : -1, t = wall - age, sh = share / 1000;
+    cellEv.set(i, { kind, t, share: sh, victim: vi });
+    if (vi >= 0) evicted.set(vi, { by: i, kind, t });
+    if (first) continue;
+    seen[i] |= 1 << kind;
+    if (kind === EV.HOT || kind === EV.PREDICT) sess.hot++;
+    if (kind === EV.RESCUE || kind === EV.DROPPED) sess.rescue++;
+    if (kind === EV.ADAPT || kind === EV.PRELOAD) { sess.moved++; if (kind === EV.PRELOAD) sess.preload++; }
+    const isLoad = kind === EV.ADAPT || kind === EV.PRELOAD, rescue = kind === EV.RESCUE || kind === EV.DROPPED;
+    // an adaptation's plan lands in one pass: spread it so it reads as a wave
+    const t0 = now + Math.max(0, REPLAY_MS - age) + (isLoad ? (n++ % 120) * 7 : 0);
+    if (isLoad) { const b = batch[kind] = batch[kind] || { n: 0, rows: new Set(), t }; b.n++; b.rows.add(row); }
+    else logEvent(kind, row, ex, sh, vrow, vex, t);
+    if (kind !== EV.DROPPED) { lit.set(i, { t0: t0 + (motion ? 300 : 0), kind }); A.start[i] = t0 + 300; }
+    if (motion && pings.length < 500) pings.push({ i, t0: t0 + 300, kind });
+    if (vi >= 0) {
+      A.start[vi] = t0 + 200;
+      if (motion) { if (A.drops.length < MAX_DROPS) A.drops.push({ i: vi, t0: t0 + 200 }); if (A.links.length < 200) A.links.push({ a: vi, b: i, t0: t0 + 200, dur: 1400, kind }); }
+      lit.delete(vi);
+    }
+    if (rescue || ((kind === EV.HOT || kind === EV.PREDICT) && sh >= 0.25)) addNote(i, kind, sh, t0);
+  }
+  for (const kind in batch) {
+    const b = batch[kind], pre = +kind === EV.PRELOAD;
+    logLine([["sw", "--load"], ["", (pre ? "preloaded " : "brought in ") + fmt(b.n) + " expert" + (b.n === 1 ? "" : "s") + " across " + b.rows.size + " layer" + (b.rows.size === 1 ? "" : "s")]], b.t);
+  }
+}
+// a figure's annotations: the latest heavy misses, lettered a, b, c...
+function addNote(i, kind, sh, t0) {
+  if (!motion) return;
+  notes = notes.filter(t => t.i !== i);
+  notes.push({ i, kind, sh, t0, letter: String.fromCharCode(97 + (noteNo++ % 26)) });
+  if (notes.length > MAX_NOTES) notes.shift();
+}
 
+// ---------------------------------------------------------------- observations
+const clock = t => { const d = new Date(t); return d.toLocaleTimeString("en-GB") + "." + Math.floor(d.getMilliseconds() / 100); };
+let logStick = true;
+$("log").addEventListener("scroll", () => { const l = $("log"); logStick = l.scrollTop + l.clientHeight >= l.scrollHeight - 8; });
+// parts: ["sw", colour var] a stain swatch, ["q", text] a quoted token, ["d", text] muted, ["", text] plain
+function logLine(parts, t) {
+  const ul = $("log"), li = document.createElement("li"), tm = document.createElement("time");
+  tm.textContent = clock(t); li.append(tm);
+  for (const [cls, text] of parts) {
+    if (cls === "sw") { const s = document.createElement("i"); s.className = "sw"; s.style.background = "var(" + text + ")"; li.append(s); continue; }
+    const s = document.createElement(cls === "q" ? "q" : "span"); if (cls && cls !== "q") s.className = cls; s.textContent = text; li.append(s);
+  }
+  (logFrag || (logFrag = document.createDocumentFragment())).append(li);
+}
+let logFrag = null;
+function flushLog() {
+  if (!logFrag) return;
+  const ul = $("log");
+  ul.querySelector(".first")?.remove();
+  ul.append(logFrag); logFrag = null;
+  while (ul.children.length > LOG_MAX) ul.firstChild.remove();
+  if (logStick) ul.scrollTop = ul.scrollHeight;
+}
+const where = (row, ex) => "L" + data.layers[row] + " · E" + ex;
+function shown(tok, max) {
+  if (tok == null) return null;
+  const s = JSON.stringify(tok).slice(1, -1);
+  return s.length > max ? s.slice(0, max - 1) + "…" : s;
+}
+function logRoute(rt) {
+  const txt = shown(rt.token, 14);
+  const parts = [];
+  if (rt.nMiss) parts.push(["sw", "--miss"]);
+  parts.push(txt === null ? ["d", "token " + fmt(rt.pos)] : ["q", txt]);
+  parts.push(["d", " — " + (rt.nMiss ? rt.nMiss + " of " + rt.ex.length + " picks missed" : "all " + rt.ex.length + " picks in memory")]);
+  logLine(parts, rt.t);
+}
+function logEvent(kind, row, ex, sh, vrow, vex, t) {
+  const pct = Math.round(sh * 100) + " %", over = vrow >= 0 ? ", in place of " + where(vrow, vex) : "";
+  if (kind === EV.RESCUE) logLine([["sw", "--miss"], ["", "rescued " + where(row, ex)], ["d", " · " + pct + over]], t);
+  else if (kind === EV.DROPPED) logLine([["sw", "--miss"], ["", "rescued " + where(row, ex)], ["d", " · " + pct + ", not kept"]], t);
+  else if (kind === EV.HOT) logLine([["sw", "--read"], ["", "read " + where(row, ex)], ["d", " · " + pct + over]], t);
+  else if (kind === EV.PREDICT) logLine([["sw", "--read"], ["", "read " + where(row, ex)], ["d", " · predicted" + over]], t);
+}
+
+// ---------------------------------------------------------------- frame
+function kick() { if (!raf && data && A) raf = requestAnimationFrame(frame); }
 function frame(t) {
   raf = 0;
   if (!data || !A || !geom) return;
   const dt = lastFrame ? Math.min(80, t - lastFrame) : 16, now = performance.now();
   lastFrame = t;
   let more = false;
-  if (motion) {
-    const kc = 1 - Math.exp(-dt / TAU_COLOR), kx = 1 - Math.exp(-dt / TAU_SLIDE);
-    const cur = A.cur, tgt = A.tgt, x = A.x, tx = A.tx, st = A.start;
-    for (let i = 0, j = 0; i < A.N; i++, j += 3) {
-      if (st[i] > now) { more = true; continue; }
-      for (let k = j; k < j + 3; k++) {
-        const dl = tgt[k] - cur[k];
-        if (dl > 0.5 || dl < -0.5) { cur[k] += dl * kc; more = true; } else cur[k] = tgt[k];
-      }
-      const dx = tx[i] - x[i];
-      if (dx > 0.003 || dx < -0.003) { x[i] += dx * kx; more = true; } else x[i] = tx[i];
-    }
-    for (let r = 0; r < A.R; r++) {
-      const dr = A.resT[r] - A.res[r];
-      if (dr > 0.05 || dr < -0.05) { A.res[r] += dr * kx; more = true; } else A.res[r] = A.resT[r];
-    }
-    A.flights = A.flights.filter(f => {
-      if (now < f.t0 + f.dur) return true;
-      A.pops.push({ i: f.i, t0: now, soft: f.land === 3, kind: f.kind });
-      return false;
-    });
-    A.links = A.links.filter(p => now < p.t0 + p.dur);
-    A.ticks = A.ticks.filter(k => {
-      if (now < k.t0) return true;
-      const el = statEls.find(s => s.label === k.label);
-      if (el) { el.div.style.setProperty("--tick", "var(" + (k.kind === EV.RESCUE || k.kind === EV.DROPPED ? "--hot" : k.kind === EV.ADAPT || k.kind === EV.PRELOAD ? "--resident" : "--loading") + ")");
-                el.div.classList.remove("tick"); void el.div.offsetWidth; el.div.classList.add("tick"); }
-      return false;
-    });
-    A.pops = A.pops.filter(p => now < p.t0 + POP_MS);
-    A.drops = A.drops.filter(p => now < p.t0 + DROP_MS);
-    statTw = statTw.filter(s => {
-      const p = Math.min(1, (now - s.t0) / STAT_MS), e = 1 - (1 - p) ** 3;
-      s.shown = s.from + (s.target - s.from) * e;
-      s.num.textContent = fmt(Math.round(s.shown));
-      return p < 1;
-    });
-    more = more || A.flights.length || A.pops.length || A.drops.length || A.links.length || A.ticks.length
-                || statTw.length || A.reading.length;
+  // cells ease to their snapshot's colour, column and place
+  const kc = motion ? 1 - Math.exp(-dt / TAU_COLOR) : 1, kx = motion ? 1 - Math.exp(-dt / TAU_SLIDE) : 1;
+  let moved = false;
+  for (let i = 0, j = 0; i < A.N; i++, j += 3) {
+    if (A.start[i] > now) { more = true; continue; }
+    for (let q = j; q < j + 3; q++) { const dl = A.tgt[q] - A.cur[q]; if (dl > 0.5 || dl < -0.5) { A.cur[q] += dl * kc; moved = true; } else if (dl) { A.cur[q] = A.tgt[q]; moved = true; } }
+    const dx = A.tx[i] - A.x[i]; if (dx > 0.003 || dx < -0.003) { A.x[i] += dx * kx; moved = true; } else if (dx) { A.x[i] = A.tx[i]; moved = true; }
   }
-  render(now);
-  const ring = [...changed.values()].some(v => Date.now() - v < RECENT_MS);
-  if ((more || (motion && ring)) && !document.hidden) raf = requestAnimationFrame(frame); else lastFrame = 0;
+  if (moved) { geom.baseDirty = true; more = true; glDirty("col"); }
+  if (B) {
+    const kp = motion ? 1 - Math.exp(-dt / TAU_PLACE) : 1;
+    let mv = false;
+    for (let j = 0; j < 3 * A.N; j++) { const dl = B.T[j] - B.P[j]; if (dl > 1e-4 || dl < -1e-4) { B.P[j] += dl * kp; mv = true; } else if (dl) { B.P[j] = B.T[j]; mv = true; } }
+    if (mv) glDirty("pos");
+    more = more || mv;
+  }
+  for (let r = 0; r < A.R; r++) { const dr = A.resT[r] - A.res[r]; if (Math.abs(dr) > 0.05) { A.res[r] += dr * kx; more = true; } else A.res[r] = A.resT[r]; }
+  // warmth and fibres fade over the chosen time
+  const cool = Math.exp(-dt / (trailSecs * 1000 / 3)), mcool = Math.exp(-dt / 2500);
+  for (let i = 0; i < A.N; i++) { if (heat[i] > 0.004) heat[i] *= cool; else heat[i] = 0; if (missHeat[i] > 0.004) missHeat[i] *= mcool; else missHeat[i] = 0; }
+  // the fibres fade ten times a second, not every frame (tens of thousands of them; the eye sees no steps)
+  if (now - synAt >= 100) {
+    const st = now - synAt, scool = Math.exp(-st / (trailSecs * 1000 / 2.5)), smcool = Math.exp(-st / 4000);
+    for (const [k, s] of syn) { s[0] *= scool; s[1] *= smcool; if (s[0] < 0.012) syn.delete(k); }
+    if (syn.size > SYN_MAX) {       // the weakest go: a threshold from a sample of the weights
+      const w = [], step = Math.max(1, Math.floor(syn.size / 4000));
+      let n = 0;
+      for (const s of syn.values()) if (n++ % step === 0) w.push(s[0]);
+      w.sort((a, b) => a - b);
+      const cut = w[Math.min(w.length - 1, Math.floor(w.length * (1 - 0.85 * SYN_MAX / syn.size)))];
+      for (const [k, s] of syn) if (s[0] <= cut) syn.delete(k);
+    }
+    synAt = now;
+  }
+  for (const rt of routes) if (rt.fed < A.R && now >= rt.start) feed(rt, grownRows(rt, now));
+  // the section turns slowly unless held (and a few seconds after it is let go)
+  const spin = mode === "brain" && motion && !cam.drag && now - cam.idleAt > 4000 && !paused;
+  if (spin) cam.yaw += dt * 2 * Math.PI / 90000;
+  if (mode === "brain") renderBrain(now); else renderGrid(now);
+  fpsCount++;
+  if (now - fpsAt >= 1000) {
+    const f = Math.round(fpsCount * 1000 / (now - fpsAt));
+    $("fps").textContent = "drawn at " + f + " frame" + (f === 1 ? "" : "s") + " a second" + (mode === "brain" ? glWho() : "");
+    fpsCount = 0; fpsAt = now;
+  }
+  window.__mapFrameMs = 0.9 * (window.__mapFrameMs || 0) + 0.1 * (performance.now() - now);   // a frame's cost on the CPU, for a look
+  for (const [i, l] of lit) if (now - l.t0 > LIT_MS) lit.delete(i);
+  A.drops = A.drops.filter(p => now < p.t0 + DROP_MS); A.links = A.links.filter(p => now < p.t0 + p.dur);
+  pings = pings.filter(p => now < p.t0 + PING_MS);
+  notes = notes.filter(k => now < k.t0 + NOTE_MS);
+  statTick(now);
+  more = more || spin || routes.length || lit.size || syn.size || A.reading.length || notes.length || statTw.length || pings.length;
+  if (more && !document.hidden && !paused) raf = requestAnimationFrame(frame); else lastFrame = 0;
 }
+const inBand = r => band === null || (r >= band[0] && r < band[1]);
 
-function render(now) {
-  const d = data, g = geom, c = $("map"), x = c.getContext("2d"), dpr = window.devicePixelRatio || 1, wall = Date.now();
-  const E = A.E, w = g.cw - g.gap, h = g.rh - g.rgap, gridW = E * g.cw, col = colors.rgb;
-  x.setTransform(dpr, 0, 0, dpr, 0, 0);
-  x.clearRect(0, 0, g.w, g.h);
-  x.globalCompositeOperation = "source-over"; x.globalAlpha = 1;
-  x.font = "11px system-ui, sans-serif"; x.textBaseline = "middle";
-  // column ticks: only meaningful in expert order
-  x.fillStyle = colors.muted; x.textAlign = "center";
-  if (ordering() === "index" || !d.demand) {
-    for (let e = 0; e < g.E; e += 64) x.fillText(String(e), g.left + e * g.cw + g.cw / 2, 8);
+// ---------------------------------------------------------------- the section view, drawn by the GPU
+// The cells' places sit in a GPU buffer and the turn is done in the vertex shader, so a turning section costs a few
+// draw calls a frame; the fibres are rebuilt ten times a second, the growing routes and the glows each frame. Text
+// (the layer numbers, the scale bar, the notes, the hover ring) is drawn on the 2D canvas above it.
+const VS = `
+attribute vec3 aPos; attribute vec4 aCol; attribute float aSize; attribute float aShape;
+uniform vec4 uRot; uniform vec4 uView; uniform vec2 uRes; uniform float uDpr; uniform float uFogMode; uniform vec3 uFog;
+varying vec4 vCol; varying float vShape;
+void main() {
+  float x1 = aPos.x * uRot.x + aPos.z * uRot.y, z1 = -aPos.x * uRot.y + aPos.z * uRot.x;
+  float y2 = aPos.y * uRot.z + z1 * uRot.w, z2 = -aPos.y * uRot.w + z1 * uRot.z;
+  float f = uView.y / (uView.y + z2);
+  vec2 s = vec2(uView.z + x1 * uView.x * f, uView.w - y2 * uView.x * f);
+  gl_Position = vec4(s.x / uRes.x * 2.0 - 1.0, 1.0 - s.y / uRes.y * 2.0, 0.0, 1.0);
+  gl_PointSize = max(1.0, aSize * f * uDpr);
+  float fa = 0.3 + 0.7 * clamp((1.7 - z2) / 3.4, 0.0, 1.0);
+  vCol = uFogMode > 1.5 ? vec4(aCol.rgb, aCol.a * fa) : (uFogMode > 0.5 ? vec4(mix(uFog, aCol.rgb, fa), aCol.a) : aCol);
+  vShape = aShape;
+}`;
+// a point's shape: 0 a cell (a dot), 1 a glow (soft, fading out), 2 a ring
+const FS = `
+precision mediump float;
+varying vec4 vCol; varying float vShape; uniform float uPoints;
+void main() {
+  if (uPoints < 0.5) { gl_FragColor = vCol; return; }
+  float r = length(gl_PointCoord - 0.5) * 2.0;
+  float a = vShape < 0.5 ? 1.0 - smoothstep(0.7, 1.0, r) : (vShape < 1.5 ? pow(max(0.0, 1.0 - r), 1.7) : 1.0 - smoothstep(0.06, 0.16, abs(r - 0.84)));
+  if (a < 0.004) discard;
+  gl_FragColor = vec4(vCol.rgb, vCol.a * a);
+}`;
+// the stage (brightest in the middle, as under a condenser), or a flat veil
+const BG_VS = `attribute vec2 aP; varying vec2 vUv; void main() { vUv = aP * 0.5 + 0.5; gl_Position = vec4(aP, 0.0, 1.0); }`;
+const BG_FS = `
+precision mediump float;
+varying vec2 vUv; uniform vec2 uRes; uniform vec3 uHi; uniform vec3 uLo; uniform vec4 uFlat;
+void main() {
+  if (uFlat.a > 0.0) { gl_FragColor = uFlat; return; }
+  float d = length((vUv - vec2(0.5, 0.48)) * uRes) / (length(uRes) * 0.58);
+  gl_FragColor = vec4(mix(uHi, uLo, clamp(d, 0.0, 1.0)), 1.0);
+}`;
+let GL = null, glFailed = false;
+// the GPU layer's resolution: at most 1.5 device pixels a CSS pixel (a 4K screen's 2 quadruples the fill for points
+// that are a pixel or two across)
+const glDpr = () => Math.min(window.devicePixelRatio || 1, 1.5);
+// the renderer behind WebGL, said only when it is software (then the browser is not using the GPU)
+function glWho() {
+  if (!GL) return "";
+  if (GL.who === undefined) {
+    const ext = GL.gl.getExtension("WEBGL_debug_renderer_info");
+    const r = ext ? String(GL.gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)) : "";
+    const m = r.match(/swiftshader|llvmpipe|softpipe|software|basic render/i);
+    GL.who = m ? " (WebGL in software, not on the GPU: " + m[0] + ")" : "";
+  }
+  return GL.who;
+}
+function glInit() {
+  if (GL || glFailed) return GL;
+  try {
+    // the discrete GPU where there are two; no multisampling (the points shade their own edges, and a browser that
+    // draws WebGL in software pays four times for it)
+    const c = $("gl"), gl = c.getContext("webgl", { alpha: false, antialias: false, premultipliedAlpha: false, powerPreference: "high-performance" });
+    if (!gl) throw new Error("no WebGL");
+    const compile = (type, src) => {
+      const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+      return s;
+    };
+    const link = (vs, fs) => {
+      const p = gl.createProgram(); gl.attachShader(p, compile(gl.VERTEX_SHADER, vs)); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+      gl.linkProgram(p); if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+      return p;
+    };
+    const P = link(VS, FS), Q = link(BG_VS, BG_FS), u = (p, n) => gl.getUniformLocation(p, n), b = () => gl.createBuffer();
+    GL = { gl, P, Q,
+      a: { pos: gl.getAttribLocation(P, "aPos"), col: gl.getAttribLocation(P, "aCol"), size: gl.getAttribLocation(P, "aSize"),
+           shape: gl.getAttribLocation(P, "aShape"), bg: gl.getAttribLocation(Q, "aP") },
+      u: { rot: u(P, "uRot"), view: u(P, "uView"), res: u(P, "uRes"), dpr: u(P, "uDpr"), fogMode: u(P, "uFogMode"), fog: u(P, "uFog"),
+           points: u(P, "uPoints"), bres: u(Q, "uRes"), hi: u(Q, "uHi"), lo: u(Q, "uLo"), flat: u(Q, "uFlat") },
+      b: { tri: b(), cellPos: b(), cellCol: b(), rim: b(), fibre: b(), lines: b(), spritesN: b(), spritesA: b(), spot: b() },
+      v: { rim: vbuf(7), fibre: vbuf(7), lines: vbuf(7), spritesN: vbuf(9), spritesA: vbuf(9), spot: vbuf(9) },
+      cellCol: null, posDirty: true, colDirty: true, rimDirty: true, fibreAt: -1e9 };
+    gl.bindBuffer(gl.ARRAY_BUFFER, GL.b.tri); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    gl.enable(gl.BLEND);
+    c.addEventListener("webglcontextlost", ev => { ev.preventDefault(); GL = null; });
+    c.addEventListener("webglcontextrestored", () => { GL = null; kick(); });
+  } catch (e) {
+    glFailed = true; GL = null; console.error(e);
+  }
+  return GL;
+}
+// growable vertex arrays: lines [x, y, z, r, g, b, a], sprites the same then [size, shape]
+function vbuf(stride) { return { a: new Float32Array(stride * 4096), n: 0, stride }; }
+function grow(v) { const b = new Float32Array(v.a.length * 2); b.set(v.a); v.a = b; }
+function lineV(v, x, y, z, c, al) {
+  if ((v.n + 1) * 7 > v.a.length) grow(v);
+  const o = v.n++ * 7, A_ = v.a;
+  A_[o] = x; A_[o + 1] = y; A_[o + 2] = z; A_[o + 3] = c[0] / 255; A_[o + 4] = c[1] / 255; A_[o + 5] = c[2] / 255; A_[o + 6] = al;
+}
+function spriteV(v, x, y, z, c, al, size, shape) {
+  if ((v.n + 1) * 9 > v.a.length) grow(v);
+  const o = v.n++ * 9, A_ = v.a;
+  A_[o] = x; A_[o + 1] = y; A_[o + 2] = z; A_[o + 3] = c[0] / 255; A_[o + 4] = c[1] / 255; A_[o + 5] = c[2] / 255; A_[o + 6] = al;
+  A_[o + 7] = size; A_[o + 8] = shape;
+}
+const cellSprite = (v, i, c, al, size, shape) => spriteV(v, B.P[3 * i], B.P[3 * i + 1], B.P[3 * i + 2], c, al, size, shape);
+function glAttribs(G, stride, sprite) {
+  const gl = G.gl, a = G.a;
+  gl.enableVertexAttribArray(a.pos); gl.vertexAttribPointer(a.pos, 3, gl.FLOAT, false, stride * 4, 0);
+  gl.enableVertexAttribArray(a.col); gl.vertexAttribPointer(a.col, 4, gl.FLOAT, false, stride * 4, 12);
+  if (sprite) {
+    gl.enableVertexAttribArray(a.size); gl.vertexAttribPointer(a.size, 1, gl.FLOAT, false, stride * 4, 28);
+    gl.enableVertexAttribArray(a.shape); gl.vertexAttribPointer(a.shape, 1, gl.FLOAT, false, stride * 4, 32);
   } else {
-    x.textAlign = "left"; x.fillText("most used", g.left, 8);
-    x.textAlign = "right"; x.fillText("least used", g.left + gridW, 8);
+    gl.disableVertexAttribArray(a.size); gl.vertexAttrib1f(a.size, 1);
+    gl.disableVertexAttribArray(a.shape); gl.vertexAttrib1f(a.shape, 0);
   }
-  // the cells, batched by colour: a Path2D a colour, so a settled frame is a few dozen fills, not 19,000
-  const buckets = new Map();
-  for (let r = 0, i = 0; r < g.R; r++) {
-    const y = g.top + r * g.rh;
-    for (let e = 0; e < E; e++, i++) {
-      const j = 3 * i, key = ((A.cur[j] + 0.5) & 255) << 16 | ((A.cur[j + 1] + 0.5) & 255) << 8 | ((A.cur[j + 2] + 0.5) & 255);
-      let p = buckets.get(key);
-      if (!p) { p = new Path2D(); buckets.set(key, p); }
-      p.rect(g.left + A.x[i] * g.cw, y, w, h);
+}
+// one batch: upload (unless it is a kept buffer), then draw with the blend asked for
+function glDraw(G, name, prim, fogMode, additive, upload = true) {
+  const gl = G.gl, v = G.v[name];
+  if (!v.n) return;
+  gl.bindBuffer(gl.ARRAY_BUFFER, G.b[name]);
+  if (upload) gl.bufferData(gl.ARRAY_BUFFER, v.a.subarray(0, v.n * v.stride), gl.DYNAMIC_DRAW);
+  glAttribs(G, v.stride, v.stride === 9);
+  gl.uniform1f(G.u.fogMode, fogMode); gl.uniform1f(G.u.points, prim === gl.POINTS ? 1 : 0);
+  gl.blendFunc(gl.SRC_ALPHA, additive ? gl.ONE : gl.ONE_MINUS_SRC_ALPHA);
+  gl.drawArrays(prim, 0, v.n);
+}
+function glFlat(G, rgba) {
+  const gl = G.gl;
+  gl.useProgram(G.Q); gl.bindBuffer(gl.ARRAY_BUFFER, G.b.tri);
+  gl.enableVertexAttribArray(G.a.bg); gl.vertexAttribPointer(G.a.bg, 2, gl.FLOAT, false, 0, 0);
+  gl.uniform4f(G.u.flat, rgba[0], rgba[1], rgba[2], rgba[3]);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.disableVertexAttribArray(G.a.bg);
+  gl.useProgram(G.P);
+}
+// the eye for the shader and for the text above it
+function viewOf(w, h) {
+  const S = Math.min(w / 2.7, h / (BH + 0.95)) * cam.zoom;
+  B.view = { cy: Math.cos(cam.yaw), sy: Math.sin(cam.yaw), cp: Math.cos(cam.pitch), sp: Math.sin(cam.pitch), S, D: 4.4, ox: w / 2, oy: h / 2 + 10 };
+}
+// the fibres a few times a second (their fading is slow): each link between two experts many tokens shared
+function buildFibres(G) {
+  const v = G.v.fibre, E = A.E, E2 = E * E, P_ = B.P;
+  v.n = 0;
+  for (const [key, s] of syn) {
+    if (s[0] < 0.05) continue;
+    const r = Math.floor(key / E2), rem = key - r * E2;
+    if (band !== null && !inBand(r) && !inBand(r + 1)) continue;
+    const a = 3 * (r * E + Math.floor(rem / E)), b = 3 * ((r + 1) * E + rem % E);
+    const col = s[1] > s[0] * 0.5 ? C.miss : C.fibre, al = Math.min(1, s[0] * 0.25) * (s[1] > s[0] * 0.5 ? 0.48 : 0.34);
+    lineV(v, P_[a], P_[a + 1], P_[a + 2], col, al); lineV(v, P_[b], P_[b + 1], P_[b + 2], col, al);
+  }
+}
+function renderBrain(now) {
+  const G = glInit();
+  if (!G) { glMissing(); return; }
+  const gl = G.gl, g = geom, glc = $("gl"), dpr = window.devicePixelRatio || 1, gd = glDpr(), E = A.E, R = A.R, N = A.N, P_ = B.P;
+  viewOf(g.w, g.h);
+  const v = B.view;
+  gl.viewport(0, 0, glc.width, glc.height);
+  // the stage
+  gl.useProgram(G.Q); gl.bindBuffer(gl.ARRAY_BUFFER, G.b.tri);
+  gl.enableVertexAttribArray(G.a.bg); gl.vertexAttribPointer(G.a.bg, 2, gl.FLOAT, false, 0, 0);
+  const hi = hex(C.hi), lo = hex(C.lo);
+  gl.uniform2f(G.u.bres, g.w, g.h); gl.uniform3f(G.u.hi, hi[0] / 255, hi[1] / 255, hi[2] / 255); gl.uniform3f(G.u.lo, lo[0] / 255, lo[1] / 255, lo[2] / 255);
+  gl.uniform4f(G.u.flat, 0, 0, 0, 0); gl.blendFunc(gl.ONE, gl.ZERO);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.disableVertexAttribArray(G.a.bg);
+  gl.useProgram(G.P);
+  gl.uniform4f(G.u.rot, v.cy, v.sy, v.cp, v.sp); gl.uniform4f(G.u.view, v.S, v.D, v.ox, v.oy);
+  gl.uniform2f(G.u.res, g.w, g.h); gl.uniform1f(G.u.dpr, gd); gl.uniform3f(G.u.fog, C.fogc[0] / 255, C.fogc[1] / 255, C.fogc[2] / 255);
+  // the sections' rims: faint folds, the focal plane's drawn plainly
+  if (G.rimDirty) {
+    const rv = G.v.rim; rv.n = 0;
+    for (let r = 0; r < R; r++) {
+      const rim = B.rim[r], y = B.slices[r].y, q = rim.length / 2, al = band === null ? 0.09 : inBand(r) ? 0.34 : 0.03;
+      for (let k = 0; k < q; k++) { const k2 = (k + 1) % q; lineV(rv, rim[2 * k], y, rim[2 * k + 1], C.ink, al); lineV(rv, rim[2 * k2], y, rim[2 * k2 + 1], C.ink, al); }
     }
   }
-  for (const [key, p] of buckets) { x.fillStyle = "rgb(" + (key >> 16) + "," + (key >> 8 & 255) + "," + (key & 255) + ")"; x.fill(p); }
-  const cellX = i => g.left + A.x[i] * g.cw, cellY = i => g.top + Math.floor(i / E) * g.rh;
-  if (motion) {
-    x.save();
-    x.beginPath(); x.rect(g.left - 2 * g.cw, 0, gridW + 4 * g.cw + 12, g.h); x.clip();
-    const kindRgb = k => k === EV.RESCUE || k === EV.DROPPED ? col.state[2] : k === EV.ADAPT || k === EV.PRELOAD ? col.state[1] : col.state[3];
-    // being read: the cell's outline breathes
-    for (const i of A.reading) {
-      const ph = 0.5 + 0.5 * Math.sin(now / 170 + i * 0.37);
-      x.strokeStyle = "rgba(" + col.state[3].join(",") + "," + (0.35 + 0.6 * ph) + ")"; x.lineWidth = 1.5;
-      x.strokeRect(cellX(i) - 1.5, cellY(i) - 1.5, w + 3, h + 3);
+  glDraw(G, "rim", gl.LINES, 2, false, G.rimDirty); G.rimDirty = false;
+  // the cells: by state (or usage), sinking into the gray with depth; outside a focal plane, out of focus
+  if (G.colDirty || !G.cellCol || G.cellCol.length !== 4 * N) {
+    if (!G.cellCol || G.cellCol.length !== 4 * N) G.cellCol = new Uint8Array(4 * N);
+    const cc = G.cellCol, fc = C.fogc;
+    for (let i = 0, j = 0; i < N; i++, j += 3) {
+      const k = inBand(Math.floor(i / E)) ? 1 : 0.22;
+      cc[4 * i] = fc[0] + (A.cur[j] - fc[0]) * k; cc[4 * i + 1] = fc[1] + (A.cur[j + 1] - fc[1]) * k; cc[4 * i + 2] = fc[2] + (A.cur[j + 2] - fc[2]) * k; cc[4 * i + 3] = 255;
     }
-    // whose slot it took: a thin arc from the evicted expert to its replacement
-    for (const l of A.links) {
-      const u = (now - l.t0) / l.dur;
-      if (u < 0) continue;
-      const ax = cellX(l.a) + w / 2, ay = cellY(l.a) + h / 2, bx = cellX(l.b) + w / 2, by = cellY(l.b) + h / 2;
-      const mx = (ax + bx) / 2 + (by - ay) * 0.18, my = (ay + by) / 2 - (bx - ax) * 0.18;
-      x.strokeStyle = "rgba(" + kindRgb(l.kind).join(",") + "," + (0.5 * (1 - u) ** 1.5) + ")";
-      x.lineWidth = 1; x.beginPath(); x.moveTo(ax, ay); x.quadraticCurveTo(mx, my, bx, by); x.stroke();
-    }
-    // flights along the layer's row from the disk side: an async read a comet that slows as it lands, an inline
-    // rescue a fast solid streak, a normal load a dotted trail at an even pace
-    x.lineCap = "butt";
-    for (const f of A.flights) {
-      const u = (now - f.t0) / f.dur;
-      if (u < 0) continue;
-      const k = f.kind || EV.HOT, rgb = kindRgb(k), rc = rgb.join(","), v = Math.min(1, u);
-      const rescue = k === EV.RESCUE || k === EV.DROPPED, normal = k === EV.ADAPT || k === EV.PRELOAD;
-      const e = rescue ? v : normal ? v * v * (3 - 2 * v) : 1 - (1 - v) ** 3;
-      const sx = g.left + gridW + 8, ex = cellX(f.i) + w / 2, y = cellY(f.i) + h / 2, hx = sx + (ex - sx) * e;
-      if (rescue) {
-        const tail = Math.min(150, sx - hx + 4), th = Math.max(2.5, h * 0.42);
-        x.fillStyle = "rgba(" + rc + ",0.95)"; x.fillRect(hx, y - th / 2, tail, th);
-        x.fillStyle = "rgba(255,255,255,0.9)"; x.fillRect(hx, y - th / 2, Math.min(4, tail), th);
-      } else if (normal) {
-        const tail = Math.min(70, sx - hx + 4), th = Math.max(1.5, h * 0.24);
-        for (let dx = 0; dx < tail; dx += 6) {
-          x.fillStyle = "rgba(" + rc + "," + (0.9 * (1 - dx / tail)) + ")"; x.fillRect(hx + dx, y - th / 2, 3.5, th);
+    gl.bindBuffer(gl.ARRAY_BUFFER, G.b.cellCol); gl.bufferData(gl.ARRAY_BUFFER, cc, gl.DYNAMIC_DRAW);
+    G.colDirty = false;
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER, G.b.cellPos);
+  if (G.posDirty) { gl.bufferData(gl.ARRAY_BUFFER, P_, gl.DYNAMIC_DRAW); G.posDirty = false; G.fibreAt = -1e9; }
+  gl.enableVertexAttribArray(G.a.pos); gl.vertexAttribPointer(G.a.pos, 3, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, G.b.cellCol);
+  gl.enableVertexAttribArray(G.a.col); gl.vertexAttribPointer(G.a.col, 4, gl.UNSIGNED_BYTE, true, 0, 0);
+  gl.disableVertexAttribArray(G.a.size); gl.vertexAttrib1f(G.a.size, 1.9);
+  gl.disableVertexAttribArray(G.a.shape); gl.vertexAttrib1f(G.a.shape, 0);
+  gl.uniform1f(G.u.fogMode, 1); gl.uniform1f(G.u.points, 1); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.drawArrays(gl.POINTS, 0, N);
+  // fibres, then the routes now: an axon up through the token's middle in each section, a dendrite out to each pick
+  const L = G.v.lines, SN = G.v.spritesN, SA = G.v.spritesA;
+  L.n = 0; SN.n = 0; SA.n = 0;
+  if (layersOn.routes) {
+    const fresh = now - G.fibreAt > 100;
+    if (fresh) { buildFibres(G); G.fibreAt = now; }
+    glDraw(G, "fibre", gl.LINES, 2, false, fresh);
+    const newest = routes.length ? routes[routes.length - 1].seq : 0;
+    for (const rt of routes) {
+      if (now < rt.start) continue;
+      const age = now - rt.start - GROW_MS, behind = newest - rt.seq;
+      if (motion && age > HOLD_MS) continue;
+      if (!motion && behind) continue;
+      if (behind > 14) continue;      // the newest dozen or so whole; the rest live on as fibres
+      const fade = (age <= 0 ? 1 : Math.pow(1 - age / HOLD_MS, 1.4)) * (behind < 3 ? 1 : 0.35), upto = grownRows(rt, now), k = rt.k;
+      let px = 0, py = 0, pz = 0;
+      for (let r = 0; r < upto; r++) {
+        let sx = 0, sy = 0, sz = 0, ss = 0;
+        for (let j = 0; j < k; j++) { const p = r * k + j, o = 3 * (r * E + rt.ex[p]), w = rt.sh[p]; sx += P_[o] * w; sy += P_[o + 1] * w; sz += P_[o + 2] * w; ss += w; }
+        const cx = sx / ss, cy = sy / ss, cz = sz / ss;
+        if (r > 0) { lineV(L, px, py, pz, C.fibre, 0.5 * fade); lineV(L, cx, cy, cz, C.fibre, 0.5 * fade); }
+        for (let j = 0; j < k; j++) {
+          const p = r * k + j, o = 3 * (r * E + rt.ex[p]), col = rt.miss[p] ? C.miss : C.fibre;
+          const al = fade * (0.1 + 0.9 * Math.min(1, rt.sh[p] * k / 2.2)) * (rt.miss[p] ? 0.7 : 0.5);
+          lineV(L, cx, cy, cz, col, al); lineV(L, P_[o], P_[o + 1], P_[o + 2], col, al);
         }
-      } else {
-        const tail = Math.min(90, (sx - hx) * 0.9 + 6), th = Math.max(1.5, h * 0.3);
-        const gr = x.createLinearGradient(hx, 0, hx + tail, 0);
-        gr.addColorStop(0, "rgba(" + rc + ",0.95)"); gr.addColorStop(1, "rgba(" + rc + ",0)");
-        x.fillStyle = gr; x.fillRect(hx, y - th / 2, tail, th);
+        px = cx; py = cy; pz = cz;
+        if (r === upto - 1 && upto < R && motion) {
+          spriteV(SA, cx, cy, cz, C.fibre, 0.35, 14, 1); spriteV(SA, cx, cy, cz, WHITE, 0.95, 3.6, 0);
+          for (let j = 0; j < k; j++) { const p = r * k + j, i = r * E + rt.ex[p]; cellSprite(SA, i, rt.miss[p] ? C.miss : C.fibre, 0.95, 3.6, 0); }
+        }
       }
     }
-    // landings: the cell flashes as its expert arrives
-    x.globalCompositeOperation = "source-over";
-    for (const p of A.pops) {
-      const u = (now - p.t0) / POP_MS;
-      if (u < 0) continue;
-      x.fillStyle = "rgba(255,255,255," + (0.85 * (1 - u) ** 4) + ")";
-      x.fillRect(cellX(p.i), cellY(p.i), w, h);
+    // the cells the recent routes picked warm by how much (the busiest ringed), eosin where missed
+    for (let i = 0; i < N; i++) {
+      const h = heat[i], m = missHeat[i];
+      if (h < 0.05 && m < 0.05) continue;
+      if (m >= 0.05) { const a = Math.min(0.9, m * 0.24); cellSprite(SN, i, C.miss, a, 2.6, 0); if (m > 1.2) cellSprite(SN, i, C.miss, a * 0.5, 10, 2); }
+      else { const a = Math.min(0.85, h * 0.15); cellSprite(SN, i, C.fibre, a, 2.6, 0); if (h > 2.2) cellSprite(SN, i, C.fibre, a * 0.4, 9, 2); }
     }
-    // evictions: the old colour shrinks into the cell
-    x.globalCompositeOperation = "source-over";
-    for (const p of A.drops) {
-      const u = (now - p.t0) / DROP_MS;
-      if (u < 0) continue;
-      const k = (1 - u) ** 2, cx = cellX(p.i) + w / 2, cy = cellY(p.i) + h / 2;
-      x.fillStyle = "rgba(" + p.rgb.join(",") + "," + (0.9 * (1 - u)) + ")";
-      x.fillRect(cx - w * k / 2, cy - h * k / 2, w * k, h * k);
+  }
+  // what came in: a load lights its cell (fluorescent green), a read after a miss violet, a rescue eosin; a ring
+  // as it lands; an evicted cell shrinks away and a faint arc joins it to its replacement
+  // a preload brings thousands at once: the newest MAX_GLOWS glow, the rest keep their lit dot (the glows' pixels,
+  // not their number, are what a weak or software GPU pays for)
+  let glows = lit.size;
+  for (const [i, l] of lit) {
+    const isLoad = l.kind === EV.ADAPT || l.kind === EV.PRELOAD, life = isLoad ? LIT_MS : READ_LIT_MS;
+    const u = (now - l.t0) / life, glow = glows-- <= MAX_GLOWS;
+    if (u < 0 || u > 1) continue;
+    if (isLoad ? !layersOn.loads : !layersOn.reads) continue;
+    const col = isLoad ? C.load : l.kind === EV.RESCUE ? C.miss : C.read, k = Math.pow(1 - u, 1.8);
+    if (glow) cellSprite(SA, i, col, (isLoad ? 0.5 : 0.4) * k, (isLoad ? 5 + 10 * k : 4 + 6 * k), 1);
+    cellSprite(SA, i, col, 0.75 * k + 0.2, 3.2, 0);
+    if (u < 0.1 && glow) cellSprite(SA, i, WHITE, 0.85 * (1 - u / 0.1), 3, 0);
+  }
+  for (const p of pings) {
+    const u = (now - p.t0) / PING_MS; if (u < 0) continue;
+    const isLoad = p.kind === EV.ADAPT || p.kind === EV.PRELOAD;
+    if (isLoad ? !layersOn.loads : !layersOn.reads) continue;
+    const col = isLoad ? C.load : p.kind === EV.RESCUE || p.kind === EV.DROPPED ? C.miss : C.read;
+    cellSprite(SA, p.i, col, (isLoad ? 0.6 : 0.45) * (1 - u), 2 * (2 + (isLoad ? 11 : 7) * Math.sqrt(u)), 2);
+  }
+  for (const p of A.drops) {
+    const u = (now - p.t0) / DROP_MS; if (u < 0) continue;
+    cellSprite(SA, p.i, C.cell, 0.7 * (1 - u), 4 * (1 - u) ** 2 + 0.5, 0);
+  }
+  for (const l of A.links) {
+    const u = (now - l.t0) / l.dur; if (u < 0) continue;
+    const isLoad = l.kind === EV.ADAPT || l.kind === EV.PRELOAD;
+    if (isLoad ? !layersOn.loads : !layersOn.reads) continue;
+    const a = 3 * l.a, b = 3 * l.b, col = isLoad ? C.load : C.read, al = 0.45 * (1 - u) ** 1.5, lift = 0.06 + 0.25 * Math.hypot(P_[b] - P_[a], P_[b + 2] - P_[a + 2]);
+    let qx = P_[a], qy = P_[a + 1], qz = P_[a + 2];
+    for (let s = 1; s <= 10; s++) {
+      const t = s / 10, x = P_[a] + (P_[b] - P_[a]) * t, y = P_[a + 1] + (P_[b + 1] - P_[a + 1]) * t + lift * 4 * t * (1 - t), z = P_[a + 2] + (P_[b + 2] - P_[a + 2]) * t;
+      lineV(L, qx, qy, qz, col, al); lineV(L, x, y, z, col, al);
+      qx = x; qy = y; qz = z;
     }
-    x.restore();
   }
-  // the spotlight: the cells a number counts, the rest veiled
-  const cat = CATS[spotHover || spot];
-  if (cat && seen) {
-    const sr = col.surface.join(",");
-    x.fillStyle = "rgba(" + sr + ",0.82)"; x.fillRect(g.left - 1, g.top - 1, gridW + 2, g.R * g.rh + 2);
-    const tw = wall, buckets2 = new Map();
-    for (let i = 0; i < A.N; i++) {
-      const r = Math.floor(i / E), on = cat.bits ? (seen[i] & cat.bits) : (d.states[r].charCodeAt(i - r * E) - 48 === cat.state);
-      if (!on) continue;
-      const j = 3 * i, key = ((A.cur[j] + 0.5) & 255) << 16 | ((A.cur[j + 1] + 0.5) & 255) << 8 | ((A.cur[j + 2] + 0.5) & 255);
-      let p = buckets2.get(key); if (!p) { p = new Path2D(); buckets2.set(key, p); } p.rect(cellX(i), cellY(i), w, h);
-      const ev = cat.bits && cellEv.get(i);
-      if (ev && tw - ev.t < 20000) {     // the recent ones ringed, fading over 20 s
-        x.strokeStyle = "rgba(" + col.ink.join(",") + "," + (0.9 * (1 - (tw - ev.t) / 20000)) + ")"; x.lineWidth = 1;
-        x.strokeRect(cellX(i) - 1.5, cellY(i) - 1.5, w + 3, h + 3);
-      }
-    }
-    for (const [key, p] of buckets2) { x.fillStyle = "rgb(" + (key >> 16) + "," + (key >> 8 & 255) + "," + (key & 255) + ")"; x.fill(p); }
+  if (motion) for (const i of A.reading) cellSprite(SA, i, C.read, 0.3 + 0.55 * (0.5 + 0.5 * Math.sin(now / 170 + i * 0.37)), 8, 2);
+  glDraw(G, "lines", gl.LINES, 2, true);
+  glDraw(G, "spritesN", gl.POINTS, 2, false);
+  glDraw(G, "spritesA", gl.POINTS, 2, true);
+  // tracing a key entry: the rest veiled, its cells lit
+  const sig = SIG[spotHover || spot];
+  if (sig) {
+    glFlat(G, [47 / 255, 49 / 255, 52 / 255, 0.8]);
+    const sv = G.v.spot, col = sig.rgb(); sv.n = 0;
+    for (let i = 0; i < N; i++) if (sig.on(i)) { cellSprite(sv, i, col, 0.95, 3, 0); cellSprite(sv, i, col, 0.18, 9, 1); }
+    glDraw(G, "spot", gl.POINTS, 0, true);
   }
-  // the layers' labels, residents (the bar and the number count to the snapshot's)
-  const maxRes = Math.max(1, ...d.resident_per_layer);
-  for (let r = 0; r < g.R; r++) {
-    const y = g.top + r * g.rh, n = A.res[r], bx = g.left + gridW + 10;
-    x.fillStyle = colors.ink2; x.textAlign = "right";
-    x.fillText(String(d.layers[r]), g.left - 7, y + h / 2);
-    x.fillStyle = colors.hair; x.fillRect(bx, y + h / 2 - 1.5, 52, 3);
-    x.fillStyle = colors.state[1]; x.fillRect(bx, y + h / 2 - 1.5, 52 * n / maxRes, 3);
-    x.fillStyle = colors.ink2; x.textAlign = "left";
-    x.fillText(String(Math.round(n)), bx + 58, y + h / 2);
+  // the text above: the layer gauge at each section's left edge, a scale bar (ten layers' height), the notes
+  const c = $("map"), x = c.getContext("2d");
+  x.setTransform(dpr, 0, 0, dpr, 0, 0); x.clearRect(0, 0, g.w, g.h);
+  const p3 = [0, 0, 0];
+  x.font = font(11, true); x.textBaseline = "middle"; x.textAlign = "right";
+  const step = R > 60 ? 6 : 4;
+  for (let r = 0; r < R; r += step) {
+    const rim = B.rim[r], sl = B.slices[r]; let best = Infinity, by = 0;
+    for (let q = 0; q < rim.length / 2; q++) { proj(rim[2 * q], sl.y, rim[2 * q + 1], p3); if (p3[0] < best) { best = p3[0]; by = p3[1]; } }
+    x.fillStyle = inBand(r) ? C.muted : C.faint;
+    x.fillRect(best - 13, by, 8, 1);
+    x.fillText(String(data.layers[r]), best - 16, by);
   }
-  // the cells that changed in the last few seconds: a ring that fades
-  x.lineWidth = 1.5;
-  for (const [i, t] of changed) {
-    const age = wall - t;
-    if (age >= RECENT_MS) continue;
-    x.strokeStyle = "rgba(" + col.ink.join(",") + "," + (motion ? 1 - age / RECENT_MS : 1) + ")";
-    x.strokeRect(cellX(i) - 0.75, cellY(i) - 0.75, w + 1.5, h + 1.5);
-  }
-  x.fillStyle = colors.muted; x.textAlign = "left";
-  x.fillText("resident", g.left + gridW + 10, 8);
+  const ten = v.S * v.cp * BH * 10 / Math.max(1, R - 1), sx = 22, sy = g.h - 22;
+  x.strokeStyle = rgba(C.ink2, 0.8); x.lineWidth = 1; x.beginPath();
+  x.moveTo(sx, sy); x.lineTo(sx, sy - ten); x.moveTo(sx - 3, sy); x.lineTo(sx + 3, sy); x.moveTo(sx - 3, sy - ten); x.lineTo(sx + 3, sy - ten); x.stroke();
+  x.textAlign = "left"; x.fillStyle = C.muted; x.fillText("10 layers", sx + 8, sy - ten / 2);
+  overlays(x, now);
+}
+function glMissing() {
+  const c = $("map"), x = c.getContext("2d"), g = geom, dpr = window.devicePixelRatio || 1;
+  x.setTransform(dpr, 0, 0, dpr, 0, 0); x.clearRect(0, 0, g.w, g.h);
+  x.font = font(15, true); x.fillStyle = C.muted; x.textAlign = "center"; x.textBaseline = "middle";
+  x.fillText("The section needs WebGL, which this browser did not give; the grid view works without it.", g.w / 2, g.h / 2);
 }
 
-let statEls = [], statKeys = "";
-// the spotlight's caption: what the cells are, how many since this page opened
-function spotText() {
-  const key = spotHover || spot, c = CATS[key], el = $("spot");
-  if (!c || !data) { el.textContent = spot ? "" : "Click or hover a number to see its experts on the map."; return; }
-  let n = 0;
-  if (c.bits && seen) for (let i = 0; i < seen.length; i++) n += (seen[i] & c.bits) !== 0;
-  else for (const row of data.states) for (let k = 0; k < row.length; k++) n += row.charCodeAt(k) - 48 === c.state;
-  el.textContent = "";
-  const b = document.createElement("b"); b.textContent = c.what;
-  let tail = c.bits ? ": " + fmt(n) + " expert" + (n === 1 ? "" : "s") + " since this page opened" : ": " + fmt(n);
-  if (key === "hot" && sessShare.length) {
-    const s = [...sessShare].sort((a, b) => a - b), med = s[Math.floor(s.length / 2)];
-    tail += ", the median miss " + Math.round(100 * med) + "% of its token's routing";
+// a load lights its cell (fluorescent green), a read after a miss violet, a rescue eosin: a glow that cools,
+// a ring as it lands; an evicted cell shrinks away, a faint arc joins it to its replacement
+function lightUp(x, now, X, Y, F) {
+  const big = mode === "brain";
+  // grouped by colour and strength: a handful of fills however many cells glow
+  const glow = new Map(), add = (col, a, cx, cy, r) => {
+    const key = col.join(",") + "|" + Math.min(9, Math.round(a * 10));
+    let p = glow.get(key); if (!p) { p = { col, a: Math.min(9, Math.round(a * 10)) / 10, path: new Path2D() }; glow.set(key, p); }
+    p.path.moveTo(cx + r, cy); p.path.arc(cx, cy, r, 0, 2 * Math.PI);
+  };
+  for (const [i, l] of lit) {
+    const isLoad = l.kind === EV.ADAPT || l.kind === EV.PRELOAD, life = isLoad ? LIT_MS : READ_LIT_MS;
+    const u = (now - l.t0) / life; if (u < 0 || u > 1) continue;
+    if (isLoad ? !layersOn.loads : !layersOn.reads) continue;
+    const col = isLoad ? C.load : l.kind === EV.RESCUE ? C.miss : C.read, k = Math.pow(1 - u, 1.8), cx = X(i), cy = Y(i), sz = big ? 1.4 * F(i) : 1;
+    add(col, (isLoad ? 0.3 : 0.2) * k, cx, cy, (isLoad ? 2.5 + 6 * k : 2 + 3.5 * k) * sz);
+    add(col, 0.75 * k + 0.2, cx, cy, 1.3 * sz);
+    if (u < 0.1) add(WHITE, 0.85 * (1 - u / 0.1), cx, cy, 1.2 * sz);
   }
-  el.append(b, document.createTextNode(tail + ". " + c.how + (spot ? " (Click it again, or press Escape, to clear.)" : "")));
+  x.globalCompositeOperation = "screen";
+  for (const g of glow.values()) if (g.a > 0) { x.fillStyle = rgba(g.col, g.a); x.fill(g.path); }
+  x.globalCompositeOperation = "source-over";
+  x.lineWidth = 1;
+  const rings = new Map();
+  for (const p of pings) {
+    const u = (now - p.t0) / PING_MS; if (u < 0) continue;
+    const isLoad = p.kind === EV.ADAPT || p.kind === EV.PRELOAD;
+    if (isLoad ? !layersOn.loads : !layersOn.reads) continue;
+    const col = isLoad ? C.load : p.kind === EV.RESCUE || p.kind === EV.DROPPED ? C.miss : C.read, rr = 2 + (isLoad ? 11 : 7) * Math.sqrt(u);
+    const a = Math.round((isLoad ? 0.6 : 0.45) * (1 - u) * 10) / 10, key = col.join(",") + "|" + a, cx = X(p.i), cy = Y(p.i);
+    let q = rings.get(key); if (!q) { q = { col, a, path: new Path2D() }; rings.set(key, q); }
+    q.path.moveTo(cx + rr, cy); q.path.arc(cx, cy, rr, 0, 2 * Math.PI);
+  }
+  for (const q of rings.values()) if (q.a > 0) { x.strokeStyle = rgba(q.col, q.a); x.stroke(q.path); }
+  const shrink = [];
+  for (const p of A.drops) {
+    const u = (now - p.t0) / DROP_MS; if (u < 0) continue;
+    const k = (1 - u) ** 2 * 4, b = Math.min(4, Math.floor(5 * (1 - u)));
+    (shrink[b] || (shrink[b] = new Path2D())).rect(X(p.i) - k / 2, Y(p.i) - k / 2, k, k);
+  }
+  shrink.forEach((path, b) => { if (path) { x.fillStyle = rgba(C.cell, 0.7 * (b + 0.5) / 5); x.fill(path); } });
+  const arcs = new Map();
+  for (const l of A.links) {
+    const u = (now - l.t0) / l.dur; if (u < 0) continue;
+    const isLoad = l.kind === EV.ADAPT || l.kind === EV.PRELOAD;
+    if (isLoad ? !layersOn.loads : !layersOn.reads) continue;
+    const ax = X(l.a), ay = Y(l.a), bx = X(l.b), by = Y(l.b), mx = (ax + bx) / 2, my = Math.min(ay, by) - 10 - Math.abs(bx - ax) * 0.12;
+    const a = Math.round(4.5 * (1 - u) ** 1.5) / 10, key = (isLoad ? "l" : "r") + a;
+    let q = arcs.get(key); if (!q) { q = { col: isLoad ? C.load : C.read, a, path: new Path2D() }; arcs.set(key, q); }
+    q.path.moveTo(ax, ay); q.path.quadraticCurveTo(mx, my, bx, by);
+  }
+  for (const q of arcs.values()) if (q.a > 0) { x.strokeStyle = rgba(q.col, q.a); x.stroke(q.path); }
+  if (motion) for (const i of A.reading) {
+    const ph = 0.5 + 0.5 * Math.sin(now / 170 + i * 0.37), s = big ? 3 * F(i) : 3;
+    x.strokeStyle = rgba(C.read, 0.3 + 0.55 * ph); x.beginPath(); x.arc(X(i), Y(i), s, 0, 2 * Math.PI); x.stroke();
+  }
 }
-function tweenTo(s, v) {
-  if (s.shown === null || !motion) { s.shown = s.target = v; s.num.textContent = fmt(v); return; }
-  if (v === s.target) return;
-  s.from = s.shown; s.target = v; s.t0 = performance.now();
-  if (!statTw.includes(s)) statTw.push(s);
-  kick();
+
+// ---------------------------------------------------------------- the grid view
+function drawBase() {
+  const g = geom, b = g.base, x = b.getContext("2d"), dpr = window.devicePixelRatio || 1, E = A.E;
+  x.setTransform(1, 0, 0, 1, 0, 0); x.clearRect(0, 0, b.width, b.height); x.setTransform(dpr, 0, 0, dpr, 0, 0);
+  x.fillStyle = "rgba(241,235,221,0.04)";
+  for (let r = 0; r < g.R; r++) x.fillRect(g.left, rowY(r) - 0.5, E * g.cw, 1);
+  const buckets = new Map(), nh = g.nodeH, nw = g.nodeW;
+  for (let r = 0, i = 0; r < g.R; r++) {
+    const y = rowY(r) - nh / 2;
+    for (let e = 0; e < E; e++, i++) {
+      const j = 3 * i, k = ((A.cur[j] + 0.5) & 255) << 16 | ((A.cur[j + 1] + 0.5) & 255) << 8 | ((A.cur[j + 2] + 0.5) & 255);
+      let p = buckets.get(k); if (!p) { p = new Path2D(); buckets.set(k, p); }
+      p.rect(g.left + A.x[i] * g.cw + (g.cw - nw) / 2, y, nw, nh);
+    }
+  }
+  for (const [k, p] of buckets) { x.fillStyle = "rgb(" + (k >> 16) + "," + (k >> 8 & 255) + "," + (k & 255) + ")"; x.fill(p); }
+  g.baseDirty = false;
 }
-function stats() {
-  const d = data, c = d.counts, dl = $("stats"), rows = [];
-  const add = (label, value, small) => rows.push([label, value, small]);
-  add("Resident", c.resident, "of " + fmt(d.total_experts) + " (" + (100 * c.resident / d.total_experts).toFixed(1) + "%)");
-  if (c.hot || d.engine === "deepseek") add("In the hot-read ring", c.hot, d.spare_slots ? "of " + fmt(d.spare_slots) : "");
-  add("Being read now", c.loading);
-  add("Memory slots", d.arena_slots);
-  for (const [k, v] of Object.entries(d.counters || {})) add(k[0].toUpperCase() + k.slice(1) + " since start", v);
-  const keys = rows.map(r => r[0]).join("|");
-  if (keys !== statKeys) {
-    dl.textContent = "";
-    statEls = rows.map(([label]) => {
+function renderGrid(now) {
+  const g = geom, c = $("map"), x = c.getContext("2d"), dpr = window.devicePixelRatio || 1, E = A.E, moved_ = g.baseDirty;
+  if (g.baseDirty) drawBase();
+  x.setTransform(dpr, 0, 0, dpr, 0, 0);
+  x.globalCompositeOperation = "source-over";
+  x.fillStyle = g.stage; x.fillRect(0, 0, g.w, g.h);
+  x.setTransform(1, 0, 0, 1, 0, 0); x.drawImage(g.base, 0, 0); x.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const nh = g.nodeH, nw = g.nodeW, cy = i => rowY(Math.floor(i / E));
+  if (layersOn.routes) {
+    if (!g.fib || now - g.fibAt > 100 || moved_) {
+      if (!g.fib) { g.fib = document.createElement("canvas"); g.fib.width = c.width; g.fib.height = c.height; }
+      const fx = g.fib.getContext("2d");
+      fx.setTransform(1, 0, 0, 1, 0, 0); fx.clearRect(0, 0, g.fib.width, g.fib.height); fx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      drawFibres(fx, colX, cy, () => 1); g.fibAt = now;
+    }
+    x.setTransform(1, 0, 0, 1, 0, 0); x.drawImage(g.fib, 0, 0); x.setTransform(dpr, 0, 0, dpr, 0, 0);
+    // the newest routes whole: each row's picks joined to the token's junctions above and below
+    x.globalCompositeOperation = "screen";
+    const buckets = [], newest = routes.length ? routes[routes.length - 1].seq : 0;
+    for (const rt of routes) {
+      if (now < rt.start || newest - rt.seq > 14) continue;
+      const age = now - rt.start - GROW_MS;
+      if (motion && age > HOLD_MS) continue;
+      if (!motion && rt.seq !== newest) continue;
+      const fade = (age <= 0 ? 1 : Math.pow(1 - age / HOLD_MS, 1.4)) * (newest - rt.seq < 3 ? 1 : 0.35), upto = grownRows(rt, now);
+      strands(rt, 0, upto, fade, colX, buckets);
+      if (motion && age < 0 && upto > 0) {
+        const r = upto - 1;
+        for (let j = 0; j < rt.k; j++) { const p = r * rt.k + j, px = colX(r * E + rt.ex[p]); x.fillStyle = rgba(rt.miss[p] ? C.miss : C.fibre, 0.9); x.beginPath(); x.arc(px, rowY(r), 2, 0, 2 * Math.PI); x.fill(); }
+      }
+    }
+    strokeBuckets(x, buckets, 0.5);
+    // warm cells, ten strengths of each colour: twenty fills, however many cells
+    x.globalCompositeOperation = "source-over";
+    const warm = [];
+    for (let i = 0; i < A.N; i++) {
+      const h = heat[i], m = missHeat[i];
+      if (h < 0.05 && m < 0.05) continue;
+      const miss = m >= 0.05, a = miss ? Math.min(0.9, m * 0.25) : Math.min(0.85, h * 0.16), k = (miss ? 10 : 0) + Math.min(9, Math.floor(a * 10));
+      (warm[k] || (warm[k] = new Path2D())).rect(colX(i) - nw / 2, cy(i) - nh / 2 - 0.5, nw, nh + 1);
+    }
+    warm.forEach((path, k) => { if (path) { x.fillStyle = rgba(k >= 10 ? C.miss : C.fibre, ((k % 10) + 0.5) / 10); x.fill(path); } });
+  }
+  lightUp(x, now, colX, cy, () => 1);
+  x.globalCompositeOperation = "source-over";
+  if (band !== null) {
+    x.fillStyle = "rgba(47,49,52,0.78)";
+    x.fillRect(0, 0, g.w, rowY(band[0]) - g.rh / 2); x.fillRect(0, rowY(band[1] - 1) + g.rh / 2, g.w, g.h);
+  }
+  // rulers: experts across the top, layers down the left, each layer's residents on the right
+  x.font = font(11, true); x.fillStyle = C.faint; x.textAlign = "center"; x.textBaseline = "middle";
+  const right = g.left + E * g.cw;
+  if (ordering === "index" || !demandRows) {
+    const step = E > 300 ? 64 : 32;
+    for (let e = 0; e <= E; e += step) { const px = g.left + e * g.cw; x.fillRect(px, 12, 1, 5); if (e < E) x.fillText(String(e), px + 10, 7); }
+  } else { x.textAlign = "left"; x.fillText("most used", g.left, 8); x.textAlign = "right"; x.fillText("least used", right, 8); }
+  x.fillStyle = C.rule; x.fillRect(g.left, 18, E * g.cw, 1);
+  const maxRes = Math.max(1, ...data.resident_per_layer);
+  x.fillRect(right + 8, g.top, 1, g.R * g.rh);
+  for (let r = 0; r < g.R; r++) {
+    const y = rowY(r), n = A.res[r];
+    x.fillStyle = C.faint; x.fillRect(right + 8, y, r % 4 === 0 ? 6 : 3, 1);
+    x.textAlign = "right"; x.fillStyle = r % 2 === 0 ? C.muted : C.faint; x.fillText(String(data.layers[r]), g.left - 8, y);
+    x.fillStyle = "rgba(241,235,221,0.08)"; x.fillRect(right + 18, y - 1, 40, 2);
+    x.fillStyle = rgba(C.ink2, 0.85); x.fillRect(right + 18, y - 1, 40 * n / maxRes, 2);
+    x.textAlign = "left"; x.fillStyle = C.muted; x.fillText(String(Math.round(n)), right + 62, y);
+  }
+  x.textAlign = "left"; x.fillStyle = C.faint; x.fillText("resident", right + 18, 8);
+  overlays(x, now);
+}
+
+// ---------------------------------------------------------------- both views: tracing, annotations, the newest token, hover
+// a note's label; `placed` keeps the frame's labels so a new one steps down past any it would cover. Returns its y.
+let placed = [];
+function label(x, text, lx, ly, a) {
+  x.font = font(12.5, true);
+  const w = x.measureText(text).width;
+  for (let k = 0; k < 8 && placed.some(r => lx - 4 < r[0] + r[2] && r[0] < lx + w + 4 && ly - 10 < r[1] + 17 && r[1] < ly + 7); k++) ly += 18;
+  placed.push([lx - 4, ly - 10, w + 8]);
+  x.fillStyle = "rgba(52,55,58," + (0.78 * a) + ")"; x.fillRect(lx - 4, ly - 10, w + 8, 17);
+  x.fillStyle = rgba(C.ink, a); x.fillText(text, lx, ly);
+  return ly;
+}
+function overlays(x, now) {
+  const g = geom, E = A.E, wall = Date.now();
+  placed = [];
+  const sig = SIG[spotHover || spot];
+  if (sig && mode === "grid") {
+    x.fillStyle = "rgba(47,49,52,0.8)";
+    if (mode === "brain") x.fillRect(0, 0, g.w, g.h); else x.fillRect(g.left - 2, g.top - 2, E * g.cw + 4, g.R * g.rh + 4);
+    x.globalCompositeOperation = "screen";
+    const col = sig.rgb();
+    for (let i = 0; i < A.N; i++) {
+      if (!sig.on(i)) continue;
+      const cx = PX(i), cy = PY(i);
+      x.fillStyle = rgba(col, 0.95); x.fillRect(cx - 1.5, cy - 1.5, 3, 3);
+      x.fillStyle = rgba(col, 0.16); x.fillRect(cx - 3.5, cy - 3.5, 7, 7);
+    }
+    x.globalCompositeOperation = "source-over";
+  }
+  x.textBaseline = "middle"; x.textAlign = "left"; x.lineWidth = 1;
+  // annotations: a ring round the cell, a leader, a lettered italic note
+  if (layersOn.reads) for (const k of notes) {
+    const u = (now - k.t0) / NOTE_MS; if (u < 0) continue;
+    const a = u < 0.8 ? 1 : (1 - u) / 0.2, cx = PX(k.i), y = PY(k.i), col = k.kind === EV.RESCUE || k.kind === EV.DROPPED ? C.miss : C.read;
+    const rr = 6 + (u < 0.06 ? (1 - u / 0.06) * 8 : 0);
+    x.strokeStyle = rgba(C.ink, 0.85 * a); x.beginPath(); x.arc(cx, y, rr, 0, 2 * Math.PI); x.stroke();
+    x.fillStyle = rgba(col, a); x.beginPath(); x.arc(cx, y, 2, 0, 2 * Math.PI); x.fill();
+    const left = cx > g.w - 220, ex = cx + (left ? -1 : 1) * (rr + 16), ey = y - rr - 10;
+    const text = k.letter + ".  " + (k.kind === EV.RESCUE || k.kind === EV.DROPPED ? "rescued" : "read after a miss") + ", " + where(Math.floor(k.i / E), k.i % E) + ", " + Math.round(k.sh * 100) + " %";
+    x.font = font(12.5, true);
+    const w = x.measureText(text).width, ly = label(x, text, left ? ex - w - 4 : ex + 4, ey, a);
+    x.strokeStyle = rgba(C.ink, 0.6 * a); x.beginPath(); x.moveTo(cx + (left ? -1 : 1) * rr * 0.7, y - rr * 0.7); x.lineTo(ex, ly); x.stroke();
+  }
+  // the newest token, noted beside its heaviest missed pick (else its top pick half way up)
+  const last = routes[routes.length - 1];
+  if (last && layersOn.routes && now >= last.start) {
+    if (!tokenNote || tokenNote.seq !== last.seq && now - tokenNote.at > 450) {
+      let best = -1, bs = -1;
+      for (let p = 0; p < last.ex.length; p++) if (last.miss[p] && last.sh[p] > bs) { bs = last.sh[p]; best = p; }
+      if (best < 0) best = Math.floor(A.R / 2) * last.k;
+      tokenNote = { seq: last.seq, at: now, i: Math.floor(best / last.k) * E + last.ex[best], rt: last };
+    }
+    const rt = tokenNote.rt, cx = PX(tokenNote.i), y = PY(tokenNote.i), age = (wall - rt.t) / 1000;
+    if (age < 6) {
+      const a = age < 4 ? 1 : (6 - age) / 2, txt = shown(rt.token, 22);
+      const text = (txt === null ? "token " + fmt(rt.pos) : "‘" + txt + "’") + " — " + (rt.nMiss ? rt.nMiss + " of " + rt.ex.length + " picks missed" : "every pick in memory");
+      x.font = font(12.5, true);
+      const w = x.measureText(text).width, left = cx + 30 + w > g.w - 6, lx = left ? cx - 30 - w : cx + 30, ly = y + 22;
+      x.strokeStyle = rgba(C.ink, 0.55 * a); x.beginPath(); x.moveTo(cx, y); x.lineTo(left ? lx + w + 2 : lx - 4, ly); x.stroke();
+      label(x, text, lx, ly, a);
+    }
+  }
+  if (hover >= 0) {
+    const cx = PX(hover), y = PY(hover);
+    x.strokeStyle = rgba(C.ink, 0.95); x.beginPath(); x.arc(cx, y, 5, 0, 2 * Math.PI); x.stroke();
+    if (mode === "grid") {
+      x.strokeStyle = "rgba(241,235,221,0.14)"; x.beginPath(); x.moveTo(g.left, y + 0.5); x.lineTo(g.left + E * g.cw, y + 0.5);
+      x.moveTo(cx + 0.5, g.top); x.lineTo(cx + 0.5, g.top + g.R * g.rh); x.stroke();
+    }
+  }
+}
+
+// ---------------------------------------------------------------- the key (it traces its cells on the field)
+const SIG = {
+  routes:   { group: "routing", name: "Token routes", desc: "each decoded token's path up through the layers", sw: "--fibre",
+              n: () => fmt(sess.tokens) + " tokens", on: i => heat[i] > 0.05, rgb: () => C.fibre },
+  missed:   { group: "routing", name: "Missed picks", desc: "a token chose an expert that was not in memory", sw: "--miss",
+              n: () => sess.picks ? (100 * sess.missed / sess.picks).toFixed(1) + " %" : "", on: i => missHeat[i] > 0.05, rgb: () => C.miss },
+  hot:      { group: "reads", name: "Read after a miss", desc: "fetched in the background, in use the next pass", sw: "--read",
+              n: () => fmt(sess.hot), on: i => seen[i] & (1 << EV.HOT | 1 << EV.PREDICT), rgb: () => C.read },
+  rescue:   { group: "reads", name: "Rescued inline", desc: "a heavy miss, read inside its own pass", sw: "--miss",
+              n: () => fmt(sess.rescue), on: i => seen[i] & (1 << EV.RESCUE | 1 << EV.DROPPED), rgb: () => C.miss },
+  moved:    { group: "residency", name: "Adaptive loads", desc: "brought in by the routing history; the cell lights", sw: "--load",
+              n: () => fmt(sess.moved - sess.preload), on: i => seen[i] & (1 << EV.ADAPT), rgb: () => C.load },
+  preload:  { group: "residency", name: "Preloads", desc: "loaded for a conversation that continues", sw: "--load",
+              n: () => fmt(sess.preload), on: i => seen[i] & (1 << EV.PRELOAD), rgb: () => C.load },
+  resident: { group: "residency", name: "Resident", desc: "in memory now", sw: "--cell",
+              n: () => data ? fmt(data.counts.resident) : "", on: i => stateOf(i) === 1, rgb: () => C.cell },
+  reading:  { group: "residency", name: "Being read", desc: "a read in flight, not yet in use", sw: "--read",
+              n: () => data ? fmt(data.counts.loading) : "", on: i => stateOf(i) === 3, rgb: () => C.read },
+};
+const SIG_KEYS = Object.keys(SIG);
+const stateOf = i => data.states[Math.floor(i / A.E)].charCodeAt(i % A.E) - 48;
+function buildSignals() {
+  const ul = $("signals"); ul.textContent = "";
+  let group = "";
+  for (const k of SIG_KEYS) {
+    const s = SIG[k];
+    if (s.group !== group) { group = s.group; const li = document.createElement("li"); li.className = "grp"; li.textContent = group; ul.append(li); }
+    const el = document.createElement("li");
+    el.className = "sig"; el.tabIndex = 0; el.setAttribute("role", "button"); el.setAttribute("aria-pressed", "false"); el.dataset.k = k;
+    const sw = document.createElement("i"); sw.className = "sw"; sw.style.background = "var(" + s.sw + ")";
+    const b = document.createElement("b"); b.textContent = s.name;
+    const n = document.createElement("span"); n.className = "n"; s.nEl = n;
+    const desc = document.createElement("span"); desc.className = "desc"; desc.textContent = s.desc;
+    el.append(sw, b, n, desc);
+    el.addEventListener("mouseenter", () => { spotHover = k; footer(); kick(); });
+    el.addEventListener("mouseleave", () => { spotHover = null; footer(); kick(); });
+    const toggle = () => { spot = spot === k ? null : k; for (const e of ul.querySelectorAll(".sig")) e.setAttribute("aria-pressed", String(e.dataset.k === spot)); footer(); kick(); };
+    el.addEventListener("click", toggle);
+    el.addEventListener("keydown", ev => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggle(); } });
+    ul.append(el);
+  }
+}
+function footer() {
+  const k = spotHover || spot, el = $("sel"); el.textContent = "";
+  if (k) {
+    const s = SIG[k], b = document.createElement("b"); b.textContent = s.name;
+    el.append("tracing ", b, " — " + s.desc + (spot ? " (Escape clears)" : ""));
+  } else if (band !== null) {
+    el.textContent = "in focus: layers " + data.layers[band[0]] + "–" + data.layers[band[1] - 1] + " (Escape clears)";
+  } else el.textContent = mode === "brain" ? "drag to turn the section, wheel to zoom, double-click to reset" : "hover a cell for its story";
+}
+// the caption's text before the first layout, so the field is measured with it in place
+function caption0(d) { if (!$("caption").textContent) $("caption").textContent = "Fig. 1 — Routing in " + d.model + "."; }
+function caption() {
+  const d = data, R = d.layers.length, el = $("caption"); el.textContent = "";
+  const b = document.createElement("b"); b.textContent = "Fig. 1";
+  const what = mode === "brain"
+    ? " Routing in " + d.model + ", sectioned by layer: layer " + d.layers[0] + " at the base, " + d.layers[R - 1] + " at the crown, " + d.experts_per_layer + " cells a section. Pale cells are in memory, dark ones are not. A token's route climbs as it is decoded; the fibres that stay are links many tokens share."
+    : " Routing in " + d.model + ", one row a layer, " + d.experts_per_layer + " cells a row. Pale cells are in memory, dark ones are not. A token's route runs down the rows as it is decoded; the fibres that stay are links many tokens share.";
+  el.append(b, " —" + what);
+}
+
+// ---------------------------------------------------------------- counts, the focal gauge, the table
+let statEls = [], statTw = [];
+function tps() { const wall = Date.now(); let n = 0; for (let i = routes.length - 1; i >= 0 && wall - routes[i].t < 3000; i--) n++; return n / 3; }
+function liveMiss() {
+  let p = 0, m = 0;
+  for (let i = routes.length - 1, c = 0; i >= 0 && c < 64; i--, c++) { p += routes[i].ex.length; m += routes[i].nMiss; }
+  return p ? 100 * m / p : null;
+}
+function counts() {
+  const d = data, ctr = d.counters || {};
+  const rows = [
+    ["resident", d.counts.resident, "of " + fmt(d.total_experts), ""],
+    ["missed", liveMiss(), "% of the last 64 tokens' picks", "pct"],
+    ["pace", tps(), "tokens a second", "dec"],
+    ["read after misses", ctr["hot reads"] ?? null, "since boot", ""],
+    ["rescued", ctr["inline rescues"] ?? null, "since boot", ""],
+  ];
+  if (!statEls.length) {
+    const dl = $("notes");
+    statEls = rows.map(([label, , , cls]) => {
       const div = document.createElement("div"), dt = document.createElement("dt"), dd = document.createElement("dd");
       const num = document.createElement("span"), small = document.createElement("small");
       dt.textContent = label; dd.append(num, small); div.append(dt, dd); dl.append(div);
-      const cat = CAT_OF[label];
-      if (cat && (CATS[cat].state || Array.isArray(d.events))) {
-        div.className = "link"; div.tabIndex = 0; div.setAttribute("role", "button"); div.setAttribute("aria-pressed", "false");
-        div.title = "Show these on the map";
-        div.addEventListener("mouseenter", () => { spotHover = cat; spotText(); kick(); });
-        div.addEventListener("mouseleave", () => { spotHover = null; spotText(); kick(); });
-        const toggle = () => { spot = spot === cat ? null : cat; for (const s of statEls) s.div.setAttribute?.("aria-pressed", String(spot && CAT_OF[s.label] === spot)); spotText(); kick(); };
-        div.addEventListener("click", toggle);
-        div.addEventListener("keydown", ev => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggle(); } });
-      }
-      return { num, small, shown: null, target: null, label, div };
+      return { num, small, shown: null, target: null, kind: cls };
     });
-    statTw = []; statKeys = keys;
   }
-  rows.forEach(([, v, small], k) => { const s = statEls[k]; s.small.textContent = small ? " " + small : ""; tweenTo(s, Number(v)); });
-  $("what").textContent = d.model + " · " + (d.sparks > 1 ? d.sparks + " Sparks" : "one Spark");
-  const notes = [];
-  if (c.not_loaded === 0 && c.loading === 0) notes.push("Every expert is in memory, so nothing is read from disk while serving.");
-  if (d.sparks > 1) notes.push("Each Spark holds its part of every resident expert; the two always agree.");
-  if (!d.demand) notes.push("This engine keeps no routing history, so there is no usage to show.");
-  $("note").textContent = notes.join(" ");
-  for (const i of document.querySelectorAll("input[name=view][value=demand], input[name=order][value=demand]")) i.disabled = !d.demand;
-  if (!d.demand) for (const i of document.querySelectorAll("input[name=view][value=state], input[name=order][value=index]")) i.checked = true;
+  rows.forEach(([, v, small], k) => {
+    const s = statEls[k];
+    s.small.textContent = v === null ? "" : small;
+    if (v === null) { s.num.textContent = "—"; s.shown = s.target = null; return; }
+    if (s.shown === null || !motion) { s.shown = s.target = v; show(s); return; }
+    if (v !== s.target) { s.from = s.shown; s.target = v; s.t0 = performance.now(); if (!statTw.includes(s)) statTw.push(s); kick(); }
+  });
 }
-
+function show(s) { s.num.textContent = s.kind === "pct" || s.kind === "dec" ? s.shown.toFixed(1) : fmt(Math.round(s.shown)); }
+function statTick(now) {
+  statTw = statTw.filter(s => { const p = Math.min(1, (now - s.t0) / STAT_MS), e = 1 - (1 - p) ** 3; s.shown = s.from + (s.target - s.from) * e; show(s); return p < 1; });
+}
+// the focal gauge: a tick a layer, as long as its residents; a dot where it missed lately. A pick focuses it and
+// its neighbours, the rest of the section out of focus
+let focalEls = [];
+function buildFocal() {
+  const el = $("focal"), R = data.layers.length; el.textContent = ""; focalEls = [];
+  for (let r = 0; r < R; r++) {
+    const b = document.createElement("button"); b.type = "button";
+    b.setAttribute("aria-label", "layer " + data.layers[r]);
+    const bar = document.createElement("i"), dot = document.createElement("b");
+    b.append(bar, dot);
+    b.addEventListener("click", () => {
+      const r0 = Math.max(0, r - 1), r1 = Math.min(R, r + 2);
+      band = band && band[0] === r0 && band[1] === r1 ? null : [r0, r1];
+      glDirty("col rim"); updateFocal(); footer(); kick();
+    });
+    el.append(b); focalEls.push({ b, bar, dot });
+  }
+}
+function updateFocal() {
+  const d = data, E = d.experts_per_layer;
+  focalEls.forEach((f, r) => {
+    const n = d.resident_per_layer[r];
+    let m = 0; for (let e = 0; e < E; e++) m += missHeat[r * E + e] > 0.2;
+    f.bar.style.width = Math.max(2, Math.round(26 * n / E)) + "px";
+    f.dot.style.opacity = m ? String(Math.min(1, 0.35 + m / 12)) : "0";
+    f.b.classList.toggle("on", band !== null && r >= band[0] && r < band[1]);
+    f.b.title = "layer " + d.layers[r] + ": " + fmt(n) + " of " + E + " resident" + (m ? ", " + m + " missed lately" : "");
+  });
+}
 function table() {
   const d = data, E = d.experts_per_layer, tb = $("rows");
   tb.textContent = "";
   d.layers.forEach((l, r) => {
     const tr = document.createElement("tr"), st = d.states[r];
-    let hot = 0, loading = 0;
-    for (let e = 0; e < E; e++) { const s = st.charCodeAt(e) - 48; hot += s === 2; loading += s === 3; }
+    let hot = 0, loading = 0, picks = 0, miss = 0;
+    for (let e = 0; e < E; e++) { const s = st.charCodeAt(e) - 48; hot += s === 2; loading += s === 3; picks += heat[r * E + e] > 0.05; miss += missHeat[r * E + e] > 0.05; }
     const n = d.resident_per_layer[r];
-    for (const v of [l, fmt(n), (100 * n / E).toFixed(0) + "%", hot, loading]) {
-      const td = document.createElement("td"); td.textContent = v; tr.append(td);
-    }
+    for (const v of [l, fmt(n), (100 * n / E).toFixed(0) + " %", hot, loading, picks, miss]) { const td = document.createElement("td"); td.textContent = v; tr.append(td); }
     tb.append(tr);
   });
 }
 
-// the poll's events, summed up for the log
-function logEvents(d) {
-  if (!Array.isArray(d.events)) return;
-  const top = d.events.reduce((m, ev) => Math.max(m, ev[0]), 0);
-  if (logEvents.seq === undefined) { logEvents.seq = top; return; }      // the history before this page: not news
-  const by = {}, layers = new Set(), shares = [];
-  for (const [seq, , row, , kind, share] of d.events) {
-    if (seq <= logEvents.seq) continue;
-    by[kind] = (by[kind] || 0) + 1; layers.add(d.layers[row]);
-    if (kind === EV.HOT || kind === EV.RESCUE) shares.push(share / 10);
-  }
-  logEvents.seq = Math.max(logEvents.seq, top);
-  const parts = [], n = k => by[k] || 0;
-  if (n(EV.HOT) + n(EV.PREDICT)) parts.push(fmt(n(EV.HOT) + n(EV.PREDICT)) + " read after misses");
-  if (n(EV.RESCUE) + n(EV.DROPPED)) parts.push(fmt(n(EV.RESCUE) + n(EV.DROPPED)) + " rescued inline");
-  if (n(EV.ADAPT)) parts.push(fmt(n(EV.ADAPT)) + " moved by the routing history");
-  if (n(EV.PRELOAD)) parts.push(fmt(n(EV.PRELOAD)) + " preloaded");
-  if (!parts.length) return;
-  if (shares.length) {
-    shares.sort((a, b) => a - b);
-    const lo = Math.round(shares[0]), hi = Math.round(shares[shares.length - 1]);
-    parts[0] += lo === hi ? " (" + (shares.length > 1 ? "misses of " : "a miss of ") + lo + "% of a token's routing)"
-                          : " (misses " + lo + "–" + hi + "% of a token's routing)";
-  }
-  const ls = [...layers].sort((a, b) => a - b), where = ls.length > 8 ? ls.length + " layers" : "layer" + (ls.length > 1 ? "s " : " ") + ls.join(", ");
-  const li = document.createElement("li"), t = document.createElement("time");
-  t.textContent = new Date().toLocaleTimeString("en-GB");
-  li.append(t, document.createTextNode(parts.join(", ") + " in " + where));
-  $("nolog")?.remove(); $("log").prepend(li);
-  while ($("log").children.length > LOG_MAX) $("log").lastChild.remove();
-}
-
-function diff() {
-  const d = data, E = d.experts_per_layer, flat = d.states.join(""), now = Date.now();
-  if (prev && prev.length === flat.length) {
-    let loaded = 0, dropped = 0, reading = 0;
-    const layers = new Set();
-    for (let i = 0; i < flat.length; i++) {
-      const a = prev.charCodeAt(i) - 48, b = flat.charCodeAt(i) - 48;
-      if (a === b) continue;
-      changed.set(i, now);
-      events.push([i, a, b]);
-      layers.add(d.layers[Math.floor(i / E)]);
-      if (b === 0) dropped++; else if (b === 3) reading++; else if (a === 0 || a === 3) loaded++;
-    }
-    if ((loaded || dropped || reading) && !Array.isArray(d.events)) {
-      const parts = [];
-      if (loaded) parts.push(fmt(loaded) + " loaded");
-      if (reading) parts.push(fmt(reading) + " started reading");
-      if (dropped) parts.push(fmt(dropped) + " dropped");
-      const ls = [...layers].sort((a, b) => a - b);
-      const where = ls.length > 8 ? ls.length + " layers" : "layer" + (ls.length > 1 ? "s " : " ") + ls.join(", ");
-      const li = document.createElement("li"), t = document.createElement("time");
-      t.textContent = new Date(now).toLocaleTimeString("en-GB");
-      li.append(t, document.createTextNode(parts.join(", ") + " in " + where));
-      $("nolog")?.remove();
-      $("log").prepend(li);
-      while ($("log").children.length > LOG_MAX) $("log").lastChild.remove();
-    }
-  }
-  for (const [i, t] of changed) if (now - t > RECENT_MS) changed.delete(i);
-  prev = flat;
-}
-
+// ---------------------------------------------------------------- polling
 function status(text, bad) { const s = $("status"); s.textContent = text; s.className = bad ? "bad" : ""; }
-function beat(ok) {
-  const p = $("pulse");
-  p.className = ok ? "live" : "bad";
-}
-
 async function poll() {
   if (paused || document.hidden) return;
+  const wantDemand = !demandRows || polls % DEMAND_EVERY === 0;
+  polls++;
   try {
-    const r = await fetch("/v1/expert-map", { headers: key ? { Authorization: "Bearer " + key } : {}, cache: "no-store" });
-    if (r.status === 401) { $("key").hidden = false; status("Waiting for an API key", true); beat(false); return; }
-    $("key").hidden = true;
+    const q = "?since=" + lastRouteSeq + "&events_since=" + lastEventSeq + "&demand=" + (wantDemand ? 1 : 0);
+    const r = await fetch("/v1/expert-map" + q, { headers: key ? { Authorization: "Bearer " + key } : {}, cache: "no-store" });
+    if (r.status === 401) { $("keyform").hidden = false; status("waiting for an API key", true); return; }
+    $("keyform").hidden = true;
     if (!r.ok) {
-      let msg = "The engine answered " + r.status;
+      let msg = "the engine answered " + r.status;
       try { msg = (await r.json()).error.message; } catch (e) {}
-      status(msg[0].toUpperCase() + msg.slice(1), true);
-      beat(false);
-      return;
+      status(msg, true); return;
     }
-    const first = !data, d = await r.json(), shape = data && (data.experts_per_layer !== d.experts_per_layer || data.layers.length !== d.layers.length);
+    const text = await r.text(); bytes = bytes * 0.8 + text.length * 0.2;
+    const d = JSON.parse(text);
+    const shape = data && (data.experts_per_layer !== d.experts_per_layer || data.layers.length !== d.layers.length);
+    const first = !data || shape;
+    if (shape) { A = null; B = null; firstPoll = true; lastRouteSeq = 0; lastEventSeq = 0; band = null; }
+    if (d.demand) demandRows = d.demand; else if (!d.has_demand) demandRows = null;
     data = d;
-    if (shape) { prev = null; changed.clear(); }
-    diff();
-    if (first || shape) { layout(); }
-    logEvents(d);
-    reorder(); legend(); stats(); table(); retarget(first || shape ? "first" : "poll"); spotText();
-    beat(true);
-    const at = new Date(d.sampled_at * 1000).toLocaleTimeString("en-GB");
-    status(d.stale ? "Engine is mid-step; map from " + at : (d.busy ? "Serving a request" : "Idle") + " · updated " + at, false);
+    if (first) { caption0(d); layout(); buildFocal(); }
+    const now = performance.now();
+    if (first || wantDemand) reorder();
+    retarget(first ? "first" : "poll");
+    addEvents(d, now); addRoutes(d, now);
+    lastRouteSeq = Math.max(lastRouteSeq, d.route_seq || 0); lastEventSeq = Math.max(lastEventSeq, d.event_seq || 0);
+    if (first) { buildSignals(); footer(); caption(); }
+    firstPoll = false;
+    counts(); updateFocal();
+    if (polls % 5 === 1) table();
+    for (const k of SIG_KEYS) if (SIG[k].nEl) SIG[k].nEl.textContent = SIG[k].n();
+    for (const b of document.querySelectorAll("[data-view=demand],[data-order=demand]")) b.disabled = !demandRows;
+    $("what").textContent = d.model + ", " + (d.sparks > 1 ? "on " + d.sparks + " Sparks" : "on one Spark") + " — " + d.layers.length + " layers of " + d.experts_per_layer + " experts";
+    $("locktext").textContent = d.tokens_shown ? "token text shown" : "token text needs the key";
+    $("tokkey").hidden = !!d.tokens_shown;
+    $("rate").textContent = "five times a second (" + (bytes / 1024).toFixed(0) + " KB each)";
+    status(d.stale ? "the engine is mid-step" : d.busy ? "serving" : "idle", false);
+    if (!routes.length && polls === 4) logLine([["d", "no routes yet: they come with decoded tokens (and need the async hot reads)"]], Date.now());
+    flushLog();
+    kick();
   } catch (e) {
-    status("No answer from the server; retrying", true);
-    beat(false);
+    status("no answer from the server; retrying", true);
+    console.error(e);
   }
 }
+async function loop() {
+  const t0 = performance.now();
+  await poll();
+  clearTimeout(timer);
+  timer = setTimeout(loop, Math.max(20, POLL_MS - (performance.now() - t0)));
+}
 
-function cellAt(ev) {
-  const g = geom, b = $("map").getBoundingClientRect(), px = ev.clientX - b.left, py = ev.clientY - b.top;
-  const col = Math.floor((px - g.left) / g.cw), row = Math.floor((py - g.top) / g.rh);
-  return col >= 0 && col < g.E && row >= 0 && row < g.R ? { row, col } : null;
+// ---------------------------------------------------------------- hover, turning, zoom
+function nearest(px, py) {
+  if (mode === "grid") {
+    const g = geom, col = Math.floor((px - g.left) / g.cw), row = Math.floor((py - g.top) / g.rh);
+    if (col < 0 || col >= g.E || row < 0 || row >= g.R) return -1;
+    hoverRC = { row, col };
+    return row * A.E + order[row][col];
+  }
+  project(geom.w, geom.h);
+  let best = -1, bd = 81;
+  for (let i = 0; i < A.N; i++) {
+    const dx = B.SX[i] - px, dy = B.SY[i] - py, d2 = dx * dx + dy * dy;
+    if (d2 < bd || (d2 === bd && B.SZ[i] < B.SZ[best])) { bd = d2; best = i; }
+  }
+  return best;
 }
 function showTip() {
-  const tip = $("tip"), cur = $("cursor");
-  if (!hover || !data) { tip.style.display = cur.style.display = "none"; return; }
-  const g = geom, d = data, e = order[hover.row][hover.col], s = d.states[hover.row].charCodeAt(e) - 48;
-  const c = $("map"), ox = c.offsetLeft, oy = c.offsetTop;
-  const cx = ox + g.left + hover.col * g.cw, cy = oy + g.top + hover.row * g.rh;
-  cur.style.display = "block";
-  cur.style.left = cx - 1 + "px"; cur.style.top = cy - 1 + "px";
-  cur.style.width = g.cw - g.gap + 2 + "px"; cur.style.height = g.rh - g.rgap + 2 + "px";
+  const tip = $("tip");
+  kick();
+  if (hover < 0 || !data || !A) { tip.style.display = "none"; return; }
+  const d = data, E = A.E, i = hover, row = Math.floor(i / E), e = i % E, s = stateOf(i);
   tip.textContent = "";
-  const b = document.createElement("b"); b.textContent = STATE_TEXT[s][0].toUpperCase() + STATE_TEXT[s].slice(1);
-  const where = document.createElement("span"); where.textContent = "Layer " + d.layers[hover.row] + ", expert " + e;
-  tip.append(b, document.createElement("br"), where);
+  const add = (tag, text, cls) => { const el = document.createElement(tag); if (cls) el.className = cls; el.textContent = text; tip.append(el); };
+  add("span", "layer " + d.layers[row] + ", expert " + e, "k"); tip.append(document.createElement("br"));
+  add("b", STATE_TEXT[s][0].toUpperCase() + STATE_TEXT[s].slice(1));
   const ago = t => { const s = Math.max(0, Math.round((Date.now() - t) / 1000)); return s < 90 ? s + " s ago" : Math.round(s / 60) + " min ago"; };
-  const whereOf = i => i >= 0 ? "layer " + d.layers[Math.floor(i / d.experts_per_layer)] + ", expert " + (i % d.experts_per_layer) : "";
-  const i0 = hover.row * d.experts_per_layer + e, ev = cellEv.get(i0), gone = evicted.get(i0);
-  const line = text => { const sp = document.createElement("span"); sp.textContent = text; tip.append(document.createElement("br"), sp); };
+  const line = text => { tip.append(document.createElement("br")); add("span", text); };
+  let n = 0, nm = 0, top = 0;
+  for (const rt of routes) for (let j = 0; j < rt.k; j++) { const p = row * rt.k + j; if (rt.ex[p] === e) { n++; nm += rt.miss[p]; top = Math.max(top, rt.sh[p]); } }
+  if (n) line("Picked by " + n + " of the last " + routes.length + " tokens" + (nm ? ", " + nm + " while not in memory" : "") + "; up to " + Math.round(100 * top) + " % of a token's routing.");
+  const ev = cellEv.get(i), gone = evicted.get(i), whereOf = j => j >= 0 ? "layer " + d.layers[Math.floor(j / E)] + ", expert " + (j % E) : "";
   if (ev && (!gone || gone.t < ev.t)) {
-    const pct = Math.round(100 * ev.share) + "%";
-    const over = ev.victim >= 0 ? " It took the slot of " + whereOf(ev.victim) + "." : "";
-    if (ev.kind === EV.HOT) line("Read " + ago(ev.t) + ": a token picked it while it was not in memory (" + pct + " of that token's routing)." + over);
+    const pct = Math.round(100 * ev.share) + " %", over = ev.victim >= 0 ? " It took the place of " + whereOf(ev.victim) + "." : "";
+    if (ev.kind === EV.HOT) line("Read " + ago(ev.t) + " after a token picked it while it was not in memory (" + pct + " of that token's routing)." + over);
     else if (ev.kind === EV.PREDICT) line("Read " + ago(ev.t) + " on the predictor's call." + over);
     else if (ev.kind === EV.RESCUE) line("Rescued inline " + ago(ev.t) + ": its miss carried " + pct + " of a token's routing, so it was read before the layer ran." + over);
-    else if (ev.kind === EV.DROPPED) line("Rescued inline " + ago(ev.t) + " (" + pct + " of a token's routing) and let go: no slot of its width was free.");
-    else if (ev.kind === EV.ADAPT) line("Moved in " + ago(ev.t) + " by the routing history." + over);
+    else if (ev.kind === EV.DROPPED) line("Rescued inline " + ago(ev.t) + " (" + pct + ") and let go: no slot of its width was free.");
+    else if (ev.kind === EV.ADAPT) line("Brought in " + ago(ev.t) + " by the routing history." + over);
     else if (ev.kind === EV.PRELOAD) line("Preloaded " + ago(ev.t) + " for a continuing conversation." + over);
   } else if (gone) {
     const why = { [EV.HOT]: "a read after a miss", [EV.PREDICT]: "a predicted read", [EV.RESCUE]: "an inline rescue", [EV.ADAPT]: "the routing history", [EV.PRELOAD]: "a preload" }[gone.kind] || "a read";
     line("Evicted " + ago(gone.t) + " for " + whereOf(gone.by) + " (" + why + ").");
   }
-  if (d.demand) {
-    const v = level(hover.row, e), use = document.createElement("span");
-    use.textContent = v === 0 ? "Never used so far" : "Used " + Math.max(1, Math.round(100 * (v / 35) ** 2)) + "% as much as the layer's most used";
-    tip.append(document.createElement("br"), use);
-  }
+  if (demandRows) { const v = level(row, e); line(v === 0 ? "Never used so far." : "Used " + Math.max(1, Math.round(100 * (v / 35) ** 2)) + " % as much as the layer's most used."); }
   tip.style.display = "block";
-  const plot = $("plot"), tw = tip.offsetWidth, th = tip.offsetHeight;
-  let tx = cx + g.cw + 10, ty = cy + g.rh + 8;
-  if (tx + tw > plot.scrollLeft + plot.clientWidth - 4) tx = cx - tw - 10;
-  if (ty + th > plot.clientHeight - 4) ty = cy - th - 8;
-  tip.style.left = Math.max(4, tx) + "px"; tip.style.top = Math.max(4, ty) + "px";
+  const plot = $("plot"), cx = PX(i), cy = PY(i), tw = tip.offsetWidth, th = tip.offsetHeight;
+  let tx = cx + 14, ty = cy + 12;
+  if (tx + tw > plot.scrollLeft + plot.clientWidth - 6) tx = cx - tw - 14;
+  if (ty + th > plot.scrollTop + plot.clientHeight - 6) ty = cy - th - 12;
+  tip.style.left = Math.max(plot.scrollLeft + 4, tx) + "px"; tip.style.top = Math.max(plot.scrollTop + 4, ty) + "px";
 }
-
-$("map").addEventListener("pointermove", ev => { hover = cellAt(ev); showTip(); });
-$("map").addEventListener("pointerleave", () => { hover = null; showTip(); });
-$("map").addEventListener("blur", () => { hover = null; showTip(); });
-$("map").addEventListener("keydown", ev => {
-  const step = { ArrowLeft: [0, -1], ArrowRight: [0, 1], ArrowUp: [-1, 0], ArrowDown: [1, 0] }[ev.key];
-  if (!step || !geom) return;
+const map = $("map");
+function local(ev) { const b = map.getBoundingClientRect(); return [ev.clientX - b.left, ev.clientY - b.top]; }
+map.addEventListener("pointerdown", ev => {
+  if (mode !== "brain") return;
+  cam.drag = { x: ev.clientX, y: ev.clientY, yaw: cam.yaw, pitch: cam.pitch };
+  map.setPointerCapture(ev.pointerId); map.classList.add("drag");
+});
+map.addEventListener("pointermove", ev => {
+  if (!geom || !A) return;
+  if (cam.drag) {
+    // the near side follows the pointer (a turn's +yaw moves it left: x' changes by z', negative in front)
+    cam.yaw = cam.drag.yaw - (ev.clientX - cam.drag.x) * 0.006;
+    cam.pitch = Math.max(-0.1, Math.min(1.25, cam.drag.pitch + (ev.clientY - cam.drag.y) * 0.004));
+    cam.idleAt = performance.now(); hover = -1; showTip(); return;
+  }
+  const [px, py] = local(ev); hover = nearest(px, py); showTip();
+});
+const endDrag = () => { if (cam.drag) { cam.drag = null; cam.idleAt = performance.now(); map.classList.remove("drag"); kick(); } };
+map.addEventListener("pointerup", endDrag); map.addEventListener("pointercancel", endDrag);
+map.addEventListener("pointerleave", () => { hover = -1; showTip(); });
+map.addEventListener("blur", () => { hover = -1; showTip(); });
+map.addEventListener("wheel", ev => {
+  if (mode !== "brain") return;
   ev.preventDefault();
-  hover = hover || { row: 0, col: 0 };
-  hover = { row: Math.max(0, Math.min(geom.R - 1, hover.row + step[0])), col: Math.max(0, Math.min(geom.E - 1, hover.col + step[1])) };
+  cam.zoom = Math.max(0.6, Math.min(3.5, cam.zoom * Math.exp(-ev.deltaY * 0.0012))); cam.idleAt = performance.now(); kick();
+}, { passive: false });
+map.addEventListener("dblclick", () => { if (mode === "brain") { cam.yaw = 1.15; cam.pitch = 0.3; cam.zoom = 1; kick(); } });
+map.addEventListener("keydown", ev => {
+  if (!geom || !A) return;
+  if (mode === "brain") {
+    const turn = { ArrowLeft: [0.12, 0], ArrowRight: [-0.12, 0], ArrowUp: [0, -0.08], ArrowDown: [0, 0.08] }[ev.key];
+    if (turn) { ev.preventDefault(); cam.yaw += turn[0]; cam.pitch = Math.max(-0.1, Math.min(1.25, cam.pitch + turn[1])); cam.idleAt = performance.now(); kick(); }
+    else if (ev.key === "+" || ev.key === "=") { cam.zoom = Math.min(3.5, cam.zoom * 1.15); kick(); }
+    else if (ev.key === "-") { cam.zoom = Math.max(0.6, cam.zoom / 1.15); kick(); }
+    return;
+  }
+  const step = { ArrowLeft: [0, -1], ArrowRight: [0, 1], ArrowUp: [-1, 0], ArrowDown: [1, 0] }[ev.key];
+  if (!step) return;
+  ev.preventDefault();
+  const h = hoverRC || { row: 0, col: 0 };
+  hoverRC = { row: Math.max(0, Math.min(geom.R - 1, h.row + step[0])), col: Math.max(0, Math.min(geom.E - 1, h.col + step[1])) };
+  hover = hoverRC.row * A.E + order[hoverRC.row][hoverRC.col];
   showTip();
 });
-for (const i of document.querySelectorAll("input[name=view], input[name=order]")) {
-  i.addEventListener("change", () => {
-    // the choice lives in the address, so a reload or a bookmark keeps it
-    history.replaceState(null, "", "#view=" + view() + "&order=" + ordering());
-    if (data) { reorder(); legend(); retarget("view"); showTip(); }
-  });
-}
+
+// ---------------------------------------------------------------- controls
+function press(sel, attr, val) { for (const b of document.querySelectorAll(sel)) b.setAttribute("aria-pressed", String(b.dataset[attr] === val)); }
+function saveHash() { history.replaceState(null, "", "#mode=" + mode + "&view=" + view + "&order=" + ordering + "&trail=" + trailSecs); }
+for (const b of document.querySelectorAll("[data-mode]")) b.addEventListener("click", () => {
+  mode = b.dataset.mode; press("[data-mode]", "mode", mode); saveHash(); hover = -1; showTip();
+  if (data) { layout(); retarget(); footer(); caption(); }
+});
+for (const b of document.querySelectorAll("[data-view]")) b.addEventListener("click", () => { view = b.dataset.view; press("[data-view]", "view", view); saveHash(); if (data) retarget("view"); });
+for (const b of document.querySelectorAll("[data-order]")) b.addEventListener("click", () => { ordering = b.dataset.order; press("[data-order]", "order", ordering); saveHash(); if (data) { reorder(); retarget("view"); } });
+for (const b of document.querySelectorAll("[data-trail]")) b.addEventListener("click", () => { trailSecs = +b.dataset.trail; press("[data-trail]", "trail", b.dataset.trail); saveHash(); kick(); });
+for (const b of document.querySelectorAll("[data-k]")) b.addEventListener("click", () => { const k = b.dataset.k; layersOn[k] = !layersOn[k]; b.setAttribute("aria-pressed", String(layersOn[k])); kick(); });
 for (const [k, v] of new URLSearchParams(location.hash.slice(1))) {
-  const i = document.querySelector('input[name="' + (k === "order" ? "order" : "view") + '"][value="' + (v === "demand" ? "demand" : k === "order" ? "index" : "state") + '"]');
-  if (i && (k === "view" || k === "order")) i.checked = true;
+  if (k === "mode" && (v === "brain" || v === "grid")) { mode = v; press("[data-mode]", "mode", v); }
+  if (k === "view" && (v === "state" || v === "demand")) { view = v; press("[data-view]", "view", v); }
+  if (k === "order" && (v === "index" || v === "demand")) { ordering = v; press("[data-order]", "order", v); }
+  if (k === "trail" && ["5", "15", "60"].includes(v)) { trailSecs = +v; press("[data-trail]", "trail", v); }
 }
 $("pause").addEventListener("click", () => {
-  paused = !paused;
-  $("pause").textContent = paused ? "Resume" : "Pause";
-  $("pause").setAttribute("aria-pressed", String(paused));
-  if (paused) status("Paused", false); else poll();
+  paused = !paused; $("pause").textContent = paused ? "resume" : "pause"; $("pause").setAttribute("aria-pressed", String(paused));
+  status(paused ? "paused" : "resuming", false);
+  if (!paused) kick();        // the poll loop keeps its beat while paused, asking nothing
 });
-$("key").addEventListener("submit", ev => {
-  ev.preventDefault();
-  key = $("keyin").value.trim();
-  try { sessionStorage.setItem("tidelm-key", key); } catch (e) {}
-  poll();
-});
-window.addEventListener("resize", () => { if (data) { layout(); retarget(); showTip(); } });
-window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { readColors(); if (data) { legend(); retarget("view"); } });
-reduce.addEventListener("change", () => { motion = !reduce.matches; if (data) { legend(); stats(); retarget(); } });
-document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(); });
+const useKey = v => { key = v.trim(); try { sessionStorage.setItem("tidelm-key", key); } catch (e) {} };
+$("keyform").addEventListener("submit", ev => { ev.preventDefault(); useKey($("keyin").value); });
+$("tokkey").addEventListener("submit", ev => { ev.preventDefault(); useKey($("tokkeyin").value); $("tokkeyin").value = ""; });
+// the field follows its box (a window resize, the caption's lines, the narrow layout's reflow)
+let rz = 0, lastBox = "";
+new ResizeObserver(() => {
+  const p = $("plot"), box = p.clientWidth + "x" + p.clientHeight;
+  if (box === lastBox) return;
+  lastBox = box; clearTimeout(rz);
+  rz = setTimeout(() => { if (data && mode === "brain") { layout(); retarget(); } else if (data) { layout(); retarget(); } }, 120);
+}).observe($("plot"));
+reduce.addEventListener("change", () => { motion = !reduce.matches; if (data) retarget(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) kick(); });
 document.addEventListener("keydown", ev => {
-  if (ev.key === "Escape" && spot) { spot = null; for (const s of statEls) s.div.setAttribute("aria-pressed", "false"); spotText(); kick(); }
+  if (ev.key !== "Escape") return;
+  if (spot) { spot = null; for (const e of document.querySelectorAll(".sig")) e.setAttribute("aria-pressed", "false"); }
+  else if (band !== null) { band = null; glDirty("col rim"); updateFocal(); }
+  footer(); kick();
 });
 
 readColors();
-poll();
-timer = setInterval(poll, POLL_MS);
+loop();
 </script>
 </body>
 </html>

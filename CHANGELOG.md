@@ -35,6 +35,17 @@ exactly what it says: the defaults are not settled and the measurements are inco
   history, a preload, and whose slot each took) and `/v1/expert-map` sends them; the page replays them,
   lights the cells behind a number when it is hovered or clicked, and tells a cell's last event in its
   tooltip. `/v1/expert-map` is open without the API key, like the page.
+- **The expert map draws every decoded token's routing** (GLM-5.3, GLM-5.3-Flash, Inkling-2-Small):
+  `/v1/expert-map` sends each token's top-k picks a layer with their shares and misses, copied from the
+  async hot reads' table the decode pass already brings to the host, and takes `since` / `events_since`
+  / `demand=0` so the page polls five times a second at ~40 KB. A route's token text goes only to a
+  request with the API key. The page is a new design: each layer a section of a brain-like volume
+  (WebGL; a grid view too), routes climbing it, the links many tokens share kept as fibres, loads and
+  reads lighting their cells, a key that traces each kind, an observation log, a focal-plane gauge.
+  Under 70 tokens a second plus a 2,000-expert preload, a frame costs 1.5 ms of CPU in the section
+  (8.7 ms in the grid) in headless Chromium, where the first 2D canvas version took 67 ms.
+- Logs name the serving family: `[inkling]` / `[flash]` boot lines and "request N, Inkling 2:" where
+  they said `[glm]` and GLM for every family.
 
 ## 0.6.0 — 2026-11-17: the first release
 

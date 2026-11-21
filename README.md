@@ -7,12 +7,15 @@ ones those are from the router's own demand while it serves, and reads the misse
 most from NVMe as decoding goes on. The resident set rises and falls with what you ask it — the
 tide — so the engine gets better the more you use it.
 
-![The expert map: 48 rows of 384 cells, each layer's experts ordered most used first, resident ones blue and the others orange](assets/expert-map.png)
+![The expert map's section view: Inkling-2-Small's 48 layers as slices of a brain-like volume, each expert a cell; token routes climb through it while experts being brought in glow green](assets/expert-map.jpg)
 
 *The engine's live expert map ([`/expert-map`](#running-it)) on the pair serving Inkling-2-Small
-(2026-11-17), each layer's experts ordered most used first: the experts in demand are resident (blue)
-and most of those not loaded (orange) are the rarely used tail. The first six layers keep 309-366 of
-their 384 experts, the last twelve 139-229.*
+(2026-11-20), a few seconds into an answer in French, unlike the traffic before it: each layer is a
+section of the volume (layer 0 at the base), each cell an expert, pale where it is in memory. The
+routing history is bringing experts in as it goes (768 in the 14 s the page had been open, the green
+glows), the misses that matter are read from disk in the background (violet) or rescued inside their
+pass (pink), the heaviest of them noted by letter, and 11.9 % of the last 64 tokens' picks missed. The fibres are links between experts that many
+tokens share.*
 
 | Profile | Model | Sparks | Routed experts | Resident | Context | Prose | Code | 8K-token prompt, first token |
 | --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
@@ -339,20 +342,27 @@ at a time: each fills both boxes, or the head. `TIDE_ENGINE=python` still starts
 their settings (the examples as of `a6ec917`), and a profile the Rust engine does not serve
 (MXFP4 GLM experts, FP4 KV) goes to them with a note.
 
-`http://<head>:8000/expert-map` shows the residency as it is now, for every profile: a row a layer
-and a cell an expert - resident, being read from disk, in DeepSeek's hot-read ring, or not loaded -
-with the cells that changed in the last few seconds outlined. Its second view colours each expert by
-how much the routing history uses it, so the ones in demand and not in memory stand out, and either
-view can order a layer's cells by use. On GLM-5.3, GLM-5.3-Flash and Inkling-2-Small it also shows why each
-expert came in, replayed a second late at its own pace: an async read after a token picked an expert
-that was not loaded (a green comet along the layer's row), an inline rescue of a heavy miss (an orange
-streak), a normal load by the routing history (a blue dotted trail), each with a thin arc from the
-expert whose slot it took; the numbers above the map light their experts on it when hovered or
-clicked, and a cell's tooltip tells its last event (the miss's share of the token's routing, the
-expert it replaced). The motion is off when the system asks for reduced motion. The page reads
-`GET /v1/expert-map` (JSON; open, like the page, when an API key is set: residency, counters and the
-last seconds' residency events, nothing of any request) once a second while it is open; the engine
-answers from host data between its steps and does nothing for it when no page is asking.
+`http://<head>:8000/expert-map` shows the residency and the routing as they happen, for every
+profile. Its section view draws each layer as one slice of a brain-like volume (layer 0 at the base)
+and each expert as a cell in it, pale where resident and dark where not, the most used at the core
+(or scattered by expert number); drag turns it, the wheel zooms, and a focal-plane gauge beside it
+brings a layer and its neighbours into focus. The grid view shows the same thing a row a layer, and
+either view can colour the cells by how much the routing history uses them. On GLM-5.3,
+GLM-5.3-Flash and Inkling-2-Small every decoded token's routing is drawn as well: its route climbs
+the layers, its picks warm their cells (pink where they missed), and the links many tokens share
+stay on as fibres for 5, 15 or 60 s. Residency events replay at their own pace: a read after a miss
+(violet), an inline rescue (pink) and a load by the routing history or for a continuing conversation
+(green) light their cell, with a faint arc from the expert whose slot it took and lettered notes on
+the heaviest misses. The key beside the field traces each kind on it, the observation log lists every
+token and event, and a cell's tooltip tells its story. The section is drawn with WebGL (the grid
+works without it), and the motion is off when the system asks for reduced motion. The page polls
+`GET /v1/expert-map` five times a second, asking only for what it has not seen (`since`,
+`events_since`; the usage rows every 2 s): residency, counters, the last seconds' residency events
+and token routes (each a token's top-k picks a layer, their shares, which ones missed). It is open
+without an API key, like the page, but a route's token text is the conversation's and goes only to a
+request that carries a key. The engine copies the routes from the async hot reads' table, already on
+the host after each decode pass, answers between its steps, and does nothing for the page when none
+is asking.
 
 ### Updating
 
