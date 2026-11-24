@@ -8,7 +8,7 @@
 //!                 [--hot 1] [--hot-async 0] [--hot-keep 32] [--hot-rescue 0.4] [--depth 7] [--cal 0.36 | --dyn 0.9] [--lookup 8] [--copy 1]
 //!                 [--adapt 1] [--adapt-every 200] [--adapt-prefill 512] [--adapt-decode 256]
 //!                 [--bg-every 2] [--loop-break 12] [--two-pass 512] [--two-pass-miss 0.15] [--preload 512]
-//!                 [--lanes 1] [--lane-chunk 1024] [--pf-load 4 (GLM-5.3; else 0)] [--pf-load-slots 32]
+//!                 [--lanes 1] [--lane-chunk 1024] [--pf-load 4] [--pf-load-slots 32]
 //!                 [--state-db FILE] [--host 0.0.0.0] [--port 8000] [--served-model-name glm-5.3]
 //!
 //! The routing history: --db is read at boot (the Python engine's torch.save .pt or this
@@ -71,15 +71,31 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
     // --pf-load TH (GLM_PF_LOAD): a prefill chunk's missing experts whose summed share over a MoE
     // sub-chunk's rows reaches TH tokens' worth read in before the layer's MoE (tidelm_glm::pfload), into
     // --pf-load-slots scratch slots (GLM_PF_LOAD_SLOTS, 32) taken out of the --slots budget; 0 off. In
-    // the guard. On at 4 for GLM-5.3, where it was measured (bit280, 2026-11-23: ten far-domain
+    // the guard. On at 4 for every family. Measured on GLM-5.3 (bit280, 2026-11-23: ten far-domain
     // 3,584-token prompts, the 512 tokens after each scored, NLL 1.6562 -> 1.5876, paired -0.069 [-0.102,
-    // -0.038], the prompts' routing weight on substitutes ~30% -> ~5%, prefill ~10% slower); off for
-    // GLM-5.3-Flash and Inkling 2, where it has not run.
-    let pf_default = if cfg.is_flash() || cfg.is_inkling() { 0.0 } else { 4.0 };
-    let pf_load = num("--pf-load", pf_default)? as f32;
-    let pf_slots = if pf_load > 0.0 { num("--pf-load-slots", 32.0)? as usize } else { 0 };
+    // -0.038], the prompts' routing weight on substitutes ~30% -> ~5%, prefill ~10% slower). On Inkling 2
+    // the same protocol bought nothing (11,833 residents, 89% of the prompts' missed weight read in: NLL
+    // 1.6564 -> 1.6596, paired +0.003 [-0.019, +0.026] - Japanese science and history -0.09 / -0.10,
+    // Chinese physics, chemistry and biology +0.09 / +0.10 / +0.09, all five outside 0 - for 21% more
+    // prefill); it is on there by the author's choice, to judge sudden changes of topic in use.
+    // GLM-5.3-Flash at TP=1 gained as GLM-5.3 did (7,250 residents, 81% of the prompts' missed weight
+    // read in: NLL 1.8129 -> 1.7374, paired -0.076 [-0.102, -0.049], no text worse outside its interval,
+    // for 23% more prefill); at TP=2 every expert is resident and they are off (below).
+    let mut pf_load = num("--pf-load", 4.0)? as f32;
+    let mut pf_slots = if pf_load > 0.0 { num("--pf-load-slots", 32.0)? as usize } else { 0 };
     if pf_load > 0.0 && pf_slots == 0 {
         return Err("--pf-load-slots 0: prefill loads need scratch slots (--pf-load 0 turns them off)".into());
+    }
+    // nothing to load where --slots holds every decoder expert (GLM-5.3-Flash at TP=2): off, so the
+    // scratch takes no residents. From the records' widths, the same on both ranks.
+    if pf_slots > 0 {
+        let p = tidelm_glm::arena::Pack::open(std::path::Path::new(&pack), cfg.hidden, cfg.moe_inter)?;
+        let size = |bits| tidelm_glm::arena::record_sizes(bits, world, cfg.hidden, cfg.moe_inter).iter().sum::<usize>();
+        let all: usize = p.records.iter().filter(|((l, _), _)| *l < cfg.layers && !cfg.dense[*l]).map(|(_, r)| size(r.bits)).sum();
+        if num("--slots", 12500.0)? as usize * size([3; 3]) >= all {
+            eprintln!("[glm] prefill loads off: --slots holds every expert");
+            (pf_load, pf_slots) = (0.0, 0);
+        }
     }
     let opt = Options {
         max_seq: num("--max-seq", 262144.0)? as usize,

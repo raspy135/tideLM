@@ -153,8 +153,7 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
     # GLM_PF_LOAD=TH: a prefill chunk's missing experts whose summed share over a MoE sub-chunk's
     # rows reaches TH tokens' worth are read in before the layer's MoE instead of computing on
     # substitutes (tidelm-glm pfload.rs), into GLM_PF_LOAD_SLOTS scratch slots (32) taken out of
-    # GLM_SLOTS' budget. Unset: the server's default, 4 for GLM-5.3 and off for GLM-5.3-Flash and
-    # Inkling 2; 0: off
+    # GLM_SLOTS' budget. Unset: the server's default, 4 (every family); 0: off
     [[ -n "${GLM_PF_LOAD:-}" ]] && args+=(--pf-load "$GLM_PF_LOAD")
     [[ -n "${GLM_PF_LOAD_SLOTS:-}" ]] && args+=(--pf-load-slots "$GLM_PF_LOAD_SLOTS")
     [[ "${GLM_GRAPHS:-1}" == 1 ]] && args+=(--graphs)
@@ -271,6 +270,11 @@ if [[ "${DSV41_HOT_READS:-1}" == 1 && "${DSV41_HOT_ASYNC:-1}" == 1 ]]; then
 else
     args+=(--hot-ring 0)
 fi
+# DSV41_PF_LOAD=TH: prefill loads (tidelm-engine pfload.rs): in a prompt's eager steps, a backbone
+# layer's missing experts with TH tokens' worth of the step's routing read into DSV41_PF_LOAD_SLOTS
+# scratch slots (32, out of RUST_BUDGET) before it routes. Unset: the server's default, 4; 0: off
+[[ -n "${DSV41_PF_LOAD:-}" ]] && args+=(--pf-load "$DSV41_PF_LOAD")
+[[ -n "${DSV41_PF_LOAD_SLOTS:-}" ]] && args+=(--pf-load-slots "$DSV41_PF_LOAD_SLOTS")
 if [[ "${DSV41_PREFIX_DISK:-1}" == 1 ]]; then
     args+=(--prefix-disk "${RUST_PREFIX_DIR:-$STATE/prefix-cache}" --prefix-disk-gb "${DSV41_PREFIX_DISK_GB:-20}"
            --prefix-disk-interval "${DSV41_PREFIX_DISK_MIN_INTERVAL_S:-300}" --prefix-disk-dedup "${DSV41_PREFIX_DISK_DEDUP:-1}")

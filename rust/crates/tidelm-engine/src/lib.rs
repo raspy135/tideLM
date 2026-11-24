@@ -20,6 +20,7 @@ pub mod hot;
 pub mod kv;
 pub mod keep;
 pub mod pair;
+pub mod pfload;
 pub mod prefix_disk;
 pub mod rope;
 pub mod vision;

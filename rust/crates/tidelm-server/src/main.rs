@@ -208,7 +208,8 @@ fn main() -> tidelm_engine::Result<()> {
     }
     // an unknown flag is an error: a test flag the server ignores (--keep-first once) loaded
     // every expert and ran the box out of memory
-    const VALUED: [&str; 33] = ["--swa-replay", "--copy-draft", "--bench-width", "--vision", "--model-dir", "--max-seq", "--lanes", "--depth", "--step-rows", "--keep-db", "--budget",
+    const VALUED: [&str; 40] = ["--pf-load", "--pf-load-slots", "--bench-nll", "--bench-nll-ab", "--bench-nll-skip",
+                                "--bench-nll-max", "--bench-nll-out", "--swa-replay", "--copy-draft", "--bench-width", "--vision", "--model-dir", "--max-seq", "--lanes", "--depth", "--step-rows", "--keep-db", "--budget",
                                 "--keep-first", "--layers", "--served-model-name", "--effort", "--host", "--port", "--world",
                                 "--rank", "--adapt-db", "--trace", "--adapt-sensitivity", "--adapt-prior", "--adapt-decode-tokens", "--adapt-probe", "--hot-ring", "--prefix-cache",
                                 "--prefix-snapshots", "--prefix-disk", "--prefix-disk-gb", "--prefix-disk-interval",
@@ -276,13 +277,39 @@ fn main() -> tidelm_engine::Result<()> {
         None => None,
     };
     let record = arg(&args, "--adapt-db").is_some();
+    // prefill loads (DSV41_PF_LOAD=TH, tidelm_engine::pfload): in a prompt's eager steps, a backbone
+    // layer's missing experts with at least TH tokens' worth of the step's routing read into
+    // --pf-load-slots scratch slots (DSV41_PF_LOAD_SLOTS, 32) before it routes; the slots come out
+    // of --budget (32 fewer residents); 0 off. On at 4 by the author's choice, as on the GLM engine: the
+    // A/B there (tidelm-server --bench-nll-ab pfload, 2026-11-23, ten far-domain 3,584-token prompts, the
+    // 512 tokens after each scored, ring off, stock wo_b) bought nothing - 88% of the prompts' missed
+    // weight read in (1.1 s a prompt, 7% of the bench), NLL 1.5771 -> 1.5885, paired +0.011 [-0.011,
+    // +0.033]; Japanese literature and history -0.10 / -0.07, Chinese physics and biology +0.07 / +0.12,
+    // all four outside 0 - and it is on to judge sudden changes of topic in use.
+    let pf_load: f32 = arg(&args, "--pf-load").map(|v| v.parse()).transpose().map_err(|e| format!("--pf-load: {e}"))?.unwrap_or(4.0);
+    // streaming weights (no --resident) has no residents to add to: off
+    let pf_load = if flag("--resident") { pf_load } else { 0.0 };
+    let pf_slots: usize = if pf_load > 0.0 {
+        arg(&args, "--pf-load-slots").map(|v| v.parse()).transpose().map_err(|e| format!("--pf-load-slots: {e}"))?.unwrap_or(32)
+    } else {
+        0
+    };
+    if pf_load > 0.0 && pf_slots == 0 {
+        return Err("--pf-load-slots 0: prefill loads need scratch slots (--pf-load 0 turns them off)".into());
+    }
+    let budget = |b: String| -> tidelm_engine::Result<usize> {
+        let b: usize = b.parse().map_err(|e| format!("--budget {b}: {e}"))?;
+        Ok(b.checked_sub(pf_slots).ok_or("--pf-load-slots: more scratch slots than the --budget")?)
+    };
     let keep = match (&adapt, &scores, arg(&args, "--budget")) {
-        (Some(a), _, Some(b)) => Some(a.boot_keep(b.parse()?)?),
+        (Some(a), _, Some(b)) => Some(a.boot_keep(budget(b)?)?),
         (Some(_), _, None) => return Err("--adapt-db needs --budget (the resident experts)".into()),
         (None, _, _) if record => None,
-        (None, Some(s), Some(b)) => Some(tidelm_engine::keep::keep_from_scores(s, 6, b.parse().unwrap())?),
+        (None, Some(s), Some(b)) => Some(tidelm_engine::keep::keep_from_scores(s, 6, budget(b)?)?),
         _ => keep_first.map(|k| vec![(0..384).map(|e| e < k).collect::<Vec<bool>>(); 40]),
     };
+    // every expert routable (no keep mask, nor one coming from rank 0 in the join): nothing to load
+    let (pf_load, pf_slots) = if keep.is_none() && !record { (0.0, 0) } else { (pf_load, pf_slots) };
     let mut opts = Options {
         max_seq,
         max_lanes: lanes,
@@ -312,6 +339,8 @@ fn main() -> tidelm_engine::Result<()> {
         // every lane at max_seq together; less overcommits, and a lane that runs out swaps
         // another to the prefix cache's disk tier (decode.rs)
         kv_tokens: arg(&args, "--kv-tokens").map(|v| v.parse()).transpose()?,
+        pf_load,
+        pf_slots,
     };
     // rank 1 of an adapting pair needs rank 0's residents before it loads them: it joins first
     let pair = match &pair_args {
@@ -363,6 +392,33 @@ fn main() -> tidelm_engine::Result<()> {
     // logged run's real continuation - what a longer draft costs - then rank 1 is released
     if let Some(path) = arg(&args, "--bench-width") {
         return bench_width(&mut engine, &path);
+    }
+    // --bench-nll JSONL (rank 0, instead of serving; tidelm-glm's bench_nll on this engine): each
+    // line's {"category", "text"} prefilled to --bench-nll-skip tokens (32) in steps of the engine's
+    // prefill rows, then teacher-forced in steps of 8 rows to --bench-nll-max (4096), every row's
+    // next-token NLL from its full logits. --bench-nll-ab pfload: prefill loads off, then on, in
+    // this boot; --bench-nll-out: each scored token's "category nll top1" a line (.off / .on
+    // appended with -ab). Then rank 1 is released.
+    if let Some(path) = arg(&args, "--bench-nll") {
+        let num = |k: &str, d: usize| -> tidelm_engine::Result<usize> {
+            Ok(arg(&args, k).map(|v| v.parse()).transpose().map_err(|e| format!("{k}: {e}"))?.unwrap_or(d))
+        };
+        let (skip, max) = (num("--bench-nll-skip", 32)?, num("--bench-nll-max", 4096)?);
+        let out = arg(&args, "--bench-nll-out");
+        match arg(&args, "--bench-nll-ab").as_deref() {
+            Some("pfload") => {
+                for on in [false, true] {
+                    engine.set_pf_load(on)?;
+                    eprintln!("bench-nll-ab: pfload {}", if on { "on" } else { "off" });
+                    let o = out.as_ref().map(|o| format!("{o}.pfload.{}", if on { "on" } else { "off" }));
+                    bench_nll(&mut engine, &text, &path, skip, max, o)?;
+                }
+            }
+            Some(k) => return Err(format!("--bench-nll-ab {k}: pfload is the one knob").into()),
+            None => bench_nll(&mut engine, &text, &path, skip, max, out)?,
+        }
+        engine.release_follower()?;
+        return Ok(());
     }
     // a step no lane decodes in prefills up to the engine's prefill rows (TIDELM_PREFILL_ROWS)
     let mut sched = Scheduler::new(&engine, SchedOptions { depth, step_rows, prefill_rows: Some(engine.pmax), logits: false })?;
@@ -487,6 +543,69 @@ fn bench_width(engine: &mut Engine, path: &str) -> tidelm_engine::Result<()> {
     let (m, lo, hi) = median(ts);
     eprintln!("bench-width: DSpark draft pass {m:.2} ms (min {lo:.2}, max {hi:.2})");
     engine.release_follower()?;
+    Ok(())
+}
+
+/// --bench-nll's pass over the texts of `path` (lane 0): per category the scored tokens' mean NLL and
+/// top-1 agreement with the text, and the prefill loads its prefills made.
+fn bench_nll(engine: &mut Engine, text: &Text, path: &str, skip: usize, max: usize, out: Option<String>)
+             -> tidelm_engine::Result<()> {
+    use std::io::Write;
+    use tidelm_engine::forward::{Seg, Want};
+    let mut dump = out.map(std::fs::File::create).transpose()?;
+    let v = engine.cfg.vocab_size;
+    let lane = 0;
+    let pf0 = engine.pf_stats();
+    let t0 = Instant::now();
+    let mut acc: std::collections::BTreeMap<String, (f64, f64, usize)> = Default::default();
+    let mut nans = 0usize;
+    for line in std::fs::read_to_string(path)?.lines().filter(|l| !l.trim().is_empty()) {
+        let j: serde_json::Value = serde_json::from_str(line)?;
+        let cat = j["category"].as_str().unwrap_or("all").to_string();
+        let ids = text.encode(j["text"].as_str().unwrap_or("")).map_err(|e| format!("{path}: {e:?}"))?;
+        if ids.len() < skip + 16 {
+            continue;
+        }
+        let ids = &ids[..ids.len().min(max)];
+        engine.reset_lane(lane)?;
+        for c in ids[..skip].chunks(engine.pmax) {
+            engine.forward_batch(&[Seg { lane, ids: c, want: Want::Nothing, decode: false, next: &[], hashes: None }])?;
+        }
+        let a = acc.entry(cat.clone()).or_default();
+        let mut i = skip;
+        while i + 1 < ids.len() {
+            let n = 8.min(ids.len() - 1 - i);
+            let lg = engine.forward_batch(&[Seg { lane, ids: &ids[i..i + n], want: Want::All, decode: true, next: &[], hashes: None }])?
+                .remove(0);
+            for r in 0..n {
+                let t = ids[i + r + 1] as usize;
+                let row: Vec<f32> = lg[r * v..(r + 1) * v].iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
+                if row.iter().any(|x| x.is_nan()) {
+                    nans += 1;
+                    continue;
+                }
+                let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+                let z: f64 = row.iter().map(|&x| (x as f64 - m).exp()).sum();
+                let nll = m + z.ln() - row[t] as f64;
+                let top = row.iter().enumerate().fold((0, f32::NEG_INFINITY), |b, (k, &x)| if x > b.1 { (k, x) } else { b }).0;
+                if let Some(f) = dump.as_mut() {
+                    writeln!(f, "{cat} {nll:.6} {}", (top == t) as u8)?;
+                }
+                a.0 += nll;
+                a.1 += (top == t) as u8 as f64;
+                a.2 += 1;
+            }
+            i += n;
+        }
+        let (s, top, n) = acc[&cat];
+        eprintln!("bench-nll: {cat}: {n} tokens, NLL {:.4}, top-1 {:.2}%", s / n as f64, 100.0 * top / n as f64);
+    }
+    let (s, top, n) = acc.values().fold((0.0, 0.0, 0usize), |x, y| (x.0 + y.0, x.1 + y.1, x.2 + y.2));
+    eprintln!("bench-nll: all: {n} tokens, NLL {:.4}, top-1 {:.2}%, {:.0} s, {nans} rows with NaN", s / n.max(1) as f64,
+              100.0 * top / n.max(1) as f64, t0.elapsed().as_secs_f64());
+    if let (Some(p0), Some(p1)) = (pf0, engine.pf_stats()) {
+        eprintln!("bench-nll: {}", p1.since(&p0).line());
+    }
     Ok(())
 }
 

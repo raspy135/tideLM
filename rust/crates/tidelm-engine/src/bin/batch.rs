@@ -95,6 +95,8 @@ fn main() -> tidelm_engine::Result<()> {
         tp: None,
         record_demand: false,
         hot_ring: 0,
+        pf_load: 0.0,
+        pf_slots: 0,
     };
     let t0 = Instant::now();
     let pair_args = tidelm_engine::pair::pair_args(&args)?;

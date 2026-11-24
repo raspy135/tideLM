@@ -391,12 +391,19 @@ pub struct Options {
     /// None: max_lanes x max_seq, every lane at max_seq together. At least max_seq: one lane
     /// always reaches it.
     pub kv_tokens: Option<usize>,
+    /// prefill loads (crate::pfload, DSV41_PF_LOAD): in an eager step, a backbone layer's missing
+    /// experts with at least this many tokens' worth of the step's routing made routable before
+    /// it routes; 0 off. Resident with a keep mask only.
+    pub pf_load: f32,
+    /// their scratch slots, past the hot-read ring's (DSV41_PF_LOAD_SLOTS)
+    pub pf_slots: usize,
 }
 
 impl Options {
     pub fn streaming(max_seq: usize, spec: bool) -> Self {
         Options { max_seq, max_lanes: 1, spec, resident: false, graphs: false, n_layers: None, keep: None, dspark_keep: None,
-                  tp: None, record_demand: false, hot_ring: 0, vision: false, swa_replay: false, kv_tokens: None }
+                  tp: None, record_demand: false, hot_ring: 0, vision: false, swa_replay: false, kv_tokens: None, pf_load: 0.0,
+                  pf_slots: 0 }
     }
 
     /// The bytes both ranks of a pair must agree on before they start (tidelm_comm::join):
@@ -416,11 +423,11 @@ impl Options {
         // overlay emits different tokens with nothing in the log
         let ablit = crate::ablit::digest()?;
         Ok(format!("tidelm-pair v3 tp | max_seq {} lanes {} spec {} resident {} graphs {} layers {:?} | keep {:x} \
-                    dspark_keep {:x} record {} hot_ring {} vision {} replay {} kv {:?} | exe {:x} | config {:x} | draft vocab {listed:x} | ablit {ablit:?} | env NO_QDQ={:?} ENGRAM_CACHE_MB={:?} \
+                    dspark_keep {:x} record {} hot_ring {} pf {} {} vision {} replay {} kv {:?} | exe {:x} | config {:x} | draft vocab {listed:x} | ablit {ablit:?} | env NO_QDQ={:?} ENGRAM_CACHE_MB={:?} \
                     DRAFT_HEAD_FMT={:?} TP_DRAFT={:?} EXPERT_TOPP={:?}/{:?} PREFILL_ROWS={} NO_SPLITK={:?} \
                     HOT={:?}/{:?}/{:?} PACKED_KV={:?}",
                    self.max_seq, self.max_lanes, self.spec, self.resident, self.graphs, self.n_layers, keep_digest,
-                   mask(&self.dspark_keep), self.record_demand, self.hot_ring, self.vision, self.swa_replay, self.kv_tokens, fnv(&exe), fnv(&cfg), std::env::var("TIDELM_NO_QDQ").ok(),
+                   mask(&self.dspark_keep), self.record_demand, self.hot_ring, self.pf_load, self.pf_slots, self.vision, self.swa_replay, self.kv_tokens, fnv(&exe), fnv(&cfg), std::env::var("TIDELM_NO_QDQ").ok(),
                    std::env::var("TIDELM_ENGRAM_CACHE_MB").ok(), std::env::var("TIDELM_DRAFT_HEAD_FMT").ok(),
                    std::env::var("TIDELM_TP_DRAFT").ok(), std::env::var("TIDELM_EXPERT_TOPP").ok(),
                    std::env::var("TIDELM_EXPERT_TOPP_MIN_K").ok(), prefill_rows(), std::env::var("TIDELM_NO_SPLITK").ok(),
@@ -447,6 +454,8 @@ const OP_DISK_LOAD: u32 = 14;
 const OP_VISION: u32 = 15;
 const OP_REPLAY: u32 = 16;
 const OP_KV_RELEASE: u32 = 17;
+const OP_PF_LOAD: u32 = 18;
+const OP_PF_PAUSE: u32 = 19;
 
 /// This engine's half of a tensor-parallel pair: the RoCE one-shot gather every sharded
 /// output goes through, the NCCL communicator, and the control channel. Rank 0 (the
@@ -1111,6 +1120,21 @@ struct HotJob {
     done: std::sync::mpsc::Sender<std::result::Result<(), String>>,
 }
 
+/// Prefill loads' state (crate::pfload): the threshold, the scratch slots past the hot-read ring,
+/// the (layer, expert) routable for the layer in flight, and the exact routing's host copy.
+struct PfLoads {
+    th: f32,
+    /// Engine::set_pf_load (a bench A/B): off, no load points at all
+    on: bool,
+    /// Engine::set_pf_pause: held for a probe's steps
+    paused: bool,
+    slots: Vec<usize>,
+    live: Vec<(usize, usize)>,
+    ids: Vec<i32>,
+    ws: Vec<f32>,
+    stats: crate::pfload::PfStats,
+}
+
 /// Async hot reads' state (crate::hot): the ring over the backbone arena's spare slots, the
 /// candidate rows and table on the device, the table's host copy (the next step plans from
 /// it), the marks of the step in flight, and the reader threads.
@@ -1318,6 +1342,8 @@ pub struct Engine {
     miss: Option<DeviceBuffer<f64>>,
     /// async hot reads (Options::hot_ring > 0): crate::hot
     hot: Option<Hot>,
+    /// prefill loads (Options::pf_load > 0): crate::pfload (not the pf_* L2 prefetch below)
+    pf_loads: Option<PfLoads>,
     /// rank 1: rank 0's hot-read state digest for the step being replayed
     peer_hot: Option<u64>,
     /// the RAM prefix cache's snapshots, by (lane, id) (decode.rs decides; both ranks hold
@@ -1451,7 +1477,7 @@ impl Resident {
         let experts_h = sc.spawn(|| -> Result<(ExpertSet, f64)> {
             tidelm_cuda::set_device(0)?;
             let set = ExpertSet::load(ckpt, "layers.", n_layers, cfg.n_routed_experts, opts.keep.as_deref(), opts.tp,
-                                      opts.hot_ring)?;
+                                      opts.hot_ring + opts.pf_slots)?;
             Ok((set, t0.elapsed().as_secs_f64()))
         });
         let mut ld = Loader::new(ckpt, stream)?;
@@ -1653,8 +1679,8 @@ impl Engine {
             Some(k) => k.iter().take(n_layers).map(|row| row.iter().filter(|&&b| b).count()).sum::<usize>(),
             None => n_layers * cfg.n_routed_experts,
         }
-        // and the hot-read ring's slots past them (the null slot is one past those)
-        + opts.hot_ring
+        // and the hot-read ring's and prefill loads' slots past them (the null slot is one past those)
+        + opts.hot_ring + opts.pf_slots
         .max(cfg.n_mtp_layers * cfg.dspark_n_routed_experts)
         .max(ARENA_SLOTS);
         let route_entries = (unsafe { ds_route_blocks(p as i32, route_slots as i32 + 1, 64) } as usize * 64).max(p * 16);
@@ -1911,6 +1937,15 @@ impl Engine {
         // serve every lane: a decode step's router records the candidates of all its decode rows,
         // whichever lane they are, and the ring's live experts are routable for the whole step.
         // (The Python engine ran one decode path a lane, hence its DSV41_MAX_CONCURRENCY=1.)
+        // the spare slots: the ring's first, then the prefill loads' scratch
+        let spare: Vec<usize> = match &resident {
+            Some(res) => (0..res.experts.owner.len()).filter(|&i| res.experts.owner[i].is_none()).collect(),
+            None => vec![],
+        };
+        if resident.is_some() && spare.len() != opts.hot_ring + opts.pf_slots {
+            return Err(format!("{} spare arena slots for a ring of {} and {} prefill-load slots", spare.len(), opts.hot_ring,
+                               opts.pf_slots).into());
+        }
         let hot = match (&resident, opts.hot_ring) {
             (_, 0) => None,
             (Some(res), ring) => {
@@ -1918,14 +1953,19 @@ impl Engine {
                     return Err("hot reads need pruned residency (a keep mask)".into());
                 }
                 let hcfg = crate::hot::HotConfig::from_env(ring, cfg.n_activated_experts)?;
-                let set = &res.experts;
-                let slots: Vec<usize> = (0..set.owner.len()).filter(|&i| set.owner[i].is_none()).collect();
-                if slots.len() != ring {
-                    return Err(format!("{} spare arena slots for a ring of {ring}", slots.len()).into());
-                }
-                Some(Hot::new(hcfg, slots, model_dir, n_layers, cfg.n_activated_experts, set)?)
+                Some(Hot::new(hcfg, spare[..ring].to_vec(), model_dir, n_layers, cfg.n_activated_experts, &res.experts)?)
             }
             (None, _) => return Err("hot reads need resident mode".into()),
+        };
+        let pf_loads = if opts.pf_load > 0.0 {
+            if resident.is_none() || opts.keep.is_none() || opts.pf_slots == 0 {
+                return Err("prefill loads need resident mode, pruned residency (a keep mask) and scratch slots".into());
+            }
+            let p = pmax * cfg.n_activated_experts;
+            Some(PfLoads { th: opts.pf_load, on: true, paused: false, slots: spare[opts.hot_ring..].to_vec(), live: vec![], ids: vec![0; p],
+                      ws: vec![0.0; p], stats: Default::default() })
+        } else {
+            None
         };
         // per lane, both halves (counts, mass) of every backbone layer's experts
         let (demand, miss) = if opts.record_demand && opts.resident {
@@ -2055,6 +2095,7 @@ impl Engine {
             pf_fork: Event::new()?,
             pf_join: Event::new()?,
             pf_open: std::cell::Cell::new(false),
+            pf_loads,
         })
     }
 
@@ -2166,6 +2207,14 @@ impl Engine {
                 OP_GRAPHS => {
                     let on = r.u32()? != 0;
                     self.set_graphs(on);
+                }
+                OP_PF_LOAD => {
+                    let on = r.u32()? != 0;
+                    self.set_pf_load(on)?;
+                }
+                OP_PF_PAUSE => {
+                    let paused = r.u32()? != 0;
+                    self.set_pf_pause(paused)?;
                 }
                 OP_MOVE_EXPERTS => {
                     let n = r.u32()? as usize;
@@ -2290,6 +2339,134 @@ impl Engine {
         hot.stats.wait_s += t0.elapsed().as_secs_f64();
         hot.ring.promote();
         Ok(())
+    }
+
+    /// A prefill load point (crate::pfload): backbone layer `l`'s exact top-k over the step's rows
+    /// (the router logits in act.z, no keep mask, image rows with bias_vl as the routing below),
+    /// its plan, the reads into scratch slots, and the planned experts routable (LUT -> slot, keep
+    /// -> 1) for the layer's own routing, which runs next. pf_release undoes them after the layer.
+    fn pf_point(&mut self, w: &Layer, l: usize, t: usize) -> Result<()> {
+        let Some(mut pf) = self.pf_loads.take() else { return Ok(()) };
+        let r = self.pf_point_with(&mut pf, w, l, t);
+        self.pf_loads = Some(pf);
+        r
+    }
+
+    fn pf_point_with(&mut self, pf: &mut PfLoads, w: &Layer, l: usize, t: usize) -> Result<()> {
+        let (e, k) = (w.n_experts, w.topk);
+        let st = &self.stream;
+        let a = &self.act;
+        let (img, bias_vl) = match self.shape {
+            Some(sh) if sh.vision => {
+                let b = w.gate_bias_vl.as_ref().ok_or("image rows, and the checkpoint has no ffn.gate.bias_vl")?;
+                (np(&self.vis_img), np(b))
+            }
+            _ => (nul(), nul()),
+        };
+        ck(unsafe {
+            ds_router(st.raw(), np(&a.z), np(&w.gate_bias), nul(), t as i32, e as i32, k as i32, self.cfg.route_scale, np(&a.idx),
+                      np(&a.rw), img, bias_vl)
+        }, "router (exact, prefill loads)")?;
+        // the live rows only (a step's filler rows route nowhere); the stream waited for, so no
+        // queued kernel still reads a scratch slot the reads overwrite
+        let live = self.live_rows * k;
+        a.idx.download_async(0, &mut pf.ids[..live], st)?;
+        a.rw.download_async(0, &mut pf.ws[..live], st)?;
+        st.synchronize()?;
+        let res = self.resident.as_mut().ok_or("prefill loads need resident mode")?;
+        let set = &mut res.experts;
+        let at = |x: usize| l * (e + 1) + x;
+        let ring = self.hot.as_ref().map(|h| &h.ring.live);
+        let lut = &set.lut_host;
+        let plan = crate::pfload::plan(&pf.ids[..live], &pf.ws[..live], k, e, |x| lut[at(x)] >= 0,
+                                       |x| ring.and_then(|r| r.get(&(l, x)).copied()), pf.th as f64, pf.slots.len());
+        let jobs: Vec<(usize, usize, usize)> = plan.reads.iter().zip(&pf.slots).map(|(&(x, _), &slot)| (slot, l, x)).collect();
+        let t0 = Instant::now();
+        if !jobs.is_empty() {
+            set.read_many(&self.ckpt, &jobs)?;
+        }
+        let rank = set.tp.map(|tp| tp.rank).unwrap_or(0);
+        let s = &mut pf.stats;
+        s.points += 1;
+        s.rows += self.live_rows as u64;
+        s.missed += plan.missed;
+        s.over += plan.over;
+        for (&(slot, _, x), &(_, wt)) in jobs.iter().zip(&plan.reads) {
+            set.lut_host[at(x)] = slot as i32;
+            pf.live.push((l, x));
+            s.loads += 1;
+            s.loaded_w += wt;
+            s.bytes += set.arena.slot_dsts(slot, rank).iter().map(|d| d.2 as u64).sum::<u64>();
+        }
+        for &(x, slot, wt) in &plan.ring {
+            set.lut_host[at(x)] = slot as i32;
+            pf.live.push((l, x));
+            s.ring += 1;
+            s.ring_w += wt;
+        }
+        s.read_s += t0.elapsed().as_secs_f64();
+        if !pf.live.is_empty() {
+            Self::pf_upload(set, self.keep.as_ref(), l, st)?;
+        }
+        Ok(())
+    }
+
+    /// Backbone layer `l`'s LUT row and keep row from the LUT's host copy (keep: routable), queued
+    /// on `st` (pageable copies: staged before the call returns).
+    fn pf_upload(set: &ExpertSet, keep: Option<&DeviceBuffer<u8>>, l: usize, st: &Stream) -> Result<()> {
+        let e = set.n_experts;
+        let row = &set.lut_host[l * (e + 1)..(l + 1) * (e + 1)];
+        set.lut.upload_async(l * (e + 1), row, st)?;
+        if let Some(keep) = keep {
+            let flags: Vec<u8> = row[..e].iter().map(|&s| (s >= 0) as u8).collect();
+            keep.upload_async(l * e, &flags, st)?;
+        }
+        Ok(())
+    }
+
+    /// After a prefill load point's layer: its experts leave routing (queued after the layer's MoE).
+    fn pf_release(&mut self) -> Result<()> {
+        let Some(pf) = self.pf_loads.as_mut() else { return Ok(()) };
+        if pf.live.is_empty() {
+            return Ok(());
+        }
+        let res = self.resident.as_mut().ok_or("prefill loads need resident mode")?;
+        let set = &mut res.experts;
+        let e = set.n_experts;
+        let mut layers = std::collections::BTreeSet::new();
+        for (l, x) in pf.live.drain(..) {
+            set.lut_host[l * (e + 1) + x] = -1;
+            layers.insert(l);
+        }
+        for l in layers {
+            Self::pf_upload(set, self.keep.as_ref(), l, &self.stream)?;
+        }
+        Ok(())
+    }
+
+    /// Prefill loads on or off (a bench A/B), on both ranks of a pair.
+    pub fn set_pf_load(&mut self, on: bool) -> Result<()> {
+        self.mirror(|m| {
+            m.u32(OP_PF_LOAD).u32(on as u32);
+        })?;
+        let pf = self.pf_loads.as_mut().ok_or("prefill loads: boot with DSV41_PF_LOAD")?;
+        pf.on = on;
+        Ok(())
+    }
+
+    /// Prefill loads held for the next steps (a probe's: decode.rs), on both ranks of a pair.
+    pub fn set_pf_pause(&mut self, paused: bool) -> Result<()> {
+        self.mirror(|m| {
+            m.u32(OP_PF_PAUSE).u32(paused as u32);
+        })?;
+        let pf = self.pf_loads.as_mut().ok_or("prefill loads: boot with DSV41_PF_LOAD")?;
+        pf.paused = paused;
+        Ok(())
+    }
+
+    /// Prefill loads' counters since boot, if booted with them.
+    pub fn pf_stats(&self) -> Option<crate::pfload::PfStats> {
+        self.pf_loads.as_ref().map(|p| p.stats.clone())
     }
 
     /// Async hot reads' counters since boot, if on.
@@ -4683,6 +4860,17 @@ impl Engine {
         let p = t * k;
         let index = |pre: &str| w.prefix.strip_prefix(pre).and_then(|r| r.trim_end_matches('.').parse::<usize>().ok());
         let (layer, block) = (index("layers."), index("mtp."));
+        gemm(sr, &self.act.mma_part, np(&self.act.y), d, Wt::Bf16 { w: np(&w.gate_w), n: e, k: d }, t, np(&self.act.z), true, e)?;
+        // prefill loads (crate::pfload): an eager step's backbone layer, never beside the hot ring's
+        // marks (a decode step's, which is never eager)
+        let pf_layer = match (layer, &self.pf_loads) {
+            (Some(l), Some(p)) if p.on && !p.paused && self.eager_step && self.hot.as_ref().map_or(true, |h| h.n_marks == 0) => Some(l),
+            _ => None,
+        };
+        if let Some(l) = pf_layer {
+            self.pf_point(w, l, t)?;
+        }
+        let st = &self.stream;
         {
             let a = &self.act;
             let keep = match (layer, block) {
@@ -4690,7 +4878,6 @@ impl Engine {
                 (_, Some(b)) => self.dspark_keep.as_ref().map(|kb| kb.ptr_at(b * e)).unwrap_or(nul()),
                 _ => nul(),
             };
-            gemm(sr, &a.mma_part, np(&a.y), d, Wt::Bf16 { w: np(&w.gate_w), n: e, k: d }, t, np(&a.z), true, e)?;
             // a backbone layer of a recording engine records its lanes' demand on the way, and
             // a decode step's leaves its hot-read candidates
             let hot = match (&self.hot, self.shape, layer) {
@@ -4748,11 +4935,18 @@ impl Engine {
             let live = if layer.is_some() { np(&a.live_pairs) } else { nul() };
             ck(unsafe { ds_lut_slots(sr, np(&a.idx), set.lut.ptr_at(bi * (e + 1)), p as i32, np(&a.keys), live) }, "lut slots")?;
             let blocks = route(sr, a, p, k, set.null_slot as usize + 1, e + 1, self.eager_step && t >= PREFILL_MOE_ROWS)?;
-            if ar.inter < cfg.moe_inter_dim {
-                return self.moe_tp(w, ar, t, k, set.null_slot, blocks);
+            let r = if ar.inter < cfg.moe_inter_dim {
+                self.moe_tp(w, ar, t, k, set.null_slot, blocks)
+            } else {
+                match self.routed_experts(ar, t, k, set.null_slot, blocks) {
+                    Ok(()) => self.shared_and_combine(w, t),
+                    Err(err) => Err(err),
+                }
+            };
+            if pf_layer.is_some() {
+                self.pf_release()?;
             }
-            self.routed_experts(ar, t, k, set.null_slot, blocks)?;
-            return self.shared_and_combine(w, t);
+            return r;
         }
         let mut idx = vec![0i32; p];
         self.act.idx.download_async(0, &mut idx, st)?;

@@ -116,13 +116,17 @@ experts. TideLM decides which share, keeps deciding, and cheaply covers the rest
      miss carrying ≥ 0.3 is not left to the next round: it is read before its layer's MoE runs
      and computed exactly (`GLM_HOT_RESCUE`; 0.3 since 2026-11-18, at the bench's speed of 0.4). `GLM_HOT_ASYNC=0` reads every one that way, for
      about 5% of the decode speed.
-   - GLM-5.3 prefill (`GLM_PF_LOAD`, on by default): per MoE layer and prompt chunk, the missing
-     experts carrying at least 4 tokens' worth of the chunk's routing are read into 32 scratch slots
-     before the layer's MoE and computed exactly, instead of on substitutes, and leave after the
-     layer. On ten 3.5K-token prompts far from the routing history (bit280), the prompts' routing
-     weight on substitutes fell from ~30% to ~5% and the loss of the 512 tokens after each from
-     1.656 to 1.588 (paired 95% [-0.102, -0.038]; code and maths unchanged), for ~10% more prefill
-     time ([pfload.rs](rust/crates/tidelm-glm/src/pfload.rs)).
+   - Prefill loads, every model (`GLM_PF_LOAD`, `DSV41_PF_LOAD`, on by default): per MoE layer and
+     prompt chunk, the missing experts carrying at least 4 tokens' worth of the chunk's routing are
+     read into 32 scratch slots before the layer's MoE and computed exactly, instead of on
+     substitutes, and leave after the layer. On ten 3.5K-token prompts far from the routing history,
+     GLM-5.3 (bit280) took the prompts' routing weight on substitutes from ~30% to ~5% and the loss
+     of the 512 tokens after each from 1.656 to 1.588 (paired 95% [-0.102, -0.038]; code and maths
+     unchanged), for ~10% more prefill time, and GLM-5.3-Flash on one Spark from 1.813 to 1.737
+     ([-0.102, -0.049]) for 23%. On Inkling-2-Small and DeepSeek the same test found no gain
+     (+0.003 [-0.019, +0.026], +0.011 [-0.011, +0.033]: some texts better, others worse, for 21% / 7%
+     more prefill); they are on there by the author's choice, to judge sudden changes of topic in
+     use ([GLM](rust/crates/tidelm-glm/src/pfload.rs), [DeepSeek](rust/crates/tidelm-engine/src/pfload.rs)).
 4. **Two Sparks as one.** Both boxes hold half of every resident expert and run tensor-parallel
    over RoCE; a boot-time guard refuses to start if the two ranks disagree on any setting that
    changes the numbers.
@@ -539,7 +543,7 @@ with what each setting measured.
 | `DSV41_PREFIX_CACHE=1`, `DSV41_PREFIX_DISK=1` | `GLM_PREFIX_DISK=1`, `GLM_KV_SPLIT=1` | Prompt caching; GLM's KV cache split across the ranks. |
 | — | `GLM_KV=fp8` | GLM's KV cache format, the one the Rust engine serves. The Python engine's 4-bit latent with the first and last ten layers in FP8 fits 320K in less memory and measured KL +0.004 against FP8 on the long eval, but in use the model's recall of its context was visibly worse. |
 | — | `GLM_EXLR8_ROUND=exact` | exlr8's codebook rounded to FP8 exactly as the format defines it, instead of in two instructions (the default: a decode pass ~2% shorter, held-out NLL unchanged). |
-| — | `GLM_PF_LOAD=4`, `GLM_PF_LOAD_SLOTS=32` | Prefill loads (above), GLM-5.3's default; `GLM_PF_LOAD=0` turns them off. The scratch slots come out of `GLM_SLOTS` (38 fewer residents on `bit280`). |
+| `DSV41_PF_LOAD=4`, `DSV41_PF_LOAD_SLOTS=32` | `GLM_PF_LOAD=4`, `GLM_PF_LOAD_SLOTS=32` | Prefill loads (above), the default; 0 turns them off. The scratch slots come out of `RUST_BUDGET` / `GLM_SLOTS` (32 fewer DeepSeek residents, 38 fewer on `bit280`); with every expert resident they are off. |
 | — | `GLM_LOOP_BREAK=12` | Stops a short cycle of tokens from repeating a 12th time (repetition loops start where experts are substituted). |
 
 ## Documentation

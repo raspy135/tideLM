@@ -955,6 +955,9 @@ impl Scheduler {
             eprintln!("hot reads: {} reads over {} decode steps since boot ({} capped, {:.2} s waited)", h.reads, h.steps, h.capped,
                       h.wait_s);
         }
+        if let Some(p) = engine.pf_stats() {
+            eprintln!("{}", p.line());
+        }
         if self.adapt.is_some() {
             self.adapt_pass(engine, None, "end of request")?;
         }
@@ -1410,6 +1413,11 @@ impl Scheduler {
         // decoding lanes', then the prefill entries', in segment order
         let owners = decode.iter().map(|d| d.0).chain(prefill.iter().map(|p| p.0));
         let seg_sampling: Vec<Sampling> = owners.map(|l| self.slots[l].as_ref().unwrap().job.sampling).collect();
+        // a probe's rows are routed for their demand alone: no prefill loads in its steps
+        let probing = prefill.iter().any(|e| e.2) && engine.pf_stats().is_some();
+        if probing {
+            engine.set_pf_pause(true)?;
+        }
         let (am, logits, nuc): (Vec<Vec<u32>>, Vec<Vec<u16>>, Vec<Vec<Nucleus>>) = if encoder {
             engine.encode_batch(&segs)?;
             (Vec::new(), Vec::new(), Vec::new())
@@ -1422,6 +1430,9 @@ impl Scheduler {
             let nuc = engine.forward_batch_sampled(&segs, &seg_sampling)?;
             (nuc.iter().map(|rows| rows.iter().map(|n| n.ids[0]).collect()).collect(), Vec::new(), nuc)
         };
+        if probing {
+            engine.set_pf_pause(false)?;
+        }
         let tp = std::time::Instant::now();
         self.stats.forward_s += (tp - tf).as_secs_f64();
         let (mut rollbacks, mut seeds) = (Vec::new(), Vec::new());

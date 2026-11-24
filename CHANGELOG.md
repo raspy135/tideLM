@@ -15,6 +15,18 @@ exactly what it says: the defaults are not settled and the measurements are inco
 
 ## Unreleased
 
+- **Prefill loads in every engine, on by default** (`DSV41_PF_LOAD=4` on DeepSeek, new in
+  `rust/crates/tidelm-engine/src/pfload.rs`; `GLM_PF_LOAD=4` now on Inkling 2 and GLM-5.3-Flash too).
+  DeepSeek: in a prompt's eager steps each backbone layer routes exactly first; its heavy missing
+  experts are read into 32 scratch slots past the hot-read ring (taken out of `RUST_BUDGET`), or
+  routed to their ring slot when the ring holds them, and none are loaded in the adaptation probe's
+  steps. The DeepSeek server gained `--bench-nll` (and `--bench-nll-ab pfload`) for the A/B. Same
+  protocol as GLM-5.3's below: Inkling 2 NLL 1.6564 -> 1.6596 (paired +0.003 [-0.019, +0.026]) for
+  21% more prefill, DeepSeek 1.5771 -> 1.5885 (+0.011 [-0.011, +0.033]) for 7%, in both some texts
+  better (Japanese, history) and others worse (Chinese physics, biology; chemistry on Inkling): on
+  there by the author's choice, not a measured gain. GLM-5.3-Flash at TP=1 gained as GLM-5.3 did:
+  1.8129 -> 1.7374 (-0.076 [-0.102, -0.049]) for 23% more prefill. With every expert resident
+  (GLM-5.3-Flash at TP=2, a DeepSeek boot without `--budget`) they turn themselves off.
 - **GLM-5.3 prefill loads, on by default** (`GLM_PF_LOAD=4`, `GLM_PF_LOAD_SLOTS=32`;
   `rust/crates/tidelm-glm/src/pfload.rs`): per MoE layer and prefill sub-chunk, the missing experts
   carrying at least 4 tokens' worth of the chunk's routing are read into 32 scratch slots before the

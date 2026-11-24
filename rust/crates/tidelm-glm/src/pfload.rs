@@ -1,7 +1,9 @@
 //! Prefill loads (GLM_PF_LOAD): a prefill chunk's missing experts read in before their layer's
 //! MoE runs, as SmallTide stages them (its prefill.rs), instead of every miss computing on a
-//! substitute. On by default for GLM-5.3 (tidelm-server's --pf-load 4, 32 scratch slots); off
-//! for GLM-5.3-Flash and Inkling 2, where it has not been measured.
+//! substitute. On by default for every family (tidelm-server's --pf-load 4, 32 scratch slots):
+//! measured on GLM-5.3 (paired NLL -0.069) and GLM-5.3-Flash at TP=1 (-0.076); on Inkling 2 the
+//! same A/B found no gain (+0.003 [-0.019, +0.026], domains split both ways) and it is on by the
+//! author's choice (glm_main.rs). Off where every expert is resident.
 //!
 //! A prefill sub-chunk of up to `moe_rows` rows routes each MoE layer exactly (moe_exact); the
 //! rows' top-k picks come to the host, each missing expert's share (a row's picks normalized to
