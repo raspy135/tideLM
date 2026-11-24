@@ -150,6 +150,13 @@ if [[ -n "${GLM_MODEL_DIR:-}" ]]; then
             echo "--- GLM_HOT_RESCUE=$GLM_HOT_RESCUE not applied: it rides on async hot reads (GLM_HOT=1, GLM_HOT_ASYNC=1)"
         fi
     fi
+    # GLM_PF_LOAD=TH: a prefill chunk's missing experts whose summed share over a MoE sub-chunk's
+    # rows reaches TH tokens' worth are read in before the layer's MoE instead of computing on
+    # substitutes (tidelm-glm pfload.rs), into GLM_PF_LOAD_SLOTS scratch slots (32) taken out of
+    # GLM_SLOTS' budget. Unset: the server's default, 4 for GLM-5.3 and off for GLM-5.3-Flash and
+    # Inkling 2; 0: off
+    [[ -n "${GLM_PF_LOAD:-}" ]] && args+=(--pf-load "$GLM_PF_LOAD")
+    [[ -n "${GLM_PF_LOAD_SLOTS:-}" ]] && args+=(--pf-load-slots "$GLM_PF_LOAD_SLOTS")
     [[ "${GLM_GRAPHS:-1}" == 1 ]] && args+=(--graphs)
     # GLM_EXLR8_ROUND=exact|fast: an exlr8 pack's (tools/glm_pack_exlr8.py) and exlr8 dense matrices'
     # (tools/glm_exlr8_dense.py) codebook rounded to E4M3 as the format defines it, or in two

@@ -117,6 +117,8 @@ pub struct ResStats {
     pub preload: usize,
     pub preload_mb: u64,
     pub preload_s: f64,
+    /// GLM_PF_LOAD: the prefill load points' coverage counters and reads (pfload.rs)
+    pub pf: crate::pfload::PfStats,
 }
 
 /// One conversation's cumulative votes: `vote` (a phase's routed weight per (layer, expert))
@@ -399,11 +401,11 @@ pub struct AdaptAsync {
 }
 
 /// One record for a reader thread: where it is in the pack, where its nine tensors go.
-struct ReadJob {
-    off: u64,
-    nbytes: usize,
-    dsts: [(usize, usize); 9],
-    done: mpsc::Sender<std::result::Result<(), String>>,
+pub(crate) struct ReadJob {
+    pub(crate) off: u64,
+    pub(crate) nbytes: usize,
+    pub(crate) dsts: [(usize, usize); 9],
+    pub(crate) done: mpsc::Sender<std::result::Result<(), String>>,
 }
 
 impl HotAsync {
@@ -416,7 +418,7 @@ impl HotAsync {
 /// `threads` readers, each with its own O_DIRECT handle, staging buffer and stream (made here, so a
 /// reader that cannot start fails its caller, not a read): a job's record read from the pack and
 /// copied into its slot's tensors, then `done`.
-fn readers(pack: &Pack, threads: usize) -> Result<mpsc::Sender<ReadJob>> {
+pub(crate) fn readers(pack: &Pack, threads: usize) -> Result<mpsc::Sender<ReadJob>> {
     let (tx, rx) = mpsc::channel::<ReadJob>();
     let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
     for _ in 0..threads {
@@ -797,7 +799,7 @@ impl Engine {
     }
 
     /// Whether (layer, expert) is a background adaptation's newcomer still loading.
-    fn adapt_pending(&self, i: usize) -> bool {
+    pub(crate) fn adapt_pending(&self, i: usize) -> bool {
         self.adapt_bg.as_ref().is_some_and(|a| a.newcomers.contains(&i))
     }
 

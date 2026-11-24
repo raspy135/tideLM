@@ -15,6 +15,16 @@ exactly what it says: the defaults are not settled and the measurements are inco
 
 ## Unreleased
 
+- **GLM-5.3 prefill loads, on by default** (`GLM_PF_LOAD=4`, `GLM_PF_LOAD_SLOTS=32`;
+  `rust/crates/tidelm-glm/src/pfload.rs`): per MoE layer and prefill sub-chunk, the missing experts
+  carrying at least 4 tokens' worth of the chunk's routing are read into 32 scratch slots before the
+  layer's MoE and computed exactly, not on substitutes. One boot, `--bench-nll-ab pfload`, `bit280`, ten
+  3,584-token prompts far from the routing history, the 512 tokens after each scored, adaptation and
+  hot reads off: the prompts' routing weight on substitutes ~30% -> ~5%, NLL 1.6562 -> 1.5876 (paired
+  -0.069, 95% [-0.102, -0.038]; code and maths unchanged, chemistry +0.09 on one text), prefill ~10%
+  slower (~1.5 s a 3.5K prompt). The scratch comes out of `GLM_SLOTS`: 13,226 residents on `bit280`
+  against 13,264. Off for GLM-5.3-Flash and Inkling 2, where it has not run; `GLM_PF_LOAD=0` turns it
+  off. The README's first-token times were taken without it and have not been re-measured.
 - **GLM-5.3 serves exlr8 `bit322`** (`configs/glm53-exlr8-bit322.env.example`, replacing
   `glm53-exlr8-home`): release 0.6 of `kindlingai/glm-5.3-exlr8-k2-k3-k4` re-encoded every expert in the
   mul1 codebook and removed `home`; 0.7's `bit322` (3.22 bpw) holds 11,543 experts at `GLM_SLOTS=12400`

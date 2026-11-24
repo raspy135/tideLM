@@ -15,6 +15,7 @@ pub mod flash_vision;
 pub mod forward;
 pub mod lend;
 pub mod lin;
+pub mod pfload;
 pub mod prefix;
 pub mod residency;
 pub mod serve;

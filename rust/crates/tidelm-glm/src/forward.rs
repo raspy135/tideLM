@@ -84,9 +84,9 @@ const OP_SNAP_COMMIT: u32 = 14;
 
 /// Schedule knobs a benchmark can switch on both ranks inside one boot (Engine::bench_knob): each
 /// moves no value, only when and where kernels run.
-pub const BENCH_KNOBS: [&str; 20] = ["l2pf", "pdl", "evict_first", "evict_kvb", "evict_skinny", "mla_half", "index_side", "fat",
+pub const BENCH_KNOBS: [&str; 21] = ["l2pf", "pdl", "evict_first", "evict_kvb", "evict_skinny", "mla_half", "index_side", "fat",
                                       "split", "osplit", "qsplit", "rot1", "round", "hot_plan", "rescue", "hc_fused", "flash_pf", "flash_both", "draft_vocab",
-                                      "ink_fuse"];
+                                      "ink_fuse", "pfload"];
 
 /// Lanes a pass may carry (glm.cu kMaxLanes).
 pub const MAX_LANES: usize = 4;
@@ -111,6 +111,9 @@ pub struct Options {
     pub prefill_reduce_bf16: bool,
     /// MoE prefill in sub-chunks of this many rows (bounds the per-pair scratch)
     pub moe_rows: usize,
+    /// GLM_PF_LOAD's scratch slots (pfload.rs): the transient class's slots below the hot reads' one,
+    /// out of the GLM_SLOTS budget (0: prefill loads off)
+    pub pf_slots: usize,
     pub pack: std::path::PathBuf,
     /// sequences served at once (GLM_LANES), sharing the KV pool max_seq positions fill
     pub lanes: usize,
@@ -129,10 +132,10 @@ impl Options {
         let cfg = std::fs::read(model_dir.join("config.json"))?;
         let exe = std::fs::read(std::env::current_exe()?)?;
         let s = format!(
-            "glm-boot v1\nconfig {:x}\nexe {:x}\nmax_seq {}\nchunk {}\nslots {}\nkv_split {}\nreduce_bf16 {}\nmoe_rows {}\n\
+            "glm-boot v1\nconfig {:x}\nexe {:x}\nmax_seq {}\nchunk {}\nslots {}\nkv_split {}\nreduce_bf16 {}\nmoe_rows {}\npf_slots {}\n\
              lanes {}\nkv_tokens {}\npack_source {}\nablit {}\nenv {}\nflags {}\n",
             sha2::Sha256::digest(&cfg), sha2::Sha256::digest(&exe), self.max_seq, self.chunk, self.slots, self.kv_split,
-            self.prefill_reduce_bf16, self.moe_rows, self.lanes, self.kv_tokens, pack.source_sha256, crate::ablit::digest()?,
+            self.prefill_reduce_bf16, self.moe_rows, self.pf_slots, self.lanes, self.kv_tokens, pack.source_sha256, crate::ablit::digest()?,
             ["TIDELM_GLM_HOT", "TIDELM_GLM_WIDE_DECODE_FROM", "NCCL_PROTO", "TIDELM_GLM_MLA_HALF", "TIDELM_GLM_FAT", "GLM_FLASH_DENSE", "TIDELM_FLASH_HC_FUSED", "GLM_INK_DENSE", "TIDELM_INK_PF_FLASH", "TIDELM_INK_FLASH_DECODE", "TIDELM_INK_FUSE", "GLM_INK_KV"].iter().map(|k| format!("{k}={}", std::env::var(k).unwrap_or_default()))
                 .collect::<Vec<_>>().join(" "), self.guard_extra);
         Ok(s.into_bytes())
@@ -437,6 +440,8 @@ pub struct Engine {
     graphs_map: std::collections::HashMap<GraphKey, tidelm_cuda::GraphExec>,
     /// synchronous hot reads between a decode pass's segments (None: off)
     pub hot: Option<crate::adapt::Hot>,
+    /// GLM_PF_LOAD: missing experts read in a prefill chunk's MoE layers (None: off)
+    pub pf: Option<crate::pfload::PfLoad>,
     /// wide_decode_from(), read once at load
     wide_from: usize,
     pub res: crate::adapt::Res,
@@ -555,9 +560,10 @@ impl Engine {
         let nl = cfg.n_layers();
         let e = cfg.experts;
         // the decoder arena: a class of slots for each width triple among the residents and a
-        // transient slot as wide as any (sync hot reads); the MTP layer's, every expert resident
+        // transient class as wide as any (sync hot reads' slot, last, and GLM_PF_LOAD's scratch
+        // slots below it); the MTP layer's, every expert resident
         let moe_all: Vec<usize> = (0..cfg.layers).filter(|&l| !cfg.dense[l]).collect();
-        let (mut arena, slot_of) = class_arena(&pack, residents, Some(&moe_all), world, cfg.hidden, cfg.moe_inter)?;
+        let (mut arena, slot_of) = class_arena(&pack, residents, Some((&moe_all, 1 + opt.pf_slots)), world, cfg.hidden, cfg.moe_inter)?;
         arena.prefill_tiled = true;
         let mut lut_h = vec![-1i32; nl * e];
         for (&(l, ex), &slot) in residents.iter().zip(&slot_of) {
@@ -566,7 +572,8 @@ impl Engine {
         let t1 = std::time::Instant::now();
         let placed: Vec<(usize, usize, usize)> = residents.iter().zip(&slot_of).map(|(&(l, ex), &s)| (s, l, ex)).collect();
         load_slots(&pack, &arena, &placed)?;
-        let widths: Vec<String> = arena.classes.iter().filter(|c| c.n > 1 || arena.classes.len() == 1)
+        // the transient class (the last) is not residents
+        let widths: Vec<String> = arena.classes[..arena.classes.len() - 1].iter()
             .map(|c| format!("{}/{}/{} x{}", c.bits[0], c.bits[1], c.bits[2], c.n)).collect();
         log(&format!("{tag} {} routed experts resident ({:.1} GB; {}) in {:.0} s", residents.len(), arena.bytes() as f64 / 1e9,
                      widths.join(", "), t1.elapsed().as_secs_f64()));
@@ -755,6 +762,7 @@ impl Engine {
             hot_plan_on: true,
             graphs_map: std::collections::HashMap::new(),
             hot: None,
+            pf: None,
             wide_from: wide_decode_from(),
             res: crate::adapt::Res::new(nl, e, n_slots, moe_layers_res, &placed),
             adapt_bg: None,
@@ -1692,6 +1700,46 @@ impl Engine {
         self.final_norm(t)
     }
 
+    /// A prefill chunk's decoder layers: layers(t, true), or with GLM_PF_LOAD each MoE layer's
+    /// sub-chunks routed exactly, their missing experts read in (pfload.rs), then computed.
+    fn layers_prefill(&mut self, t: usize) -> Result<()> {
+        if self.pf.is_none() {
+            return self.layers(t, true);
+        }
+        self.positions(t, false)?;
+        self.embed(t, false, np(&self.act.h), true)?;
+        for l in 0..self.cfg.layers {
+            self.layer_pre(l, t, true)?;
+            if matches!(self.w.layers[l].mlp, Mlp::Dense { .. }) {
+                self.mlp(l, t, true)?;
+                continue;
+            }
+            // mlp()'s MoE sub-chunks, a load point between each one's exact routing and the rest
+            let sub = self.opt.moe_rows;
+            let mut r0 = 0;
+            while r0 < t {
+                let n = sub.min(t - r0);
+                self.moe_exact(l, r0, n)?;
+                self.pf_load_point(l, n)?;
+                self.moe_rest(l, r0, n, true)?;
+                r0 += n;
+            }
+            self.pf_release()?;
+        }
+        self.prefetch_join()?;
+        self.final_norm(t)
+    }
+
+    /// The exact top-k moe_exact left for its `n` rows (expert ids, weights) to the host, the
+    /// stream waited for (a prefill load point).
+    pub(crate) fn pf_routing(&self, n: usize, ids: &mut [i32], ws: &mut [f32]) -> Result<()> {
+        let m = n * self.cfg.topk;
+        self.act.eids.download_async(0, &mut ids[..m], &self.st)?;
+        self.act.ew.download_async(0, &mut ws[..m], &self.st)?;
+        self.st.synchronize()?;
+        Ok(())
+    }
+
     /// The decoder's last MLP output added and the final norm into hn (mHC: the streams' mean).
     fn final_norm(&self, t: usize) -> Result<()> {
         if self.cfg.hc.is_some() {
@@ -2239,9 +2287,10 @@ impl Act {
 }
 
 /// An arena for `items` (layer, expert): a class for each width triple among them in sorted order,
-/// slots handed out in item order within a class; with `transient` (the decoder's MoE layers), one
-/// more slot as wide as any of those layers' records. Returns each item's slot.
-pub fn class_arena(pack: &Pack, items: &[(usize, usize)], transient: Option<&[usize]>, world: usize, hidden: usize,
+/// slots handed out in item order within a class; with `transient` (the decoder's MoE layers and a
+/// count), that many more slots as wide as any of those layers' records, the last class. Returns each
+/// item's slot.
+pub fn class_arena(pack: &Pack, items: &[(usize, usize)], transient: Option<(&[usize], usize)>, world: usize, hidden: usize,
                    inter: usize) -> Result<(Arena, Vec<usize>)> {
     let bits: Vec<crate::arena::Bits> = items.iter().map(|&(l, x)| pack.record(l, x).map(|r| r.bits)).collect::<Result<_>>()?;
     let mut counts: std::collections::BTreeMap<crate::arena::Bits, usize> = std::collections::BTreeMap::new();
@@ -2249,7 +2298,7 @@ pub fn class_arena(pack: &Pack, items: &[(usize, usize)], transient: Option<&[us
         *counts.entry(*b).or_default() += 1;
     }
     let mut classes: Vec<(crate::arena::Bits, usize)> = counts.into_iter().collect();
-    if let Some(layers) = transient {
+    if let Some((layers, count)) = transient {
         let mut w = [0usize; 3];
         for (&(l, _), r) in &pack.records {
             if layers.contains(&l) {
@@ -2258,7 +2307,7 @@ pub fn class_arena(pack: &Pack, items: &[(usize, usize)], transient: Option<&[us
                 }
             }
         }
-        classes.push((w, 1));
+        classes.push((w, count));
     }
     let arena = Arena::new(&classes, pack.cb, world, hidden, inter)?;
     let mut next: Vec<usize> = arena.classes.iter().map(|c| c.first).collect();
@@ -2512,7 +2561,7 @@ impl Engine {
             }
             let part = &ids[c0..c0 + n];
             self.stage(part, &[(lane, n, self.pos)], false)?;
-            self.layers(n, true)?;
+            self.layers_prefill(n)?;
             self.flash_commit(&[(lane, n, self.pos)]);
             self.last_rows = n;
             if next.is_some() {
@@ -2867,6 +2916,9 @@ impl Engine {
         if name == "rescue" {
             return self.bench_knob(name, true); // a rescue A/B boots with it on
         }
+        if name == "pfload" {
+            return self.bench_knob(name, true); // as rescue: an A/B boots with it on
+        }
         if name == "round" {
             let boot = self.exlr8_boot_exact;
             return self.bench_knob(name, boot);
@@ -2959,6 +3011,11 @@ impl Engine {
                 s.fuse = on;
                 unsafe { tidelm_kernels::inkling::ink_set_mix_v(on as i32) };
             }
+            // GLM_PF_LOAD: off still measures (the coverage counters), it reads nothing
+            20 => match self.pf.as_mut() {
+                Some(p) => p.on = on,
+                None => return Err("bench knob pfload: boot with GLM_PF_LOAD".into()),
+            },
             _ => return Err(format!("bench knob {code}").into()),
         }
         self.graphs_map.clear();

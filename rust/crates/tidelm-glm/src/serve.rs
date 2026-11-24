@@ -1009,6 +1009,7 @@ impl Server {
                            r1.adapt_wait_s - r0.adapt_wait_s,
                            r1.preload - r0.preload, (r1.preload_mb - r0.preload_mb) / 1_000_000, r1.preload_s - r0.preload_s,
                            s.fallbacks);
+        let line = if self.eng.pf.is_some() { format!("{line}, {}", r1.pf.line(&r0.pf)) } else { line };
         let (id, lane, prompt) = (run.job.id, run.lane, run.job.prompt.clone());
         let rkeys: Vec<u128> = run.job.images.iter().map(crate::flash_image::image_key).collect();
         let pkey = store_tokens(&prompt, &run.job.images, &rkeys);

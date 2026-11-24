@@ -8,7 +8,7 @@
 //!                 [--hot 1] [--hot-async 0] [--hot-keep 32] [--hot-rescue 0.4] [--depth 7] [--cal 0.36 | --dyn 0.9] [--lookup 8] [--copy 1]
 //!                 [--adapt 1] [--adapt-every 200] [--adapt-prefill 512] [--adapt-decode 256]
 //!                 [--bg-every 2] [--loop-break 12] [--two-pass 512] [--two-pass-miss 0.15] [--preload 512]
-//!                 [--lanes 1] [--lane-chunk 1024]
+//!                 [--lanes 1] [--lane-chunk 1024] [--pf-load 4 (GLM-5.3; else 0)] [--pf-load-slots 32]
 //!                 [--state-db FILE] [--host 0.0.0.0] [--port 8000] [--served-model-name glm-5.3]
 //!
 //! The routing history: --db is read at boot (the Python engine's torch.save .pt or this
@@ -34,7 +34,7 @@ pub fn is_glm(model_dir: &std::path::Path) -> bool {
 }
 
 pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
-    const VALUED: [&str; 57] = ["--exlr8-round", "--kv-tokens", "--bench-nll-ab", "--bench-nll-adapt", "--hot-predict", "--hot-victim", "--hot-rescue", "--bench-prefill-ab", "--bench-ab", "--bench-ab-rounds", "--bench-nll-skip", "--bench-nll-rows", "--bench-nll-max", "--lanes", "--lane-chunk", "--bench-nll-out", "--bench-nll", "--bench-widths", "--copy", "--hot-async", "--bench-width", "--bench-ctx", "--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
+    const VALUED: [&str; 59] = ["--pf-load", "--pf-load-slots", "--exlr8-round", "--kv-tokens", "--bench-nll-ab", "--bench-nll-adapt", "--hot-predict", "--hot-victim", "--hot-rescue", "--bench-prefill-ab", "--bench-ab", "--bench-ab-rounds", "--bench-nll-skip", "--bench-nll-rows", "--bench-nll-max", "--lanes", "--lane-chunk", "--bench-nll-out", "--bench-nll", "--bench-widths", "--copy", "--hot-async", "--bench-width", "--bench-ctx", "--model-dir", "--pack", "--db", "--state-db", "--world", "--rank", "--addr", "--slots",
                                 "--max-seq", "--chunk", "--hot", "--hot-keep", "--depth", "--cal", "--dyn", "--lookup",
                                 "--adapt", "--adapt-every", "--adapt-prefill", "--adapt-decode", "--bg-every", "--loop-break",
                                 "--two-pass", "--two-pass-miss", "--host", "--port", "--served-model-name", "--moe-rows",
@@ -67,6 +67,20 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         Some("exact") => true,
         Some(v) => return Err(format!("--exlr8-round {v}: fast or exact").into()),
     };
+    let cfg = tidelm_glm::config::GlmConfig::load(&model_dir)?;
+    // --pf-load TH (GLM_PF_LOAD): a prefill chunk's missing experts whose summed share over a MoE
+    // sub-chunk's rows reaches TH tokens' worth read in before the layer's MoE (tidelm_glm::pfload), into
+    // --pf-load-slots scratch slots (GLM_PF_LOAD_SLOTS, 32) taken out of the --slots budget; 0 off. In
+    // the guard. On at 4 for GLM-5.3, where it was measured (bit280, 2026-11-23: ten far-domain
+    // 3,584-token prompts, the 512 tokens after each scored, NLL 1.6562 -> 1.5876, paired -0.069 [-0.102,
+    // -0.038], the prompts' routing weight on substitutes ~30% -> ~5%, prefill ~10% slower); off for
+    // GLM-5.3-Flash and Inkling 2, where it has not run.
+    let pf_default = if cfg.is_flash() || cfg.is_inkling() { 0.0 } else { 4.0 };
+    let pf_load = num("--pf-load", pf_default)? as f32;
+    let pf_slots = if pf_load > 0.0 { num("--pf-load-slots", 32.0)? as usize } else { 0 };
+    if pf_load > 0.0 && pf_slots == 0 {
+        return Err("--pf-load-slots 0: prefill loads need scratch slots (--pf-load 0 turns them off)".into());
+    }
     let opt = Options {
         max_seq: num("--max-seq", 262144.0)? as usize,
         chunk: num("--chunk", 4096.0)? as usize,
@@ -75,9 +89,10 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         kv_tokens: num("--kv-tokens", 0.0)? as usize,
         prefill_reduce_bf16: arg(args, "--reduce").as_deref() != Some("fp32"),
         moe_rows: num("--moe-rows", 2048.0)? as usize,
+        pf_slots: pf_slots,
         pack: PathBuf::from(&pack),
         lanes: num("--lanes", 1.0)? as usize,
-        guard_extra: format!("graphs {} hot {} async {} predict {} victim {} rescue {} oracle {} prefix {} gb {} preload {} exlr8-round {}",
+        guard_extra: format!("graphs {} hot {} async {} predict {} victim {} rescue {} oracle {} prefix {} gb {} preload {} exlr8-round {} pf-load {pf_load}",
                              args.iter().any(|a| a == "--graphs"),
                              arg(args, "--hot").unwrap_or_else(|| "1".into()), arg(args, "--hot-async").unwrap_or_default(),
                              arg(args, "--hot-predict").unwrap_or_default(), arg(args, "--hot-victim").unwrap_or_default(),
@@ -86,7 +101,6 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
                              arg(args, "--preload").unwrap_or_default(), if exlr8_exact { "exact" } else { "fast" }),
     };
     tidelm_cuda::set_device(0)?;
-    let cfg = tidelm_glm::config::GlmConfig::load(&model_dir)?;
     let e = cfg.experts;
     let mut pair = None;
     if world == 2 {
@@ -114,7 +128,18 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
         let pack = tidelm_glm::arena::Pack::open(&opt.pack, cfg.hidden, cfg.moe_inter)?;
         let unit: usize = tidelm_glm::arena::record_sizes([3; 3], world, cfg.hidden, cfg.moe_inter).iter().sum();
         let cost = |l: usize, x: usize| pack.records.get(&(l, x)).map(|r| r.nbytes).unwrap_or(usize::MAX);
-        let r = tidelm_glm::residency::placement_bytes(&m, e, &swap, opt.slots * unit, 2 * cfg.topk, &cost);
+        // GLM_PF_LOAD's scratch slots come out of it: each as wide as the widest expert of the MoE layers
+        let mut wide = [0usize; 3];
+        for (&(l, _), r) in &pack.records {
+            if swap.contains(&l) {
+                for i in 0..3 {
+                    wide[i] = wide[i].max(r.bits[i]);
+                }
+            }
+        }
+        let scratch = opt.pf_slots * tidelm_glm::arena::record_sizes(wide, world, cfg.hidden, cfg.moe_inter).iter().sum::<usize>();
+        let budget = (opt.slots * unit).checked_sub(scratch).ok_or("--pf-load-slots: the scratch is over the --slots budget")?;
+        let r = tidelm_glm::residency::placement_bytes(&m, e, &swap, budget, 2 * cfg.topk, &cost);
         if let Some(p) = pair.as_mut() {
             let mut msg = tidelm_comm::Msg::default();
             msg.u32s(&r.iter().map(|&(l, x)| (l * e + x) as u32).collect::<Vec<_>>());
@@ -151,6 +176,11 @@ pub fn main(args: &[String], model_dir: PathBuf) -> tidelm_engine::Result<()> {
             Some("slow") => true,
             Some(v) => return Err(format!("--hot-victim {v}: score or slow").into()),
         };
+    }
+    if pf_load > 0.0 {
+        eng.enable_pf_load(pf_load, pf_slots)?;
+        log(&format!("[glm] prefill loads on: a missing expert with {pf_load} tokens' worth of a prefill sub-chunk's routing read \
+                      in before its layer's MoE, {pf_slots} scratch slots"));
     }
     // GLM-5.3-Flash's image input (GLM_VISION=1): the tower and a request's features on demand
     if eng.cfg.is_flash() && std::env::var("GLM_VISION").as_deref() == Ok("1") {
@@ -599,6 +629,8 @@ fn bench_nll(eng: &mut Engine, path: &str, text: &Text, keep: usize, out: Option
     // TIDELM_GLM_PREFILL_CHECK=N (debug): text N's prefill computed twice, through the prefill
     // path and as decode passes of 8 rows (no hot reads planned between), the last row compared
     let check: Option<usize> = std::env::var("TIDELM_GLM_PREFILL_CHECK").ok().and_then(|v| v.parse().ok());
+    // GLM_PF_LOAD's counters (the texts' prefills: the skipped rows each text starts with)
+    let pf0 = eng.res.stats.pf.clone();
     let mut ntext = 0usize;
     for line in std::fs::read_to_string(path)?.lines().filter(|l| !l.trim().is_empty()) {
         let v: serde_json::Value = serde_json::from_str(line)?;
@@ -681,6 +713,9 @@ fn bench_nll(eng: &mut Engine, path: &str, text: &Text, keep: usize, out: Option
                {} unkept, {} inline rescues, {:.2} s waited)", 100.0 * miss[1] / miss[0].max(1.0), 100.0 * miss[3] / miss[2].max(1e-20),
               reads as f64 / npass.max(1) as f64, reads as f64 / tn.max(1) as f64, st.hot_unkept - s0.1, st.hot_rescue - s0.3,
               st.hot_wait_s - s0.2);
+    if eng.pf.is_some() {
+        eprintln!("bench-nll: {}", st.pf.bench_line(&pf0));
+    }
     if last {
         eng.stop_follower()?;
     }
